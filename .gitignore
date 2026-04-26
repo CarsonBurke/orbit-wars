@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Data — never commit raw competition data (only the top-level data/ dir)
+/data/*
+!/data/README.md
+
+# Tensorboard / training runs (top-level only — keep src/owars/runs etc. tracked)
+/runs/*
+!/runs/.gitkeep
+
+# Model checkpoints (top-level only)
+/checkpoints/*
+!/checkpoints/.gitkeep
+
+# Model checkpoints (any depth)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Other ML training artifacts
+wandb/
+mlruns/
+lightning_logs/
+
+# Replays + episode logs
+replays/
+episode_logs/
+*.replay.json
+
+# Submissions (built artifacts; main.py source is tracked)
+/submission/build/
+submission*.tar.gz
+submission*.zip
+
+# Kaggle
+*.kaggle.json
+.kaggle/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local secrets and overrides
+.env
+.env.local
+*.local
+configs/local/

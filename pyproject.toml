@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "owars"
+version = "0.0.1"
+description = "Orbit Wars — RL bot for the Kaggle Orbit Wars simulation competition"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.3",
+  "tensorboard>=2.16",
+  "tqdm>=4.66",
+  "pyyaml>=6.0",
+  "rich>=13.7",
+  "kaggle-environments>=1.16",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "ipykernel",
+  "matplotlib",
+  "seaborn",
+]
+kaggle = [
+  "kaggle>=1.6",
+]
+
+[project.scripts]
+owars-train = "owars.training.train:main"
+owars-eval = "owars.training.evaluate:main"
+owars-ablate = "owars.training.ablate:main"
+owars-bundle = "owars.submission.bundle:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "N"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
