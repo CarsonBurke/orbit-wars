@@ -1,0 +1,34 @@
+import yaml
+
+from owars.training.config import RunConfig, deep_override
+
+
+def test_load_default():
+    cfg = RunConfig.from_dict({})
+    assert cfg.run.name == "default"
+    assert cfg.game.num_players == 2
+    assert cfg.model.depth == 3
+
+
+def test_unknown_key_raises():
+    try:
+        RunConfig.from_dict({"model": {"not_a_real_field": 1}})
+    except KeyError:
+        return
+    raise AssertionError("expected KeyError for unknown model field")
+
+
+def test_deep_override_merges():
+    base = {"a": {"x": 1, "y": 2}, "b": 3}
+    over = {"a": {"y": 20}, "c": 5}
+    out = deep_override(base, over)
+    assert out["a"]["x"] == 1 and out["a"]["y"] == 20
+    assert out["b"] == 3 and out["c"] == 5
+
+
+def test_real_yaml_loads():
+    cfg = RunConfig.from_dict(yaml.safe_load(open("configs/ppo_base.yaml")))
+    assert cfg.run.name == "ppo_base"
+    assert cfg.game.episode_steps == 500
+    assert 0.0 <= cfg.opponents.self_play_prob <= 1.0
+    assert cfg.opponents.top_k > 0
