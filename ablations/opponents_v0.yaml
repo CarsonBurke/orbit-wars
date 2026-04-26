@@ -1,0 +1,20 @@
+# Opponent-pool composition sweep.
+#
+# In a self-play RL competition, opponent diversity is the single biggest
+# knob: pure self-play tends to collapse on a narrow strategy band; mixing
+# in fixed baselines and frozen snapshots keeps gradients honest and tracks
+# *transferable* improvements. This matrix isolates that knob.
+#
+# Run with: python scripts/ablate.py --matrix ablations/opponents_v0.yaml
+
+base: configs/ppo_base.yaml
+name: opponents_v0
+
+cells:
+  - { run.name: pool_self_only,    opponents.pool: ["self"] }
+  - { run.name: pool_self_heavy,   opponents.pool: ["self", "self", "self", "heuristic"] }
+  - { run.name: pool_balanced,     opponents.pool: ["self", "heuristic", "sniper", "random"] }
+  - { run.name: pool_baselines,    opponents.pool: ["heuristic", "sniper", "random"] }
+  - { run.name: pool_heuristic,    opponents.pool: ["heuristic"] }
+  - { run.name: pool_no_random,    opponents.pool: ["self", "heuristic", "sniper"] }
+  - { run.name: pool_with_frozen,  opponents.pool: ["self", "heuristic", "sniper", "random"], opponents.snapshot_every: 10 }

@@ -1,0 +1,67 @@
+# Four-player FFA config.
+#
+# Differences from `ppo_base.yaml`:
+#   - num_players: 4
+#   - longer training (4-player games have longer credit-assignment chains)
+#   - larger snapshot pool (FFA strategy collapse is steeper, so a deeper
+#     league of past selves helps)
+#   - more pretraining (sparser per-trajectory variance — random and
+#     heuristic FFAs land more decisively on a "winner takes all" outcome,
+#     so the value target distribution is more bimodal and easier to
+#     pre-fit).
+
+run:
+  name: ppo_4p
+  seed: 0
+  device: cuda
+  total_updates: 300
+
+game:
+  num_players: 4
+  episode_steps: 500
+  ship_speed: 6.0
+
+model:
+  dim: 128
+  ff_dim: 384
+  depth: 4
+  n_heads: 4
+  dropout: 0.0
+  fraction_concentration: 4.0
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 0.5
+  minibatch_size: 1024
+  epochs_per_update: 4
+
+ppo:
+  gamma: 1.0
+  lambda_critic: 1.0
+  lambda_policy: 0.95
+  lambda_policy_alpha: 0.0
+  clip_eps: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.015   # a touch higher to keep diverse strategies alive
+  pretrain_updates: 75
+  pretrain_episodes: 32
+  pretrain_lr: 1.0e-3
+  pretrain_behavior: heuristic
+
+rollout:
+  episodes_per_update: 12
+  parallel_workers: 1
+  max_moves_per_turn: 24
+
+opponents:
+  snapshot_every: 25
+  top_k: 12              # FFA wants more snapshot diversity
+  self_play_prob: 0.8
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+reward:
+  win_value: 1.0
+  loss_value: -1.0
+  draw_value: 0.0

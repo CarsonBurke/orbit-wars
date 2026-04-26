@@ -1,0 +1,22 @@
+# Headline ablation — the "did the modeling work pay off?" comparison.
+#
+# Cells:
+#   - heuristic        : pure-heuristic agent, no learning (control)
+#   - ppo_small        : 2-layer/64-dim transformer policy with PPO
+#   - ppo_base         : the "main" model
+#   - ppo_no_self      : same as base but no self-play in the pool
+#                         (isolates whether self-play is doing work)
+#
+# Each cell gets one seed. If two cells land within noise, reseed *that
+# pair* by editing run.seed and rerunning — cheaper than always × 3.
+#
+# Run with: python scripts/ablate.py --matrix ablations/headline.yaml
+
+base: configs/ppo_base.yaml
+name: headline
+
+cells:
+  - { run.name: heuristic,  run.total_updates: 0 }
+  - { run.name: ppo_small,  model.depth: 2, model.dim: 64, model.ff_dim: 192 }
+  - { run.name: ppo_base    }
+  - { run.name: ppo_no_self, opponents.pool: ["heuristic", "sniper", "random"] }

@@ -1,0 +1,45 @@
+# PPO knobs sweep.
+# One knob per cell. PPO is usually the smallest dial in a self-play RL
+# project — model architecture and opponents move the score more — but
+# wrong PPO settings can mask real signal, so we check.
+#
+# Run with: python scripts/ablate.py --matrix ablations/ppo_v0.yaml
+
+base: configs/ppo_base.yaml
+name: ppo_v0
+
+cells:
+  # learning rate
+  - { run.name: lr_1em4, optim.lr: 1.0e-4 }
+  - { run.name: lr_3em4, optim.lr: 3.0e-4 }
+  - { run.name: lr_1em3, optim.lr: 1.0e-3 }
+
+  # clip range
+  - { run.name: clip_010, ppo.clip_eps: 0.10 }
+  - { run.name: clip_020, ppo.clip_eps: 0.20 }
+  - { run.name: clip_030, ppo.clip_eps: 0.30 }
+
+  # entropy coef
+  - { run.name: ent_001,  ppo.entropy_coef: 0.001 }
+  - { run.name: ent_010,  ppo.entropy_coef: 0.01 }
+  - { run.name: ent_030,  ppo.entropy_coef: 0.03 }
+
+  # value coef
+  - { run.name: vc_025,   ppo.value_coef: 0.25 }
+  - { run.name: vc_050,   ppo.value_coef: 0.5 }
+  - { run.name: vc_100,   ppo.value_coef: 1.0 }
+
+  # discount
+  - { run.name: gamma_99,   ppo.gamma: 0.99 }
+  - { run.name: gamma_995,  ppo.gamma: 0.995 }
+  - { run.name: gamma_999,  ppo.gamma: 0.999 }
+
+  # gae lambda
+  - { run.name: lam_080, ppo.gae_lambda: 0.80 }
+  - { run.name: lam_095, ppo.gae_lambda: 0.95 }
+  - { run.name: lam_098, ppo.gae_lambda: 0.98 }
+
+  # epochs / minibatches
+  - { run.name: epochs_2,  optim.epochs_per_update: 2 }
+  - { run.name: epochs_4,  optim.epochs_per_update: 4 }
+  - { run.name: epochs_8,  optim.epochs_per_update: 8 }

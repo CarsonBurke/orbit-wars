@@ -1,0 +1,21 @@
+# Reward-shaping sweep.
+#
+# The terminal margin is the load-bearing signal — but pure terminal
+# rewards are very sparse over a 500-step game. Small intermediate shaping
+# helps credit-assignment, but too much shaping pushes the policy toward
+# the proxy and away from the actual win-rate.
+#
+# Run with: python scripts/ablate.py --matrix ablations/reward_v0.yaml
+
+base: configs/ppo_base.yaml
+name: reward_v0
+
+cells:
+  - { run.name: terminal_only, reward.capture_bonus: 0.0, reward.loss_penalty: 0.0, reward.sun_loss_penalty: 0.0 }
+  - { run.name: cap_only,      reward.capture_bonus: 0.05, reward.loss_penalty: 0.0 }
+  - { run.name: cap_and_loss,  reward.capture_bonus: 0.05, reward.loss_penalty: -0.05 }
+  - { run.name: heavy_capture, reward.capture_bonus: 0.1,  reward.loss_penalty: -0.1 }
+  - { run.name: light_shaping, reward.capture_bonus: 0.02, reward.loss_penalty: -0.02 }
+  - { run.name: margin_high,   reward.margin_scale: 0.005 }
+  - { run.name: margin_low,    reward.margin_scale: 0.0001 }
+  - { run.name: sun_strong,    reward.sun_loss_penalty: -0.001 }

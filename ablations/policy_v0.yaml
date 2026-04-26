@@ -1,0 +1,35 @@
+# Policy/encoder architecture sweep.
+# One knob per cell. Pick the top 1–2 settings per axis, then combine in v1.
+#
+# Run with: python scripts/ablate.py --matrix ablations/policy_v0.yaml
+
+base: configs/ppo_base.yaml
+name: policy_v0
+
+cells:
+  # depth
+  - { run.name: depth_2, model.depth: 2 }
+  - { run.name: depth_3, model.depth: 3 }
+  - { run.name: depth_4, model.depth: 4 }
+  - { run.name: depth_6, model.depth: 6 }
+
+  # width (dim with proportional ff_dim ~ 3x)
+  - { run.name: dim_64,  model.dim: 64,  model.ff_dim: 192 }
+  - { run.name: dim_96,  model.dim: 96,  model.ff_dim: 256 }
+  - { run.name: dim_128, model.dim: 128, model.ff_dim: 384 }
+  - { run.name: dim_192, model.dim: 192, model.ff_dim: 576 }
+
+  # heads
+  - { run.name: heads_2, model.n_heads: 2 }
+  - { run.name: heads_4, model.n_heads: 4 }
+  - { run.name: heads_8, model.n_heads: 8 }
+
+  # dropout
+  - { run.name: dropout_0,  model.dropout: 0.0 }
+  - { run.name: dropout_10, model.dropout: 0.1 }
+  - { run.name: dropout_20, model.dropout: 0.2 }
+
+  # fraction-head concentration
+  - { run.name: conc_2, model.fraction_concentration: 2.0 }
+  - { run.name: conc_4, model.fraction_concentration: 4.0 }
+  - { run.name: conc_8, model.fraction_concentration: 8.0 }

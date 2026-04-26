@@ -1,0 +1,77 @@
+# Main PPO config — the "primary" learned model.
+#
+# 2-player by default. Switch `game.num_players` to 4 for the FFA variant —
+# the model architecture is the same; only the opponent pool composition
+# and reward shaping should be tuned per-mode.
+#
+# VAPO defaults baked in:
+#   - γ = 1.0 (finite-horizon, terminal-only reward — no discounting)
+#   - λ_critic = 1.0 (Monte-Carlo target, unbiased)
+#   - λ_policy = 0.95 (variance-reduced advantage)
+#   - 50 critic-only pretraining updates against the heuristic baseline
+#     before PPO turns on (cold-starts the value head).
+#   - Token-level policy loss (sum-then-divide-by-step-count) — built
+#     into ppo.py, not a flag.
+
+run:
+  name: ppo_base
+  seed: 0
+  device: cuda
+  log_root: runs
+  ckpt_root: checkpoints
+  total_updates: 200
+
+game:
+  num_players: 2
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  dim: 96
+  ff_dim: 256
+  depth: 3
+  n_heads: 4
+  dropout: 0.0
+  fraction_concentration: 4.0
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 0.5
+  minibatch_size: 1024
+  epochs_per_update: 4
+
+ppo:
+  gamma: 1.0
+  lambda_critic: 1.0
+  lambda_policy: 0.95
+  lambda_policy_alpha: 0.0
+  clip_eps: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  pretrain_updates: 50
+  pretrain_episodes: 32
+  pretrain_lr: 1.0e-3
+  pretrain_behavior: heuristic
+
+rollout:
+  episodes_per_update: 16
+  parallel_workers: 1
+  max_moves_per_turn: 16
+
+opponents:
+  snapshot_every: 25
+  top_k: 8
+  self_play_prob: 0.8
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+reward:
+  win_value: 1.0
+  loss_value: -1.0
+  draw_value: 0.0
+  capture_bonus: 0.0
+  loss_penalty: 0.0
+  sun_loss_penalty: 0.0
+  margin_scale: 0.0
