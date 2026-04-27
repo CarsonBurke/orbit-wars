@@ -3,21 +3,26 @@
 We track a single rating per *identity* — the live learner ("learner") and
 each frozen snapshot ("frozen:<label>"). Snapshots don't learn but their
 ratings drift as new games are played; this is what lets us cull weak
-snapshots (lowest-Elo eviction in `OpponentPool`).
+snapshots (UCB-based eviction in `OpponentPool`).
 
 For 2-player matches this is textbook Elo. For FFA we aggregate scores by
 identity (when "self" fills multiple seats they share an identity) and
 update each pair of distinct identities once, with `K / (N − 1)` per pair
 so the per-game K-budget on any one rating is bounded.
 
-Choice of plain Elo over Glicko/TrueSkill: the snapshot population turns
-over fast (~100s of games per rating before it's evicted) and we don't
-care about rating-deviation calibration, only relative ordering. Plain
-Elo is one screenful of code; Glicko-2 is dozens.
+The pool evicts by `ucb(name) = rating + 2 * K / sqrt(games_played)` rather
+than raw rating: a freshly-added snapshot whose initial rating happens to
+dip on its first game shouldn't be culled before it's had a fair sample.
+Eviction-by-lowest-UCB means we cut a snapshot only when we're *confident*
+it's weak — high uncertainty (low n) inflates UCB and protects newcomers,
+which is the opposite of what an LCB-based rule would do (LCB punishes
+fresh snapshots since their interval extends far below the mean). Cheap
+stand-in for Glicko-2's rating-deviation without the full RD bookkeeping.
 """
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -42,6 +47,18 @@ class EloTracker:
 
     def get(self, name: str) -> float:
         return self.ratings.get(name, self.initial_rating)
+
+    def ucb(self, name: str, z: float = 2.0) -> float:
+        """Upper confidence bound on the rating: `μ + z·K/√n`.
+
+        With `z=2.0` and the default K=32, a snapshot at rating 1500 with
+        zero games has ucb ≈ 1564; after 64 games it tightens to ≈ 1508.
+        `OpponentPool` evicts by *lowest* UCB so few-games snapshots get a
+        protective uncertainty buffer — only snapshots that are well-
+        measured *and* low-rated drop below newcomers and get culled.
+        """
+        n = max(1, self.games_played.get(name, 0))
+        return self.get(name) + z * self.k_factor / math.sqrt(n)
 
     def set(self, name: str, rating: float) -> None:
         self.ratings[name] = rating

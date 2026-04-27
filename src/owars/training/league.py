@@ -7,9 +7,11 @@ Sampling rule (per opponent slot, independently):
     by Elo. If the pool is empty, fall back to "self".
 
 Eviction: when a new snapshot pushes the pool past `top_k`, drop the
-*lowest-Elo* member (it's no longer providing useful gradient diversity).
-This is the league analogue of "keep the strongest opponents alive" —
-weak snapshots are replaced rather than aging out by FIFO.
+member with the *lowest UCB* (upper-confidence bound on Elo, see
+`EloTracker.ucb`). Few-games snapshots get a wide interval that lifts
+their UCB above battle-tested peers' UCBs at the same point estimate, so
+they're protected during their first sample; only snapshots that are
+*both* weak and well-measured drop to the bottom and get culled.
 
 Heuristic baselines (random/sniper/heuristic) intentionally aren't in this
 pool — they live in `evaluate.py` for benchmark runs and in the value-
@@ -122,7 +124,11 @@ class OpponentPool:
     def _trim_to_top_k(self) -> None:
         if len(self._frozen) <= self.top_k:
             return
-        ranked = sorted(self._frozen.keys(), key=lambda n: self.elo.get(n), reverse=True)
+        # Sort by UCB so a snapshot that's weak *and* well-measured is the
+        # one to go — not a freshly-added snapshot whose first game happened
+        # to be a loss against a strong opponent. Lowest-UCB == lowest-rating
+        # under high certainty == confident this one's actually weak.
+        ranked = sorted(self._frozen.keys(), key=lambda n: self.elo.ucb(n), reverse=True)
         for name in ranked[self.top_k :]:
             self._frozen.pop(name, None)
             # Leave the rating in EloTracker — it's history; cheap to keep.
