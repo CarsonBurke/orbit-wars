@@ -190,8 +190,10 @@ class SelfAttention(nn.Module):
         nn.init.orthogonal_(self.c_v.weight, gain=0.1)
         # Zero-init output projection — see block-level docstring on
         # cold-start identity. Wins over orthogonal because it's *after*.
+        # No bias (parameter-golf: every Linear is `bias=False`); the bias
+        # would be a per-channel drift channel with no upside since the
+        # residual already adds zero contribution at cold-start.
         nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # `x` is a nested-jagged tensor of shape [B, j, D] where j varies
@@ -248,7 +250,7 @@ class TransformerBlock(nn.Module):
         self.ff = nn.Sequential(
             CastedLinear(dim, ff_dim),
             nn.GELU(),
-            CastedLinear(ff_dim, dim),
+            CastedLinear(ff_dim, dim, bias=False),
         )
         self.drop = nn.Dropout(dropout)
         # Orthogonal init for the input projection (both dims ≥64 →
@@ -262,7 +264,6 @@ class TransformerBlock(nn.Module):
         # exact identity at step 0 — the residual stream carries
         # `embed_norm(embeds)` through unchanged.
         nn.init.zeros_(self.ff[-1].weight)
-        nn.init.zeros_(self.ff[-1].bias)
         # Per-channel learnable residual scaling on each branch
         # (parameter-golf `Block.attn_scale/mlp_scale`, sota_train_gpt.py:111).
         # Ones-init → identity to a vanilla pre-norm block at step 0, but the
@@ -372,21 +373,20 @@ class OrbitPolicy(nn.Module):
         # 2·dim input for the same reason as target_query. Outputs (μ, log σ)
         # of a tanh-squashed Normal over [-1, 1]; sampling.py maps to [0, 1]
         # to get the fraction-of-garrison-to-send.
-        self.fraction_head = CastedLinear(2 * cfg.dim, 2)
+        self.fraction_head = CastedLinear(2 * cfg.dim, 2, bias=False)
         # μ row gets the same gain=0.1 orthogonal init as the rest of the
         # network — small initial pre-tanh mean → tight fraction distribution
         # at cold-start → bounded first-update Δlog_prob.
-        # log σ row is zeroed (both weight and bias) so σ ≡ 1 at init: pre-tanh
+        # log σ row weight is zeroed so σ ≡ 1 at init: pre-tanh
         # ~ N(0, 1), tanh-squashed → wide distribution over (-1, 1), which
         # sampling.py maps to a near-uniform fraction in [0, 1].
         nn.init.orthogonal_(self.fraction_head.weight, gain=0.1)
-        nn.init.zeros_(self.fraction_head.bias)
         with torch.no_grad():
             self.fraction_head.weight[1].zero_()
         self.value_head = nn.Sequential(
             CastedLinear(cfg.dim, cfg.value_hidden),
             nn.GELU(),
-            CastedLinear(cfg.value_hidden, 1),
+            CastedLinear(cfg.value_hidden, 1, bias=False),
         )
         # Orthogonal init for the value-head input projection (both dims
         # ≥64 if `value_hidden ≥ 64`).
@@ -400,7 +400,6 @@ class OrbitPolicy(nn.Module):
         # This stops cold-start critic noise from injecting spurious
         # advantage signal into the actor's first few updates.
         nn.init.zeros_(self.value_head[-1].weight)
-        nn.init.zeros_(self.value_head[-1].bias)
         # Cached on-device self-target mask. P is bounded by MAX_PLANETS,
         # so we allocate once at module init and slice per-forward instead
         # of allocating a fresh `torch.eye` every step (~num_envs × episode
