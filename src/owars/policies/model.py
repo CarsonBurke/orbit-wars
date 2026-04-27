@@ -68,27 +68,26 @@ from .config import OrbitPolicyConfig
 from .features import EncodedObs
 
 
-class SquaredLeakyReLU(nn.Module):
-    """Activation: `leaky_relu(x, 0.5)²` (parameter-golf `sota_train_gpt.py:109`).
+class SquaredReLU(nn.Module):
+    """Activation: `relu(x)²` — Primer / modded-nanogpt / parameter-golf
+    `train_gpt.py:619`.
 
-    A "squared ReLU" / Primer-style activation with a smooth negative branch:
       • x ≥ 0 → x²
-      • x < 0 → (0.5·x)² = 0.25·x²
+      • x < 0 → 0  (rectifier semantics — feature is "off" for negatives)
 
-    Quadratic growth on both sides means larger derivative magnitudes than
-    GELU as |x| grows; pg tolerates this because RMSNorm, QK-norm, and
-    ortho-init bound the inputs to this activation, so the unbounded
-    derivative regime is never reached in practice. Stateless module —
-    fits drop-in inside `nn.Sequential` where the original `nn.GELU()` was.
+    Picked over the `leaky_relu(x, 0.5)²` variant in pg's `sota_train_gpt.py`
+    because the leaky² curve is a U-shape (negative inputs still produce
+    `0.25·x²` activation, with a sign-flipped gradient on the negative
+    branch). The rectifier semantics here are the more conservative choice
+    and what modded-nanogpt and Primer use; in practice the empirical gap
+    on bounded-input regimes (RMSNorm + QK-norm + zero-init proj) is small
+    and ReLU² has the cleaner "feature on/off" interpretation.
 
-    Implemented via the identity `leaky_relu(x, 0.5) = 0.5·x + 0.5·relu(x)`
-    rather than `F.leaky_relu`, because the FF block runs on nested-jagged
-    tensors during encoding and `aten.leaky_relu` has no NJT kernel — but
-    `relu`, `mul`, and `add` all do.
+    NJT-safe: `relu` has a nested-jagged kernel, unlike `leaky_relu`.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (0.5 * x + 0.5 * F.relu(x)).square()
+        return F.relu(x).square()
 
 
 class CastedLinear(nn.Linear):
@@ -279,7 +278,7 @@ class TransformerBlock(nn.Module):
         self.ln_scale_factor = 1.0
         self.ff = nn.Sequential(
             CastedLinear(dim, ff_dim, bias=False),
-            SquaredLeakyReLU(),
+            SquaredReLU(),
             CastedLinear(ff_dim, dim, bias=False),
         )
         self.drop = nn.Dropout(dropout)
@@ -436,7 +435,7 @@ class OrbitPolicy(nn.Module):
             self.fraction_head.weight[1].zero_()
         self.value_head = nn.Sequential(
             CastedLinear(cfg.dim, cfg.value_hidden, bias=False),
-            SquaredLeakyReLU(),
+            SquaredReLU(),
             CastedLinear(cfg.value_hidden, 1, bias=False),
         )
         # Orthogonal init for the value-head input projection (both dims
