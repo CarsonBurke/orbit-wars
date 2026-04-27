@@ -346,6 +346,15 @@ def _ppo_loop(
 ) -> dict:
     summary: dict = {"updates": []}
 
+    # Seed the pool with a snapshot of the random-init model. Without this,
+    # `_sample_one` returns LEARNER_NAME for every slot until the first
+    # snapshot lands at `snapshot_every`, every game is learner-vs-learner,
+    # `update_from_game` early-returns on a single identity, and Elo stays
+    # frozen. The init snapshot is *not* pinned — if it's bad it'll lose
+    # rating and UCB-eviction will cull it like any other weak snapshot.
+    init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
+    pool.add_snapshot("init", model, init_ckpt)
+
     # Compile *only* the PPO-update forward+backward path. The minibatch
     # shape there is fixed at `[minibatch_size, MAX_PLANETS, ...]` and gets
     # called epochs × ⌈n/mb⌉ times per update (~32×200 invocations on the
