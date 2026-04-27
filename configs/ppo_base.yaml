@@ -33,7 +33,9 @@ model:
                    # cheapest setting that lets SDPA dispatch to the FA2 kernel
                    # under bf16 autocast. dim=96 (head_dim=24) silently fell
                    # back to the math/mem-efficient kernel.
-  ff_dim: 512      # standard 4·dim ratio
+  ff_dim: 256      # 2·dim — sufficient for the trunk's small token count
+                   # (≤17 planets + meta), and halves PPO-update activation
+                   # footprint vs the canonical 4·dim.
   depth: 3
   n_heads: 4
   dropout: 0.0
@@ -44,7 +46,7 @@ optim:
   # stationary; PPO is non-stationary (each update sees a new behavior
   # distribution) and WD would bias the policy toward pre-update weights
   # in a way the importance ratio doesn't account for.
-  muon_lr: 0.02
+  muon_lr: 0.022   # parameter-golf's `matrix_lr` exactly.
   # AdamW (everything else).
   lr: 3.0e-4
   weight_decay: 1.0e-4
@@ -66,7 +68,11 @@ ppo:
                        # the policy lean into beneficial moves more freely.
                        # Set equal to clip_eps_low to recover vanilla PPO.
   value_coef: 0.5
-  entropy_coef: 0.01
+  entropy_coef: 0.0   # cleanrl `ppo_continuous_action.py:69` default. With
+                       # the LOG_SIGMA_MIN floor, low-init μ head (gain=0.01),
+                       # and zeroed log_σ row, the cold-start policy is already
+                       # near-uniform — the entropy bonus mainly fights the
+                       # value gradient over log_σ during early updates.
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`
                         # warms V on a state distribution PPO immediately
