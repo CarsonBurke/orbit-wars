@@ -900,12 +900,12 @@ class NumpyOrbitWarsEnv:
 
 
 class NumpyVecEnv:
-    """Adaptive in-process vector env with the same subset protocol as `VecEnv`.
+    """Batched in-process vector env with the same subset protocol as `VecEnv`.
 
     Map generation and comet path generation remain delegated to
     `NumpyOrbitWarsEnv` because they are per-game stochastic rejection
-    samplers. Idle turns are updated in padded batch arrays; turns with
-    launches or live fleets use the scalar NumPy env as the correctness oracle.
+    samplers. Normal launch/fleet/combat turns are updated in padded batch
+    arrays so active rollouts do not bounce through scalar env objects.
     """
 
     def __init__(
@@ -987,25 +987,17 @@ class NumpyVecEnv:
                 self.last_states[idx] = state
                 out[idx] = (state, bool(self.done[idx]), None)
                 continue
-            if self._needs_scalar_step(idx, normalized):
-                env = self._write_env(idx)
-                state = env.step(normalized)
-                self._store_env(idx, env)
-                self.last_states[idx] = state
-                out[idx] = (
-                    state,
-                    bool(self.done[idx]),
-                    env.final_state() if self.done[idx] else None,
-                )
-                continue
             self.step_count[idx] += 1
             active.append(idx)
             active_actions[idx] = normalized
 
         if active:
             self._prepare_comets(active)
+            self._process_moves_batch(active, active_actions)
             self._produce_batch(active)
-            self._move_planets_batch(active)
+            combat_lists, remove = self._move_fleets_batch(active)
+            self._move_planets_and_sweep_batch(active, combat_lists, remove)
+            self._resolve_combat_batch(active, combat_lists)
             self._check_done_batch(active)
             for idx in active:
                 state = self._state(idx, active_actions[idx])
@@ -1016,11 +1008,6 @@ class NumpyVecEnv:
                     self._final_state_from_state(state) if self.done[idx] else None,
                 )
         return out
-
-    def _needs_scalar_step(self, idx: int, actions: list[Any]) -> bool:
-        if self.fleet_mask[idx].any():
-            return True
-        return any(action and isinstance(action, list) for action in actions)
 
     def set_recording(self, enabled: bool) -> None:
         if not enabled:
@@ -1101,6 +1088,13 @@ class NumpyVecEnv:
         env.angular_velocity = float(self.angular_velocity[idx])
         env.next_fleet_id = int(self.next_fleet_id[idx])
         return env
+
+    def _compact_fleets(self, idx: int) -> None:
+        rows = self.fleets[idx, self.fleet_mask[idx]].copy()
+        self.fleet_mask[idx].fill(False)
+        if len(rows):
+            self.fleets[idx, : len(rows)] = rows
+            self.fleet_mask[idx, : len(rows)] = True
 
     def _normalize_actions(self, action: Any) -> list[Any]:
         actions = action if isinstance(action, list) else []
@@ -1191,13 +1185,161 @@ class NumpyVecEnv:
                 env._spawn_comets()
                 self._store_env(idx, env)
 
+    def _process_moves_batch(
+        self, active: list[int], actions_by_env: dict[int, list[Any]]
+    ) -> None:
+        rows_by_env: dict[int, list[list[float]]] = {}
+        for idx in active:
+            actions = actions_by_env[idx]
+            if not any(action and isinstance(action, list) for action in actions):
+                continue
+            ids = np.zeros(self.planet_cap, dtype=np.int64)
+            ids[self.planet_mask[idx]] = self.planets[
+                idx, self.planet_mask[idx], P_ID
+            ].astype(np.int64)
+            rows: list[list[float]] = []
+            for player_id in range(self.num_players):
+                action = actions[player_id]
+                if not action or not isinstance(action, list):
+                    continue
+                for move in action:
+                    try:
+                        if len(move) != 3:
+                            continue
+                        from_id, angle, ships = move
+                        from_id = int(from_id)
+                        ships = int(ships)
+                        angle = float(angle)
+                    except (TypeError, ValueError):
+                        continue
+                    matches = np.nonzero(self.planet_mask[idx] & (ids == from_id))[0]
+                    if len(matches) == 0:
+                        continue
+                    pidx = int(matches[0])
+                    planet = self.planets[idx, pidx]
+                    if int(planet[P_OWNER]) != player_id:
+                        continue
+                    if planet[P_SHIPS] >= ships and ships > 0:
+                        self.planets[idx, pidx, P_SHIPS] -= ships
+                        start_x = planet[P_X] + math.cos(angle) * (
+                            planet[P_RADIUS] + 0.1
+                        )
+                        start_y = planet[P_Y] + math.sin(angle) * (
+                            planet[P_RADIUS] + 0.1
+                        )
+                        rows.append(
+                            [
+                                self.next_fleet_id[idx],
+                                player_id,
+                                start_x,
+                                start_y,
+                                angle,
+                                from_id,
+                                ships,
+                            ]
+                        )
+                        self.next_fleet_id[idx] += 1
+            if rows:
+                rows_by_env[idx] = rows
+        for idx, rows in rows_by_env.items():
+            used = int(np.sum(self.fleet_mask[idx]))
+            self._ensure_fleet_capacity(used + len(rows))
+            free = np.nonzero(~self.fleet_mask[idx])[0][: len(rows)]
+            self.fleets[idx, free] = np.asarray(rows, dtype=np.float64)
+            self.fleet_mask[idx, free] = True
+
     def _produce_batch(self, active: list[int]) -> None:
         env_idx = np.asarray(active, dtype=np.int64)
         owned = self.planet_mask[env_idx] & (self.planets[env_idx, :, P_OWNER] != -1)
         self.planets[env_idx, :, P_SHIPS] += owned * self.planets[env_idx, :, P_PROD]
 
-    def _move_planets_batch(self, active: list[int]) -> None:
+    def _move_fleets_batch(
+        self, active: list[int]
+    ) -> tuple[list[defaultdict[int, list[np.ndarray]]], np.ndarray]:
+        combat_lists: list[defaultdict[int, list[np.ndarray]]] = [
+            defaultdict(list) for _ in range(self.num_envs)
+        ]
+        remove = np.zeros_like(self.fleet_mask)
+        active_arr = np.asarray(active, dtype=np.int64)
+        active_fleet_mask = np.zeros_like(self.fleet_mask)
+        active_fleet_mask[active_arr] = self.fleet_mask[active_arr]
+        env_ids, fleet_slots = np.nonzero(active_fleet_mask)
+        if len(env_ids) == 0:
+            return combat_lists, remove
+
+        old = self.fleets[env_ids, fleet_slots][:, [F_X, F_Y]].copy()
+        ships = self.fleets[env_ids, fleet_slots, F_SHIPS]
+        speeds = 1.0 + (self.ship_speed - 1.0) * (
+            np.log(ships) / math.log(1000.0)
+        ) ** 1.5
+        speeds = np.minimum(speeds, self.ship_speed)
+        self.fleets[env_ids, fleet_slots, F_X] += (
+            np.cos(self.fleets[env_ids, fleet_slots, F_ANGLE]) * speeds
+        )
+        self.fleets[env_ids, fleet_slots, F_Y] += (
+            np.sin(self.fleets[env_ids, fleet_slots, F_ANGLE]) * speeds
+        )
+        new = self.fleets[env_ids, fleet_slots][:, [F_X, F_Y]].copy()
+        rem_flat = (
+            (new[:, 0] < 0)
+            | (new[:, 0] > BOARD_SIZE)
+            | (new[:, 1] < 0)
+            | (new[:, 1] > BOARD_SIZE)
+        )
+        active_flat = ~rem_flat
+        if np.any(active_flat):
+            center = np.repeat(
+                np.asarray([[CENTER, CENTER]], dtype=np.float64),
+                int(np.sum(active_flat)),
+                axis=0,
+            )
+            sun_dist = _points_to_segments_distance(
+                center, old[active_flat], new[active_flat]
+            )
+            active_ix = np.nonzero(active_flat)[0]
+            rem_flat[active_ix[sun_dist < SUN_RADIUS]] = True
+        active_flat = ~rem_flat
+        if np.any(active_flat):
+            local = np.nonzero(active_flat)[0]
+            e = env_ids[local]
+            points = self.planets[e, :, :][:, :, [P_X, P_Y]].copy()
+            points[~self.planet_mask[e]] = 0.0
+            starts = old[local]
+            ends = new[local]
+            seg = ends - starts
+            l2 = np.einsum("ij,ij->i", seg, seg)
+            diff = points - starts[:, None, :]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = np.einsum("mpd,md->mp", diff, seg) / l2[:, None]
+            t = np.clip(
+                np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0
+            )
+            proj = starts[:, None, :] + t[:, :, None] * seg[:, None, :]
+            dists = np.linalg.norm(points - proj, axis=2)
+            hits = self.planet_mask[e] & (dists < self.planets[e, :, P_RADIUS])
+            has_hit = hits.any(axis=1)
+            first = np.argmax(hits, axis=1)
+            for row, pslot in zip(np.nonzero(has_hit)[0], first[has_hit], strict=False):
+                flat_idx = int(local[int(row)])
+                env_idx = int(env_ids[flat_idx])
+                fleet_slot = int(fleet_slots[flat_idx])
+                pid = int(self.planets[env_idx, int(pslot), P_ID])
+                combat_lists[env_idx][pid].append(
+                    self.fleets[env_idx, fleet_slot].copy()
+                )
+                rem_flat[flat_idx] = True
+        remove[env_ids, fleet_slots] = rem_flat
+        return combat_lists, remove
+
+    def _move_planets_and_sweep_batch(
+        self,
+        active: list[int],
+        combat_lists: list[defaultdict[int, list[np.ndarray]]],
+        remove: np.ndarray,
+    ) -> None:
+        moving: list[tuple[int, int, float, float, float, float, float]] = []
         for idx in active:
+            track_sweep = self.fleet_mask[idx].any()
             comet_ids = set(self.envs[idx].comet_planet_ids)
             for pslot in np.nonzero(self.planet_mask[idx])[0]:
                 pid = int(self.planets[idx, pslot, P_ID])
@@ -1220,15 +1362,41 @@ class NumpyVecEnv:
                 dx = init[P_X] - CENTER
                 dy = init[P_Y] - CENTER
                 radius = math.sqrt(dx**2 + dy**2)
+                old_x = float(self.planets[idx, pslot, P_X])
+                old_y = float(self.planets[idx, pslot, P_Y])
                 if radius + self.planets[idx, pslot, P_RADIUS] < ROTATION_RADIUS_LIMIT:
                     angle = math.atan2(dy, dx) + self.angular_velocity[idx] * (
                         self.step_count[idx] - 1
                     )
                     self.planets[idx, pslot, P_X] = CENTER + radius * math.cos(angle)
                     self.planets[idx, pslot, P_Y] = CENTER + radius * math.sin(angle)
-            self._move_comets_for_env(idx)
+                new_x = float(self.planets[idx, pslot, P_X])
+                new_y = float(self.planets[idx, pslot, P_Y])
+                if track_sweep and (old_x, old_y) != (new_x, new_y):
+                    moving.append(
+                        (
+                            idx,
+                            pid,
+                            float(self.planets[idx, pslot, P_RADIUS]),
+                            old_x,
+                            old_y,
+                            new_x,
+                            new_y,
+                        )
+                    )
+            self._move_comets_for_env(idx, moving)
 
-    def _move_comets_for_env(self, idx: int) -> None:
+        self._sweep_moving_batch(moving, combat_lists, remove)
+        for idx in active:
+            if self.fleet_mask[idx].any():
+                self.fleet_mask[idx, remove[idx]] = False
+                self._compact_fleets(idx)
+
+    def _move_comets_for_env(
+        self,
+        idx: int,
+        moving: list[tuple[int, int, float, float, float, float, float]],
+    ) -> None:
         env = self.envs[idx]
         expired: list[int] = []
         ids = np.zeros(self.planet_cap, dtype=np.int64)
@@ -1247,8 +1415,22 @@ class NumpyVecEnv:
                 if path_idx >= len(path):
                     expired.append(int(pid))
                     continue
+                old_x = float(self.planets[idx, pslot, P_X])
+                old_y = float(self.planets[idx, pslot, P_Y])
                 self.planets[idx, pslot, P_X] = path[path_idx, 0]
                 self.planets[idx, pslot, P_Y] = path[path_idx, 1]
+                if self.fleet_mask[idx].any() and old_x >= 0:
+                    moving.append(
+                        (
+                            idx,
+                            int(pid),
+                            float(self.planets[idx, pslot, P_RADIUS]),
+                            old_x,
+                            old_y,
+                            float(path[path_idx, 0]),
+                            float(path[path_idx, 1]),
+                        )
+                    )
         if expired:
             self._remove_comet_planets_batch(idx, expired)
 
@@ -1277,6 +1459,82 @@ class NumpyVecEnv:
                 path for path, ok in zip(group["paths"], keep, strict=False) if ok
             ]
         env.comets = [group for group in env.comets if group["planet_ids"]]
+
+    def _sweep_moving_batch(
+        self,
+        moving: list[tuple[int, int, float, float, float, float, float]],
+        combat_lists: list[defaultdict[int, list[np.ndarray]]],
+        remove: np.ndarray,
+    ) -> None:
+        if not moving:
+            return
+        arr = np.asarray(moving, dtype=np.float64)
+        env_order = np.unique(arr[:, 0].astype(np.int64))
+        for env_idx in env_order:
+            rows = arr[arr[:, 0].astype(np.int64) == env_idx]
+            candidates = np.nonzero(self.fleet_mask[env_idx] & ~remove[env_idx])[0]
+            if len(candidates) == 0:
+                continue
+            pts = self.fleets[env_idx, candidates][:, [F_X, F_Y]]
+            dists = _all_point_segment_distances(pts, rows[:, 3:5], rows[:, 5:7])
+            hits = dists < rows[:, 2:3]
+            hit_fleets = np.nonzero(hits.any(axis=0))[0]
+            if len(hit_fleets) == 0:
+                continue
+            first_planet = np.argmax(hits[:, hit_fleets], axis=0)
+            for local_fleet, moving_idx in zip(hit_fleets, first_planet, strict=False):
+                fleet_slot = int(candidates[int(local_fleet)])
+                pid = int(rows[int(moving_idx), 1])
+                combat_lists[int(env_idx)][pid].append(
+                    self.fleets[int(env_idx), fleet_slot].copy()
+                )
+                remove[int(env_idx), fleet_slot] = True
+
+    def _resolve_combat_batch(
+        self,
+        active: list[int],
+        combat_lists: list[defaultdict[int, list[np.ndarray]]],
+    ) -> None:
+        for idx in active:
+            if not combat_lists[idx]:
+                continue
+            ids = np.zeros(self.planet_cap, dtype=np.int64)
+            ids[self.planet_mask[idx]] = self.planets[
+                idx, self.planet_mask[idx], P_ID
+            ].astype(np.int64)
+            for pid, planet_fleets in combat_lists[idx].items():
+                matches = np.nonzero(self.planet_mask[idx] & (ids == int(pid)))[0]
+                if len(matches) == 0:
+                    continue
+                pidx = int(matches[0])
+                player_ships: dict[int, int] = {}
+                for fleet in planet_fleets:
+                    owner = int(fleet[F_OWNER])
+                    player_ships[owner] = player_ships.get(owner, 0) + int(
+                        fleet[F_SHIPS]
+                    )
+                sorted_players = sorted(
+                    player_ships.items(), key=lambda item: item[1], reverse=True
+                )
+                top_player, top_ships = sorted_players[0]
+                if len(sorted_players) > 1:
+                    survivor_ships = top_ships - sorted_players[1][1]
+                    if sorted_players[0][1] == sorted_players[1][1]:
+                        survivor_ships = 0
+                    survivor_owner = top_player if survivor_ships > 0 else -1
+                else:
+                    survivor_owner = top_player
+                    survivor_ships = top_ships
+                if survivor_ships > 0:
+                    if int(self.planets[idx, pidx, P_OWNER]) == survivor_owner:
+                        self.planets[idx, pidx, P_SHIPS] += survivor_ships
+                    else:
+                        self.planets[idx, pidx, P_SHIPS] -= survivor_ships
+                        if self.planets[idx, pidx, P_SHIPS] < 0:
+                            self.planets[idx, pidx, P_OWNER] = survivor_owner
+                            self.planets[idx, pidx, P_SHIPS] = abs(
+                                self.planets[idx, pidx, P_SHIPS]
+                            )
 
     def _check_done_batch(self, active: list[int]) -> None:
         for idx in active:
