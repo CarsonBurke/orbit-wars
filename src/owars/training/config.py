@@ -48,11 +48,29 @@ class OptimCfg:
     # `muon_lr` is naturally ~50–100× larger than an AdamW lr because Muon
     # updates are bounded after orthogonalization; parameter-golf uses 0.022
     # for matrix params on a 512-dim transformer.
-    muon_lr: float = 0.02
+    muon_lr: float = 0.022
+    # Slower Muon LR for the action-head readout matrices (target_query,
+    # target_key, fraction_head, noop_head). parameter-golf gives the LM
+    # head ~3× slower LR than the trunk (`head_lr=0.008` vs `matrix_lr=0.022`,
+    # `sota_train_gpt.py:10,211`). The readout is the only path between
+    # encoder shifts and policy logits/μ — slowing it dampens ratio drift
+    # per step without slowing the trunk's ability to learn the value
+    # function. value_head matrices stay at `muon_lr` (value loss isn't
+    # on the KL critical path).
+    muon_head_lr: float = 0.008
     muon_momentum: float = 0.95
     muon_backend_steps: int = 5
     muon_row_normalize: bool = True
     muon_weight_decay: float = 0.0
+    # Linear ramp `momentum_warmup_start` → `muon_momentum` over the first
+    # `muon_momentum_warmup_steps` optimizer-step calls. Prevents the
+    # momentum buffer from baking in noise from the first few gradient
+    # samples on a freshly-initialized policy — those gradients are
+    # atypically noisy and a 0.95 buffer would carry them for ~20 steps.
+    # (parameter-golf uses 1500 steps, 0.92 → 0.99; we ramp faster because
+    # PPO's first updates land before that long.)
+    muon_momentum_warmup_steps: int = 100
+    muon_momentum_warmup_start: float = 0.85
     # AdamW (default group: biases, summary tokens). PPO-canonical 3e-4.
     lr: float = 3e-4
     # AdamW (control-tensor group: per-channel residual scales `attn_scale`,

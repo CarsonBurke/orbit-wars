@@ -74,6 +74,8 @@ class Muon(torch.optim.Optimizer):
         nesterov: bool = True,
         weight_decay: float = 0.0,
         row_normalize: bool = False,
+        momentum_warmup_steps: int = 0,
+        momentum_warmup_start: float = 0.85,
     ):
         defaults = dict(
             lr=lr,
@@ -82,8 +84,18 @@ class Muon(torch.optim.Optimizer):
             nesterov=nesterov,
             weight_decay=weight_decay,
             row_normalize=row_normalize,
+            momentum_warmup_steps=momentum_warmup_steps,
+            momentum_warmup_start=momentum_warmup_start,
         )
         super().__init__(params, defaults)
+        # Per-instance step counter for the momentum-warmup schedule.
+        # Mirrors parameter-golf `step_fn` (sota_train_gpt.py:402): linear
+        # ramp from `momentum_warmup_start` → `momentum` over the first
+        # `momentum_warmup_steps` calls to `step()`. The point is to avoid
+        # building a long momentum tail over the *first few* gradient
+        # samples, which on a fresh policy are atypically noisy and would
+        # otherwise persist in the EMA for ~1/(1-momentum) steps.
+        self._step_count: int = 0
 
     @torch.no_grad()
     def step(self, closure=None):  # noqa: D401
@@ -97,6 +109,11 @@ class Muon(torch.optim.Optimizer):
                 continue
             lr = group["lr"]
             momentum = group["momentum"]
+            warmup_steps = group["momentum_warmup_steps"]
+            if warmup_steps > 0:
+                frac = min(self._step_count / warmup_steps, 1.0)
+                warmup_start = group["momentum_warmup_start"]
+                momentum = (1.0 - frac) * warmup_start + frac * momentum
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
             row_normalize = group["row_normalize"]
@@ -119,6 +136,7 @@ class Muon(torch.optim.Optimizer):
                 if wd > 0.0:
                     p.data.mul_(1.0 - lr * wd)
                 p.data.add_(g.to(p.dtype), alpha=-lr)
+        self._step_count += 1
         return loss
 
 
