@@ -72,8 +72,14 @@ rollout:
   max_moves_per_turn: 16
 
 opponents:
-  snapshot_every: 25
-  top_k: 8
+  snapshot_every: 1   # one snapshot per PPO update — weights only move once
+                      # per update, so this is the finest meaningful cadence.
+                      # UCB-based eviction in `OpponentPool._trim_to_top_k`
+                      # handles prioritization toward strong+well-measured
+                      # snapshots and culls the rest.
+  top_k: 24           # ~24 updates of historical diversity before eviction
+                      # kicks in — wide enough to dodge near-Nash collapse
+                      # against very recent self.
   self_play_prob: 0.8
   initial_rating: 1500.0
   k_factor: 32.0
