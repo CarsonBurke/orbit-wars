@@ -37,6 +37,7 @@ from ..game import (
     ROTATION_RADIUS_LIMIT,
 )
 from ..game.observation import Observation
+from ..game.physics import fleet_speed
 
 MAX_PLANETS: int = 64
 MAX_FLEETS: int = 384
@@ -160,8 +161,6 @@ def _fleet_features(
     # Fleet's own speed is determined by its ship count via the official
     # log curve; encoding it explicitly is cheap and saves the model the
     # detour.
-    from ..game.physics import fleet_speed
-
     sp = min(1.0, fleet_speed(f.ships) / MAX_SHIP_SPEED)
     return [
         nx, ny, math.cos(f.angle), math.sin(f.angle),
@@ -280,4 +279,31 @@ def encode_observation(o: Observation, device: str | torch.device = "cpu") -> En
         planet_garrison=torch.from_numpy(p_gar).to(device),
         fleet_feats=torch.from_numpy(f_feats).to(device),
         fleet_mask=torch.from_numpy(f_mask).to(device),
+    )
+
+
+def stack_encoded(feats_list: list[EncodedObs]) -> EncodedObs:
+    """Stack a list of unbatched `EncodedObs` into a batched one.
+
+    Each input has tensors shaped `[P, ...]` / `[P]` / `[F, ...]` / `[F]`;
+    output tensors gain a leading batch dim. Used by the vectorized
+    rollout to produce one big batch per env-step.
+    """
+    pf, pm, pom, pid, pg, ff, fm = [], [], [], [], [], [], []
+    for f in feats_list:
+        pf.append(f.planet_feats)
+        pm.append(f.planet_mask)
+        pom.append(f.planet_owned_mask)
+        pid.append(f.planet_ids)
+        pg.append(f.planet_garrison)
+        ff.append(f.fleet_feats)
+        fm.append(f.fleet_mask)
+    return EncodedObs(
+        planet_feats=torch.stack(pf),
+        planet_mask=torch.stack(pm),
+        planet_owned_mask=torch.stack(pom),
+        planet_ids=torch.stack(pid),
+        planet_garrison=torch.stack(pg),
+        fleet_feats=torch.stack(ff),
+        fleet_mask=torch.stack(fm),
     )

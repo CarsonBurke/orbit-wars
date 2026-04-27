@@ -28,7 +28,22 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ..policies.features import EncodedObs
 from ..policies.model import OrbitPolicy
+
+
+def _slice_feats(batch: dict[str, torch.Tensor], mb) -> EncodedObs:
+    """Build an `EncodedObs` view over a minibatch slice. Avoids the
+    ad-hoc per-loop class that used to live inline."""
+    return EncodedObs(
+        planet_feats=batch["planet_feats"][mb],
+        planet_mask=batch["planet_mask"][mb],
+        planet_owned_mask=batch["planet_owned_mask"][mb],
+        planet_ids=batch["planet_ids"][mb],
+        planet_garrison=batch["planet_garrison"][mb],
+        fleet_feats=batch["fleet_feats"][mb],
+        fleet_mask=batch["fleet_mask"][mb],
+    )
 
 
 @dataclass
@@ -112,8 +127,9 @@ def ppo_update(
     Expected keys:
       `planet_feats`, `planet_mask`, `planet_owned_mask`, `planet_ids`,
       `planet_garrison`, `fleet_feats`, `fleet_mask`,
-      `target_idx` [B,P], `fraction` [B,P], `old_log_prob` [B,P],
-      `advantage` [B], `return` [B], `owned_mask` [B,P].
+      `target_idx` [B,P], `fraction` [B,P], `angle_offset` [B,P],
+      `old_log_prob` [B,P], `advantage` [B], `return` [B],
+      `owned_mask` [B,P].
 
     Policy loss is *token-level* (VAPO §4.2): summed over all
     (sample, owned-planet) pairs and divided by the count of active
@@ -130,39 +146,33 @@ def ppo_update(
         for start in range(0, n, minibatch_size):
             mb = idx[start : start + minibatch_size]
 
-            class _Feats:
-                pass
+            out = model(_slice_feats(batch, mb))
 
-            feats = _Feats()
-            feats.planet_feats = batch["planet_feats"][mb]
-            feats.planet_mask = batch["planet_mask"][mb]
-            feats.planet_owned_mask = batch["planet_owned_mask"][mb]
-            feats.planet_ids = batch["planet_ids"][mb]
-            feats.planet_garrison = batch["planet_garrison"][mb]
-            feats.fleet_feats = batch["fleet_feats"][mb]
-            feats.fleet_mask = batch["fleet_mask"][mb]
-
-            out = model(feats)  # type: ignore[arg-type]
-
-            owned = batch["owned_mask"][mb]
-            owned_f = owned.float()
+            owned_f = batch["owned_mask"][mb].float()
             p = out.target_logits.shape[1]
             target = batch["target_idx"][mb].clamp(0, p)
             target_log_probs = F.log_softmax(out.target_logits, dim=-1)
             target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
 
-            # Beta log-prob for the recorded fraction; only counted when the
-            # action wasn't no-op (target slot == p). Mirrors what the
-            # rollout's `sample_with_record` stored in `old_log_prob`.
+            # Beta log-probs for the recorded fraction *and* angle residual;
+            # both are only counted when the action wasn't no-op (target slot
+            # == p). Mirrors what `sample_with_record` stored in `old_log_prob`.
             frac = batch["fraction"][mb].clamp(1e-6, 1.0 - 1e-6)
-            beta_dist = torch.distributions.Beta(out.fraction_alpha, out.fraction_beta)
-            frac_lp = beta_dist.log_prob(frac)
+            frac_dist = torch.distributions.Beta(out.fraction_alpha, out.fraction_beta)
+            frac_lp = frac_dist.log_prob(frac)
+            ang = batch["angle_offset"][mb].clamp(1e-6, 1.0 - 1e-6)
+            angle_dist = torch.distributions.Beta(out.angle_alpha, out.angle_beta)
+            angle_lp = angle_dist.log_prob(ang)
             is_noop = (target == p).float()
-            chosen = target_lp + (1.0 - is_noop) * frac_lp
+            move_mask = 1.0 - is_noop
+            chosen = target_lp + move_mask * (frac_lp + angle_lp)
 
             old_log_prob = batch["old_log_prob"][mb]  # [B, P]
+            # Advantages were normalized once over the whole batch in
+            # `_stack_trajectories`; standard PPO does this rather than
+            # per-minibatch (per-mb adds noise from each minibatch's own
+            # mean/std).
             advantage = batch["advantage"][mb]
-            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
             # Token-level (per-owned-planet) PPO ratio. We broadcast the
             # per-trajectory advantage over the planet axis.
@@ -176,12 +186,16 @@ def ppo_update(
 
             value_loss = (out.value - batch["return"][mb]).pow(2).mean()
 
-            # Categorical(logits=...).entropy() handles -inf logits cleanly
-            # (0 * log 0 → 0 internally); the naive p*log(p) form returns
-            # nan whenever any target slot is masked.
-            entropy = torch.distributions.Categorical(
-                logits=out.target_logits
-            ).entropy()
+            # Reuse `target_log_probs` for the entropy term — cheaper than
+            # constructing Categorical(logits=...).entropy() which redoes
+            # log_softmax internally. We clamp -inf log-probs to the finite
+            # min (Categorical.entropy's exact trick): exp(-inf)=0 and 0*
+            # -3.4e38=0, but 0*-inf=nan and a torch.where mask wouldn't
+            # save us — both branches are evaluated and the nan poisons
+            # the backward pass.
+            min_real = torch.finfo(target_log_probs.dtype).min
+            log_probs_safe = target_log_probs.clamp_min(min_real)
+            entropy = -(target_log_probs.exp() * log_probs_safe).sum(dim=-1)
             entropy = (entropy * owned_f).sum() / denom
 
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
@@ -238,20 +252,7 @@ def value_only_update(
         np.random.shuffle(idx)
         for start in range(0, n, minibatch_size):
             mb = idx[start : start + minibatch_size]
-
-            class _Feats:
-                pass
-
-            feats = _Feats()
-            feats.planet_feats = batch["planet_feats"][mb]
-            feats.planet_mask = batch["planet_mask"][mb]
-            feats.planet_owned_mask = batch["planet_owned_mask"][mb]
-            feats.planet_ids = batch["planet_ids"][mb]
-            feats.planet_garrison = batch["planet_garrison"][mb]
-            feats.fleet_feats = batch["fleet_feats"][mb]
-            feats.fleet_mask = batch["fleet_mask"][mb]
-
-            out = model(feats)  # type: ignore[arg-type]
+            out = model(_slice_feats(batch, mb))
             value_loss = (out.value - batch["return"][mb]).pow(2).mean()
 
             optimizer.zero_grad(set_to_none=True)
