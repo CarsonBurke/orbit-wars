@@ -28,6 +28,7 @@ from typing import Any
 _RESET = "reset"
 _STEP = "step"
 _CLOSE = "close"
+_SET_RECORDING = "set_recording"
 
 
 def _env_worker(
@@ -35,10 +36,21 @@ def _env_worker(
     num_players: int,
     episode_steps: int,
     ship_speed: float,
+    record_replay: bool,
 ) -> None:
     """Subprocess entrypoint. Lazy-imports kaggle_environments so the main
     process can spawn workers even on machines that lack the dep at
-    import-time (the import only fires inside the worker)."""
+    import-time (the import only fires inside the worker).
+
+    Non-recording workers null out interior entries of `env.steps`/`env.logs`
+    after every step to free the per-step state dicts. **`len(env.steps)` is
+    preserved** because kaggle's `core.py:602` writes the next observation's
+    `step` field as `len(self.steps)`, and the orbit_wars interpreter keys
+    planet rotation, comet spawns, and episode termination off that field —
+    truncating the list freezes time at step 1 and silently breaks training
+    dynamics. The recording worker keeps full history so it can render the
+    finished game to HTML on done.
+    """
     from kaggle_environments import make  # type: ignore[import-not-found]
 
     env = make(
@@ -56,19 +68,32 @@ def _env_worker(
                 return
             if cmd == _CLOSE:
                 return
+            if cmd == _SET_RECORDING:
+                record_replay = bool(payload)
+                remote.send(("ok", None, False, None, None))
+                continue
             if cmd == _RESET:
                 state = env.reset(num_agents=num_players)
-                remote.send(("ok", state, False, None))
+                remote.send(("ok", state, False, None, None))
             elif cmd == _STEP:
                 state = env.step(payload)
                 done = bool(env.done)
                 final = env.steps[-1] if done else None
-                remote.send(("ok", state, done, final))
+                replay_html: str | None = None
+                if done and record_replay:
+                    replay_html = env.render(mode="html")
+                if not record_replay and len(env.steps) >= 2:
+                    # Free the just-superseded state dict but leave the
+                    # list length alone (see core.py:602 dependency above).
+                    env.steps[-2] = None
+                    if len(env.logs) >= 2:
+                        env.logs[-2] = None
+                remote.send(("ok", state, done, final, replay_html))
             else:
-                remote.send(("err", f"unknown cmd: {cmd!r}", True, None))
+                remote.send(("err", f"unknown cmd: {cmd!r}", True, None, None))
     except Exception as e:  # bubble worker errors back to main
         try:
-            remote.send(("err", repr(e), True, None))
+            remote.send(("err", repr(e), True, None, None))
         except Exception:
             pass
 
@@ -89,17 +114,28 @@ class VecEnv:
         episode_steps: int,
         ship_speed: float,
         start_method: str = "spawn",
+        replay_env_idx: int | None = None,
     ):
         self.num_envs = num_envs
+        self.replay_env_idx = replay_env_idx
+        # Latest finished game's rendered HTML from the recording worker.
+        # Caller reads after a rollout, then resets to None on the next reset().
+        self.last_replay_html: str | None = None
         ctx = mp.get_context(start_method)
         pipe_pairs = [ctx.Pipe(duplex=True) for _ in range(num_envs)]
         self._remotes = [main for main, _ in pipe_pairs]
         work_remotes = [worker for _, worker in pipe_pairs]
         self._workers: list[mp.process.BaseProcess] = []
-        for wr in work_remotes:
+        for i, wr in enumerate(work_remotes):
             p = ctx.Process(
                 target=_env_worker,
-                args=(wr, num_players, episode_steps, ship_speed),
+                args=(
+                    wr,
+                    num_players,
+                    episode_steps,
+                    ship_speed,
+                    i == replay_env_idx,
+                ),
                 daemon=True,
             )
             p.start()
@@ -112,11 +148,12 @@ class VecEnv:
     # ----- env protocol -----------------------------------------------------
 
     def reset(self) -> list[Any]:
+        self.last_replay_html = None
         for r in self._remotes:
             r.send((_RESET, None))
         out = []
         for i, r in enumerate(self._remotes):
-            tag, state, _done, _final = r.recv()
+            tag, state, _done, _final, _html = r.recv()
             if tag != "ok":
                 raise RuntimeError(f"worker {i} reset failed: {state}")
             out.append(state)
@@ -129,18 +166,38 @@ class VecEnv:
 
         Returns `{env_idx: (state, done, final)}`. `final` is the kaggle
         env's last `steps` entry (per-seat reward + status) when done, else
-        None.
+        None. If `replay_env_idx` is set and that env finishes during this
+        call, the rendered HTML is stashed on `self.last_replay_html`.
         """
         assert len(indices) == len(actions), (len(indices), len(actions))
         for i, a in zip(indices, actions):
             self._remotes[i].send((_STEP, a))
         results: dict[int, tuple[Any, bool, Any]] = {}
         for i in indices:
-            tag, state, done, final = self._remotes[i].recv()
+            tag, state, done, final, html = self._remotes[i].recv()
             if tag != "ok":
                 raise RuntimeError(f"worker {i} step failed: {state}")
+            if html is not None:
+                self.last_replay_html = html
             results[i] = (state, done, final)
         return results
+
+    def set_recording(self, enabled: bool) -> None:
+        """Toggle replay recording on the worker at `replay_env_idx`.
+
+        No-op if `replay_env_idx` is None. Lets callers skip the
+        render+pipe-transfer cost when no consumer wants the HTML
+        (e.g., during value pretraining).
+        """
+        if self.replay_env_idx is None:
+            return
+        r = self._remotes[self.replay_env_idx]
+        r.send((_SET_RECORDING, enabled))
+        tag, _state, _done, _final, _html = r.recv()
+        if tag != "ok":
+            raise RuntimeError(f"worker {self.replay_env_idx} set_recording failed")
+        if not enabled:
+            self.last_replay_html = None
 
     def close(self) -> None:
         if self._closed:

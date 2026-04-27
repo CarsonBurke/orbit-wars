@@ -307,12 +307,19 @@ def train_one_run(cfg: RunConfig) -> dict:
     # One subprocess pool reused across pretraining + every PPO update.
     # Spawning per-call cost ~16-32 s of pure interpreter startup × every
     # rollout (cumulative ~1 h on a full run); `vec.reset()` is cheap.
+    # `replay_env_idx=0` keeps env 0's full step history so the PPO loop
+    # can dump one rendered game per update; the other workers trim
+    # `env.steps` to save memory.
     with VecEnv(
         num_envs=cfg.rollout.num_envs,
         num_players=cfg.game.num_players,
         episode_steps=cfg.game.episode_steps,
         ship_speed=cfg.game.ship_speed,
+        replay_env_idx=0,
     ) as vec:
+        # Pretrain doesn't write replays — skip the per-episode render +
+        # pipe-transfer cost. _ppo_loop re-enables before the first update.
+        vec.set_recording(False)
         pretrain_value(cfg, model, pretrain_opt, logger, device, vec)
         return _ppo_loop(cfg, model, optimizer, elo, pool, logger, device, vec)
 
@@ -342,6 +349,13 @@ def _ppo_loop(
     if device.type == "cuda":
         train_model = torch.compile(model)  # type: ignore[assignment]
 
+    # One rendered game per update lands here (env 0 is the recording
+    # worker; see VecEnv(replay_env_idx=0) above). Pretrain disabled
+    # recording; turn it back on for the PPO loop.
+    vec.set_recording(True)
+    replays_dir = logger.path / "replays"
+    replays_dir.mkdir(parents=True, exist_ok=True)
+
     for update in range(cfg.run.total_updates):
         play_count: dict[str, int] = defaultdict(int)
         win_count: dict[str, int] = defaultdict(int)
@@ -361,6 +375,11 @@ def _ppo_loop(
             device=str(device),
             reward_cfg=cfg.reward,
         )
+
+        if vec.last_replay_html is not None:
+            (replays_dir / f"update_{update:04d}.html").write_text(
+                vec.last_replay_html
+            )
 
         for env_idx, traj in enumerate(trajs):
             slots = opponents_per_env[env_idx]
