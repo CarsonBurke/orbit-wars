@@ -211,6 +211,72 @@ def _build_moves_from_lists(
     return moves
 
 
+def _build_moves_from_packed_fields(
+    fields_l: list[list[float]],
+    o: Observation,
+    max_moves: int,
+) -> list[Move]:
+    moves: list[Move] = []
+    by_id = {pl.id: pl for pl in o.planets}
+    omega = o.angular_velocity
+    p = len(fields_l)
+    for i, fields in enumerate(fields_l):
+        ti = int(fields[0])
+        if fields[2] < 0.5 or fields[3] < 0.5:
+            continue
+        if ti == p or ti == i:
+            continue
+        target_id = int(fields_l[ti][4]) if 0 <= ti < p else -1
+        if target_id < 0:
+            continue
+        mine = by_id.get(int(fields[4]))
+        target = by_id.get(target_id)
+        if mine is None or target is None or mine.ships < 2:
+            continue
+
+        f = max(0.0, min(1.0, float(fields[1])))
+        send = max(1, min(mine.ships - 1, int(round(mine.ships * f))))
+        if send <= 0:
+            continue
+
+        ang = _lead_angle(
+            mine.x, mine.y, target.x, target.y, target.radius, omega, send
+        )
+        if ang is None:
+            continue
+        moves.append(Move(mine.id, ang, send))
+        if len(moves) >= max_moves:
+            break
+
+    return moves
+
+
+def _packed_action_fields(
+    target_idx: torch.Tensor,
+    frac: torch.Tensor,
+    owned: torch.Tensor,
+    pmask: torch.Tensor,
+    ids: torch.Tensor,
+) -> list[list[list[float]]]:
+    """Copy all Python action fields to host in one transfer.
+
+    Separate `.cpu().tolist()` calls on CUDA each synchronize the stream.
+    Packing the small [B, P] fields together keeps PPO records on-device
+    while making env-action materialization pay one synchronization.
+    """
+    packed = torch.stack(
+        (
+            target_idx.float(),
+            frac.float(),
+            owned.float(),
+            pmask.float(),
+            ids.float(),
+        ),
+        dim=-1,
+    )
+    return packed.detach().cpu().tolist()
+
+
 def _build_moves(
     target_idx: torch.Tensor,
     frac: torch.Tensor,
@@ -406,24 +472,14 @@ def sample_batch_with_records(
         target_logits, fraction_mu, fraction_log_sigma, p, deterministic
     )
 
-    target_idx_l: list[list[int]] = target_idx.detach().cpu().tolist()
-    frac_l: list[list[float]] = frac.detach().cpu().tolist()
-    owned_l: list[list[bool]] = out.planet_owned_mask.detach().cpu().tolist()
-    pmask_l: list[list[bool]] = out.planet_mask.detach().cpu().tolist()
-    ids_l: list[list[int]] = out.planet_ids.detach().cpu().tolist()
+    fields_l = _packed_action_fields(
+        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
 
     moves_list: list[list[Move]] = []
     records: list[SampleRecord] = []
     for k in range(b_dim):
-        moves = _build_moves_from_lists(
-            target_idx_l[k],
-            frac_l[k],
-            owned_l[k],
-            pmask_l[k],
-            ids_l[k],
-            parsed_list[k],
-            max_moves,
-        )
+        moves = _build_moves_from_packed_fields(fields_l[k], parsed_list[k], max_moves)
         moves_list.append(moves)
         records.append(
             SampleRecord(
@@ -458,21 +514,11 @@ def sample_batch_actions(
         z = fraction_mu + fraction_log_sigma.exp() * torch.randn_like(fraction_mu)
         frac = (torch.tanh(z) + 1.0) / 2.0
 
-    target_idx_l: list[list[int]] = target_idx.detach().cpu().tolist()
-    frac_l: list[list[float]] = frac.detach().cpu().tolist()
-    owned_l: list[list[bool]] = out.planet_owned_mask.detach().cpu().tolist()
-    pmask_l: list[list[bool]] = out.planet_mask.detach().cpu().tolist()
-    ids_l: list[list[int]] = out.planet_ids.detach().cpu().tolist()
+    fields_l = _packed_action_fields(
+        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
 
     return [
-        _build_moves_from_lists(
-            target_idx_l[k],
-            frac_l[k],
-            owned_l[k],
-            pmask_l[k],
-            ids_l[k],
-            parsed_list[k],
-            max_moves,
-        )
+        _build_moves_from_packed_fields(fields_l[k], parsed_list[k], max_moves)
         for k in range(b_dim)
     ]
