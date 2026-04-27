@@ -158,7 +158,7 @@ class OpponentsCfg:
     snapshot_every: int = 25      # save a frozen snapshot for the pool every N updates
     top_k: int = 8                # max live snapshots; lowest-Elo evicted past this
     self_play_prob: float = 0.8   # P(opponent slot = current learner) per slot
-    snapshot_device: str = "cpu"  # "cpu", "cuda", or "train" to mirror run.device
+    snapshot_device: str = "train"  # "cpu", "cuda", or "train" to mirror run.device
     initial_rating: float = 1500.0
     k_factor: float = 32.0
 

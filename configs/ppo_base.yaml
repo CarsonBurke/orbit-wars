@@ -94,6 +94,7 @@ rollout:
   max_moves_per_turn: 16
 
 opponents:
+  snapshot_device: train
   snapshot_every: 1   # one snapshot per PPO update — weights only move once
                       # per update, so this is the finest meaningful cadence.
                       # UCB-based eviction in `OpponentPool._trim_to_top_k`
