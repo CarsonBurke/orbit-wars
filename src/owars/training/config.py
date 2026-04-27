@@ -180,6 +180,9 @@ class RunCfg:
     name: str = "default"
     seed: int = 0
     device: str = "cuda"
+    # Small batched rollout forwards are slower with large CPU thread pools.
+    # 0 leaves PyTorch's process default unchanged.
+    torch_num_threads: int = 8
     log_root: str = "runs"
     ckpt_root: str = "checkpoints"
     total_updates: int = 200

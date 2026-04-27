@@ -415,7 +415,21 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
 
 def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     set_seed(cfg.run.seed)
+    if cfg.run.torch_num_threads > 0:
+        torch.set_num_threads(cfg.run.torch_num_threads)
+        try:
+            torch.set_num_interop_threads(max(1, cfg.run.torch_num_threads))
+        except RuntimeError:
+            pass
     device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
+    # parameter-golf `sota_train_gpt.py:465` pins SDPA to flash-only. We
+    # *do not* — the nested-jagged SDPA dispatcher (`torch/nested/_internal/
+    # sdpa.py`) only has flash and math jagged kernels; mem_efficient and
+    # cudnn aren't reachable through the jagged path at all, and flash's
+    # eligibility heuristic rejects small-batch rollouts → math is the only
+    # fallback. Disabling math caused "No viable backend" during rollout.
+    # Leaving the default backends in place: jagged forwards consistently
+    # pick flash when it's eligible and math otherwise.
     model = _build_model(cfg).to(device)
     # parameter-golf fp32-master pattern: cast everything to bf16, then
     # restore fp32 for the params that actually need precision (Linear
