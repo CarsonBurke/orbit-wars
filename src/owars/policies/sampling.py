@@ -62,12 +62,23 @@ LEAD_T_HORIZON_STEPS: float = 600.0  # episode is 500 steps; a bit of slack
 
 @dataclass
 class SampleRecord:
-    """Per-planet record of the sampled action — used by PPO rollouts."""
+    """Per-planet record of the sampled action — used by PPO rollouts.
+
+    The full distribution parameters (`target_logits`, `fraction_mu`,
+    `fraction_log_sigma`) are recorded alongside the sample so PPO can
+    compute the analytical KL divergence between the rollout-time policy
+    and the current policy (PMPO penalty, dreamer4 §`pmpo_kl_div_loss_weight`).
+    Importance-ratio PPO uses only `log_prob`, but the KL term needs the
+    full distributions — hence both.
+    """
 
     target_idx: torch.Tensor   # [P] long, in [0, P] (P = no-op slot)
     fraction: torch.Tensor     # [P] float in [0, 1] — squashed action used to build the move
     frac_z: torch.Tensor       # [P] float — pre-tanh Normal sample (used to recompute log_prob in PPO)
     log_prob: torch.Tensor     # [P] float — Categorical + tanh-Normal
+    target_logits: torch.Tensor       # [P, P+1] — old-policy categorical logits (PMPO KL input)
+    fraction_mu: torch.Tensor         # [P] — old-policy pre-tanh Normal mean
+    fraction_log_sigma: torch.Tensor  # [P] — old-policy pre-tanh Normal log σ
 
 
 def _lead_angle(
@@ -412,6 +423,9 @@ def sample_with_record(
         fraction=frac,
         frac_z=frac_z,
         log_prob=log_prob,
+        target_logits=target_logits,
+        fraction_mu=fraction_mu,
+        fraction_log_sigma=fraction_log_sigma,
     )
     return moves, record
 
@@ -487,6 +501,9 @@ def sample_batch_with_records(
                 fraction=frac[k],
                 frac_z=frac_z[k],
                 log_prob=log_prob[k],
+                target_logits=target_logits[k],
+                fraction_mu=fraction_mu[k],
+                fraction_log_sigma=fraction_log_sigma[k],
             )
         )
     return moves_list, records

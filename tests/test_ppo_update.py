@@ -62,6 +62,9 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
     target_idx = torch.stack([r.target_idx for r in records])
     frac_z = torch.stack([r.frac_z for r in records])
     log_prob = torch.stack([r.log_prob for r in records])
+    old_target_logits = torch.stack([r.target_logits for r in records])
+    old_fraction_mu = torch.stack([r.fraction_mu for r in records])
+    old_fraction_log_sigma = torch.stack([r.fraction_log_sigma for r in records])
 
     return {
         "planet_feats": planet_feats,
@@ -77,6 +80,9 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
         "owned_mask": planet_owned,
         "advantage": torch.randn(B),
         "return": torch.randn(B),
+        "old_target_logits": old_target_logits,
+        "old_fraction_mu": old_fraction_mu,
+        "old_fraction_log_sigma": old_fraction_log_sigma,
     }
 
 
@@ -89,13 +95,17 @@ def test_ppo_update_runs_and_returns_finite_metrics():
     log = ppo_update(
         model, optim, batch,
         clip_eps_low=0.2, clip_eps_high=0.28,
-        value_coef=0.5, entropy_coef=0.01,
+        value_coef=0.5, entropy_coef=0.01, pmpo_kl_coef=0.3,
         epochs=2, minibatch_size=4, grad_clip=0.5,
     )
 
-    for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_frac"):
+    for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_frac", "pmpo_kl"):
         v = getattr(log, name)
         assert math.isfinite(v), f"{name}={v!r}"
+    # On epoch 0 the new policy ≡ old policy, so KL must start at exactly 0.
+    # The reported number is the running mean across all (epoch, minibatch)
+    # updates, so we just sanity-check non-negativity here.
+    assert log.pmpo_kl >= 0.0, log.pmpo_kl
 
 
 def test_log_prob_recompute_matches_sample_time():

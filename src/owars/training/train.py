@@ -244,15 +244,22 @@ def _stack_trajectories(
     batch = _stack_encoded(trajs)
 
     tidx, fz, lp, owned = [], [], [], []
+    otl, omu, olsig = [], [], []
     for t in trajs:
         tidx.extend(t.target_idx)
         fz.extend(t.frac_z)
         lp.extend(t.log_prob)
         owned.extend(t.owned_mask)
+        otl.extend(t.old_target_logits)
+        omu.extend(t.old_fraction_mu)
+        olsig.extend(t.old_fraction_log_sigma)
     batch["target_idx"] = torch.stack(tidx).long()
     batch["frac_z"] = torch.stack(fz).float()
     batch["old_log_prob"] = torch.stack(lp).float()
     batch["owned_mask"] = torch.stack(owned).bool()
+    batch["old_target_logits"] = torch.stack(otl).float()
+    batch["old_fraction_mu"] = torch.stack(omu).float()
+    batch["old_fraction_log_sigma"] = torch.stack(olsig).float()
 
     # Single global CPU pull of every per-step value across the batch —
     # one sync instead of one per trajectory.
@@ -591,6 +598,7 @@ def _ppo_loop(
             clip_eps_high=cfg.ppo.clip_eps_high,
             value_coef=cfg.ppo.value_coef,
             entropy_coef=cfg.ppo.entropy_coef,
+            pmpo_kl_coef=cfg.ppo.pmpo_kl_coef,
             epochs=cfg.optim.epochs_per_update,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
@@ -607,6 +615,7 @@ def _ppo_loop(
                 "entropy": log.entropy,
                 "approx_kl": log.approx_kl,
                 "clip_frac": log.clip_frac,
+                "pmpo_kl": log.pmpo_kl,
                 "win_rate": win_rate,
                 "margin": margin,
                 "elo_learner": elo.get(LEARNER_NAME),

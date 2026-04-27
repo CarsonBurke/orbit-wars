@@ -28,12 +28,12 @@ from typing import Any
 import torch
 
 from ..game import parse_observation
-from ..policies.features import encode_observations, select_encoded
+from ..policies.features import EncodedObs, encode_observations
 from ..policies.model import OrbitPolicy
 from ..policies.sampling import sample_batch_actions, sample_batch_with_records
 from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
-from .rollout import Trajectory, record_step
+from .rollout import Trajectory
 from .vec_env import VecEnv
 
 
@@ -41,6 +41,9 @@ def _empty_traj() -> Trajectory:
     return Trajectory(
         encoded=[], target_idx=[], frac_z=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
+        old_target_logits=[],
+        old_fraction_mu=[],
+        old_fraction_log_sigma=[],
     )
 
 
@@ -254,13 +257,81 @@ def _step_learner_bucket(
         )
         records = []
 
+    if record_trajectories:
+        learner_rows = [
+            k for k, (_env_idx, seat, _obs) in enumerate(bucket) if seat == learner_seat
+        ]
+        learner_envs = [bucket[k][0] for k in learner_rows]
+        if learner_rows:
+            row_idx = torch.as_tensor(
+                learner_rows, device=stacked.planet_feats.device, dtype=torch.long
+            )
+            rec = _materialize_records_cpu(stacked, out, records, row_idx, learner_rows)
+            for j, env_idx in enumerate(learner_envs):
+                traj = trajectories[env_idx]
+                traj.encoded.append(
+                    EncodedObs(
+                        planet_feats=rec["planet_feats"][j],
+                        planet_mask=rec["planet_mask"][j],
+                        planet_owned_mask=rec["planet_owned_mask"][j],
+                        planet_ids=rec["planet_ids"][j],
+                        planet_garrison=rec["planet_garrison"][j],
+                        fleet_feats=rec["fleet_feats"][j],
+                        fleet_mask=rec["fleet_mask"][j],
+                    )
+                )
+                traj.target_idx.append(rec["target_idx"][j])
+                traj.frac_z.append(rec["frac_z"][j])
+                traj.log_prob.append(rec["log_prob"][j])
+                traj.value.append(rec["value"][j])
+                traj.owned_mask.append(rec["owned_mask"][j])
+                traj.old_target_logits.append(rec["old_target_logits"][j])
+                traj.old_fraction_mu.append(rec["old_fraction_mu"][j])
+                traj.old_fraction_log_sigma.append(rec["old_fraction_log_sigma"][j])
+                traj.reward.append(0.0)
+
     for k, (env_idx, seat, _obs) in enumerate(bucket):
         actions_per_env[env_idx][seat] = [m.as_list() for m in moves_list[k]]
-        if record_trajectories and seat == learner_seat:
-            record_step(
-                trajectories[env_idx],
-                feats=select_encoded(stacked, k, clone=True),
-                value_t=out.value[k],
-                owned_mask_t=out.planet_owned_mask[k],
-                record=records[k],
-            )
+
+
+def _materialize_records_cpu(
+    stacked: EncodedObs,
+    out: Any,
+    records: list[Any],
+    row_idx: torch.Tensor,
+    rows: list[int],
+) -> dict[str, torch.Tensor]:
+    """Copy learner rollout records to CPU once per field per env step.
+
+    Keeping every per-step feature tensor on CUDA caps rollout parallelism and
+    leaves thousands of small device allocations alive until PPO batching.
+    The action sampler already synchronizes for Python env actions, so this
+    moves trajectory storage off VRAM at the same loop boundary.
+    """
+    return {
+        "planet_feats": stacked.planet_feats.index_select(0, row_idx).detach().cpu(),
+        "planet_mask": stacked.planet_mask.index_select(0, row_idx).detach().cpu(),
+        "planet_owned_mask": stacked.planet_owned_mask.index_select(0, row_idx)
+        .detach()
+        .cpu(),
+        "planet_ids": stacked.planet_ids.index_select(0, row_idx).detach().cpu(),
+        "planet_garrison": stacked.planet_garrison.index_select(0, row_idx)
+        .detach()
+        .cpu(),
+        "fleet_feats": stacked.fleet_feats.index_select(0, row_idx).detach().cpu(),
+        "fleet_mask": stacked.fleet_mask.index_select(0, row_idx).detach().cpu(),
+        "target_idx": torch.stack([records[k].target_idx for k in rows]).detach().cpu(),
+        "frac_z": torch.stack([records[k].frac_z for k in rows]).detach().cpu(),
+        "log_prob": torch.stack([records[k].log_prob for k in rows]).detach().cpu(),
+        "value": out.value.index_select(0, row_idx).detach().cpu(),
+        "owned_mask": out.planet_owned_mask.index_select(0, row_idx).detach().cpu(),
+        "old_target_logits": torch.stack(
+            [records[k].target_logits for k in rows]
+        ).detach().cpu(),
+        "old_fraction_mu": torch.stack(
+            [records[k].fraction_mu for k in rows]
+        ).detach().cpu(),
+        "old_fraction_log_sigma": torch.stack(
+            [records[k].fraction_log_sigma for k in rows]
+        ).detach().cpu(),
+    }

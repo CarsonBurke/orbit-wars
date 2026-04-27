@@ -73,6 +73,13 @@ ppo:
                        # and zeroed log_σ row, the cold-start policy is already
                        # near-uniform — the entropy bonus mainly fights the
                        # value gradient over log_σ during early updates.
+  pmpo_kl_coef: 0.3   # dreamer4 default (`dreamer4.py:3083`). Adds an
+                       # analytical KL(new ‖ old) penalty to the policy loss
+                       # using the rollout-time distribution as the reference.
+                       # The Normal-Normal KL's `log(σ_old/σ_new)` term gives
+                       # a smooth σ-floor in place of the removed hard clamp,
+                       # while the categorical KL keeps the target distribution
+                       # from sharpening per-update past the old policy.
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`
                         # warms V on a state distribution PPO immediately

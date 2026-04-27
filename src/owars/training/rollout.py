@@ -35,12 +35,17 @@ class Trajectory:
     """
 
     encoded: list[EncodedObs]
-    target_idx: list[torch.Tensor]    # [P] long
-    frac_z: list[torch.Tensor]        # [P] float — pre-tanh Normal sample (PPO recomputes log_prob from this)
-    log_prob: list[torch.Tensor]      # [P] float
-    value: list[torch.Tensor]         # scalar tensors (no .item() in the hot loop)
+    target_idx: list[torch.Tensor]            # [P] long
+    frac_z: list[torch.Tensor]                # [P] float — pre-tanh Normal sample (PPO recomputes log_prob from this)
+    log_prob: list[torch.Tensor]              # [P] float
+    value: list[torch.Tensor]                 # scalar tensors (no .item() in the hot loop)
     reward: list[float]
-    owned_mask: list[torch.Tensor]    # [P] bool
+    owned_mask: list[torch.Tensor]            # [P] bool
+    # Old-policy distribution parameters captured at rollout time. Used by
+    # PMPO's analytical KL(new ‖ old) penalty (`ppo.py::ppo_update`).
+    old_target_logits: list[torch.Tensor]     # [P, P+1] float
+    old_fraction_mu: list[torch.Tensor]       # [P] float
+    old_fraction_log_sigma: list[torch.Tensor]  # [P] float
     final_score: float = 0.0
     won: bool = False
     drawn: bool = False
@@ -126,6 +131,7 @@ def rollout_episode(
     traj = Trajectory(
         encoded=[], target_idx=[], frac_z=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
+        old_target_logits=[], old_fraction_mu=[], old_fraction_log_sigma=[],
     )
 
     while not env.done:
@@ -181,6 +187,9 @@ def record_step(
     traj.log_prob.append(record.log_prob.detach().clone())
     traj.value.append(value_t.detach().clone())
     traj.owned_mask.append(owned_mask_t.detach().clone())
+    traj.old_target_logits.append(record.target_logits.detach().clone())
+    traj.old_fraction_mu.append(record.fraction_mu.detach().clone())
+    traj.old_fraction_log_sigma.append(record.fraction_log_sigma.detach().clone())
     traj.reward.append(0.0)
 
 

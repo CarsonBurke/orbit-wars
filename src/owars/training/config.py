@@ -116,6 +116,13 @@ class PPOCfg:
     clip_eps_high: float = 0.28
     value_coef: float = 0.5
     entropy_coef: float = 0.01
+    # dreamer4 PMPO-style soft trust region: add `coef · KL(new ‖ old)` to
+    # the policy loss using the rollout-time distribution as reference.
+    # Replaces the (now-removed) hard `LOG_SIGMA` clamp — the Normal-Normal
+    # KL contains a `log(σ_old/σ_new)` term that diverges as σ_new collapses,
+    # giving a smooth σ-floor that adapts to the old policy's σ.
+    # dreamer4's default is 0.3 (`dreamer4.py:3083`); set to 0 to disable.
+    pmpo_kl_coef: float = 0.3
     # --- Value pretraining (cold-start the critic before PPO turns on). ---
     pretrain_updates: int = 0
     pretrain_episodes: int = 64

@@ -32,6 +32,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributions import Normal, kl_divergence
 
 from ..policies.features import EncodedObs
 from ..policies.model import OrbitPolicy
@@ -56,8 +57,9 @@ class PPOLog:
     policy_loss: float
     value_loss: float
     entropy: float
-    approx_kl: float
+    approx_kl: float       # importance-ratio approximation E[old_lp − new_lp]
     clip_frac: float
+    pmpo_kl: float         # analytical KL(new ‖ old) over the full distributions
 
 
 def compute_gae(
@@ -124,6 +126,7 @@ def ppo_update(
     clip_eps_high: float,
     value_coef: float,
     entropy_coef: float,
+    pmpo_kl_coef: float = 0.0,
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
@@ -135,7 +138,16 @@ def ppo_update(
       `planet_garrison`, `fleet_feats`, `fleet_mask`,
       `target_idx` [B,P], `frac_z` [B,P],
       `old_log_prob` [B,P], `advantage` [B], `return` [B],
-      `owned_mask` [B,P].
+      `owned_mask` [B,P],
+      `old_target_logits` [B,P,P+1], `old_fraction_mu` [B,P],
+      `old_fraction_log_sigma` [B,P].
+
+    `pmpo_kl_coef` adds `coef · KL(new_policy ‖ old_policy)` to the policy
+    loss (dreamer4 `dreamer4.py:4298-4336`). KL is computed analytically per
+    owned planet — Categorical(target) + Normal(fraction) — using the
+    rollout-time distribution parameters as the reference. The Normal KL's
+    `log(σ_old / σ_new)` term diverges as σ_new collapses, so this acts as
+    a soft σ-floor in place of a hard clamp on `log_σ`. Set to 0 to disable.
 
     `frac_z` is the *pre-tanh* Normal sample recorded at rollout time. The
     new policy's log_prob is computed by re-evaluating Normal(μ, σ).log_prob
@@ -145,12 +157,11 @@ def ppo_update(
     (sample, owned-planet) pairs and divided by the count of active
     pairs in the minibatch. Standard PPO would average per-sample first.
 
-    This is *clip-PPO*, not KL-PPO: the trust region is enforced exclusively
-    by `clip(ratio, 1 ± ε)`. We don't run a KL early-stop — `approx_kl` is
-    logged for diagnostics only. Per-update drift is bounded *by
-    construction* via (a) orthogonal init + Muon's NS5-bounded spectral-
-    norm step, (b) `logit_softcap` capping output logit magnitudes, and
-    (c) `muon_weight_decay` preventing weight-norm drift over time.
+    Trust region: PPO ratio clip + (when `pmpo_kl_coef > 0`) an analytical
+    PMPO-style KL penalty against the rollout-time distribution. The KL
+    term is the soft replacement for the hard `LOG_SIGMA` clamp — see the
+    `pmpo_kl_coef` docstring below. We do *not* run a KL early-stop;
+    `approx_kl` is the importance-ratio approximation, logged for diagnostics.
     """
     n = batch["planet_feats"].shape[0]
     device = batch["planet_feats"].device
@@ -257,7 +268,57 @@ def ppo_update(
             planet_entropy = target_entropy + move_mask * normal_entropy
             entropy = (planet_entropy * owned_f).sum() / denom
 
-            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+            pmpo_kl = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
+            if pmpo_kl_coef != 0.0:
+                # PMPO analytical KL(new ‖ old), per owned planet, summed over
+                # the categorical target axis and added to the Normal-fraction
+                # KL. Both KLs are exact closed forms; no Monte-Carlo estimator.
+                old_target_logits = batch["old_target_logits"][mb].float()
+                old_target_log_probs = F.log_softmax(old_target_logits, dim=-1)
+                # Self-target slots have `target_logits = -inf` (`model.py`
+                # `_self_target_mask`), so `log_softmax` yields `-inf` there.
+                # Naive `(-inf) − (-inf) = NaN` in the subtraction; clamp
+                # log-probs to dtype-min first. At masked slots `p_new = 0`
+                # so the contribution is 0 by construction, but the
+                # subtraction is now finite. Same trick the entropy block
+                # below uses.
+                kl_min = torch.finfo(target_log_probs.dtype).min
+                log_p_new_safe = target_log_probs.clamp_min(kl_min)
+                log_p_old_safe = old_target_log_probs.clamp_min(kl_min)
+                target_probs = target_log_probs.exp()
+                target_kl = (
+                    target_probs * (log_p_new_safe - log_p_old_safe)
+                ).sum(dim=-1)  # [B, P]
+
+                old_mu = batch["old_fraction_mu"][mb].float()
+                old_log_sigma = batch["old_fraction_log_sigma"][mb].float()
+                # Use `torch.distributions.kl_divergence` for the closed-form
+                # Normal-Normal KL — same pattern as dreamer4's
+                # `mean_log_var_to_distr` + `kl.kl_divergence` path
+                # (`dreamer4.py:1234-1237`). No clamps on σ: the regularizer
+                # itself + the small-init fraction head are what keep log_σ
+                # bounded; reintroducing a clamp here would defeat the
+                # whole point of removing the LOG_SIGMA hard clamp.
+                new_normal = Normal(fraction_mu, fraction_log_sigma.exp())
+                old_normal = Normal(old_mu, old_log_sigma.exp())
+                frac_kl = kl_divergence(new_normal, old_normal)  # [B, P]
+                # Apply the fraction KL on every owned planet, not only the ones
+                # whose old sample was a move: σ-collapse on a no-op planet is
+                # still a regression in policy quality, and the regularizer
+                # should bind regardless of which action was sampled.
+                planet_kl = target_kl + frac_kl
+                # KL is non-negative analytically; bf16-forward → fp32-cast
+                # leaves last-bit noise that can dip slightly below zero
+                # when new ≈ old (first PPO minibatch). Clamp to keep the
+                # logged scalar honest and avoid surprising consumers.
+                pmpo_kl = ((planet_kl * owned_f).sum() / denom).clamp_min(0.0)
+
+            loss = (
+                policy_loss
+                + value_coef * value_loss
+                - entropy_coef * entropy
+                + pmpo_kl_coef * pmpo_kl
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -281,6 +342,7 @@ def ppo_update(
                     entropy.detach(),
                     kl.detach(),
                     clip_frac.detach(),
+                    pmpo_kl.detach(),
                 ]
             ).float()
             if metric_sum is None:
@@ -290,7 +352,7 @@ def ppo_update(
 
     n_steps = max(1, n_steps)
     if metric_sum is None:
-        logs = [0.0] * 5
+        logs = [0.0] * 6
     else:
         logs = (metric_sum / n_steps).detach().cpu().tolist()
     return PPOLog(
@@ -299,6 +361,7 @@ def ppo_update(
         entropy=float(logs[2]),
         approx_kl=float(logs[3]),
         clip_frac=float(logs[4]),
+        pmpo_kl=float(logs[5]),
     )
 
 
