@@ -276,10 +276,20 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     return params
 
 
-def train_one_run(cfg: RunConfig) -> dict:
+def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     set_seed(cfg.run.seed)
     device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
     model = _build_model(cfg).to(device)
+    if load_weights is not None:
+        # Resume: load model weights only — fresh optimizer state and a fresh
+        # opponent pool. Restoring the optimizer is rarely worth it across
+        # league/self-play composition changes since AdamW's running stats
+        # decay quickly anyway, and a fresh pool means no stale snapshots
+        # whose weights no longer match the current architecture.
+        ckpt = torch.load(load_weights, map_location=device, weights_only=False)
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        model.load_state_dict(state)
+        print(f"loaded weights from {load_weights}")
     pretrain_opt = torch.optim.AdamW(
         _value_pretrain_params(model),
         lr=cfg.ppo.pretrain_lr,
@@ -464,9 +474,16 @@ def _ppo_loop(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
+    p.add_argument(
+        "--load",
+        default=None,
+        help="Path to a .pt checkpoint whose `model` state_dict should be "
+        "loaded into the policy before training starts. Optimizer state and "
+        "the opponent pool are NOT restored.",
+    )
     args = p.parse_args()
     cfg = load_config(args.config)
-    summary = train_one_run(cfg)
+    summary = train_one_run(cfg, load_weights=args.load)
     print({k: v for k, v in summary.items() if k != "updates"})
 
 
