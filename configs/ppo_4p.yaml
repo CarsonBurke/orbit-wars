@@ -41,7 +41,8 @@ ppo:
   lambda_critic: 1.0
   lambda_policy: 0.95
   lambda_policy_alpha: 0.0
-  clip_eps: 0.2
+  clip_eps_low: 0.2
+  clip_eps_high: 0.28
   value_coef: 0.5
   entropy_coef: 0.015   # a touch higher to keep diverse strategies alive
   pretrain_updates: 75

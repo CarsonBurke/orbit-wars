@@ -54,7 +54,12 @@ class PPOCfg:
     lambda_critic: float = 1.0
     lambda_policy: float = 0.95
     lambda_policy_alpha: float = 0.0   # 0 ⇒ use fixed `lambda_policy`
-    clip_eps: float = 0.2
+    # Asymmetric PPO clipping (VAPO §4.4 / DAPO): a wider upper bound lets
+    # the policy lean into beneficial moves while a tight lower bound limits
+    # catastrophic policy jumps on negative advantage. The 0.2/0.28 default
+    # is the VAPO recommendation; setting them equal recovers vanilla PPO.
+    clip_eps_low: float = 0.2
+    clip_eps_high: float = 0.28
     value_coef: float = 0.5
     entropy_coef: float = 0.01
     # --- Value pretraining (cold-start the critic before PPO turns on). ---

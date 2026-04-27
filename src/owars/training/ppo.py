@@ -115,7 +115,8 @@ def ppo_update(
     optimizer: torch.optim.Optimizer,
     batch: dict[str, torch.Tensor],
     *,
-    clip_eps: float,
+    clip_eps_low: float,
+    clip_eps_high: float,
     value_coef: float,
     entropy_coef: float,
     epochs: int,
@@ -141,64 +142,80 @@ def ppo_update(
     pl_loss = vl_loss = ent_log = kl_log = clip_log = 0.0
     n_steps = 0
 
+    # bf16 autocast unlocks the SDPA Flash-Attention 2 kernel (head_dim must
+    # also be FA-eligible — see model config). bf16 has fp32-equivalent range
+    # so no GradScaler is needed; AdamW keeps fp32 master weights via
+    # PyTorch's autocast handling. Outside cuda we stay in fp32.
+    autocast_enabled = (
+        next(model.parameters()).is_cuda
+        if any(True for _ in model.parameters())
+        else False
+    )
     for _ in range(epochs):
         np.random.shuffle(idx)
         for start in range(0, n, minibatch_size):
             mb = idx[start : start + minibatch_size]
 
-            out = model(_slice_feats(batch, mb))
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
+            ):
+                out = model(_slice_feats(batch, mb))
 
-            owned_f = batch["owned_mask"][mb].float()
-            p = out.target_logits.shape[1]
-            target = batch["target_idx"][mb].clamp(0, p)
-            target_log_probs = F.log_softmax(out.target_logits, dim=-1)
-            target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+                owned_f = batch["owned_mask"][mb].float()
+                p = out.target_logits.shape[1]
+                target = batch["target_idx"][mb].clamp(0, p)
+                target_log_probs = F.log_softmax(out.target_logits, dim=-1)
+                target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
 
-            # Beta log-probs for the recorded fraction *and* angle residual;
-            # both are only counted when the action wasn't no-op (target slot
-            # == p). Mirrors what `sample_with_record` stored in `old_log_prob`.
-            frac = batch["fraction"][mb].clamp(1e-6, 1.0 - 1e-6)
-            frac_dist = torch.distributions.Beta(out.fraction_alpha, out.fraction_beta)
-            frac_lp = frac_dist.log_prob(frac)
-            ang = batch["angle_offset"][mb].clamp(1e-6, 1.0 - 1e-6)
-            angle_dist = torch.distributions.Beta(out.angle_alpha, out.angle_beta)
-            angle_lp = angle_dist.log_prob(ang)
-            is_noop = (target == p).float()
-            move_mask = 1.0 - is_noop
-            chosen = target_lp + move_mask * (frac_lp + angle_lp)
+                # Beta log-probs for the recorded fraction *and* angle residual;
+                # both are only counted when the action wasn't no-op (target slot
+                # == p). Mirrors what `sample_with_record` stored in `old_log_prob`.
+                frac = batch["fraction"][mb].clamp(1e-6, 1.0 - 1e-6)
+                frac_dist = torch.distributions.Beta(out.fraction_alpha, out.fraction_beta)
+                frac_lp = frac_dist.log_prob(frac)
+                ang = batch["angle_offset"][mb].clamp(1e-6, 1.0 - 1e-6)
+                angle_dist = torch.distributions.Beta(out.angle_alpha, out.angle_beta)
+                angle_lp = angle_dist.log_prob(ang)
+                is_noop = (target == p).float()
+                move_mask = 1.0 - is_noop
+                chosen = target_lp + move_mask * (frac_lp + angle_lp)
 
-            old_log_prob = batch["old_log_prob"][mb]  # [B, P]
-            # Advantages were normalized once over the whole batch in
-            # `_stack_trajectories`; standard PPO does this rather than
-            # per-minibatch (per-mb adds noise from each minibatch's own
-            # mean/std).
-            advantage = batch["advantage"][mb]
+                old_log_prob = batch["old_log_prob"][mb]  # [B, P]
+                # Advantages were normalized once over the whole batch in
+                # `_stack_trajectories`; standard PPO does this rather than
+                # per-minibatch (per-mb adds noise from each minibatch's own
+                # mean/std).
+                advantage = batch["advantage"][mb]
 
-            # Token-level (per-owned-planet) PPO ratio. We broadcast the
-            # per-trajectory advantage over the planet axis.
-            ratio = (chosen - old_log_prob).exp()  # [B, P]
-            adv_b = advantage.unsqueeze(-1).expand_as(ratio)
-            unclipped = ratio * adv_b
-            clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_b
-            per_token = -torch.min(unclipped, clipped)
-            denom = owned_f.sum().clamp_min(1.0)
-            policy_loss = (per_token * owned_f).sum() / denom
+                # Token-level (per-owned-planet) PPO ratio. We broadcast the
+                # per-trajectory advantage over the planet axis.
+                ratio = (chosen - old_log_prob).exp()  # [B, P]
+                adv_b = advantage.unsqueeze(-1).expand_as(ratio)
+                unclipped = ratio * adv_b
+                # Asymmetric clip — `1 - eps_low` on the lower bound, `1 +
+                # eps_high` on the upper. Equal eps recovers symmetric PPO.
+                clipped = (
+                    torch.clamp(ratio, 1.0 - clip_eps_low, 1.0 + clip_eps_high) * adv_b
+                )
+                per_token = -torch.min(unclipped, clipped)
+                denom = owned_f.sum().clamp_min(1.0)
+                policy_loss = (per_token * owned_f).sum() / denom
 
-            value_loss = (out.value - batch["return"][mb]).pow(2).mean()
+                value_loss = (out.value - batch["return"][mb]).pow(2).mean()
 
-            # Reuse `target_log_probs` for the entropy term — cheaper than
-            # constructing Categorical(logits=...).entropy() which redoes
-            # log_softmax internally. We clamp -inf log-probs to the finite
-            # min (Categorical.entropy's exact trick): exp(-inf)=0 and 0*
-            # -3.4e38=0, but 0*-inf=nan and a torch.where mask wouldn't
-            # save us — both branches are evaluated and the nan poisons
-            # the backward pass.
-            min_real = torch.finfo(target_log_probs.dtype).min
-            log_probs_safe = target_log_probs.clamp_min(min_real)
-            entropy = -(target_log_probs.exp() * log_probs_safe).sum(dim=-1)
-            entropy = (entropy * owned_f).sum() / denom
+                # Reuse `target_log_probs` for the entropy term — cheaper than
+                # constructing Categorical(logits=...).entropy() which redoes
+                # log_softmax internally. We clamp -inf log-probs to the finite
+                # min (Categorical.entropy's exact trick): exp(-inf)=0 and 0*
+                # -3.4e38=0, but 0*-inf=nan and a torch.where mask wouldn't
+                # save us — both branches are evaluated and the nan poisons
+                # the backward pass.
+                min_real = torch.finfo(target_log_probs.dtype).min
+                log_probs_safe = target_log_probs.clamp_min(min_real)
+                entropy = -(target_log_probs.exp() * log_probs_safe).sum(dim=-1)
+                entropy = (entropy * owned_f).sum() / denom
 
-            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -207,7 +224,13 @@ def ppo_update(
 
             with torch.no_grad():
                 kl = ((old_log_prob - chosen) * owned_f).sum() / denom
-                clip_frac = (((ratio - 1.0).abs() > clip_eps).float() * owned_f).sum() / denom
+                # Count tokens whose ratio drifted past *either* asymmetric
+                # bound — preserves the diagnostic of "fraction clipped" even
+                # when eps_low ≠ eps_high.
+                clip_low = ratio < (1.0 - clip_eps_low)
+                clip_high = ratio > (1.0 + clip_eps_high)
+                clipped_mask = (clip_low | clip_high).float()
+                clip_frac = (clipped_mask * owned_f).sum() / denom
 
             pl_loss += float(policy_loss.item())
             vl_loss += float(value_loss.item())

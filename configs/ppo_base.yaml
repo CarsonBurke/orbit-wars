@@ -28,8 +28,12 @@ game:
   ship_speed: 6.0
 
 model:
-  dim: 96
-  ff_dim: 256
+  dim: 128         # head_dim = dim / n_heads = 32 — Flash Attention 2 only
+                   # accepts head_dim ∈ {16, 32, 64, 128, 256}, so 32 is the
+                   # cheapest setting that lets SDPA dispatch to the FA2 kernel
+                   # under bf16 autocast. dim=96 (head_dim=24) silently fell
+                   # back to the math/mem-efficient kernel.
+  ff_dim: 512      # standard 4·dim ratio
   depth: 3
   n_heads: 4
   dropout: 0.0
@@ -47,7 +51,11 @@ ppo:
   lambda_critic: 1.0
   lambda_policy: 0.95
   lambda_policy_alpha: 0.0
-  clip_eps: 0.2
+  clip_eps_low: 0.2    # tight lower bound — limits catastrophic policy
+                       # jumps when advantage is negative.
+  clip_eps_high: 0.28  # wider upper bound (VAPO §4.4 / DAPO default) — lets
+                       # the policy lean into beneficial moves more freely.
+                       # Set equal to clip_eps_low to recover vanilla PPO.
   value_coef: 0.5
   entropy_coef: 0.01
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
