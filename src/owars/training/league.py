@@ -68,11 +68,13 @@ class OpponentPool:
         elo: EloTracker,
         top_k: int = 8,
         self_play_prob: float = 0.8,
+        device: str = "cpu",
         rng: random.Random | None = None,
     ):
         self.elo = elo
         self.top_k = top_k
         self.self_play_prob = self_play_prob
+        self.device = device
         self.rng = rng or random.Random()
         self._frozen: dict[str, AgentFn] = {}
 
@@ -100,7 +102,11 @@ class OpponentPool:
             {"model": snap.state_dict(), "config": snap.cfg.to_dict()}, ckpt_path
         )
         name = f"frozen:{label}"
-        self._frozen[name] = LearnedAgent(ckpt_path, deterministic=False)
+        self._frozen[name] = LearnedAgent(
+            ckpt_path,
+            device=self.device,
+            deterministic=False,
+        )
         if seed_rating is None:
             seed_rating = self.elo.get(LEARNER_NAME)
         self.elo.set(name, float(seed_rating))

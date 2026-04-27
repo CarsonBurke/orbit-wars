@@ -20,8 +20,9 @@ class OrbitPolicyConfig:
 
     # Action factorization. For each owned planet we emit:
     #   - logits over (target_planet | no-op)
-    #   - a fraction of garrison to send (Beta-distributed)
-    fraction_concentration: float = 4.0
+    #   - a tanh-squashed Normal(μ, σ) on the fraction of garrison to send.
+    # Launch angle is derived from the chosen target via an iterative
+    # lead-intercept solver in `sampling.py` — no learned angle component.
 
     # Value head — always a single scalar predicting expected score margin.
     value_hidden: int = 64

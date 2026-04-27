@@ -28,9 +28,9 @@ from typing import Any
 import torch
 
 from ..game import parse_observation
-from ..policies.features import encode_observation, stack_encoded
+from ..policies.features import encode_observations, select_encoded
 from ..policies.model import OrbitPolicy
-from ..policies.sampling import sample_batch_with_records
+from ..policies.sampling import sample_batch_actions, sample_batch_with_records
 from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
 from .rollout import Trajectory, record_step
@@ -39,7 +39,7 @@ from .vec_env import VecEnv
 
 def _empty_traj() -> Trajectory:
     return Trajectory(
-        encoded=[], target_idx=[], fraction=[], angle_offset=[],
+        encoded=[], target_idx=[], frac_z=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
     )
 
@@ -105,6 +105,8 @@ def rollout_episodes_batched(
     learner_seat: int = 0,
     deterministic: bool = False,
     reward_cfg: RewardCfg | None = None,
+    record_trajectories: bool = True,
+    max_moves_per_turn: int = 16,
 ) -> list[Trajectory]:
     """Play `len(opponents_per_env)` episodes in parallel; one Trajectory per env.
 
@@ -143,7 +145,8 @@ def rollout_episodes_batched(
                 continue
             state = states[env_idx]
             for seat in range(num_players):
-                obs = state[seat]["observation"]
+                seat_state = state[seat]
+                obs = seat_state["observation"]
                 slot = seat_agents[env_idx][seat]
                 if slot is None or slot.name == LEARNER_NAME:
                     learner_bucket.append((env_idx, seat, obs))
@@ -164,12 +167,23 @@ def rollout_episodes_batched(
                 learner_seat,
                 device,
                 deterministic,
+                record_trajectories,
+                max_moves_per_turn,
             )
 
-        # 3. Per-snapshot inference (small batches).
+        # 3. Per-snapshot inference. Learned snapshots expose `act_batch`;
+        # builtin Python baselines stay on the scalar callable path.
         for _name, bucket in opp_buckets.items():
-            for env_idx, seat, obs, slot in bucket:
-                actions_per_env[env_idx][seat] = slot.agent(obs)
+            agent = bucket[0][3].agent
+            act_batch = getattr(agent, "act_batch", None)
+            if callable(act_batch):
+                obs_list = [obs for _env_idx, _seat, obs, _slot in bucket]
+                batched_actions = act_batch(obs_list)
+                for (env_idx, seat, _obs, _slot), acts in zip(bucket, batched_actions):
+                    actions_per_env[env_idx][seat] = acts
+            else:
+                for env_idx, seat, obs, slot in bucket:
+                    actions_per_env[env_idx][seat] = slot.agent(obs)
 
         # 4. Step alive envs in parallel.
         active = [i for i in range(num_envs) if not dones[i]]
@@ -198,6 +212,8 @@ def _step_learner_bucket(
     learner_seat: int,
     device: str,
     deterministic: bool,
+    record_trajectories: bool,
+    max_moves_per_turn: int,
 ) -> None:
     """Encode + batch-forward the learner identity across (env, seat) pairs.
 
@@ -206,20 +222,44 @@ def _step_learner_bucket(
     — PPO trains on the learner's transitions, not the self-play side's.
     """
     parsed_list = [parse_observation(obs) for _, _, obs in bucket]
-    feats_list = [encode_observation(p, device=device) for p in parsed_list]
-    stacked = stack_encoded(feats_list)
-    with torch.no_grad():
-        out = model(stacked)
-    moves_list, records = sample_batch_with_records(
-        out, parsed_list, deterministic=deterministic
+    stacked = encode_observations(
+        parsed_list,
+        device=device,
+        pin_memory=torch.device(device).type == "cuda",
     )
+    # bf16 autocast on CUDA is what unlocks FA-2 dispatch in
+    # `SelfAttention.forward` — fp32 inputs make SDPA fall back to the
+    # mem-efficient kernel. Same regime as `ppo_update`.
+    autocast_enabled = torch.device(device).type == "cuda"
+    with (
+        torch.no_grad(),
+        torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
+        ),
+    ):
+        out = model(stacked)
+    if record_trajectories:
+        moves_list, records = sample_batch_with_records(
+            out,
+            parsed_list,
+            deterministic=deterministic,
+            max_moves=max_moves_per_turn,
+        )
+    else:
+        moves_list = sample_batch_actions(
+            out,
+            parsed_list,
+            deterministic=deterministic,
+            max_moves=max_moves_per_turn,
+        )
+        records = []
 
     for k, (env_idx, seat, _obs) in enumerate(bucket):
         actions_per_env[env_idx][seat] = [m.as_list() for m in moves_list[k]]
-        if seat == learner_seat:
+        if record_trajectories and seat == learner_seat:
             record_step(
                 trajectories[env_idx],
-                feats=feats_list[k],
+                feats=select_encoded(stacked, k, clone=True),
                 value_t=out.value[k],
                 owned_mask_t=out.planet_owned_mask[k],
                 record=records[k],

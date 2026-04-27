@@ -22,7 +22,6 @@ model:
   depth: 3
   n_heads: 4
   dropout: 0.0
-  fraction_concentration: 4.0
 
 optim:
   lr: 3.0e-4

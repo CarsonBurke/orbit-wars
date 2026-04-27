@@ -40,7 +40,8 @@ def test_policy_forward_shapes():
     out = model(feats)
     # batch dim was added implicitly by the encoder fast path.
     assert out.target_logits.shape == (1, 64, 65)
-    assert out.fraction_alpha.shape == (1, 64)
+    assert out.fraction_mu.shape == (1, 64)
+    assert out.fraction_log_sigma.shape == (1, 64)
     assert out.value.shape == (1,)
 
 

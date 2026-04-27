@@ -37,11 +37,13 @@ import torch
 import random
 
 from ..policies.config import OrbitPolicyConfig
-from ..policies.model import OrbitPolicy
+from ..policies.model import OrbitPolicy, restore_fp32_params
 from ..utils import TBLogger, set_seed
-from .config import RunConfig, load_config
+from .config import OptimCfg, RunConfig, load_config
 from .elo import EloTracker
 from .league import BUILTIN, LEARNER_NAME, OpponentPool, OpponentSlot
+from .muon import MultiOptimizer, Muon
+from .numpy_env import NumpyVecEnv
 from .ppo import (
     _slice_feats,
     compute_gae,
@@ -54,6 +56,102 @@ from .rollout import Trajectory
 from .vec_env import VecEnv
 from .vec_rollout import rollout_episodes_batched
 
+# Parameter-name patterns that should *never* go to Muon even when shape
+# is 2D. These are control tensors (per-channel scales, residual mixes)
+# that conceptually act as scalars-per-channel; orthogonalizing their
+# 2D shape would destroy the per-channel meaning. Mirrors parameter-golf
+# `CONTROL_TENSOR_NAME_PATTERNS`.
+_CONTROL_TENSOR_PATTERNS: tuple[str, ...] = (
+    "attn_scale",
+    "ff_scale",
+    "resid_mix",
+    "actor_token",
+    "critic_token",
+)
+
+# Subset of control tensors that route to the *fast* AdamW group at
+# `control_lr` (≈ `muon_lr`) — per-channel residual scales and the
+# attention-temperature gain. The summary tokens (`actor_token`,
+# `critic_token`) intentionally stay in the slow default group: they are
+# learnable biases on the residual stream and moving them at scalar speed
+# destabilizes early training.
+_CONTROL_LR_PATTERNS: tuple[str, ...] = (
+    "attn_scale",
+    "ff_scale",
+    "resid_mix",
+    "q_gain",
+)
+
+
+def _split_params(
+    model: OrbitPolicy,
+) -> tuple[
+    list[torch.nn.Parameter],
+    list[torch.nn.Parameter],
+    list[torch.nn.Parameter],
+]:
+    """Partition `model.parameters()` into (muon, adamw_default, adamw_control).
+
+    Muon: 2D weight matrices that aren't control tensors — Linear weights
+    inside attention, FF, the projection heads, and embeddings.
+
+    AdamW (control-lr): per-channel residual scales and `q_gain` — these
+    need update magnitudes comparable to Muon's matrix updates, see
+    `OptimCfg.control_lr`.
+
+    AdamW (default-lr): everything else — biases, summary tokens.
+    """
+    muon: list[torch.nn.Parameter] = []
+    adamw_default: list[torch.nn.Parameter] = []
+    adamw_control: list[torch.nn.Parameter] = []
+    for name, p in model.named_parameters():
+        is_control = any(pat in name for pat in _CONTROL_TENSOR_PATTERNS)
+        is_control_lr = any(pat in name for pat in _CONTROL_LR_PATTERNS)
+        if p.ndim == 2 and not is_control:
+            muon.append(p)
+        elif is_control_lr:
+            adamw_control.append(p)
+        else:
+            adamw_default.append(p)
+    return muon, adamw_default, adamw_control
+
+
+def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
+    """Construct the dual Muon + AdamW optimizer.
+
+    See `OptimCfg` and `muon.py` for rationale. The combined object exposes
+    `step` / `zero_grad` / `param_groups` so the PPO loop's clip-grad and
+    step calls work transparently across both children.
+    """
+    muon_params, adamw_default, adamw_control = _split_params(model)
+    muon_opt = Muon(
+        muon_params,
+        lr=cfg.muon_lr,
+        momentum=cfg.muon_momentum,
+        backend_steps=cfg.muon_backend_steps,
+        row_normalize=cfg.muon_row_normalize,
+        weight_decay=cfg.muon_weight_decay,
+    )
+    # parameter-golf-style AdamW: betas=(0.9, 0.95) instead of the default
+    # (0.9, 0.999). β2=0.95 makes the second-moment estimate reach steady
+    # state in ~20 steps instead of ~1000 — important for cold-start, where
+    # the first few hundred updates have rapidly-changing gradient
+    # statistics and a stale running variance underestimates the current
+    # step size, which translates into oversized parameter updates.
+    #
+    # Two AdamW param-groups: control tensors at `control_lr` (≈ muon_lr,
+    # parity with matrix updates) and everything else at `lr`.
+    adamw_opt = torch.optim.AdamW(
+        [
+            {"params": adamw_default, "lr": cfg.lr},
+            {"params": adamw_control, "lr": cfg.control_lr},
+        ],
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        betas=(0.9, 0.95),
+    )
+    return MultiOptimizer([muon_opt, adamw_opt])
+
 
 def _build_model(cfg: RunConfig) -> OrbitPolicy:
     pcfg = OrbitPolicyConfig(
@@ -62,7 +160,6 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         depth=cfg.model.depth,
         n_heads=cfg.model.n_heads,
         dropout=cfg.model.dropout,
-        fraction_concentration=cfg.model.fraction_concentration,
     )
     return OrbitPolicy(pcfg)
 
@@ -72,7 +169,7 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
 
     Per-step records on Trajectory are already device tensors (see the
     Trajectory docstring) — we just gather and stack here. Encoder-only:
-    the actor-side records (target_idx / fraction / old_log_prob /
+    the actor-side records (target_idx / frac_z / old_log_prob /
     owned_mask) are added by `_stack_trajectories`, which lets
     `_pretrain_value_batch` skip them entirely.
     """
@@ -111,16 +208,14 @@ def _stack_trajectories(
     """
     batch = _stack_encoded(trajs)
 
-    tidx, frac, ang, lp, owned = [], [], [], [], []
+    tidx, fz, lp, owned = [], [], [], []
     for t in trajs:
         tidx.extend(t.target_idx)
-        frac.extend(t.fraction)
-        ang.extend(t.angle_offset)
+        fz.extend(t.frac_z)
         lp.extend(t.log_prob)
         owned.extend(t.owned_mask)
     batch["target_idx"] = torch.stack(tidx).long()
-    batch["fraction"] = torch.stack(frac).float()
-    batch["angle_offset"] = torch.stack(ang).float()
+    batch["frac_z"] = torch.stack(fz).float()
     batch["old_log_prob"] = torch.stack(lp).float()
     batch["owned_mask"] = torch.stack(owned).bool()
 
@@ -210,6 +305,7 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                 device=str(device),
                 deterministic=False,
                 reward_cfg=cfg.reward,
+                max_moves_per_turn=cfg.rollout.max_moves_per_turn,
             ))
         batch = {k: v.to(device) for k, v in _pretrain_value_batch(trajs).items()}
         loss = value_only_update(
@@ -227,12 +323,18 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
         # attention tensor (tokens ≈ 64 planets + 384 fleets + 2 summary).
         n = batch["planet_feats"].shape[0]
         mb = cfg.optim.minibatch_size
-        with torch.no_grad():
+        autocast_enabled = device.type == "cuda"
+        with (
+            torch.no_grad(),
+            torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
+            ),
+        ):
             chunks = [
                 model(_slice_feats(batch, slice(s, s + mb))).value
                 for s in range(0, n, mb)
             ]
-            preds = torch.cat(chunks).cpu().numpy()
+            preds = torch.cat(chunks).float().cpu().numpy()
         var_y = float(np.var(rets)) + 1e-9
         ev = 1.0 - float(np.var(rets - preds)) / var_y
         logger.scalars("pretrain", {"value_loss": loss, "explained_variance": ev}, step)
@@ -263,10 +365,10 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     Includes the encoder (shared backbone), both summary tokens (actor_token
     feeds the encoder self-attention so h_critic depends on it; critic_token
     feeds the value head directly), and the value head. Excludes the actor
-    heads (target_query/key, noop_logit, fraction_head, angle_head) — they
-    receive zero gradient from the value loss, and including them would let
-    AdamW's weight-decay pull them toward zero with no learning signal,
-    leaving PPO to start from a worse-than-init policy.
+    heads (target_query/key, noop_head, fraction_head) — they receive zero
+    gradient from the value loss, and including them would let AdamW's
+    weight-decay pull them toward zero with no learning signal, leaving PPO
+    to start from a worse-than-init policy.
     """
     encoder = [model.planet_embed, model.fleet_embed, *model.layers]
     value = [model.value_head]
@@ -280,6 +382,15 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     set_seed(cfg.run.seed)
     device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
     model = _build_model(cfg).to(device)
+    # parameter-golf fp32-master pattern: cast everything to bf16, then
+    # restore fp32 for the params that actually need precision (Linear
+    # weights, biases, control tensors, summary tokens). This is the
+    # explicit equivalent of relying on autocast's implicit weight
+    # casting — but with a deterministic dtype boundary that doesn't
+    # fight `torch.compile` or nested-jagged subclass tracking.
+    if device.type == "cuda":
+        model.bfloat16()
+        restore_fp32_params(model)
     if load_weights is not None:
         # Resume: load model weights only — fresh optimizer state and a fresh
         # opponent pool. Restoring the optimizer is rarely worth it across
@@ -295,21 +406,22 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
         lr=cfg.ppo.pretrain_lr,
         weight_decay=cfg.optim.weight_decay,
     )
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.optim.lr,
-        weight_decay=cfg.optim.weight_decay,
-    )
+    optimizer = _build_optimizer(model, cfg.optim)
 
     elo = EloTracker(
         initial_rating=cfg.opponents.initial_rating,
         k_factor=cfg.opponents.k_factor,
     )
     elo.ensure(LEARNER_NAME)
+    snapshot_device = (
+        str(device) if cfg.opponents.snapshot_device == "train"
+        else cfg.opponents.snapshot_device
+    )
     pool = OpponentPool(
         elo=elo,
         top_k=cfg.opponents.top_k,
         self_play_prob=cfg.opponents.self_play_prob,
+        device=snapshot_device,
         rng=random.Random(cfg.run.seed),
     )
     logger = TBLogger(cfg.run.name, root=cfg.run.log_root)
@@ -320,12 +432,15 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     # `replay_env_idx=0` keeps env 0's full step history so the PPO loop
     # can dump one rendered game per update; the other workers trim
     # `env.steps` to save memory.
-    with VecEnv(
+    vec_cls = NumpyVecEnv if cfg.rollout.env_backend == "numpy" else VecEnv
+    if cfg.rollout.env_backend not in {"kaggle", "numpy"}:
+        raise ValueError(f"unknown rollout.env_backend: {cfg.rollout.env_backend!r}")
+    with vec_cls(
         num_envs=cfg.rollout.num_envs,
         num_players=cfg.game.num_players,
         episode_steps=cfg.game.episode_steps,
         ship_speed=cfg.game.ship_speed,
-        replay_env_idx=0,
+        replay_env_idx=None if cfg.rollout.env_backend == "numpy" else 0,
     ) as vec:
         # Pretrain doesn't write replays — skip the per-episode render +
         # pipe-transfer cost. _ppo_loop re-enables before the first update.
@@ -393,6 +508,7 @@ def _ppo_loop(
             num_players=cfg.game.num_players,
             device=str(device),
             reward_cfg=cfg.reward,
+            max_moves_per_turn=cfg.rollout.max_moves_per_turn,
         )
 
         if vec.last_replay_html is not None:

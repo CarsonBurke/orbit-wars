@@ -7,8 +7,11 @@ import torch
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation
 from owars.policies.features import stack_encoded
+from owars.policies.model import PolicyOutput
 from owars.policies.sampling import (
     SampleRecord,
+    sample_actions,
+    sample_batch_actions,
     sample_batch_with_records,
     sample_with_record,
 )
@@ -34,6 +37,40 @@ def _obs(player: int = 0):
 
 def _model() -> OrbitPolicy:
     return OrbitPolicy(OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2))
+
+
+def _forced_move_output(feats) -> PolicyOutput:
+    """PolicyOutput that deterministically launches from planet 0 to planet 1."""
+    batched = feats.planet_ids.dim() == 2
+    b = int(feats.planet_ids.shape[0]) if batched else 1
+    p = int(feats.planet_ids.shape[-1])
+    target_logits = torch.full((b, p, p + 1), -100.0)
+    target_logits[:, :, p] = 0.0
+    target_logits[:, 0, :] = -100.0
+    target_logits[:, 0, 1] = 100.0
+    fraction_mu = torch.zeros((b, p))
+    fraction_mu[:, 0] = 2.0
+    fraction_log_sigma = torch.zeros((b, p))
+    if not batched:
+        target_logits = target_logits[:1]
+        fraction_mu = fraction_mu[:1]
+        fraction_log_sigma = fraction_log_sigma[:1]
+        planet_owned_mask = feats.planet_owned_mask.unsqueeze(0)
+        planet_mask = feats.planet_mask.unsqueeze(0)
+        planet_ids = feats.planet_ids.unsqueeze(0)
+    else:
+        planet_owned_mask = feats.planet_owned_mask
+        planet_mask = feats.planet_mask
+        planet_ids = feats.planet_ids
+    return PolicyOutput(
+        target_logits=target_logits,
+        fraction_mu=fraction_mu,
+        fraction_log_sigma=fraction_log_sigma,
+        value=torch.zeros(b),
+        planet_owned_mask=planet_owned_mask,
+        planet_mask=planet_mask,
+        planet_ids=planet_ids,
+    )
 
 
 def test_stack_encoded_preserves_fields():
@@ -65,6 +102,7 @@ def test_batched_sampler_shapes_and_record_lengths():
         assert isinstance(rec, SampleRecord)
         assert rec.target_idx.shape == (out.target_logits.shape[1],)
         assert rec.fraction.shape == (out.target_logits.shape[1],)
+        assert rec.frac_z.shape == (out.target_logits.shape[1],)
         assert rec.log_prob.shape == (out.target_logits.shape[1],)
 
 
@@ -110,3 +148,48 @@ def test_batched_deterministic_argmax_matches_logits():
     expected = out.target_logits.argmax(dim=-1)
     assert torch.equal(records[0].target_idx, expected[0])
     assert torch.equal(records[1].target_idx, expected[1])
+
+
+def test_moves_only_sampler_matches_record_path_deterministic():
+    o = parse_observation(_obs())
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+
+    moves = sample_actions(out, o, deterministic=True)
+    moves_with_record, _record = sample_with_record(out, o, deterministic=True)
+
+    assert moves
+    assert [m.as_list() for m in moves] == [m.as_list() for m in moves_with_record]
+
+
+def test_moves_only_sampler_matches_record_path_stochastic_under_fixed_seed():
+    o = parse_observation(_obs())
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+
+    torch.manual_seed(123)
+    moves = sample_actions(out, o, deterministic=False)
+    torch.manual_seed(123)
+    moves_with_record, _record = sample_with_record(out, o, deterministic=False)
+
+    assert moves
+    assert [m.as_list() for m in moves] == [m.as_list() for m in moves_with_record]
+
+
+def test_batched_moves_only_sampler_matches_record_path_under_fixed_seed():
+    o = parse_observation(_obs())
+    feats = encode_observation(o)
+    stacked = stack_encoded([feats, feats])
+    out = _forced_move_output(stacked)
+
+    torch.manual_seed(123)
+    moves = sample_batch_actions(out, [o, o], deterministic=False)
+    torch.manual_seed(123)
+    moves_with_records, _records = sample_batch_with_records(
+        out, [o, o], deterministic=False
+    )
+
+    assert all(row for row in moves)
+    assert [[m.as_list() for m in row] for row in moves] == [
+        [m.as_list() for m in row] for row in moves_with_records
+    ]

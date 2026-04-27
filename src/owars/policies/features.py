@@ -245,40 +245,165 @@ def _infer_num_players(o: Observation) -> int:
     return max(2, max(candidates) + 1)
 
 
-def encode_observation(o: Observation, device: str | torch.device = "cpu") -> EncodedObs:
-    p_feats = np.zeros((MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
-    p_mask = np.zeros(MAX_PLANETS, dtype=bool)
-    p_owned = np.zeros(MAX_PLANETS, dtype=bool)
-    p_ids = -np.ones(MAX_PLANETS, dtype=np.int64)
-    p_gar = np.zeros(MAX_PLANETS, dtype=np.float32)
+def _fill_encoded_arrays(
+    o: Observation,
+    p_feats: np.ndarray,
+    p_mask: np.ndarray,
+    p_owned: np.ndarray,
+    p_ids: np.ndarray,
+    p_gar: np.ndarray,
+    f_feats: np.ndarray,
+    f_mask: np.ndarray,
+    row: int | None = None,
+) -> None:
+    if row is None:
+        p_feats_r = p_feats
+        p_mask_r = p_mask
+        p_owned_r = p_owned
+        p_ids_r = p_ids
+        p_gar_r = p_gar
+        f_feats_r = f_feats
+        f_mask_r = f_mask
+    else:
+        p_feats_r = p_feats[row]
+        p_mask_r = p_mask[row]
+        p_owned_r = p_owned[row]
+        p_ids_r = p_ids[row]
+        p_gar_r = p_gar[row]
+        f_feats_r = f_feats[row]
+        f_mask_r = f_mask[row]
 
     comet_motion = _comet_motion_by_id(o)
     planet_pos = {p.id: (p.x, p.y) for p in o.planets}
     num_players = _infer_num_players(o)
 
     for i, p in enumerate(o.planets[:MAX_PLANETS]):
-        p_feats[i] = _planet_features(
+        p_feats_r[i] = _planet_features(
             p, o.player, num_players, o.angular_velocity, comet_motion
         )
-        p_mask[i] = True
-        p_owned[i] = p.owner == o.player
-        p_ids[i] = p.id
-        p_gar[i] = p.ships
+        p_mask_r[i] = True
+        p_owned_r[i] = p.owner == o.player
+        p_ids_r[i] = p.id
+        p_gar_r[i] = p.ships
 
+    for j, f in enumerate(o.fleets[:MAX_FLEETS]):
+        f_feats_r[j] = _fleet_features(f, o.player, num_players, planet_pos)
+        f_mask_r[j] = True
+
+
+def _tensor_from_numpy(
+    array: np.ndarray,
+    device: str | torch.device,
+    *,
+    pin_memory: bool,
+) -> torch.Tensor:
+    t = torch.from_numpy(array)
+    target = torch.device(device)
+    if pin_memory and target.type == "cuda":
+        t = t.pin_memory()
+        return t.to(target, non_blocking=True)
+    return t.to(target)
+
+
+def encode_observation(
+    o: Observation,
+    device: str | torch.device = "cpu",
+    *,
+    pin_memory: bool = False,
+) -> EncodedObs:
+    p_feats = np.zeros((MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
+    p_mask = np.zeros(MAX_PLANETS, dtype=bool)
+    p_owned = np.zeros(MAX_PLANETS, dtype=bool)
+    p_ids = -np.ones(MAX_PLANETS, dtype=np.int64)
+    p_gar = np.zeros(MAX_PLANETS, dtype=np.float32)
     f_feats = np.zeros((MAX_FLEETS, FLEET_FEAT_DIM), dtype=np.float32)
     f_mask = np.zeros(MAX_FLEETS, dtype=bool)
-    for j, f in enumerate(o.fleets[:MAX_FLEETS]):
-        f_feats[j] = _fleet_features(f, o.player, num_players, planet_pos)
-        f_mask[j] = True
+
+    _fill_encoded_arrays(o, p_feats, p_mask, p_owned, p_ids, p_gar, f_feats, f_mask)
 
     return EncodedObs(
-        planet_feats=torch.from_numpy(p_feats).to(device),
-        planet_mask=torch.from_numpy(p_mask).to(device),
-        planet_owned_mask=torch.from_numpy(p_owned).to(device),
-        planet_ids=torch.from_numpy(p_ids).to(device),
-        planet_garrison=torch.from_numpy(p_gar).to(device),
-        fleet_feats=torch.from_numpy(f_feats).to(device),
-        fleet_mask=torch.from_numpy(f_mask).to(device),
+        planet_feats=_tensor_from_numpy(p_feats, device, pin_memory=pin_memory),
+        planet_mask=_tensor_from_numpy(p_mask, device, pin_memory=pin_memory),
+        planet_owned_mask=_tensor_from_numpy(p_owned, device, pin_memory=pin_memory),
+        planet_ids=_tensor_from_numpy(p_ids, device, pin_memory=pin_memory),
+        planet_garrison=_tensor_from_numpy(p_gar, device, pin_memory=pin_memory),
+        fleet_feats=_tensor_from_numpy(f_feats, device, pin_memory=pin_memory),
+        fleet_mask=_tensor_from_numpy(f_mask, device, pin_memory=pin_memory),
+    )
+
+
+def encode_observations(
+    observations: list[Observation],
+    device: str | torch.device = "cpu",
+    *,
+    pin_memory: bool = False,
+) -> EncodedObs:
+    """Encode observations directly into one batched tensor set.
+
+    This keeps rollout from doing many tiny host-to-device copies before
+    stacking. The fixed caps stay unchanged, so compiled training forwards
+    still see stable shapes.
+    """
+    b = len(observations)
+    p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
+    p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
+    p_owned = np.zeros((b, MAX_PLANETS), dtype=bool)
+    p_ids = -np.ones((b, MAX_PLANETS), dtype=np.int64)
+    p_gar = np.zeros((b, MAX_PLANETS), dtype=np.float32)
+    f_feats = np.zeros((b, MAX_FLEETS, FLEET_FEAT_DIM), dtype=np.float32)
+    f_mask = np.zeros((b, MAX_FLEETS), dtype=bool)
+
+    for row, o in enumerate(observations):
+        _fill_encoded_arrays(
+            o, p_feats, p_mask, p_owned, p_ids, p_gar, f_feats, f_mask, row=row
+        )
+
+    return EncodedObs(
+        planet_feats=_tensor_from_numpy(p_feats, device, pin_memory=pin_memory),
+        planet_mask=_tensor_from_numpy(p_mask, device, pin_memory=pin_memory),
+        planet_owned_mask=_tensor_from_numpy(p_owned, device, pin_memory=pin_memory),
+        planet_ids=_tensor_from_numpy(p_ids, device, pin_memory=pin_memory),
+        planet_garrison=_tensor_from_numpy(p_gar, device, pin_memory=pin_memory),
+        fleet_feats=_tensor_from_numpy(f_feats, device, pin_memory=pin_memory),
+        fleet_mask=_tensor_from_numpy(f_mask, device, pin_memory=pin_memory),
+    )
+
+
+def unbind_encoded(feats: EncodedObs) -> list[EncodedObs]:
+    """Return batch-row views as unbatched `EncodedObs` objects."""
+    if feats.planet_feats.dim() == 2:
+        return [feats]
+    return [
+        EncodedObs(
+            planet_feats=feats.planet_feats[i],
+            planet_mask=feats.planet_mask[i],
+            planet_owned_mask=feats.planet_owned_mask[i],
+            planet_ids=feats.planet_ids[i],
+            planet_garrison=feats.planet_garrison[i],
+            fleet_feats=feats.fleet_feats[i],
+            fleet_mask=feats.fleet_mask[i],
+        )
+        for i in range(feats.planet_feats.shape[0])
+    ]
+
+
+def select_encoded(feats: EncodedObs, index: int, *, clone: bool = False) -> EncodedObs:
+    """Return one batch row, optionally cloned to avoid retaining the full batch."""
+    if feats.planet_feats.dim() == 2:
+        return feats
+
+    def row(t: torch.Tensor) -> torch.Tensor:
+        out = t[index]
+        return out.detach().clone() if clone else out
+
+    return EncodedObs(
+        planet_feats=row(feats.planet_feats),
+        planet_mask=row(feats.planet_mask),
+        planet_owned_mask=row(feats.planet_owned_mask),
+        planet_ids=row(feats.planet_ids),
+        planet_garrison=row(feats.planet_garrison),
+        fleet_feats=row(feats.fleet_feats),
+        fleet_mask=row(feats.fleet_mask),
     )
 
 

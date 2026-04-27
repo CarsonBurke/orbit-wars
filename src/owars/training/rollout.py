@@ -36,8 +36,7 @@ class Trajectory:
 
     encoded: list[EncodedObs]
     target_idx: list[torch.Tensor]    # [P] long
-    fraction: list[torch.Tensor]      # [P] float in [0, 1]
-    angle_offset: list[torch.Tensor]  # [P] float in [0, 1] — pre-rescale Beta sample
+    frac_z: list[torch.Tensor]        # [P] float — pre-tanh Normal sample (PPO recomputes log_prob from this)
     log_prob: list[torch.Tensor]      # [P] float
     value: list[torch.Tensor]         # scalar tensors (no .item() in the hot loop)
     reward: list[float]
@@ -68,8 +67,15 @@ def _policy_step(
 ) -> tuple[list[list], dict]:
     parsed = parse_observation(obs)
     feats = encode_observation(parsed, device=device)
-    out = model(feats)
-    moves, record = sample_with_record(out, parsed, deterministic=deterministic)
+    autocast_enabled = torch.device(device).type == "cuda"
+    with (
+        torch.no_grad(),
+        torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
+        ),
+    ):
+        out = model(feats)
+        moves, record = sample_with_record(out, parsed, deterministic=deterministic)
     return [m.as_list() for m in moves], {
         "feats": feats,
         "policy_out": out,
@@ -118,7 +124,7 @@ def rollout_episode(
     state = env.reset(num_agents=num_players)
 
     traj = Trajectory(
-        encoded=[], target_idx=[], fraction=[], angle_offset=[],
+        encoded=[], target_idx=[], frac_z=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
     )
 
@@ -166,16 +172,15 @@ def record_step(
 ) -> None:
     """Append one step's per-planet records into a `Trajectory`.
 
-    All five tensor inputs are stored as-is on the rollout device — see
-    `Trajectory`'s docstring for why we don't pull to CPU here.
+    Tensor records stay on the rollout device, but are cloned so a learner
+    row does not keep the full batched rollout output alive.
     """
     traj.encoded.append(feats)
-    traj.target_idx.append(record.target_idx.detach())
-    traj.fraction.append(record.fraction.detach())
-    traj.angle_offset.append(record.angle_offset.detach())
-    traj.log_prob.append(record.log_prob.detach())
-    traj.value.append(value_t.detach())
-    traj.owned_mask.append(owned_mask_t.detach())
+    traj.target_idx.append(record.target_idx.detach().clone())
+    traj.frac_z.append(record.frac_z.detach().clone())
+    traj.log_prob.append(record.log_prob.detach().clone())
+    traj.value.append(value_t.detach().clone())
+    traj.owned_mask.append(owned_mask_t.detach().clone())
     traj.reward.append(0.0)
 
 

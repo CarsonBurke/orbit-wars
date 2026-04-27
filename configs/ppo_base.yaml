@@ -37,12 +37,21 @@ model:
   depth: 3
   n_heads: 4
   dropout: 0.0
-  fraction_concentration: 4.0
 
 optim:
+  # Muon (matrix params). Matches parameter-golf `matrix_lr=0.022`.
+  # `muon_weight_decay` left at 0 — pg uses heavy WD because LM training is
+  # stationary; PPO is non-stationary (each update sees a new behavior
+  # distribution) and WD would bias the policy toward pre-update weights
+  # in a way the importance ratio doesn't account for.
+  muon_lr: 0.02
+  # AdamW (everything else).
   lr: 3.0e-4
   weight_decay: 1.0e-4
-  grad_clip: 0.5
+  grad_clip: 0.3   # parameter-golf default; tighter than the canonical 0.5.
+                   # The single most impactful per-step lever for keeping
+                   # PPO ratios close to 1: it caps gradient magnitude
+                   # *before* Muon/AdamW transform it into a parameter step.
   minibatch_size: 1024
   epochs_per_update: 4
 

@@ -24,12 +24,45 @@ class ModelCfg:
     depth: int = 3
     n_heads: int = 4
     dropout: float = 0.0
-    fraction_concentration: float = 4.0
 
 
 @dataclass
 class OptimCfg:
+    """Optimizer hyperparameters.
+
+    We use a parameter-golf-style dual-optimizer setup: **Muon (with row
+    normalization, "normuon")** for 2D matrix weights in the transformer
+    blocks and projection heads, and **AdamW** for everything else
+    (LayerNorm gains/biases, summary tokens, control tensors like
+    `attn_scale`/`ff_scale`/`resid_mix`, and Linear biases).
+
+    Muon orthogonalizes the gradient via Newton-Schulz iteration, producing
+    updates with bounded spectral norm regardless of the gradient's input
+    magnitude. This kills the cold-start first-update KL spike — AdamW's
+    first step takes a full-lr step in the gradient direction with no
+    running variance to scale against, whereas Muon's first step is
+    pre-normalized to unit-spectral-norm before the lr multiply.
+    """
+
+    # Muon (matrix-2D weights in blocks + projection heads).
+    # `muon_lr` is naturally ~50–100× larger than an AdamW lr because Muon
+    # updates are bounded after orthogonalization; parameter-golf uses 0.022
+    # for matrix params on a 512-dim transformer.
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_backend_steps: int = 5
+    muon_row_normalize: bool = True
+    muon_weight_decay: float = 0.0
+    # AdamW (default group: biases, summary tokens). PPO-canonical 3e-4.
     lr: float = 3e-4
+    # AdamW (control-tensor group: per-channel residual scales `attn_scale`,
+    # `ff_scale`, `resid_mix`, and per-head attention temperature `q_gain`).
+    # parameter-golf runs `scalar_lr ≈ matrix_lr` (0.02 vs 0.022) — equal
+    # update magnitudes between Muon-driven matrices and AdamW-driven
+    # scalars. With `lr=3e-4` the scalars move 67× slower than the matrices
+    # and can't damp residual contribution fast enough to compensate for
+    # actor drift, so KL accumulates. Match `muon_lr` to restore parity.
+    control_lr: float = 0.02
     weight_decay: float = 1e-4
     grad_clip: float = 0.5
     minibatch_size: int = 1024
@@ -81,6 +114,7 @@ class RolloutCfg:
 
     num_envs: int = 16
     max_moves_per_turn: int = 16
+    env_backend: str = "numpy"  # "numpy" in-process or "kaggle" subprocesses
 
 
 @dataclass
@@ -96,6 +130,7 @@ class OpponentsCfg:
     snapshot_every: int = 25      # save a frozen snapshot for the pool every N updates
     top_k: int = 8                # max live snapshots; lowest-Elo evicted past this
     self_play_prob: float = 0.8   # P(opponent slot = current learner) per slot
+    snapshot_device: str = "cpu"  # "cpu", "cuda", or "train" to mirror run.device
     initial_rating: float = 1500.0
     k_factor: float = 32.0
 

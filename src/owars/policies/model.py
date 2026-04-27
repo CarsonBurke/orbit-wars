@@ -22,9 +22,23 @@ having to go autoregressive.
 
 We deliberately do **not** down-project after the actor concat: target_query
 and fraction_head take 2d-wide inputs and project to their natural output
-dim (d for query/key, 2 for Beta params). Down-projecting `[planet_h ||
-h_actor]` back to d would discard exactly the global-context capacity the
-extra token was added to provide.
+dim (d for query/key, 2 for the Normal's (μ, log σ)). Down-projecting
+`[planet_h || h_actor]` back to d would discard exactly the global-context
+capacity the extra token was added to provide.
+
+**No angle head.** The launch angle is computed exactly via an iterative
+lead-intercept solver in `sampling.py`; a previous Beta(α,β) residual
+existed only to patch a one-pass approximation and was the dominant source
+of PPO ratio explosions when α or β collapsed below 1.
+
+**Fraction head is a tanh-squashed Normal**, not a Beta. The two Beta
+params (α, β) couple "shift the mode" with "sharpen the peak," and the
+sharpen direction is unbounded — concentrations would creep into the
+hundreds and the policy log_prob would explode under small parameter
+changes (see VAPO §4 for the symptom; the diagnosis is α+β collapse). A
+Gaussian's μ (mode) and σ (spread) are independent gradient axes, log_prob
+is bounded above by `-log σ + const`, and PPO's importance ratio cannot
+explode as long as `log σ` is clamped. Standard pattern from SAC.
 
 **Critic still shares the encoder backbone.** Value-loss gradients flow
 through the same transformer the actor uses. This is tamed by
@@ -52,39 +66,242 @@ from .config import OrbitPolicyConfig
 from .features import EncodedObs
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, ff_dim: int, n_heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(dim)
-        self.ln2 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(
-            dim, n_heads, dropout=dropout, batch_first=True
+class CastedLinear(nn.Linear):
+    """Linear with `forward` that casts the fp32-master weight (and bias) to
+    the input dtype on each call (parameter-golf `sota_train_gpt.py:80`).
+
+    The store-master / cast-on-forward pattern is the same precision regime
+    you'd get from `torch.autocast(bf16)` over a vanilla `nn.Linear`, but
+    explicit: the dtype boundary is in this method, no autocast cache,
+    no implicit interaction with `torch.compile` or nested-jagged tracing.
+    Combined with `model.bfloat16()` + `restore_fp32_params(model)` (which
+    walks the module tree and `.float()`-s every `CastedLinear` plus all
+    `ndim<2` params and named control tensors), this gives:
+
+      • bf16 storage for activations/embeddings (memory)
+      • fp32 master for *every* weight matrix Muon and AdamW update
+        against (precision in the optimizer's per-element accumulators)
+      • bf16 compute path on every Linear forward (speed)
+
+    All without relying on autocast for the bf16 boundary.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight.to(x.dtype)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, w, b)
+
+
+# Names of control-tensor parameters that must stay in fp32 even after
+# `model.bfloat16()` — small tensors with high-precision-sensitive
+# updates (per-channel residual scales, attention temperature, summary
+# tokens). Matches parameter-golf's `CONTROL_TENSOR_NAME_PATTERNS`.
+_FP32_NAME_SUBSTRINGS: tuple[str, ...] = (
+    "attn_scale",
+    "ff_scale",
+    "resid_mix",
+    "q_gain",
+    "actor_token",
+    "critic_token",
+)
+
+
+def restore_fp32_params(model: nn.Module) -> None:
+    """After `model.bfloat16()`, restore fp32 master copies for the params
+    that need precision: every `CastedLinear` weight/bias, every `ndim<2`
+    param (biases, RMSNorm/LayerNorm gains, scalars), and every named
+    control tensor (`_FP32_NAME_SUBSTRINGS`).
+
+    Lifted from parameter-golf's `restore_fp32_params`. The end-state
+    invariant: control tensors and biases are fp32, Linear weights are
+    fp32 master (bf16 compute via `CastedLinear`), other ndim≥2 buffers/
+    params (none in our model — embeddings are CastedLinear, not
+    `nn.Embedding`) stay bf16.
+    """
+    for module in model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    for name, param in model.named_parameters():
+        wants_fp32 = param.ndim < 2 or any(
+            sub in name for sub in _FP32_NAME_SUBSTRINGS
         )
+        if wants_fp32 and param.dtype != torch.float32:
+            param.data = param.data.float()
+
+# Clamp range for the Normal's log σ. Lower bound keeps log_prob bounded above
+# (Normal.log_prob's max is `-log σ - 0.5·log(2π)`); upper bound keeps the
+# policy from being pure noise. Standard SAC values; the policy can still
+# converge to near-deterministic via μ alone.
+LOG_SIGMA_MIN: float = -5.0
+LOG_SIGMA_MAX: float = 2.0
+
+
+class SelfAttention(nn.Module):
+    """Multi-head self-attention with QK-norm + per-head q_gain on a
+    nested-jagged input — strict-flash dispatch.
+
+    parameter-golf pattern (`sota_train_gpt.py:CausalSelfAttention`):
+      1. Project x → Q, K, V.
+      2. **RMSNorm Q and K per-head** along the head-dim. Pins ‖q_h‖ and
+         ‖k_h‖ to fixed magnitude so attention-logit magnitude does not
+         drift as the QKV projections move under Muon (or any optimizer).
+      3. Multiply Q by per-head learnable `q_gain` (init=5). This is the
+         *attention temperature*: high gain → sharp softmax, low → flat.
+      4. SDPA on a `torch.nested` jagged tensor under `sdpa_kernel(
+         [SDPBackend.FLASH_ATTENTION])` — packed valid tokens, no
+         attn_mask, no padding wasted in the kernel. Real FA-2.
+      5. Output projection (zero-init for cold-start identity).
+
+    Variable-length set masking is handled *outside* the kernel: the
+    encoder packs valid tokens into a jagged tensor (`OrbitPolicy.encode`)
+    and unpacks back to padded `[B, T, D]` after the block stack. SDPA's
+    flash backend rejects any non-causal mask, and PyTorch silently falls
+    back to mem-efficient when `attn_mask` is non-None — using nested-jagged
+    is the only way to *guarantee* FA-2 for bidirectional variable-length
+    attention.
+    """
+
+    def __init__(self, dim: int, n_heads: int, qk_gain_init: float = 5.0):
+        super().__init__()
+        if dim % n_heads != 0:
+            raise ValueError(f"dim {dim} not divisible by n_heads {n_heads}")
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        # Three separate Q/K/V projections (parameter-golf style). NestedTensor
+        # supports `unbind(dim=0)` only, so a fused-QKV → unbind doesn't work.
+        # Splitting at the projection level is also more idiomatic in modern
+        # PyTorch attention impls.
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, dim, bias=False)
+        self.c_v = CastedLinear(dim, dim, bias=False)
+        self.out_proj = CastedLinear(dim, dim, bias=False)
+        # Per-head scalar gain on Q after RMSNorm — sets the attention
+        # softmax temperature. Init 5.0 ≈ parameter-golf's `qk_gain_init`.
+        self.q_gain = nn.Parameter(torch.full((n_heads,), float(qk_gain_init)))
+        # Orthogonal init for Q/K/V projections (parameter-golf
+        # `_init_weights`, sota_train_gpt.py:146 — applied to every Linear
+        # with both dims ≥64 that isn't `_zero_init`). At spectral norm 1
+        # the relative perturbation per Muon NS5 step is `lr` (= 0.02 in
+        # our default), vs. 2× larger from PyTorch's kaiming_uniform_(a=√5)
+        # whose spectral norm is ~0.5 at dim=128 — so orthogonal init
+        # halves first-step log-prob drift.
+        nn.init.orthogonal_(self.c_q.weight, gain=0.1)
+        nn.init.orthogonal_(self.c_k.weight, gain=0.1)
+        nn.init.orthogonal_(self.c_v.weight, gain=0.1)
+        # Zero-init output projection — see block-level docstring on
+        # cold-start identity. Wins over orthogonal because it's *after*.
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # `x` is a nested-jagged tensor of shape [B, j, D] where j varies
+        # per batch. All elementwise / Linear / RMSNorm ops broadcast over
+        # the jagged dim natively.
+        q = self.c_q(x).unflatten(-1, (self.n_heads, self.head_dim))
+        k = self.c_k(x).unflatten(-1, (self.n_heads, self.head_dim))
+        v = self.c_v(x).unflatten(-1, (self.n_heads, self.head_dim))
+        q = F.rms_norm(q, (self.head_dim,))
+        k = F.rms_norm(k, (self.head_dim,))
+        q = q * self.q_gain.to(q.dtype)[None, None, :, None]
+        # SDPA expects [B, H, j, head_dim]. Caller is responsible for
+        # bf16 autocast on CUDA — that's what enables FA-2 dispatch.
+        # Putting an inner autocast or `sdpa_kernel` here breaks AOT
+        # autograd's nested-jagged subclass accounting under
+        # `torch.compile` (see parameter-golf `sota_train_gpt.py`: outer
+        # autocast around the whole training step, no inner contexts).
+        # On CPU SDPA dispatches to the math kernel — used only by tests.
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        o = o.transpose(1, 2).flatten(-2)  # [B, j, H*head_dim] nested
+        return self.out_proj(o)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        ff_dim: int,
+        n_heads: int,
+        dropout: float = 0.0,
+        *,
+        layer_idx: int = 0,
+    ):
+        super().__init__()
+        # RMSNorm without learnable affine — parameter-golf moves all
+        # per-channel scale into explicit `attn_scale`/`ff_scale`/`resid_mix`
+        # so the norm itself is a pure unit-RMS projection. LayerNorm's γ
+        # would otherwise be a free per-channel scale that competes with
+        # those explicit params and isn't routed to the scalar AdamW group.
+        self.ln1 = nn.RMSNorm(dim, elementwise_affine=False)
+        self.ln2 = nn.RMSNorm(dim, elementwise_affine=False)
+        self.attn = SelfAttention(dim, n_heads)
+        # Depth attenuation disabled (no-op constant). Was `1/√(layer+1)`
+        # following parameter-golf `Block.ln_scale_factor`, but with ortho
+        # init at gain=0.1 the residual-stream growth is already bounded
+        # by tiny step-0 weights — the depth scale was over-suppressing
+        # gradient flow into deeper layers and giving worse KL than a
+        # plain pre-norm block. Kept as an attribute (=1.0) so re-enabling
+        # is a one-line change.
+        self.ln_scale_factor = 1.0
         self.ff = nn.Sequential(
-            nn.Linear(dim, ff_dim),
+            CastedLinear(dim, ff_dim),
             nn.GELU(),
-            nn.Linear(ff_dim, dim),
+            CastedLinear(ff_dim, dim),
         )
         self.drop = nn.Dropout(dropout)
+        # Orthogonal init for the input projection (both dims ≥64 →
+        # parameter-golf init policy). Output projection is zero-init
+        # for the cold-start identity property and wins over orthogonal
+        # because the zeros_ runs after.
+        nn.init.orthogonal_(self.ff[0].weight, gain=0.1)
+        # Zero-init the FF output projection. Attn already zero-inits its
+        # own out_proj inside `SelfAttention.__init__`. Combined with
+        # `resid_mix=(1, 0)` and `attn_scale=ff_scale=1`, each block is an
+        # exact identity at step 0 — the residual stream carries
+        # `embed_norm(embeds)` through unchanged.
+        nn.init.zeros_(self.ff[-1].weight)
+        nn.init.zeros_(self.ff[-1].bias)
+        # Per-channel learnable residual scaling on each branch
+        # (parameter-golf `Block.attn_scale/mlp_scale`, sota_train_gpt.py:111).
+        # Ones-init → identity to a vanilla pre-norm block at step 0, but the
+        # optimizer can learn to attenuate each residual branch per channel.
+        self.attn_scale = nn.Parameter(torch.ones(dim))
+        self.ff_scale = nn.Parameter(torch.ones(dim))
+        # Per-channel learnable mix between the current residual stream `x`
+        # and the original block-stack input `x0` (parameter-golf `resid_mix`,
+        # sota_train_gpt.py:111). Initialized to (1, 0) so the block sees `x`
+        # unchanged at step 0. Lets each block independently re-mix the
+        # un-transformed embedding stream when middle layers dominate norms.
+        self.resid_mix = nn.Parameter(
+            torch.stack([torch.ones(dim), torch.zeros(dim)])
+        )
 
-    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None) -> torch.Tensor:
-        h = self.ln1(x)
-        a, _ = self.attn(h, h, h, key_padding_mask=key_padding_mask, need_weights=False)
-        x = x + self.drop(a)
-        x = x + self.drop(self.ff(self.ln2(x)))
+    def forward(self, x: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
+        # `x` and `x0` are nested-jagged tensors of shape [B, j, D]. All
+        # ops below broadcast over the jagged dim. Cast scale/mix params
+        # to activation dtype to keep the bf16 residual path bf16 (see
+        # parameter-golf `sota_train_gpt.py`).
+        dt = x.dtype
+        mix = self.resid_mix.to(dt)
+        x_in = mix[0] * x + mix[1] * x0
+        a = self.attn(self.ln1(x_in) * self.ln_scale_factor)
+        x = x_in + self.attn_scale.to(dt) * self.drop(a)
+        x = x + self.ff_scale.to(dt) * self.drop(
+            self.ff(self.ln2(x) * self.ln_scale_factor)
+        )
         return x
 
 
 @dataclass
 class PolicyOutput:
-    target_logits: torch.Tensor  # [B, P, P+1]  +1 = no-op slot
-    fraction_alpha: torch.Tensor  # [B, P]
-    fraction_beta: torch.Tensor   # [B, P]
-    angle_alpha: torch.Tensor     # [B, P]
-    angle_beta: torch.Tensor      # [B, P]
-    value: torch.Tensor           # [B]
-    planet_owned_mask: torch.Tensor  # [B, P] bool
-    planet_mask: torch.Tensor        # [B, P] bool
+    target_logits: torch.Tensor       # [B, P, P+1]  +1 = no-op slot
+    fraction_mu: torch.Tensor         # [B, P]  pre-tanh Normal mean
+    fraction_log_sigma: torch.Tensor  # [B, P]  pre-tanh Normal log-std (clamped)
+    value: torch.Tensor               # [B]
+    planet_owned_mask: torch.Tensor   # [B, P] bool
+    planet_mask: torch.Tensor         # [B, P] bool
     planet_ids: torch.Tensor          # [B, P] long
 
 
@@ -92,8 +309,8 @@ class OrbitPolicy(nn.Module):
     def __init__(self, cfg: OrbitPolicyConfig):
         super().__init__()
         self.cfg = cfg
-        self.planet_embed = nn.Linear(cfg.planet_features, cfg.dim)
-        self.fleet_embed = nn.Linear(cfg.fleet_features, cfg.dim)
+        self.planet_embed = CastedLinear(cfg.planet_features, cfg.dim)
+        self.fleet_embed = CastedLinear(cfg.fleet_features, cfg.dim)
         # Two learnable summary tokens (PMA-style). Initialized small so
         # they don't dominate the encoder at step 0 — gradient flow alone
         # will scale them up as the heads start using their output.
@@ -101,36 +318,89 @@ class OrbitPolicy(nn.Module):
         self.critic_token = nn.Parameter(torch.zeros(1, 1, cfg.dim))
         nn.init.trunc_normal_(self.actor_token, std=0.02)
         nn.init.trunc_normal_(self.critic_token, std=0.02)
+        # Embed-LN normalizes the residual-stream entry point. The per-token
+        # embeddings (planet_embed, fleet_embed) and the two summary tokens
+        # have heterogeneous scales, so a single LN here gives every block
+        # the same input regime and stabilizes resid_mix's `x0` reference.
+        self.embed_norm = nn.RMSNorm(cfg.dim, elementwise_affine=False)
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(cfg.dim, cfg.ff_dim, cfg.n_heads, cfg.dropout)
-                for _ in range(cfg.depth)
+                TransformerBlock(
+                    cfg.dim,
+                    cfg.ff_dim,
+                    cfg.n_heads,
+                    cfg.dropout,
+                    layer_idx=i,
+                )
+                for i in range(cfg.depth)
             ]
         )
+        # Final-LN — standard for pre-norm transformers. Without it the
+        # residual stream's scale grows ~unbounded (every block adds; nothing
+        # normalizes the running sum), and downstream linear heads see
+        # depth-dependent activation magnitudes.
+        self.final_norm = nn.RMSNorm(cfg.dim, elementwise_affine=False)
         # `target_query` consumes [planet_h || h_actor] → 2·dim. `target_key`
         # stays at `dim` because adding the same h_actor to every key shifts
         # all `q·k` row-wise by a constant and cancels in the softmax — it
         # can't change the relative ranking of targets. Putting it on the
         # query side only is what gives the actor token bite.
-        self.target_query = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
-        self.target_key = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.noop_logit = nn.Parameter(torch.zeros(1))
-        # 2·dim input for the same reason as target_query.
-        self.fraction_head = nn.Linear(2 * cfg.dim, 2)  # log-alpha, log-beta offsets
-        # Per-planet Beta(α, β) on a Δangle residual added to the analytic
-        # lead-intercept in `sampling.py`. The simulator's actual arrival
-        # step depends on planet motion *during travel*, so the analytic
-        # prior is approximate; the residual lets the policy learn to
-        # over/under-shoot per planet (e.g. consistently aim a bit ahead
-        # for fast-orbiting targets). Per-(planet, target) would be more
-        # expressive but quadratic; the per-target physics is already in
-        # the analytic baseline, so per-planet residual suffices.
-        self.angle_head = nn.Linear(2 * cfg.dim, 2)
+        self.target_query = CastedLinear(2 * cfg.dim, cfg.dim, bias=False)
+        self.target_key = CastedLinear(cfg.dim, cfg.dim, bias=False)
+        # Orthogonal init at gain=1 (parameter-golf `_init_weights` policy
+        # for Linears with both dims ≥64). Spectral norm 1 means a Muon
+        # NS5 update of magnitude `muon_lr` produces a `muon_lr`-fraction
+        # *relative* perturbation in outputs — predictable first-step
+        # behavior, no dependence on the kaiming_uniform fan-in scale.
+        # An earlier Xavier(gain=1) attempt blew up first-step KL because
+        # Xavier's variance is *larger* than kaiming default; orthogonal at
+        # gain=1 has unit spectral norm but still bounded variance, which
+        # is what we actually want for log-prob stability.
+        nn.init.orthogonal_(self.target_query.weight, gain=0.1)
+        nn.init.orthogonal_(self.target_key.weight, gain=0.1)
+        # Per-planet no-op head — gives every owned planet its own no-op
+        # logit conditioned on local context, instead of a single shared
+        # scalar. Empirically the shared-scalar version led the policy to
+        # express "do nothing" via tiny `fraction` samples (sending fleets
+        # of 1 ship) because the global no-op slot couldn't compete with
+        # the per-planet attention logits. Bias init to a positive value
+        # so cold-start prefers no-op per planet — the policy must earn
+        # the right to attack via advantage.
+        self.noop_head = CastedLinear(2 * cfg.dim, 1)
+        nn.init.zeros_(self.noop_head.weight)
+        nn.init.constant_(self.noop_head.bias, 1.5)
+        # 2·dim input for the same reason as target_query. Outputs (μ, log σ)
+        # of a tanh-squashed Normal over [-1, 1]; sampling.py maps to [0, 1]
+        # to get the fraction-of-garrison-to-send.
+        self.fraction_head = CastedLinear(2 * cfg.dim, 2)
+        # μ row gets the same gain=0.1 orthogonal init as the rest of the
+        # network — small initial pre-tanh mean → tight fraction distribution
+        # at cold-start → bounded first-update Δlog_prob.
+        # log σ row is zeroed (both weight and bias) so σ ≡ 1 at init: pre-tanh
+        # ~ N(0, 1), tanh-squashed → wide distribution over (-1, 1), which
+        # sampling.py maps to a near-uniform fraction in [0, 1].
+        nn.init.orthogonal_(self.fraction_head.weight, gain=0.1)
+        nn.init.zeros_(self.fraction_head.bias)
+        with torch.no_grad():
+            self.fraction_head.weight[1].zero_()
         self.value_head = nn.Sequential(
-            nn.Linear(cfg.dim, cfg.value_hidden),
+            CastedLinear(cfg.dim, cfg.value_hidden),
             nn.GELU(),
-            nn.Linear(cfg.value_hidden, 1),
+            CastedLinear(cfg.value_hidden, 1),
         )
+        # Orthogonal init for the value-head input projection (both dims
+        # ≥64 if `value_hidden ≥ 64`).
+        if (
+            self.value_head[0].weight.shape[0] >= 64
+            and self.value_head[0].weight.shape[1] >= 64
+        ):
+            nn.init.orthogonal_(self.value_head[0].weight, gain=0.1)
+        # Zero-init the value head's last layer so V(s) ≡ 0 before any
+        # gradient step — same parameter-golf lever as the action heads.
+        # This stops cold-start critic noise from injecting spurious
+        # advantage signal into the actor's first few updates.
+        nn.init.zeros_(self.value_head[-1].weight)
+        nn.init.zeros_(self.value_head[-1].bias)
         # Cached on-device self-target mask. P is bounded by MAX_PLANETS,
         # so we allocate once at module init and slice per-forward instead
         # of allocating a fresh `torch.eye` every step (~num_envs × episode
@@ -143,6 +413,7 @@ class OrbitPolicy(nn.Module):
             persistent=False,
         )
 
+    @torch.compiler.disable
     def encode(
         self, feats: EncodedObs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -152,6 +423,16 @@ class OrbitPolicy(nn.Module):
         `token_mask` is the planets+fleets mask (excludes the two summary
         tokens, which are always real and only consumed via the dedicated
         `h_actor` / `h_critic` slices).
+
+        Decorated `@torch.compiler.disable` because the body uses
+        `torch.nested.nested_tensor_from_jagged` to pack variable-length
+        sets for FA-2 dispatch (no `attn_mask`, no padding waste). AOT
+        autograd's tangent metadata accounting for the jagged subclass
+        breaks during backward under `torch.compile` (raises
+        `AssertionError: expected len(meta.attrs) == len(runtime_subclass_keys)`).
+        Disabling compile here lets the encoder run eager-with-FA-2 while
+        the action heads / value head (fixed `[B, P, D]` shapes) still
+        compile cleanly.
         """
         # Promote to batch dim if not already.
         if feats.planet_feats.dim() == 2:
@@ -174,13 +455,31 @@ class OrbitPolicy(nn.Module):
         actor_t = self.actor_token.expand(b, -1, -1)
         critic_t = self.critic_token.expand(b, -1, -1)
         h = torch.cat([actor_t, critic_t, h_p, h_f], dim=1)
-        # The two summary tokens are always real (never masked out).
+        # Normalize the residual-stream entry point. embed_norm runs on
+        # padded `[B, T, D]` since LN is per-token — padded positions are
+        # normalized too but get dropped by the nested-jagged pack below.
+        h = self.embed_norm(h)
+        # Pack only the *valid* tokens into a nested-jagged tensor. This is
+        # the path that lets SDPA dispatch to real FA-2 (no attn_mask). The
+        # two summary tokens are always valid.
         summary_mask = torch.ones(b, 2, dtype=torch.bool, device=planet_mask.device)
         full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
-        # `key_padding_mask=True` means *masked out* in MultiheadAttention.
-        kpm = ~full_mask
+        lengths = full_mask.sum(dim=-1)  # [B]
+        offsets = torch.zeros(b + 1, dtype=torch.int64, device=h.device)
+        offsets[1:] = lengths.cumsum(0)
+        # Boolean indexing flattens valid tokens row-major across the batch.
+        values = h[full_mask]
+        h_nt = torch.nested.nested_tensor_from_jagged(values, offsets)
+        # `x0` is the post-embed-norm residual stream; each block's resid_mix
+        # mixes against this fixed reference.
+        x0_nt = h_nt
         for layer in self.layers:
-            h = layer(h, key_padding_mask=kpm)
+            h_nt = layer(h_nt, x0_nt)
+        h_nt = self.final_norm(h_nt)
+        # Unpack: scatter valid tokens back to original padded positions.
+        out_values = h_nt.values()  # [total_valid, D]
+        h = torch.zeros_like(h)
+        h[full_mask] = out_values
         h_actor = h[:, 0]                 # [B, d]
         h_critic = h[:, 1]                # [B, d]
         planet_h = h[:, 2 : 2 + p]        # [B, P, d]
@@ -222,30 +521,25 @@ class OrbitPolicy(nn.Module):
         logits = logits.masked_fill(
             self._self_target_mask[:p, :p].unsqueeze(0), float("-inf")
         )
-        # Concat the per-planet no-op logit on the last axis.
-        noop = self.noop_logit.view(1, 1, 1).expand(b, p, 1)
+        # Per-planet no-op logit (conditioned on local context + h_actor),
+        # concatenated as the (P+1)-th target slot.
+        noop = self.noop_head(planet_with_ctx)  # [B, P, 1]
         target_logits = torch.cat([logits, noop], dim=-1)  # [B, P, P+1]
 
-        # Fraction head — interpret outputs as log-offsets on a base concentration.
-        base = float(self.cfg.fraction_concentration)
+        # Fraction head: pre-tanh Normal (μ, log σ). Clamping log σ both ways
+        # keeps Normal.log_prob bounded above by `-log σ_min + const` and below
+        # by something finite, so PPO's importance ratio cannot explode.
         offs = self.fraction_head(planet_with_ctx)
-        alpha = base * F.softplus(offs[..., 0]) + 1e-3
-        beta = base * F.softplus(offs[..., 1]) + 1e-3
-
-        # Angle residual head — same parameterization, separate weights.
-        a_offs = self.angle_head(planet_with_ctx)
-        angle_alpha = base * F.softplus(a_offs[..., 0]) + 1e-3
-        angle_beta = base * F.softplus(a_offs[..., 1]) + 1e-3
+        fraction_mu = offs[..., 0]
+        fraction_log_sigma = offs[..., 1].clamp(LOG_SIGMA_MIN, LOG_SIGMA_MAX)
 
         # Value: dedicated critic token (replaces mean-pool).
         value = self.value_head(h_critic).squeeze(-1)
 
         return PolicyOutput(
             target_logits=target_logits,
-            fraction_alpha=alpha,
-            fraction_beta=beta,
-            angle_alpha=angle_alpha,
-            angle_beta=angle_beta,
+            fraction_mu=fraction_mu,
+            fraction_log_sigma=fraction_log_sigma,
             value=value,
             planet_owned_mask=planet_owned,
             planet_mask=planet_mask,
