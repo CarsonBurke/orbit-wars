@@ -42,8 +42,7 @@ ppo:
   pretrain_updates: 0
 
 rollout:
-  episodes_per_update: 4
-  parallel_workers: 1
+  num_envs: 4
   max_moves_per_turn: 16
 
 opponents:

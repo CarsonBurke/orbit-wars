@@ -22,7 +22,7 @@ def test_empty_pool_samples_only_self():
     elo = EloTracker()
     pool = OpponentPool(elo=elo, top_k=8, self_play_prob=0.0, rng=random.Random(0))
     model = _tiny_model()
-    slots = pool.sample(8, current_model=model)
+    slots = pool.sample(8)
     assert all(s.name == LEARNER_NAME for s in slots)
 
 
@@ -35,7 +35,7 @@ def test_self_play_prob_split(tmp_path: Path):
     pool.add_snapshot("a", model, tmp_path / "a.pt")
 
     n = 2000
-    slots = pool.sample(n, current_model=model)
+    slots = pool.sample(n)
     self_count = sum(1 for s in slots if s.name == LEARNER_NAME)
     # Tolerance: ±5%.
     assert 0.45 * n <= self_count <= 0.55 * n
@@ -68,7 +68,7 @@ def test_sampling_only_picks_alive_snapshots(tmp_path: Path):
     pool.add_snapshot("hi2", model, tmp_path / "hi2.pt", seed_rating=1700.0)
 
     alive = set(pool.snapshot_names())
-    slots = pool.sample(50, current_model=model)
+    slots = pool.sample(50)
     for s in slots:
         if s.name == LEARNER_NAME:
             continue

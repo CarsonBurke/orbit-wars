@@ -48,30 +48,16 @@ BUILTIN: dict[str, AgentFn] = {
 
 @dataclass
 class OpponentSlot:
-    """One filled opponent seat — name is the Elo identity."""
+    """One filled opponent seat — `name` is the Elo identity.
 
-    name: str
-    agent: AgentFn
-
-
-class _SelfAgent:
-    """Wraps the live learner as a no-grad opponent. Recomputes each call
-    against the latest weights — that's what makes "self" actually self.
+    `agent` is None for self-play seats (`name == LEARNER_NAME`): the
+    vectorized rollout batches those obs into the learner forward, so it
+    never invokes a per-seat callable. For snapshot seats `agent` is the
+    `LearnedAgent` to call on each obs.
     """
 
-    def __init__(self, model: OrbitPolicy):
-        self._m = model
-
-    def __call__(self, obs: Any) -> list[list]:
-        from ..game import parse_observation
-        from ..policies.features import encode_observation
-        from ..policies.sampling import sample_actions
-
-        parsed = parse_observation(obs)
-        feats = encode_observation(parsed)
-        with torch.no_grad():
-            out = self._m(feats)
-        return [m.as_list() for m in sample_actions(out, parsed, deterministic=False)]
+    name: str
+    agent: AgentFn | None
 
 
 class OpponentPool:
@@ -139,16 +125,15 @@ class OpponentPool:
 
     # --- sampling ------------------------------------------------------------
 
-    def sample(self, k: int, current_model: OrbitPolicy) -> list[OpponentSlot]:
+    def sample(self, k: int) -> list[OpponentSlot]:
         """Sample `k` opponent slots independently per slot."""
-        slots: list[OpponentSlot] = []
-        for _ in range(k):
-            slots.append(self._sample_one(current_model))
-        return slots
+        return [self._sample_one() for _ in range(k)]
 
-    def _sample_one(self, current_model: OrbitPolicy) -> OpponentSlot:
+    def _sample_one(self) -> OpponentSlot:
         use_self = (not self._frozen) or (self.rng.random() < self.self_play_prob)
         if use_self:
-            return OpponentSlot(name=LEARNER_NAME, agent=_SelfAgent(current_model))
+            # No agent callable: vec_rollout batches self-play seats into
+            # the learner forward via identity == LEARNER_NAME.
+            return OpponentSlot(name=LEARNER_NAME, agent=None)
         name = self.rng.choice(self.snapshot_names())
         return OpponentSlot(name=name, agent=self._frozen[name])

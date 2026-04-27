@@ -66,8 +66,15 @@ class PPOCfg:
 
 @dataclass
 class RolloutCfg:
-    episodes_per_update: int = 16
-    parallel_workers: int = 1
+    """Per-update rollout settings.
+
+    `num_envs` is the parallelism: each PPO update plays exactly this many
+    episodes in parallel via subprocess workers, and the policy forward
+    is batched across all alive envs each step. There's no separate
+    "workers" knob — workers == envs, one each.
+    """
+
+    num_envs: int = 16
     max_moves_per_turn: int = 16
 
 

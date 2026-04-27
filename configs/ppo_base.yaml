@@ -50,14 +50,17 @@ ppo:
   clip_eps: 0.2
   value_coef: 0.5
   entropy_coef: 0.01
-  pretrain_updates: 50
+  pretrain_updates: 0   # PMA critic token gives the value head a dedicated
+                        # representation, and pretraining against `heuristic`
+                        # warms V on a state distribution PPO immediately
+                        # leaves. Cold-start pain is brief; the wallclock cost
+                        # of pretraining wasn't paying for itself.
   pretrain_episodes: 32
   pretrain_lr: 1.0e-3
   pretrain_behavior: heuristic
 
 rollout:
-  episodes_per_update: 16
-  parallel_workers: 1
+  num_envs: 16              # parallel envs (= episodes per update)
   max_moves_per_turn: 16
 
 opponents:

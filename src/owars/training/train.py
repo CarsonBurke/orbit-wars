@@ -43,13 +43,16 @@ from .config import RunConfig, load_config
 from .elo import EloTracker
 from .league import BUILTIN, LEARNER_NAME, OpponentPool, OpponentSlot
 from .ppo import (
+    _slice_feats,
     compute_gae,
     compute_mc_return,
     length_adaptive_lambda,
     ppo_update,
     value_only_update,
 )
-from .rollout import Trajectory, rollout_episode
+from .rollout import Trajectory
+from .vec_env import VecEnv
+from .vec_rollout import rollout_episodes_batched
 
 
 def _build_model(cfg: RunConfig) -> OrbitPolicy:
@@ -64,11 +67,18 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
     return OrbitPolicy(pcfg)
 
 
-def _stack_step_features(trajs: list[Trajectory]) -> dict[str, list]:
+def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
+    """Walk every (traj, step) once and emit stacked EncodedObs tensors.
+
+    Per-step records on Trajectory are already device tensors (see the
+    Trajectory docstring) — we just gather and stack here. Encoder-only:
+    the actor-side records (target_idx / fraction / old_log_prob /
+    owned_mask) are added by `_stack_trajectories`, which lets
+    `_pretrain_value_batch` skip them entirely.
+    """
     pf, pm, pom, pid, pg, ff, fm = [], [], [], [], [], [], []
-    tidx, frac, lp, owned = [], [], [], []
     for t in trajs:
-        for step_i, e in enumerate(t.encoded):
+        for e in t.encoded:
             pf.append(e.planet_feats)
             pm.append(e.planet_mask)
             pom.append(e.planet_owned_mask)
@@ -76,12 +86,15 @@ def _stack_step_features(trajs: list[Trajectory]) -> dict[str, list]:
             pg.append(e.planet_garrison)
             ff.append(e.fleet_feats)
             fm.append(e.fleet_mask)
-            tidx.append(torch.from_numpy(t.target_idx[step_i]))
-            frac.append(torch.from_numpy(t.fraction[step_i]))
-            lp.append(torch.from_numpy(t.log_prob[step_i]))
-            owned.append(torch.from_numpy(t.owned_mask[step_i]))
-    return dict(pf=pf, pm=pm, pom=pom, pid=pid, pg=pg, ff=ff, fm=fm,
-                tidx=tidx, frac=frac, lp=lp, owned=owned)
+    return {
+        "planet_feats": torch.stack(pf),
+        "planet_mask": torch.stack(pm),
+        "planet_owned_mask": torch.stack(pom),
+        "planet_ids": torch.stack(pid),
+        "planet_garrison": torch.stack(pg),
+        "fleet_feats": torch.stack(ff),
+        "fleet_mask": torch.stack(fm),
+    }
 
 
 def _stack_trajectories(
@@ -96,13 +109,36 @@ def _stack_trajectories(
     Critic target = GAE-λ_critic returns (typically λ=1 → MC return).
     Actor advantage = GAE-λ_policy advantages (optionally length-adaptive).
     """
-    s = _stack_step_features(trajs)
-    advs_all, rets_all = [], []
+    batch = _stack_encoded(trajs)
 
+    tidx, frac, ang, lp, owned = [], [], [], [], []
+    for t in trajs:
+        tidx.extend(t.target_idx)
+        frac.extend(t.fraction)
+        ang.extend(t.angle_offset)
+        lp.extend(t.log_prob)
+        owned.extend(t.owned_mask)
+    batch["target_idx"] = torch.stack(tidx).long()
+    batch["fraction"] = torch.stack(frac).float()
+    batch["angle_offset"] = torch.stack(ang).float()
+    batch["old_log_prob"] = torch.stack(lp).float()
+    batch["owned_mask"] = torch.stack(owned).bool()
+
+    # Single global CPU pull of every per-step value across the batch —
+    # one sync instead of one per trajectory.
+    value_tensors = [torch.stack(t.value) for t in trajs if t.value]
+    if value_tensors:
+        all_values = torch.cat(value_tensors).detach().to(torch.float32).cpu().numpy()
+    else:
+        all_values = np.zeros(0, dtype=np.float32)
+
+    advs_all, rets_all = [], []
+    offset = 0
     for t in trajs:
         rewards = np.asarray(t.reward, dtype=np.float32)
-        values = np.asarray(t.value, dtype=np.float32)
         T = len(rewards)
+        values = all_values[offset : offset + T]
+        offset += T
         if lambda_policy_alpha > 0.0:
             lam_p = length_adaptive_lambda(T, lambda_policy_alpha)
         else:
@@ -114,21 +150,10 @@ def _stack_trajectories(
 
     advs = torch.from_numpy(np.concatenate(advs_all)).float()
     rets = torch.from_numpy(np.concatenate(rets_all)).float()
-    return {
-        "planet_feats": torch.stack(s["pf"]),
-        "planet_mask": torch.stack(s["pm"]),
-        "planet_owned_mask": torch.stack(s["pom"]),
-        "planet_ids": torch.stack(s["pid"]),
-        "planet_garrison": torch.stack(s["pg"]),
-        "fleet_feats": torch.stack(s["ff"]),
-        "fleet_mask": torch.stack(s["fm"]),
-        "target_idx": torch.stack(s["tidx"]).long(),
-        "fraction": torch.stack(s["frac"]).float(),
-        "old_log_prob": torch.stack(s["lp"]).float(),
-        "advantage": advs,
-        "return": rets,
-        "owned_mask": torch.stack(s["owned"]).bool(),
-    }
+    # Normalize once over the full batch — see ppo_update for why.
+    batch["advantage"] = (advs - advs.mean()) / (advs.std() + 1e-8)
+    batch["return"] = rets
+    return batch
 
 
 def _pretrain_value_batch(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
@@ -137,62 +162,55 @@ def _pretrain_value_batch(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
     With terminal-only ±1 reward this is a constant per trajectory =
     the eventual game outcome — i.e. supervised regression of V(s) onto
     the win indicator. Exactly the cold-start signal we want.
+
+    Encoder fields only — `value_only_update` doesn't read the actor-side
+    records, so we skip stacking and host→device-copying them.
     """
-    s = _stack_step_features(trajs)
+    batch = _stack_encoded(trajs)
     rets_all = [compute_mc_return(np.asarray(t.reward, dtype=np.float32), gamma=1.0) for t in trajs]
-    rets = torch.from_numpy(np.concatenate(rets_all)).float()
-    # Pretraining batch only needs the value-relevant fields.
-    n = sum(len(t.reward) for t in trajs)
-    zeros_b = torch.zeros(n, dtype=torch.float32)
-    zeros_bp = torch.zeros((n, s["pf"][0].shape[0]), dtype=torch.float32)
-    zeros_bp_long = torch.zeros((n, s["pf"][0].shape[0]), dtype=torch.long)
-    zeros_bp_bool = torch.zeros((n, s["pf"][0].shape[0]), dtype=torch.bool)
-    return {
-        "planet_feats": torch.stack(s["pf"]),
-        "planet_mask": torch.stack(s["pm"]),
-        "planet_owned_mask": torch.stack(s["pom"]),
-        "planet_ids": torch.stack(s["pid"]),
-        "planet_garrison": torch.stack(s["pg"]),
-        "fleet_feats": torch.stack(s["ff"]),
-        "fleet_mask": torch.stack(s["fm"]),
-        "target_idx": zeros_bp_long,
-        "fraction": zeros_bp,
-        "old_log_prob": zeros_bp,
-        "advantage": zeros_b,
-        "return": rets,
-        "owned_mask": zeros_bp_bool,
-    }
+    batch["return"] = torch.from_numpy(np.concatenate(rets_all)).float()
+    return batch
 
 
 def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Optimizer,
-                   logger: TBLogger, device: torch.device) -> None:
+                   logger: TBLogger, device: torch.device, vec: VecEnv) -> None:
     """VAPO-style cold-start: regress V(s) onto trajectory outcome.
 
     Behavior policy is `cfg.ppo.pretrain_behavior` (defaults to
     `heuristic`). The actor parameters update too — that's fine, the
     critic shares the encoder and we only run a few hundred steps before
-    PPO takes over.
+    PPO takes over. Uses the same batched rollout as PPO so cold-start
+    isn't an order of magnitude slower than the hot loop.
     """
     if cfg.ppo.pretrain_updates <= 0:
         return
     behavior = BUILTIN.get(cfg.ppo.pretrain_behavior)
     if behavior is None:
         raise ValueError(f"unknown pretrain_behavior={cfg.ppo.pretrain_behavior!r}")
-    others = [behavior] * (cfg.game.num_players - 1)
+    # Wrap the heuristic baseline as a frozen-style OpponentSlot so
+    # rollout_episodes_batched can use it. Behavior policies are pure
+    # Python (no model forward), so they fall into the per-snapshot
+    # branch — exactly what we want.
+    behavior_slot = OpponentSlot(name=cfg.ppo.pretrain_behavior, agent=behavior)
+    opponents_per_env = [
+        [behavior_slot] * (cfg.game.num_players - 1)
+        for _ in range(cfg.rollout.num_envs)
+    ]
 
     for step in range(cfg.ppo.pretrain_updates):
+        # Round episode count up to the nearest num_envs batch.
+        batches = max(1, cfg.ppo.pretrain_episodes // cfg.rollout.num_envs)
         trajs: list[Trajectory] = []
-        for _ in range(cfg.ppo.pretrain_episodes):
-            traj = rollout_episode(
-                model, others,
+        for _ in range(batches):
+            trajs.extend(rollout_episodes_batched(
+                model,
+                vec,
+                opponents_per_env,
                 num_players=cfg.game.num_players,
-                episode_steps=cfg.game.episode_steps,
-                ship_speed=cfg.game.ship_speed,
                 device=str(device),
                 deterministic=False,
                 reward_cfg=cfg.reward,
-            )
-            trajs.append(traj)
+            ))
         batch = {k: v.to(device) for k, v in _pretrain_value_batch(trajs).items()}
         loss = value_only_update(
             model, optimizer, batch,
@@ -204,21 +222,17 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
         # Explained variance: 1 - Var(target - pred)/Var(target). Tracked
         # because raw value loss can be misleading when the target
         # distribution shifts (e.g., as the behavior policy gets crushed).
+        # Minibatched: a full-batch forward over `pretrain_episodes ×
+        # episode_steps` samples blows up the [B, heads, tokens, tokens]
+        # attention tensor (tokens ≈ 64 planets + 384 fleets + 2 summary).
+        n = batch["planet_feats"].shape[0]
+        mb = cfg.optim.minibatch_size
         with torch.no_grad():
-            from ..policies.features import EncodedObs
-
-            class _F:
-                pass
-
-            f = _F()
-            f.planet_feats = batch["planet_feats"]
-            f.planet_mask = batch["planet_mask"]
-            f.planet_owned_mask = batch["planet_owned_mask"]
-            f.planet_ids = batch["planet_ids"]
-            f.planet_garrison = batch["planet_garrison"]
-            f.fleet_feats = batch["fleet_feats"]
-            f.fleet_mask = batch["fleet_mask"]
-            preds = model(f).value.cpu().numpy()
+            chunks = [
+                model(_slice_feats(batch, slice(s, s + mb))).value
+                for s in range(0, n, mb)
+            ]
+            preds = torch.cat(chunks).cpu().numpy()
         var_y = float(np.var(rets)) + 1e-9
         ev = 1.0 - float(np.var(rets - preds)) / var_y
         logger.scalars("pretrain", {"value_loss": loss, "explained_variance": ev}, step)
@@ -246,15 +260,17 @@ def _seat_names(learner_seat: int, slots: list[OpponentSlot]) -> list[str]:
 def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     """Params that *actually* get gradient from value-only loss.
 
-    Includes the encoder (shared backbone) and the value head; excludes
-    actor heads (target_query/key, noop_logit, fraction_head). Including
-    actor params here would be a silent bug: AdamW with weight_decay would
-    pull them toward zero each step despite zero gradient signal, leaving
-    PPO to start from a worse-than-init policy.
+    Includes the encoder (shared backbone), both summary tokens (actor_token
+    feeds the encoder self-attention so h_critic depends on it; critic_token
+    feeds the value head directly), and the value head. Excludes the actor
+    heads (target_query/key, noop_logit, fraction_head, angle_head) — they
+    receive zero gradient from the value loss, and including them would let
+    AdamW's weight-decay pull them toward zero with no learning signal,
+    leaving PPO to start from a worse-than-init policy.
     """
     encoder = [model.planet_embed, model.fleet_embed, *model.layers]
     value = [model.value_head]
-    params: list[torch.nn.Parameter] = []
+    params: list[torch.nn.Parameter] = [model.actor_token, model.critic_token]
     for m in encoder + value:
         params.extend(m.parameters())
     return params
@@ -288,35 +304,68 @@ def train_one_run(cfg: RunConfig) -> dict:
     )
     logger = TBLogger(cfg.run.name, root=cfg.run.log_root)
 
-    pretrain_value(cfg, model, pretrain_opt, logger, device)
+    # One subprocess pool reused across pretraining + every PPO update.
+    # Spawning per-call cost ~16-32 s of pure interpreter startup × every
+    # rollout (cumulative ~1 h on a full run); `vec.reset()` is cheap.
+    with VecEnv(
+        num_envs=cfg.rollout.num_envs,
+        num_players=cfg.game.num_players,
+        episode_steps=cfg.game.episode_steps,
+        ship_speed=cfg.game.ship_speed,
+    ) as vec:
+        pretrain_value(cfg, model, pretrain_opt, logger, device, vec)
+        return _ppo_loop(cfg, model, optimizer, elo, pool, logger, device, vec)
 
+
+def _ppo_loop(
+    cfg: RunConfig,
+    model: OrbitPolicy,
+    optimizer: torch.optim.Optimizer,
+    elo: EloTracker,
+    pool: OpponentPool,
+    logger: TBLogger,
+    device: torch.device,
+    vec: VecEnv,
+) -> dict:
     summary: dict = {"updates": []}
 
+    # Compile *only* the PPO-update forward+backward path. The minibatch
+    # shape there is fixed at `[minibatch_size, MAX_PLANETS, ...]` and gets
+    # called epochs × ⌈n/mb⌉ times per update (~32×200 invocations on the
+    # default config) — one-time inductor cost amortizes cleanly. We keep
+    # the *rollout* using the raw `model` because its bucket size varies
+    # per env-step (envs finish on different steps), which would force
+    # recompiles. Same module, same parameters — only the forward dispatch
+    # differs. Snapshotting (deepcopy) and `_value_pretrain_params` also
+    # operate on the raw module.
+    train_model: OrbitPolicy = model
+    if device.type == "cuda":
+        train_model = torch.compile(model)  # type: ignore[assignment]
+
     for update in range(cfg.run.total_updates):
-        trajs: list[Trajectory] = []
         play_count: dict[str, int] = defaultdict(int)
         win_count: dict[str, int] = defaultdict(int)
 
-        for _ in range(cfg.rollout.episodes_per_update):
-            slots = pool.sample(cfg.game.num_players - 1, current_model=model)
-            traj = rollout_episode(
-                model,
-                [s.agent for s in slots],
-                num_players=cfg.game.num_players,
-                episode_steps=cfg.game.episode_steps,
-                ship_speed=cfg.game.ship_speed,
-                device=str(device),
-                reward_cfg=cfg.reward,
-            )
-            trajs.append(traj)
+        # Sample opponents once per env, then play all envs in parallel.
+        # Each env's seat assignment is fixed for the episode; the rollout
+        # batches the *policy forward* across envs each step.
+        opponents_per_env = [
+            pool.sample(cfg.game.num_players - 1)
+            for _ in range(cfg.rollout.num_envs)
+        ]
+        trajs = rollout_episodes_batched(
+            model,
+            vec,
+            opponents_per_env,
+            num_players=cfg.game.num_players,
+            device=str(device),
+            reward_cfg=cfg.reward,
+        )
 
-            # Build per-seat (identity, score) and feed Elo. The learner's
-            # seat is LEARNER_NAME; opponent seats carry their slot name
-            # (LEARNER_NAME for self-play, "frozen:..." for snapshots).
+        for env_idx, traj in enumerate(trajs):
+            slots = opponents_per_env[env_idx]
             seat_names = _seat_names(traj.learner_seat, slots)
             elo.update_from_game(list(zip(seat_names, traj.seat_rewards)))
-
-            # Per-opponent-identity win-rate tracking.
             for s in slots:
                 play_count[s.name] += 1
                 if traj.won:
@@ -332,7 +381,7 @@ def train_one_run(cfg: RunConfig) -> dict:
         batch = {k: v.to(device) for k, v in batch.items()}
 
         log = ppo_update(
-            model,
+            train_model,
             optimizer,
             batch,
             clip_eps=cfg.ppo.clip_eps,

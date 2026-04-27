@@ -12,13 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-import numpy as np
 import torch
 
 from ..game import parse_observation
 from ..policies.features import EncodedObs, encode_observation
 from ..policies.model import OrbitPolicy
-from ..policies.sampling import sample_with_record
+from ..policies.sampling import SampleRecord, sample_with_record
 from .config import RewardCfg
 
 AgentFn = Callable[[Any], list[list]]
@@ -26,15 +25,23 @@ AgentFn = Callable[[Any], list[list]]
 
 @dataclass
 class Trajectory:
-    """Per-step records for the *learning* agent only."""
+    """Per-step records for the *learning* agent only.
+
+    Per-step tensors stay on the *rollout device* (i.e. wherever the
+    policy ran). Pulling them to CPU per-step would force a stream
+    sync per env-step — at 16 envs × 500 steps that's 8000 syncs per
+    PPO update on GPU. Instead we accumulate device tensors and
+    `.cpu()` the whole list once when building the PPO batch.
+    """
 
     encoded: list[EncodedObs]
-    target_idx: list[np.ndarray]   # [P] long, only owned slots are "active"
-    fraction: list[np.ndarray]     # [P] float in [0, 1]
-    log_prob: list[np.ndarray]     # [P] float
-    value: list[float]
+    target_idx: list[torch.Tensor]    # [P] long
+    fraction: list[torch.Tensor]      # [P] float in [0, 1]
+    angle_offset: list[torch.Tensor]  # [P] float in [0, 1] — pre-rescale Beta sample
+    log_prob: list[torch.Tensor]      # [P] float
+    value: list[torch.Tensor]         # scalar tensors (no .item() in the hot loop)
     reward: list[float]
-    owned_mask: list[np.ndarray]   # [P] bool — which slots had a real action
+    owned_mask: list[torch.Tensor]    # [P] bool
     final_score: float = 0.0
     won: bool = False
     drawn: bool = False
@@ -111,8 +118,8 @@ def rollout_episode(
     state = env.reset(num_agents=num_players)
 
     traj = Trajectory(
-        encoded=[], target_idx=[], fraction=[], log_prob=[], value=[],
-        reward=[], owned_mask=[],
+        encoded=[], target_idx=[], fraction=[], angle_offset=[],
+        log_prob=[], value=[], reward=[], owned_mask=[],
     )
 
     while not env.done:
@@ -122,7 +129,7 @@ def rollout_episode(
                 obs = slot["observation"]
                 acts, info = _policy_step(model, obs, device, deterministic)
                 actions.append(acts)
-                _record_step(traj, info, env)
+                _record_step(traj, info)
             else:
                 obs = slot["observation"]
                 actions.append(agents[seat](obs))
@@ -150,22 +157,35 @@ def rollout_episode(
     return traj
 
 
-def _record_step(traj: Trajectory, info: dict, env) -> None:
-    out = info["policy_out"]
-    record = info["record"]
+def record_step(
+    traj: Trajectory,
+    feats: EncodedObs,
+    value_t: torch.Tensor,
+    owned_mask_t: torch.Tensor,
+    record: Any,
+) -> None:
+    """Append one step's per-planet records into a `Trajectory`.
 
-    # The sampler already produced the per-planet action and its log-prob;
-    # PPO's importance ratio depends on these being the *actual* sampled
-    # action, not a re-derivation from the move list.
-    target_idx = record.target_idx.detach().cpu().numpy().astype(np.int64)
-    fraction = record.fraction.detach().cpu().numpy().astype(np.float32)
-    log_prob = record.log_prob.detach().cpu().numpy().astype(np.float32)
-    owned = out.planet_owned_mask[0].cpu().numpy()
-
-    traj.encoded.append(info["feats"])
-    traj.target_idx.append(target_idx)
-    traj.fraction.append(fraction)
-    traj.log_prob.append(log_prob)
-    traj.value.append(float(out.value[0].item()))
-    traj.owned_mask.append(owned.copy())
+    All five tensor inputs are stored as-is on the rollout device — see
+    `Trajectory`'s docstring for why we don't pull to CPU here.
+    """
+    traj.encoded.append(feats)
+    traj.target_idx.append(record.target_idx.detach())
+    traj.fraction.append(record.fraction.detach())
+    traj.angle_offset.append(record.angle_offset.detach())
+    traj.log_prob.append(record.log_prob.detach())
+    traj.value.append(value_t.detach())
+    traj.owned_mask.append(owned_mask_t.detach())
     traj.reward.append(0.0)
+
+
+def _record_step(traj: Trajectory, info: dict) -> None:
+    """Serial-rollout adapter — pulls slot 0 out of the model output."""
+    out = info["policy_out"]
+    record_step(
+        traj,
+        feats=info["feats"],
+        value_t=out.value[0],
+        owned_mask_t=out.planet_owned_mask[0],
+        record=info["record"],
+    )

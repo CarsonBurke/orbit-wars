@@ -50,8 +50,7 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  episodes_per_update: 12
-  parallel_workers: 1
+  num_envs: 16
   max_moves_per_turn: 24
 
 opponents:
