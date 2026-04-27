@@ -36,9 +36,11 @@ params (α, β) couple "shift the mode" with "sharpen the peak," and the
 sharpen direction is unbounded — concentrations would creep into the
 hundreds and the policy log_prob would explode under small parameter
 changes (see VAPO §4 for the symptom; the diagnosis is α+β collapse). A
-Gaussian's μ (mode) and σ (spread) are independent gradient axes, log_prob
-is bounded above by `-log σ + const`, and PPO's importance ratio cannot
-explode as long as `log σ` is clamped. Standard pattern from SAC.
+Gaussian's μ (mode) and σ (spread) are independent gradient axes; cold-start
+KL is bounded by the gain=0.01 init on the μ readout + zeroed log_σ row
+(dreamer4 `dreamer4.py:1000` `* 1e-2`; cleanrl `ppo_continuous_action.py:127`
+`std=0.01`). log σ is left unclamped per dreamer4; if σ-collapse becomes
+a problem mid-training, deepen the head before reintroducing clamps.
 
 **Critic still shares the encoder backbone.** Value-loss gradients flow
 through the same transformer the actor uses. This is tamed by
@@ -152,15 +154,9 @@ def restore_fp32_params(model: nn.Module) -> None:
         if wants_fp32 and param.dtype != torch.float32:
             param.data = param.data.float()
 
-# Clamp range for the Normal's log σ. Lower bound caps `1/σ²`, which is the
-# scale of `d(log_p)/d(μ)` for the tanh-Gaussian fraction head: σ collapsing
-# toward 0 makes the PPO importance ratio hypersensitive to μ updates and
-# KL spikes. σ here is the *pre-tanh latent std*, not the action; a deterministic
-# fraction is `tanh(μ)` and is unaffected by this floor. SAC's classic -5 floor
-# is calibrated for unbounded continuous control where σ doubles as exploration
-# magnitude; for our [0,1] fraction head, σ ≥ exp(-2) ≈ 0.135 still permits
-# near-saturated commits (tanh squashes the latent variance flat) while
-# preventing the 1/σ² blowup. Upper bound keeps the policy from being pure noise.
+# Reserved for re-enabling a log-σ clamp if PPO σ-collapse re-emerges.
+# Currently unused — see the fraction-head construction in `OrbitPolicy.forward`
+# for the dreamer4-style unclamped policy.
 LOG_SIGMA_MIN: float = -2.0
 LOG_SIGMA_MAX: float = 2.0
 
@@ -337,7 +333,7 @@ class TransformerBlock(nn.Module):
 class PolicyOutput:
     target_logits: torch.Tensor       # [B, P, P+1]  +1 = no-op slot
     fraction_mu: torch.Tensor         # [B, P]  pre-tanh Normal mean
-    fraction_log_sigma: torch.Tensor  # [B, P]  pre-tanh Normal log-std (clamped)
+    fraction_log_sigma: torch.Tensor  # [B, P]  pre-tanh Normal log-std (unclamped)
     value: torch.Tensor               # [B]
     planet_owned_mask: torch.Tensor   # [B, P] bool
     planet_mask: torch.Tensor         # [B, P] bool
@@ -618,12 +614,15 @@ class OrbitPolicy(nn.Module):
         noop = self.noop_head(planet_with_ctx)  # [B, P, 1]
         target_logits = torch.cat([logits, noop], dim=-1)  # [B, P, P+1]
 
-        # Fraction head: pre-tanh Normal (μ, log σ). Clamping log σ both ways
-        # keeps Normal.log_prob bounded above by `-log σ_min + const` and below
-        # by something finite, so PPO's importance ratio cannot explode.
+        # Fraction head: pre-tanh Normal (μ, log σ). Unclamped per dreamer4
+        # (`dreamer4.py:398-404, 1102, 1130-1134`) — log σ is allowed to roam
+        # freely. Cold-start KL is bounded by the gain=0.01 init on the μ
+        # row + zeroed log_σ row, not by a clamp. If σ-collapse becomes a
+        # problem mid-training, deepen the head (dreamer4-style 4·d MLP)
+        # before reintroducing clamps.
         offs = self.fraction_head(planet_with_ctx)
         fraction_mu = offs[..., 0]
-        fraction_log_sigma = offs[..., 1].clamp(LOG_SIGMA_MIN, LOG_SIGMA_MAX)
+        fraction_log_sigma = offs[..., 1]
 
         # Value: dedicated critic token (replaces mean-pool).
         value = self.value_head(h_critic).squeeze(-1)
