@@ -45,6 +45,41 @@ def test_policy_forward_shapes():
     assert out.value.shape == (1,)
 
 
+def test_policy_ignores_padded_token_features():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    o = parse_observation(_obs())
+    feats = encode_observation(o)
+    noisy = encode_observation(o)
+    noisy.planet_feats[~noisy.planet_mask] = torch.randn_like(
+        noisy.planet_feats[~noisy.planet_mask]
+    )
+    noisy.fleet_feats[~noisy.fleet_mask] = torch.randn_like(
+        noisy.fleet_feats[~noisy.fleet_mask]
+    )
+
+    with torch.no_grad():
+        clean_out = model(feats)
+        noisy_out = model(noisy)
+
+    valid_planets = feats.planet_mask.unsqueeze(0)
+    valid_cols = torch.cat(
+        [
+            feats.planet_mask,
+            torch.ones(1, dtype=torch.bool),
+        ]
+    ).unsqueeze(0)
+    assert torch.allclose(clean_out.value, noisy_out.value)
+    assert torch.allclose(
+        clean_out.fraction_mu[valid_planets],
+        noisy_out.fraction_mu[valid_planets],
+    )
+    assert torch.allclose(
+        clean_out.target_logits[valid_planets][:, valid_cols.squeeze(0)],
+        noisy_out.target_logits[valid_planets][:, valid_cols.squeeze(0)],
+    )
+
+
 def test_sample_actions_returns_legal_moves():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
     model = OrbitPolicy(cfg)

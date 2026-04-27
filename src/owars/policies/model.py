@@ -66,6 +66,29 @@ from .config import OrbitPolicyConfig
 from .features import EncodedObs
 
 
+class SquaredLeakyReLU(nn.Module):
+    """Activation: `leaky_relu(x, 0.5)²` (parameter-golf `sota_train_gpt.py:109`).
+
+    A "squared ReLU" / Primer-style activation with a smooth negative branch:
+      • x ≥ 0 → x²
+      • x < 0 → (0.5·x)² = 0.25·x²
+
+    Quadratic growth on both sides means larger derivative magnitudes than
+    GELU as |x| grows; pg tolerates this because RMSNorm, QK-norm, and
+    ortho-init bound the inputs to this activation, so the unbounded
+    derivative regime is never reached in practice. Stateless module —
+    fits drop-in inside `nn.Sequential` where the original `nn.GELU()` was.
+
+    Implemented via the identity `leaky_relu(x, 0.5) = 0.5·x + 0.5·relu(x)`
+    rather than `F.leaky_relu`, because the FF block runs on nested-jagged
+    tensors during encoding and `aten.leaky_relu` has no NJT kernel — but
+    `relu`, `mul`, and `add` all do.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (0.5 * x + 0.5 * F.relu(x)).square()
+
+
 class CastedLinear(nn.Linear):
     """Linear with `forward` that casts the fp32-master weight (and bias) to
     the input dtype on each call (parameter-golf `sota_train_gpt.py:80`).
@@ -101,6 +124,7 @@ _FP32_NAME_SUBSTRINGS: tuple[str, ...] = (
     "ff_scale",
     "resid_mix",
     "q_gain",
+    "target_q_gain",
     "actor_token",
     "critic_token",
 )
@@ -128,11 +152,16 @@ def restore_fp32_params(model: nn.Module) -> None:
         if wants_fp32 and param.dtype != torch.float32:
             param.data = param.data.float()
 
-# Clamp range for the Normal's log σ. Lower bound keeps log_prob bounded above
-# (Normal.log_prob's max is `-log σ - 0.5·log(2π)`); upper bound keeps the
-# policy from being pure noise. Standard SAC values; the policy can still
-# converge to near-deterministic via μ alone.
-LOG_SIGMA_MIN: float = -5.0
+# Clamp range for the Normal's log σ. Lower bound caps `1/σ²`, which is the
+# scale of `d(log_p)/d(μ)` for the tanh-Gaussian fraction head: σ collapsing
+# toward 0 makes the PPO importance ratio hypersensitive to μ updates and
+# KL spikes. σ here is the *pre-tanh latent std*, not the action; a deterministic
+# fraction is `tanh(μ)` and is unaffected by this floor. SAC's classic -5 floor
+# is calibrated for unbounded continuous control where σ doubles as exploration
+# magnitude; for our [0,1] fraction head, σ ≥ exp(-2) ≈ 0.135 still permits
+# near-saturated commits (tanh squashes the latent variance flat) while
+# preventing the 1/σ² blowup. Upper bound keeps the policy from being pure noise.
+LOG_SIGMA_MIN: float = -2.0
 LOG_SIGMA_MAX: float = 2.0
 
 
@@ -195,10 +224,12 @@ class SelfAttention(nn.Module):
         # residual already adds zero contribution at cold-start.
         nn.init.zeros_(self.out_proj.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # `x` is a nested-jagged tensor of shape [B, j, D] where j varies
-        # per batch. All elementwise / Linear / RMSNorm ops broadcast over
-        # the jagged dim natively.
+    def forward(
+        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # `x` is either a nested-jagged tensor of shape [B, j, D] where j
+        # varies per batch, or a dense padded tensor [B, T, D] with
+        # `valid_mask=True` for real tokens.
         q = self.c_q(x).unflatten(-1, (self.n_heads, self.head_dim))
         k = self.c_k(x).unflatten(-1, (self.n_heads, self.head_dim))
         v = self.c_v(x).unflatten(-1, (self.n_heads, self.head_dim))
@@ -215,7 +246,10 @@ class SelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        attn_mask = None
+        if valid_mask is not None:
+            attn_mask = valid_mask[:, None, None, :]
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
         o = o.transpose(1, 2).flatten(-2)  # [B, j, H*head_dim] nested
         return self.out_proj(o)
 
@@ -248,8 +282,8 @@ class TransformerBlock(nn.Module):
         # is a one-line change.
         self.ln_scale_factor = 1.0
         self.ff = nn.Sequential(
-            CastedLinear(dim, ff_dim),
-            nn.GELU(),
+            CastedLinear(dim, ff_dim, bias=False),
+            SquaredLeakyReLU(),
             CastedLinear(ff_dim, dim, bias=False),
         )
         self.drop = nn.Dropout(dropout)
@@ -279,15 +313,19 @@ class TransformerBlock(nn.Module):
             torch.stack([torch.ones(dim), torch.zeros(dim)])
         )
 
-    def forward(self, x: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
-        # `x` and `x0` are nested-jagged tensors of shape [B, j, D]. All
-        # ops below broadcast over the jagged dim. Cast scale/mix params
-        # to activation dtype to keep the bf16 residual path bf16 (see
-        # parameter-golf `sota_train_gpt.py`).
+    def forward(
+        self,
+        x: torch.Tensor,
+        x0: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # `x` and `x0` are nested-jagged [B, j, D] or dense padded
+        # [B, T, D]. Cast scale/mix params to activation dtype to keep the
+        # bf16 residual path bf16 (see parameter-golf `sota_train_gpt.py`).
         dt = x.dtype
         mix = self.resid_mix.to(dt)
         x_in = mix[0] * x + mix[1] * x0
-        a = self.attn(self.ln1(x_in) * self.ln_scale_factor)
+        a = self.attn(self.ln1(x_in) * self.ln_scale_factor, valid_mask)
         x = x_in + self.attn_scale.to(dt) * self.drop(a)
         x = x + self.ff_scale.to(dt) * self.drop(
             self.ff(self.ln2(x) * self.ln_scale_factor)
@@ -348,6 +386,20 @@ class OrbitPolicy(nn.Module):
         # query side only is what gives the actor token bite.
         self.target_query = CastedLinear(2 * cfg.dim, cfg.dim, bias=False)
         self.target_key = CastedLinear(cfg.dim, cfg.dim, bias=False)
+        # Target attention temperature (per parameter-golf `q_gain` pattern,
+        # `sota_train_gpt.py:101,104`). We RMS-norm Q & K below, then scale
+        # by this learnable scalar before the softmax. Pins the target-logit
+        # magnitude regardless of how `target_query`/`target_key` weights
+        # drift under Muon — the readout had been the only unprotected
+        # attention path in the model.
+        # Init=1.0 (not pg's 5.0): pg's softmax is over a 50k-token vocab
+        # where each per-token log_prob is small enough that gain=5 is fine,
+        # but our target softmax is over ≤17 slots — gain=5 here makes the
+        # cold-start distribution sharp, so first-update Δlog_prob (and
+        # approx_kl) blows up. Init=1 reproduces the standard sqrt(d)-scaled
+        # attention temperature; the optimizer can sharpen via the control-LR
+        # group as training proceeds.
+        self.target_q_gain = nn.Parameter(torch.tensor(1.0))
         # Orthogonal init at gain=1 (parameter-golf `_init_weights` policy
         # for Linears with both dims ≥64). Spectral norm 1 means a Muon
         # NS5 update of magnitude `muon_lr` produces a `muon_lr`-fraction
@@ -357,8 +409,11 @@ class OrbitPolicy(nn.Module):
         # Xavier's variance is *larger* than kaiming default; orthogonal at
         # gain=1 has unit spectral norm but still bounded variance, which
         # is what we actually want for log-prob stability.
-        nn.init.orthogonal_(self.target_query.weight, gain=0.1)
-        nn.init.orthogonal_(self.target_key.weight, gain=0.1)
+        # Mild reduction vs trunk's 0.1 — but largely vacuous: the einsum
+        # output is QK-RMSNormed and tempered by `target_q_gain`, so init
+        # weight magnitude on these doesn't translate to logit magnitude.
+        nn.init.orthogonal_(self.target_query.weight, gain=0.05)
+        nn.init.orthogonal_(self.target_key.weight, gain=0.05)
         # Per-planet no-op head — gives every owned planet its own no-op
         # logit conditioned on local context, instead of a single shared
         # scalar. Empirically the shared-scalar version led the policy to
@@ -374,18 +429,18 @@ class OrbitPolicy(nn.Module):
         # of a tanh-squashed Normal over [-1, 1]; sampling.py maps to [0, 1]
         # to get the fraction-of-garrison-to-send.
         self.fraction_head = CastedLinear(2 * cfg.dim, 2, bias=False)
-        # μ row gets the same gain=0.1 orthogonal init as the rest of the
-        # network — small initial pre-tanh mean → tight fraction distribution
-        # at cold-start → bounded first-update Δlog_prob.
-        # log σ row weight is zeroed so σ ≡ 1 at init: pre-tanh
-        # ~ N(0, 1), tanh-squashed → wide distribution over (-1, 1), which
-        # sampling.py maps to a near-uniform fraction in [0, 1].
-        nn.init.orthogonal_(self.fraction_head.weight, gain=0.1)
+        # μ row at gain=0.01 — cleanrl PPO's canonical actor-mean init
+        # (`ppo_continuous_action.py:127`, the "Implementation Matters"
+        # recipe). Initial pre-tanh μ ≈ 0 → fraction distribution is
+        # near-uniform on [0,1] regardless of feature magnitudes coming out
+        # of the trunk → first-update Δlog_prob is bounded by the trunk's
+        # update size, not the head's. log σ row is zeroed so σ ≡ 1 at init.
+        nn.init.orthogonal_(self.fraction_head.weight, gain=0.01)
         with torch.no_grad():
             self.fraction_head.weight[1].zero_()
         self.value_head = nn.Sequential(
-            CastedLinear(cfg.dim, cfg.value_hidden),
-            nn.GELU(),
+            CastedLinear(cfg.dim, cfg.value_hidden, bias=False),
+            SquaredLeakyReLU(),
             CastedLinear(cfg.value_hidden, 1, bias=False),
         )
         # Orthogonal init for the value-head input projection (both dims
@@ -458,11 +513,40 @@ class OrbitPolicy(nn.Module):
         # padded `[B, T, D]` since LN is per-token — padded positions are
         # normalized too but get dropped by the nested-jagged pack below.
         h = self.embed_norm(h)
+        summary_mask = torch.ones(b, 2, dtype=torch.bool, device=planet_mask.device)
+        full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
+        if h.device.type == "cpu":
+            # Nested-jagged dispatch is much slower than dense masked SDPA on
+            # CPU. Keep nested for CUDA, where it unlocks the flash path.
+            # On CPU, pack each batch row to the maximum real token count in
+            # the batch, run dense masked attention there, then scatter back
+            # to the canonical padded layout expected by the action heads.
+            t = full_mask.shape[1]
+            lengths = full_mask.sum(dim=-1)
+            max_len = int(lengths.max().item())
+            positions = torch.arange(t, device=h.device).expand(b, t)
+            positions = positions.masked_fill(~full_mask, t)
+            packed_pos = positions.sort(dim=1).values[:, :max_len]
+            packed_mask = packed_pos != t
+            safe_pos = packed_pos.clamp(max=t - 1)
+            gather_idx = safe_pos.unsqueeze(-1).expand(-1, -1, h.shape[-1])
+            h_packed = h.gather(1, gather_idx)
+            x0 = h_packed
+            for layer in self.layers:
+                h_packed = layer(h_packed, x0, packed_mask)
+            h_packed = self.final_norm(h_packed)
+            h = torch.zeros_like(h)
+            h.scatter_(1, gather_idx, h_packed * packed_mask.unsqueeze(-1))
+            h_actor = h[:, 0]
+            h_critic = h[:, 1]
+            planet_h = h[:, 2 : 2 + p]
+            fleet_h = h[:, 2 + p : 2 + p + f]
+            token_mask = torch.cat([planet_mask, fleet_mask], dim=1)
+            return planet_h, fleet_h, h_actor, h_critic, token_mask
+
         # Pack only the *valid* tokens into a nested-jagged tensor. This is
         # the path that lets SDPA dispatch to real FA-2 (no attn_mask). The
         # two summary tokens are always valid.
-        summary_mask = torch.ones(b, 2, dtype=torch.bool, device=planet_mask.device)
-        full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
         lengths = full_mask.sum(dim=-1)  # [B]
         offsets = torch.zeros(b + 1, dtype=torch.int64, device=h.device)
         offsets[1:] = lengths.cumsum(0)
@@ -509,7 +593,16 @@ class OrbitPolicy(nn.Module):
         # add a column-constant term to `q·k` that cancels in the softmax.
         q = self.target_query(planet_with_ctx)
         k = self.target_key(planet_h)
-        # [B, P, P]
+        # QK-RMSNorm + learnable gain — same pattern as `SelfAttention`.
+        # `F.rms_norm` along the last dim pins ‖q‖ and ‖k‖ to √d regardless
+        # of weight magnitude, so the post-softmax target distribution has
+        # a magnitude bound that doesn't drift with the projection norms.
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        q = q * self.target_q_gain.to(q.dtype)
+        # [B, P, P] — keep the canonical 1/√d divisor; `target_q_gain`
+        # multiplies on top, mirroring how trunk SDPA's auto-scale plus
+        # `q_gain` compose.
         logits = torch.einsum("bid,bjd->bij", q, k) / (d**0.5)
         # Mask out padded *targets*.
         logits = logits.masked_fill(~planet_mask.unsqueeze(1), float("-inf"))

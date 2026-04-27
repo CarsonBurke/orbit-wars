@@ -19,7 +19,10 @@ class GameCfg:
 
 @dataclass
 class ModelCfg:
-    dim: int = 96
+    # head_dim = dim / n_heads = 32 — the smallest setting in FA-2's eligible
+    # set {16, 32, 64, 128, 256} that gives bf16 SDPA the flash kernel.
+    # `dim=96` (head_dim=24) silently falls back to math/mem-efficient.
+    dim: int = 128
     ff_dim: int = 256
     depth: int = 3
     n_heads: int = 4

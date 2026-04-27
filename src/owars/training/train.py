@@ -71,15 +71,15 @@ _CONTROL_TENSOR_PATTERNS: tuple[str, ...] = (
 
 # Subset of control tensors that route to the *fast* AdamW group at
 # `control_lr` (≈ `muon_lr`) — per-channel residual scales and the
-# attention-temperature gain. The summary tokens (`actor_token`,
-# `critic_token`) intentionally stay in the slow default group: they are
-# learnable biases on the residual stream and moving them at scalar speed
-# destabilizes early training.
+# attention-temperature gains (trunk `q_gain` + `target_q_gain`). The
+# summary tokens (`actor_token`, `critic_token`) intentionally stay in
+# the slow default group: they are learnable biases on the residual
+# stream and moving them at scalar speed destabilizes early training.
 _CONTROL_LR_PATTERNS: tuple[str, ...] = (
     "attn_scale",
     "ff_scale",
     "resid_mix",
-    "q_gain",
+    "q_gain",  # also matches `target_q_gain` via substring
 )
 
 # Parameter-name patterns for the *slow* Muon group: action-head readouts
