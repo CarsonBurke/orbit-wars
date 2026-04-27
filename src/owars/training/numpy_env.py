@@ -900,7 +900,13 @@ class NumpyOrbitWarsEnv:
 
 
 class NumpyVecEnv:
-    """In-process vector wrapper with the same subset protocol as `VecEnv`."""
+    """Adaptive in-process vector env with the same subset protocol as `VecEnv`.
+
+    Map generation and comet path generation remain delegated to
+    `NumpyOrbitWarsEnv` because they are per-game stochastic rejection
+    samplers. Idle turns are updated in padded batch arrays; turns with
+    launches or live fleets use the scalar NumPy env as the correctness oracle.
+    """
 
     def __init__(
         self,
@@ -915,6 +921,10 @@ class NumpyVecEnv:
         self.num_envs = num_envs
         self.replay_env_idx = replay_env_idx
         self.last_replay_html: str | None = None
+        self.num_players = num_players
+        self.episode_steps = episode_steps
+        self.ship_speed = ship_speed
+        self.comet_speed = comet_speed
         self.envs = [
             NumpyOrbitWarsEnv(
                 num_players=num_players,
@@ -925,21 +935,92 @@ class NumpyVecEnv:
             )
             for i in range(num_envs)
         ]
+        self.planet_cap = 96
+        self.fleet_cap = 256
+        self.planets = np.empty((num_envs, self.planet_cap, 7), dtype=np.float64)
+        self.initial_planets = np.empty((num_envs, self.planet_cap, 7), dtype=np.float64)
+        self.planet_mask = np.zeros((num_envs, self.planet_cap), dtype=bool)
+        self.initial_planet_mask = np.zeros((num_envs, self.planet_cap), dtype=bool)
+        self.fleets = np.empty((num_envs, self.fleet_cap, 7), dtype=np.float64)
+        self.fleet_mask = np.zeros((num_envs, self.fleet_cap), dtype=bool)
+        self.done = np.zeros(num_envs, dtype=bool)
+        self.initialized = np.zeros(num_envs, dtype=bool)
+        self.step_count = np.zeros(num_envs, dtype=np.int64)
+        self.angular_velocity = np.zeros(num_envs, dtype=np.float64)
+        self.next_fleet_id = np.zeros(num_envs, dtype=np.int64)
+        self.last_states: list[list[dict[str, Any]]] = []
 
     def reset(self) -> list[list[dict[str, Any]]]:
         self.last_replay_html = None
-        return [env.reset() for env in self.envs]
+        states = [env.reset() for env in self.envs]
+        self.planet_mask.fill(False)
+        self.initial_planet_mask.fill(False)
+        self.fleet_mask.fill(False)
+        self.done.fill(False)
+        self.initialized.fill(False)
+        self.step_count.fill(0)
+        self.angular_velocity.fill(0.0)
+        self.next_fleet_id.fill(0)
+        for i, env in enumerate(self.envs):
+            self._store_env(i, env)
+        self.last_states = states
+        return states
 
     def step_subset(
         self, indices: list[int], actions: list[Any]
     ) -> dict[int, tuple[list[dict[str, Any]], bool, list[SimpleNamespace] | None]]:
         assert len(indices) == len(actions), (len(indices), len(actions))
-        out = {}
+        out: dict[int, tuple[list[dict[str, Any]], bool, list[SimpleNamespace] | None]] = {}
+        active: list[int] = []
+        active_actions: dict[int, list[Any]] = {}
         for idx, action in zip(indices, actions, strict=True):
-            env = self.envs[idx]
-            state = env.step(action)
-            out[idx] = (state, env.done, env.final_state())
+            if self.done[idx]:
+                state = self.last_states[idx]
+                out[idx] = (state, True, self._final_state_from_state(state))
+                continue
+            normalized = self._normalize_actions(action)
+            if not self.initialized[idx]:
+                env = self.envs[idx]
+                env.step(normalized)
+                self._store_env(idx, env)
+                state = self._state(idx, normalized)
+                self.last_states[idx] = state
+                out[idx] = (state, bool(self.done[idx]), None)
+                continue
+            if self._needs_scalar_step(idx, normalized):
+                env = self._write_env(idx)
+                state = env.step(normalized)
+                self._store_env(idx, env)
+                self.last_states[idx] = state
+                out[idx] = (
+                    state,
+                    bool(self.done[idx]),
+                    env.final_state() if self.done[idx] else None,
+                )
+                continue
+            self.step_count[idx] += 1
+            active.append(idx)
+            active_actions[idx] = normalized
+
+        if active:
+            self._prepare_comets(active)
+            self._produce_batch(active)
+            self._move_planets_batch(active)
+            self._check_done_batch(active)
+            for idx in active:
+                state = self._state(idx, active_actions[idx])
+                self.last_states[idx] = state
+                out[idx] = (
+                    state,
+                    bool(self.done[idx]),
+                    self._final_state_from_state(state) if self.done[idx] else None,
+                )
         return out
+
+    def _needs_scalar_step(self, idx: int, actions: list[Any]) -> bool:
+        if self.fleet_mask[idx].any():
+            return True
+        return any(action and isinstance(action, list) for action in actions)
 
     def set_recording(self, enabled: bool) -> None:
         if not enabled:
@@ -953,3 +1034,274 @@ class NumpyVecEnv:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    # ----- storage ---------------------------------------------------------
+
+    def _ensure_planet_capacity(self, needed: int) -> None:
+        if needed <= self.planet_cap:
+            return
+        new_cap = max(needed, self.planet_cap * 2)
+        planets = np.empty((self.num_envs, new_cap, 7), dtype=np.float64)
+        initial = np.empty((self.num_envs, new_cap, 7), dtype=np.float64)
+        pm = np.zeros((self.num_envs, new_cap), dtype=bool)
+        im = np.zeros((self.num_envs, new_cap), dtype=bool)
+        planets[:, : self.planet_cap] = self.planets
+        initial[:, : self.planet_cap] = self.initial_planets
+        pm[:, : self.planet_cap] = self.planet_mask
+        im[:, : self.planet_cap] = self.initial_planet_mask
+        self.planet_cap = new_cap
+        self.planets = planets
+        self.initial_planets = initial
+        self.planet_mask = pm
+        self.initial_planet_mask = im
+
+    def _ensure_fleet_capacity(self, needed: int) -> None:
+        if needed <= self.fleet_cap:
+            return
+        new_cap = max(needed, self.fleet_cap * 2)
+        fleets = np.empty((self.num_envs, new_cap, 7), dtype=np.float64)
+        fm = np.zeros((self.num_envs, new_cap), dtype=bool)
+        fleets[:, : self.fleet_cap] = self.fleets
+        fm[:, : self.fleet_cap] = self.fleet_mask
+        self.fleet_cap = new_cap
+        self.fleets = fleets
+        self.fleet_mask = fm
+
+    def _store_env(self, idx: int, env: NumpyOrbitWarsEnv) -> None:
+        self._ensure_planet_capacity(max(len(env.planets), len(env.initial_planets)))
+        self._ensure_fleet_capacity(max(1, len(env.fleets)))
+        self.planet_mask[idx].fill(False)
+        self.initial_planet_mask[idx].fill(False)
+        self.fleet_mask[idx].fill(False)
+        if len(env.planets):
+            self.planets[idx, : len(env.planets)] = env.planets
+            self.planet_mask[idx, : len(env.planets)] = True
+        if len(env.initial_planets):
+            self.initial_planets[idx, : len(env.initial_planets)] = env.initial_planets
+            self.initial_planet_mask[idx, : len(env.initial_planets)] = True
+        if len(env.fleets):
+            self.fleets[idx, : len(env.fleets)] = env.fleets
+            self.fleet_mask[idx, : len(env.fleets)] = True
+        self.done[idx] = env.done
+        self.initialized[idx] = env._initialized
+        self.step_count[idx] = env._step
+        self.angular_velocity[idx] = env.angular_velocity
+        self.next_fleet_id[idx] = env.next_fleet_id
+
+    def _write_env(self, idx: int) -> NumpyOrbitWarsEnv:
+        env = self.envs[idx]
+        env.planets = self.planets[idx, self.planet_mask[idx]].copy()
+        env.initial_planets = self.initial_planets[
+            idx, self.initial_planet_mask[idx]
+        ].copy()
+        env.fleets = self.fleets[idx, self.fleet_mask[idx]].copy()
+        env.done = bool(self.done[idx])
+        env._initialized = bool(self.initialized[idx])
+        env._step = int(self.step_count[idx])
+        env.angular_velocity = float(self.angular_velocity[idx])
+        env.next_fleet_id = int(self.next_fleet_id[idx])
+        return env
+
+    def _normalize_actions(self, action: Any) -> list[Any]:
+        actions = action if isinstance(action, list) else []
+        if len(actions) < self.num_players:
+            actions = [*actions, *([None] * (self.num_players - len(actions)))]
+        return actions
+
+    # ----- public state materialization ------------------------------------
+
+    def _state(self, idx: int, actions: list[Any]) -> list[dict[str, Any]]:
+        rewards = self._current_rewards(idx)
+        status = "DONE" if self.done[idx] else "ACTIVE"
+        base = self._observation_base(idx)
+        return [
+            {
+                "action": actions[player] if player < len(actions) else None,
+                "reward": rewards[player],
+                "info": {},
+                "observation": self._observation(idx, player, base),
+                "status": status,
+            }
+            for player in range(self.num_players)
+        ]
+
+    def _observation_base(self, idx: int) -> dict[str, Any]:
+        env = self.envs[idx]
+        return {
+            "remainingOverageTime": 60,
+            "step": int(self.step_count[idx]),
+            "planets": [
+                _planet_row_to_list(row)
+                for row in self.planets[idx, self.planet_mask[idx]]
+            ],
+            "fleets": [
+                _fleet_row_to_list(row)
+                for row in self.fleets[idx, self.fleet_mask[idx]]
+            ],
+            "angular_velocity": float(self.angular_velocity[idx]),
+            "initial_planets": [
+                _planet_row_to_list(row)
+                for row in self.initial_planets[idx, self.initial_planet_mask[idx]]
+            ],
+            "next_fleet_id": int(self.next_fleet_id[idx]),
+            "comets": [
+                {
+                    "planet_ids": list(group["planet_ids"]),
+                    "paths": [path.tolist() for path in group["paths"]],
+                    "path_index": int(group["path_index"]),
+                }
+                for group in env.comets
+            ],
+            "comet_planet_ids": list(env.comet_planet_ids),
+        }
+
+    def _observation(self, idx: int, player: int, base: dict[str, Any]) -> dict[str, Any]:
+        obs = dict(base)
+        obs["player"] = player
+        return obs
+
+    @staticmethod
+    def _final_state_from_state(state: list[dict[str, Any]]) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                reward=s["reward"],
+                status=s["status"],
+                action=s["action"],
+                observation=s["observation"],
+            )
+            for s in state
+        ]
+
+    # ----- batched simulation ----------------------------------------------
+
+    def _prepare_comets(self, active: list[int]) -> None:
+        for idx in active:
+            env = self.envs[idx]
+            spawn_step = int(self.step_count[idx])
+            expired: list[int] = []
+            for group in env.comets:
+                path_idx = int(group["path_index"])
+                for i, pid in enumerate(group["planet_ids"]):
+                    if path_idx >= len(group["paths"][i]):
+                        expired.append(int(pid))
+            if expired:
+                self._remove_comet_planets_batch(idx, expired)
+            if spawn_step in COMET_SPAWN_STEPS:
+                self._write_env(idx)
+                env._spawn_comets()
+                self._store_env(idx, env)
+
+    def _produce_batch(self, active: list[int]) -> None:
+        env_idx = np.asarray(active, dtype=np.int64)
+        owned = self.planet_mask[env_idx] & (self.planets[env_idx, :, P_OWNER] != -1)
+        self.planets[env_idx, :, P_SHIPS] += owned * self.planets[env_idx, :, P_PROD]
+
+    def _move_planets_batch(self, active: list[int]) -> None:
+        for idx in active:
+            comet_ids = set(self.envs[idx].comet_planet_ids)
+            for pslot in np.nonzero(self.planet_mask[idx])[0]:
+                pid = int(self.planets[idx, pslot, P_ID])
+                if pid in comet_ids:
+                    continue
+                if not self.initial_planet_mask[idx, pslot]:
+                    continue
+                init = self.initial_planets[idx, pslot]
+                if int(init[P_ID]) != pid:
+                    matches = np.nonzero(
+                        self.initial_planet_mask[idx]
+                        & (
+                            self.initial_planets[idx, :, P_ID].astype(np.int64)
+                            == pid
+                        )
+                    )[0]
+                    if len(matches) == 0:
+                        continue
+                    init = self.initial_planets[idx, int(matches[0])]
+                dx = init[P_X] - CENTER
+                dy = init[P_Y] - CENTER
+                radius = math.sqrt(dx**2 + dy**2)
+                if radius + self.planets[idx, pslot, P_RADIUS] < ROTATION_RADIUS_LIMIT:
+                    angle = math.atan2(dy, dx) + self.angular_velocity[idx] * (
+                        self.step_count[idx] - 1
+                    )
+                    self.planets[idx, pslot, P_X] = CENTER + radius * math.cos(angle)
+                    self.planets[idx, pslot, P_Y] = CENTER + radius * math.sin(angle)
+            self._move_comets_for_env(idx)
+
+    def _move_comets_for_env(self, idx: int) -> None:
+        env = self.envs[idx]
+        expired: list[int] = []
+        ids = np.zeros(self.planet_cap, dtype=np.int64)
+        ids[self.planet_mask[idx]] = self.planets[
+            idx, self.planet_mask[idx], P_ID
+        ].astype(np.int64)
+        for group in env.comets:
+            group["path_index"] += 1
+            path_idx = int(group["path_index"])
+            for i, pid in enumerate(list(group["planet_ids"])):
+                matches = np.nonzero(self.planet_mask[idx] & (ids == int(pid)))[0]
+                if len(matches) == 0:
+                    continue
+                pslot = int(matches[0])
+                path = group["paths"][i]
+                if path_idx >= len(path):
+                    expired.append(int(pid))
+                    continue
+                self.planets[idx, pslot, P_X] = path[path_idx, 0]
+                self.planets[idx, pslot, P_Y] = path[path_idx, 1]
+        if expired:
+            self._remove_comet_planets_batch(idx, expired)
+
+    def _remove_comet_planets_batch(self, idx: int, pids: list[int]) -> None:
+        expired = set(int(pid) for pid in pids)
+        ids = np.zeros(self.planet_cap, dtype=np.int64)
+        ids[self.planet_mask[idx]] = self.planets[
+            idx, self.planet_mask[idx], P_ID
+        ].astype(np.int64)
+        initial_ids = np.zeros(self.planet_cap, dtype=np.int64)
+        initial_ids[self.initial_planet_mask[idx]] = self.initial_planets[
+            idx, self.initial_planet_mask[idx], P_ID
+        ].astype(np.int64)
+        self.planet_mask[idx] &= ~np.isin(ids, list(expired))
+        self.initial_planet_mask[idx] &= ~np.isin(initial_ids, list(expired))
+        env = self.envs[idx]
+        env.comet_planet_ids = [
+            pid for pid in env.comet_planet_ids if pid not in expired
+        ]
+        for group in env.comets:
+            keep = [pid not in expired for pid in group["planet_ids"]]
+            group["planet_ids"] = [
+                pid for pid, ok in zip(group["planet_ids"], keep, strict=False) if ok
+            ]
+            group["paths"] = [
+                path for path, ok in zip(group["paths"], keep, strict=False) if ok
+            ]
+        env.comets = [group for group in env.comets if group["planet_ids"]]
+
+    def _check_done_batch(self, active: list[int]) -> None:
+        for idx in active:
+            terminated = (self.step_count[idx] - 1) >= self.episode_steps - 2
+            alive = set(
+                int(o)
+                for o in self.planets[idx, self.planet_mask[idx], P_OWNER]
+                if int(o) != -1
+            )
+            alive.update(
+                int(o) for o in self.fleets[idx, self.fleet_mask[idx], F_OWNER]
+            )
+            if len(alive) <= 1:
+                terminated = True
+            self.done[idx] = terminated
+
+    def _current_rewards(self, idx: int) -> list[int]:
+        if not self.done[idx]:
+            return [0] * self.num_players
+        scores = [0] * self.num_players
+        for p in self.planets[idx, self.planet_mask[idx]]:
+            owner = int(p[P_OWNER])
+            if owner != -1:
+                scores[owner] += int(p[P_SHIPS])
+        for f in self.fleets[idx, self.fleet_mask[idx]]:
+            scores[int(f[F_OWNER])] += int(f[F_SHIPS])
+        max_score = max(scores)
+        return [1 if score == max_score and max_score > 0 else -1 for score in scores]

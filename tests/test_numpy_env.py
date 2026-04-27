@@ -158,3 +158,130 @@ def test_numpy_vec_env_uses_vecenv_subset_protocol():
     assert sorted(results) == [0, 2]
     assert results[0][0][0]["observation"]["step"] == 1
     assert results[2][0][0]["observation"]["step"] == 1
+
+
+def test_numpy_vec_env_matches_scalar_fallback_with_launches():
+    num_envs = 3
+    scalar = [
+        NumpyOrbitWarsEnv(
+            num_players=2,
+            episode_steps=120,
+            ship_speed=6.0,
+            random_seed=i,
+        )
+        for i in range(num_envs)
+    ]
+    scalar_states = [env.reset() for env in scalar]
+    vec = NumpyVecEnv(
+        num_envs=num_envs,
+        num_players=2,
+        episode_steps=120,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    vec_states = vec.reset()
+    for env_idx in range(num_envs):
+        _assert_obs_close(
+            vec_states[env_idx][0]["observation"],
+            scalar_states[env_idx][0]["observation"],
+        )
+
+    for _ in range(40):
+        actions = []
+        for env_idx, env in enumerate(scalar):
+            action = _simple_actions(scalar_states[env_idx][0]["observation"], 2)
+            actions.append(action)
+            scalar_states[env_idx] = env.step(action)
+        results = vec.step_subset(list(range(num_envs)), actions)
+        for env_idx in range(num_envs):
+            vec_states[env_idx] = results[env_idx][0]
+            _assert_obs_close(
+                vec_states[env_idx][0]["observation"],
+                scalar_states[env_idx][0]["observation"],
+            )
+            assert results[env_idx][1] == scalar[env_idx].done
+
+
+def test_numpy_vec_env_matches_scalar_subset_stepping():
+    scalar = [
+        NumpyOrbitWarsEnv(
+            num_players=2,
+            episode_steps=80,
+            ship_speed=6.0,
+            random_seed=i,
+        )
+        for i in range(3)
+    ]
+    scalar_states = [env.reset() for env in scalar]
+    vec = NumpyVecEnv(
+        num_envs=3,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    vec_states = vec.reset()
+
+    active = [0, 2]
+    actions = []
+    for env_idx in active:
+        action = _simple_actions(scalar_states[env_idx][0]["observation"], 2)
+        actions.append(action)
+        scalar_states[env_idx] = scalar[env_idx].step(action)
+    results = vec.step_subset(active, actions)
+    for env_idx in active:
+        vec_states[env_idx] = results[env_idx][0]
+        _assert_obs_close(
+            vec_states[env_idx][0]["observation"],
+            scalar_states[env_idx][0]["observation"],
+        )
+    assert (
+        vec_states[1][0]["observation"]["step"]
+        == scalar_states[1][0]["observation"]["step"]
+        == 0
+    )
+
+    all_actions = []
+    for env_idx, env in enumerate(scalar):
+        action = _simple_actions(scalar_states[env_idx][0]["observation"], 2)
+        all_actions.append(action)
+        scalar_states[env_idx] = env.step(action)
+    results = vec.step_subset([0, 1, 2], all_actions)
+    for env_idx in range(3):
+        vec_states[env_idx] = results[env_idx][0]
+        _assert_obs_close(
+            vec_states[env_idx][0]["observation"],
+            scalar_states[env_idx][0]["observation"],
+        )
+
+
+def test_numpy_vec_env_matches_scalar_4p_noops():
+    scalar = [
+        NumpyOrbitWarsEnv(
+            num_players=4,
+            episode_steps=60,
+            ship_speed=6.0,
+            random_seed=i,
+        )
+        for i in range(2)
+    ]
+    scalar_states = [env.reset() for env in scalar]
+    vec = NumpyVecEnv(
+        num_envs=2,
+        num_players=4,
+        episode_steps=60,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    vec_states = vec.reset()
+    for _ in range(20):
+        actions = [[[], [], [], []] for _ in scalar]
+        for env_idx, env in enumerate(scalar):
+            scalar_states[env_idx] = env.step(actions[env_idx])
+        results = vec.step_subset([0, 1], actions)
+        for env_idx in range(2):
+            vec_states[env_idx] = results[env_idx][0]
+            _assert_obs_close(
+                vec_states[env_idx][0]["observation"],
+                scalar_states[env_idx][0]["observation"],
+            )
