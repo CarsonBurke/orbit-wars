@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -31,10 +32,10 @@ import torch
 from ..game import (
     BOARD_SIZE,
     CENTER,
-    Fleet,
     MAX_SHIP_SPEED,
-    Planet,
     ROTATION_RADIUS_LIMIT,
+    Fleet,
+    Planet,
 )
 from ..game.observation import Observation
 from ..game.physics import fleet_speed
@@ -202,6 +203,161 @@ def _comet_motion_by_id(o: Observation) -> dict[int, tuple[float, float] | None]
     return out
 
 
+def _get_raw(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _comet_motion_by_id_raw(o: Any) -> dict[int, tuple[float, float] | None]:
+    out: dict[int, tuple[float, float] | None] = {
+        int(pid): None for pid in (_get_raw(o, "comet_planet_ids", []) or [])
+    }
+    for group in _get_raw(o, "comets", []) or []:
+        ids = group.get("planet_ids") or []
+        paths = group.get("paths") or []
+        idx = group.get("path_index", 0)
+        for k, pid in enumerate(ids):
+            if k >= len(paths):
+                continue
+            path = paths[k]
+            if len(path) == 0 or idx + 1 >= len(path):
+                continue
+            cur = path[idx]
+            nxt = path[idx + 1]
+            try:
+                dx = float(nxt[0]) - float(cur[0])
+                dy = float(nxt[1]) - float(cur[1])
+            except (TypeError, IndexError, ValueError):
+                continue
+            out[int(pid)] = (dx, dy)
+    return out
+
+
+def _infer_num_players_raw(o: Any) -> int:
+    explicit = _get_raw(o, "num_players", None)
+    if explicit is not None:
+        return max(2, int(explicit))
+    candidates: list[int] = []
+    initial_planets = _get_raw(o, "initial_planets", [])
+    if initial_planets is None:
+        initial_planets = []
+    for p in initial_planets:
+        owner = int(p[1])
+        if owner >= 0:
+            candidates.append(owner)
+    if not candidates:
+        planets = _get_raw(o, "planets", [])
+        if planets is None:
+            planets = []
+        for p in planets:
+            owner = int(p[1])
+            if owner >= 0:
+                candidates.append(owner)
+    return max(2, max(candidates) + 1) if candidates else 2
+
+
+def _planet_features_raw(
+    p: Any,
+    player: int,
+    num_players: int,
+    angular_velocity: float,
+    comet_motion_by_id: dict[int, tuple[float, float] | None],
+) -> list[float]:
+    pid = int(p[0])
+    owner = int(p[1])
+    x = float(p[2])
+    y = float(p[3])
+    radius = float(p[4])
+    ships = int(p[5])
+    production = int(p[6])
+    nx = (x - CENTER[0]) / BOARD_SIZE
+    ny = (y - CENTER[1]) / BOARD_SIZE
+    dist_to_sun = math.hypot(x - CENTER[0], y - CENTER[1]) / BOARD_SIZE
+    if pid in comet_motion_by_id:
+        step = comet_motion_by_id[pid]
+        if step is None:
+            cos_h, sin_h, sp, orb_r, om, is_orb, is_com = (
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
+            )
+        else:
+            dx, dy = step
+            n = math.hypot(dx, dy)
+            if n <= 0.0:
+                cos_h, sin_h, sp, orb_r, om, is_orb, is_com = (
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
+                )
+            else:
+                cos_h, sin_h, sp, orb_r, om, is_orb, is_com = (
+                    dx / n, dy / n, min(1.0, n / MAX_SHIP_SPEED), 0.0, 0.0, 0.0, 1.0
+                )
+    else:
+        rx, ry = x - CENTER[0], y - CENTER[1]
+        orbital_radius = math.hypot(rx, ry)
+        is_orbiting = (orbital_radius + radius) < ROTATION_RADIUS_LIMIT
+        if is_orbiting and orbital_radius > 1e-9:
+            vx = -ry * angular_velocity
+            vy = rx * angular_velocity
+            speed = math.hypot(vx, vy)
+            cos_h, sin_h, sp, orb_r, om, is_orb, is_com = (
+                vx / max(speed, 1e-9),
+                vy / max(speed, 1e-9),
+                min(1.0, speed / MAX_SHIP_SPEED),
+                orbital_radius / 50.0,
+                abs(angular_velocity) / MAX_OMEGA,
+                1.0,
+                0.0,
+            )
+        else:
+            cos_h, sin_h, sp, orb_r, om, is_orb, is_com = (
+                0.0, 0.0, 0.0, orbital_radius / 50.0, 0.0, 0.0, 0.0
+            )
+    s, n_, e0, e1, e2 = _owner_onehot(owner, player, num_players)
+    return [
+        nx, ny, dist_to_sun, radius / 5.0,
+        math.log1p(ships) / 8.0, production / 5.0,
+        cos_h, sin_h, sp,
+        orb_r, om,
+        is_orb, is_com,
+        s, n_, e0, e1, e2,
+        1.0,
+    ]
+
+
+def _fleet_features_raw(
+    f: Any,
+    player: int,
+    num_players: int,
+    planet_pos_by_id: dict[int, tuple[float, float]],
+) -> list[float]:
+    owner = int(f[1])
+    x = float(f[2])
+    y = float(f[3])
+    angle = float(f[4])
+    from_planet_id = int(f[5])
+    ships = int(f[6])
+    src = planet_pos_by_id.get(from_planet_id)
+    if src is None:
+        from_nx, from_ny, has_from = 0.0, 0.0, 0.0
+    else:
+        from_nx = (src[0] - CENTER[0]) / BOARD_SIZE
+        from_ny = (src[1] - CENTER[1]) / BOARD_SIZE
+        has_from = 1.0
+    s, n_, e0, e1, e2 = _owner_onehot(owner, player, num_players)
+    sp = min(1.0, fleet_speed(ships) / MAX_SHIP_SPEED)
+    return [
+        (x - CENTER[0]) / BOARD_SIZE,
+        (y - CENTER[1]) / BOARD_SIZE,
+        math.cos(angle),
+        math.sin(angle),
+        math.log1p(ships) / 8.0,
+        from_nx, from_ny, has_from,
+        sp,
+        s, n_, e0, e1, e2,
+        0.0,
+    ]
+
+
 @dataclass
 class EncodedObs:
     planet_feats: torch.Tensor      # [P_max, planet_dim]
@@ -291,6 +447,60 @@ def _fill_encoded_arrays(
         f_mask_r[j] = True
 
 
+def _fill_encoded_arrays_raw(
+    o: Any,
+    p_feats: np.ndarray,
+    p_mask: np.ndarray,
+    p_owned: np.ndarray,
+    p_ids: np.ndarray,
+    p_gar: np.ndarray,
+    f_feats: np.ndarray,
+    f_mask: np.ndarray,
+    row: int | None = None,
+) -> None:
+    if row is None:
+        p_feats_r = p_feats
+        p_mask_r = p_mask
+        p_owned_r = p_owned
+        p_ids_r = p_ids
+        p_gar_r = p_gar
+        f_feats_r = f_feats
+        f_mask_r = f_mask
+    else:
+        p_feats_r = p_feats[row]
+        p_mask_r = p_mask[row]
+        p_owned_r = p_owned[row]
+        p_ids_r = p_ids[row]
+        p_gar_r = p_gar[row]
+        f_feats_r = f_feats[row]
+        f_mask_r = f_mask[row]
+
+    planets = _get_raw(o, "planets", [])
+    fleets = _get_raw(o, "fleets", [])
+    if planets is None:
+        planets = []
+    if fleets is None:
+        fleets = []
+    player = int(_get_raw(o, "player", 0) or 0)
+    angular_velocity = float(_get_raw(o, "angular_velocity", 0.0) or 0.0)
+    comet_motion = _comet_motion_by_id_raw(o)
+    planet_pos = {int(p[0]): (float(p[2]), float(p[3])) for p in planets}
+    num_players = _infer_num_players_raw(o)
+
+    for i, p in enumerate(planets[:MAX_PLANETS]):
+        p_feats_r[i] = _planet_features_raw(
+            p, player, num_players, angular_velocity, comet_motion
+        )
+        p_mask_r[i] = True
+        p_owned_r[i] = int(p[1]) == player
+        p_ids_r[i] = int(p[0])
+        p_gar_r[i] = int(p[5])
+
+    for j, f in enumerate(fleets[:MAX_FLEETS]):
+        f_feats_r[j] = _fleet_features_raw(f, player, num_players, planet_pos)
+        f_mask_r[j] = True
+
+
 def _tensor_from_numpy(
     array: np.ndarray,
     device: str | torch.device,
@@ -355,6 +565,43 @@ def encode_observations(
 
     for row, o in enumerate(observations):
         _fill_encoded_arrays(
+            o, p_feats, p_mask, p_owned, p_ids, p_gar, f_feats, f_mask, row=row
+        )
+
+    return EncodedObs(
+        planet_feats=_tensor_from_numpy(p_feats, device, pin_memory=pin_memory),
+        planet_mask=_tensor_from_numpy(p_mask, device, pin_memory=pin_memory),
+        planet_owned_mask=_tensor_from_numpy(p_owned, device, pin_memory=pin_memory),
+        planet_ids=_tensor_from_numpy(p_ids, device, pin_memory=pin_memory),
+        planet_garrison=_tensor_from_numpy(p_gar, device, pin_memory=pin_memory),
+        fleet_feats=_tensor_from_numpy(f_feats, device, pin_memory=pin_memory),
+        fleet_mask=_tensor_from_numpy(f_mask, device, pin_memory=pin_memory),
+    )
+
+
+def encode_raw_observations(
+    observations: list[Any],
+    device: str | torch.device = "cpu",
+    *,
+    pin_memory: bool = False,
+) -> EncodedObs:
+    """Encode Kaggle-style observation dicts directly.
+
+    This is the rollout hot path. It avoids constructing `Observation`,
+    `Planet`, and `Fleet` Python objects for every alive seat at every env
+    tick while preserving the exact tensor contract of `encode_observations`.
+    """
+    b = len(observations)
+    p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
+    p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
+    p_owned = np.zeros((b, MAX_PLANETS), dtype=bool)
+    p_ids = -np.ones((b, MAX_PLANETS), dtype=np.int64)
+    p_gar = np.zeros((b, MAX_PLANETS), dtype=np.float32)
+    f_feats = np.zeros((b, MAX_FLEETS, FLEET_FEAT_DIM), dtype=np.float32)
+    f_mask = np.zeros((b, MAX_FLEETS), dtype=bool)
+
+    for row, o in enumerate(observations):
+        _fill_encoded_arrays_raw(
             o, p_feats, p_mask, p_owned, p_ids, p_gar, f_feats, f_mask, row=row
         )
 

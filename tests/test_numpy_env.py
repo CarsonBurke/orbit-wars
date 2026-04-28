@@ -4,7 +4,14 @@ import math
 from typing import Any
 
 import numpy as np
+import torch
 
+from owars.policies.features import encode_raw_observations
+from owars.policies.model import PolicyOutput
+from owars.policies.sampling import (
+    sample_batch_actions_context,
+    sample_batch_actions_raw,
+)
 from owars.training.numpy_env import NumpyOrbitWarsEnv, NumpyVecEnv
 
 
@@ -158,6 +165,85 @@ def test_numpy_vec_env_uses_vecenv_subset_protocol():
     assert sorted(results) == [0, 2]
     assert results[0][0][0]["observation"]["step"] == 1
     assert results[2][0][0]["observation"]["step"] == 1
+
+
+def test_numpy_vec_fast_policy_batch_matches_raw_observations():
+    vec = NumpyVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    states = vec.reset()
+    states[0] = vec.step_subset([0], [[[], []]])[0][0]
+    raw = [states[0][0]["observation"], states[0][1]["observation"]]
+
+    fast, contexts = vec.policy_batch([(0, 0), (0, 1)], device="cpu")
+    expected = encode_raw_observations(raw, device="cpu")
+
+    assert torch.allclose(fast.planet_feats, expected.planet_feats)
+    assert torch.equal(fast.planet_mask, expected.planet_mask)
+    assert torch.equal(fast.planet_owned_mask, expected.planet_owned_mask)
+    assert torch.equal(fast.planet_ids, expected.planet_ids)
+    assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
+    assert torch.equal(fast.fleet_mask, expected.fleet_mask)
+    assert len(contexts) == 2
+
+    b, p = fast.planet_ids.shape
+    logits = torch.full((b, p, p + 1), -100.0)
+    logits[:, :, p] = 0.0
+    logits[:, 0, :] = -100.0
+    logits[:, 0, 1] = 100.0
+    out = PolicyOutput(
+        target_logits=logits,
+        fraction_alpha=torch.full((b, p), 20.0),
+        fraction_beta=torch.ones((b, p)),
+        value=torch.zeros(b),
+        value_logits=torch.zeros(b, 51),
+        planet_owned_mask=fast.planet_owned_mask,
+        planet_mask=fast.planet_mask,
+        planet_ids=fast.planet_ids,
+    )
+    assert sample_batch_actions_context(out, contexts, deterministic=True) == (
+        sample_batch_actions_raw(out, raw, deterministic=True)
+    )
+
+
+def test_numpy_vec_fast_step_matches_materialized_step():
+    normal = NumpyVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    fast = NumpyVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    normal_states = normal.reset()
+    fast.reset()
+
+    for _ in range(10):
+        actions = [
+            _simple_actions(normal_states[env_idx][0]["observation"], 2)
+            for env_idx in range(2)
+        ]
+        normal_results = normal.step_subset([0, 1], actions)
+        fast_results = fast.step_subset_fast([0, 1], actions)
+        for env_idx in range(2):
+            normal_states[env_idx] = normal_results[env_idx][0]
+            assert fast_results[env_idx][0] is None or fast_results[env_idx][1]
+            for seat in range(2):
+                _assert_obs_close(
+                    fast.observation(env_idx, seat),
+                    normal_states[env_idx][seat]["observation"],
+                )
+            assert fast_results[env_idx][1] == normal_results[env_idx][1]
 
 
 def test_numpy_vec_env_matches_scalar_fallback_with_launches():

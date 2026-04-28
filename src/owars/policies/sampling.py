@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch.distributions import Beta
@@ -84,6 +85,14 @@ class SampleRecord:
     target_logits: torch.Tensor       # [P, P+1] — old-policy categorical logits (PMPO KL input)
     fraction_alpha: torch.Tensor      # [P] — old-policy Beta α (post soft-cap)
     fraction_beta: torch.Tensor       # [P] — old-policy Beta β (post soft-cap)
+
+
+@dataclass(slots=True)
+class ActionContext:
+    """Fast action builder context backed by simulator planet rows."""
+
+    planets: Any
+    angular_velocity: float
 
 
 def _lead_angle(
@@ -265,6 +274,108 @@ def _build_moves_from_packed_fields(
             break
 
     return moves
+
+
+def _build_action_lists_from_packed_fields_raw(
+    fields_l: list[list[float]],
+    obs: Any,
+    max_moves: int,
+) -> list[list]:
+    planets = obs.get("planets", []) if isinstance(obs, dict) else getattr(obs, "planets", [])
+    by_id = {int(p[0]): p for p in planets}
+    omega = float(
+        (obs.get("angular_velocity", 0.0) if isinstance(obs, dict) else getattr(obs, "angular_velocity", 0.0))
+        or 0.0
+    )
+    actions: list[list] = []
+    p = len(fields_l)
+    for i, fields in enumerate(fields_l):
+        ti = int(fields[0])
+        if fields[2] < 0.5 or fields[3] < 0.5:
+            continue
+        if ti == p or ti == i:
+            continue
+        target_id = int(fields_l[ti][4]) if 0 <= ti < p else -1
+        if target_id < 0:
+            continue
+        mine = by_id.get(int(fields[4]))
+        target = by_id.get(target_id)
+        if mine is None or target is None:
+            continue
+        mine_ships = int(mine[5])
+        if mine_ships < 2:
+            continue
+
+        frac = max(0.0, min(1.0, float(fields[1])))
+        send = max(1, min(mine_ships - 1, int(round(mine_ships * frac))))
+        if send <= 0:
+            continue
+
+        ang = _lead_angle(
+            float(mine[2]),
+            float(mine[3]),
+            float(target[2]),
+            float(target[3]),
+            float(target[4]),
+            omega,
+            send,
+        )
+        if ang is None:
+            continue
+        actions.append([int(mine[0]), float(ang), int(send)])
+        if len(actions) >= max_moves:
+            break
+
+    return actions
+
+
+def _build_action_lists_from_packed_fields_context(
+    fields_l: list[list[float]],
+    context: ActionContext,
+    max_moves: int,
+) -> list[list]:
+    by_id = {int(p[0]): p for p in context.planets}
+    omega = float(context.angular_velocity)
+    actions: list[list] = []
+    p = len(fields_l)
+    for i, fields in enumerate(fields_l):
+        ti = int(fields[0])
+        if fields[2] < 0.5 or fields[3] < 0.5:
+            continue
+        if ti == p or ti == i:
+            continue
+        target_id = int(fields_l[ti][4]) if 0 <= ti < p else -1
+        if target_id < 0:
+            continue
+        mine = by_id.get(int(fields[4]))
+        target = by_id.get(target_id)
+        if mine is None or target is None:
+            continue
+        mine_ships = int(mine[5])
+        if mine_ships < 2:
+            continue
+
+        frac = max(0.0, min(1.0, float(fields[1])))
+        send = max(1, min(mine_ships - 1, int(round(mine_ships * frac))))
+        if send <= 0:
+            continue
+
+        ang = _lead_angle(
+            float(mine[2]),
+            float(mine[3]),
+            float(target[2]),
+            float(target[3]),
+            float(target[4]),
+            omega,
+            send,
+        )
+        if ang is None:
+            continue
+        actions.append([int(mine[0]), float(ang), int(send)])
+        if len(actions) >= max_moves:
+            break
+
+    return actions
 
 
 def _packed_action_fields(
@@ -480,6 +591,88 @@ def sample_batch_with_records(
     return moves_list, records
 
 
+def sample_batch_with_records_raw(
+    out: PolicyOutput,
+    raw_observations: list[Any],
+    deterministic: bool = False,
+    max_moves: int = 16,
+) -> tuple[list[list[list]], list[SampleRecord]]:
+    """Batched sampler that builds Kaggle action lists from raw obs dicts."""
+    target_logits = out.target_logits
+    fraction_alpha = out.fraction_alpha
+    fraction_beta = out.fraction_beta
+    b_dim, p, _ = target_logits.shape
+    assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
+
+    target_idx, frac, log_prob = _sample_distributions(
+        target_logits, fraction_alpha, fraction_beta, p, deterministic
+    )
+    fields_l = _packed_action_fields(
+        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+
+    actions_list: list[list[list]] = []
+    records: list[SampleRecord] = []
+    for k in range(b_dim):
+        actions_list.append(
+            _build_action_lists_from_packed_fields_raw(
+                fields_l[k], raw_observations[k], max_moves
+            )
+        )
+        records.append(
+            SampleRecord(
+                target_idx=target_idx[k],
+                fraction=frac[k],
+                log_prob=log_prob[k],
+                target_logits=target_logits[k],
+                fraction_alpha=fraction_alpha[k],
+                fraction_beta=fraction_beta[k],
+            )
+        )
+    return actions_list, records
+
+
+def sample_batch_with_records_context(
+    out: PolicyOutput,
+    contexts: list[ActionContext],
+    deterministic: bool = False,
+    max_moves: int = 16,
+) -> tuple[list[list[list]], list[SampleRecord]]:
+    """Batched sampler that builds action lists from fast env contexts."""
+    target_logits = out.target_logits
+    fraction_alpha = out.fraction_alpha
+    fraction_beta = out.fraction_beta
+    b_dim, p, _ = target_logits.shape
+    assert len(contexts) == b_dim, (len(contexts), b_dim)
+
+    target_idx, frac, log_prob = _sample_distributions(
+        target_logits, fraction_alpha, fraction_beta, p, deterministic
+    )
+    fields_l = _packed_action_fields(
+        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+
+    actions_list: list[list[list]] = []
+    records: list[SampleRecord] = []
+    for k in range(b_dim):
+        actions_list.append(
+            _build_action_lists_from_packed_fields_context(
+                fields_l[k], contexts[k], max_moves
+            )
+        )
+        records.append(
+            SampleRecord(
+                target_idx=target_idx[k],
+                fraction=frac[k],
+                log_prob=log_prob[k],
+                target_logits=target_logits[k],
+                fraction_alpha=fraction_alpha[k],
+                fraction_beta=fraction_beta[k],
+            )
+        )
+    return actions_list, records
+
+
 def sample_batch_actions(
     out: PolicyOutput,
     parsed_list: list[Observation],
@@ -508,5 +701,71 @@ def sample_batch_actions(
 
     return [
         _build_moves_from_packed_fields(fields_l[k], parsed_list[k], max_moves)
+        for k in range(b_dim)
+    ]
+
+
+def sample_batch_actions_raw(
+    out: PolicyOutput,
+    raw_observations: list[Any],
+    deterministic: bool = True,
+    max_moves: int = 16,
+) -> list[list[list]]:
+    """Batched moves-only sampler for raw Kaggle-style observations."""
+    target_logits = out.target_logits
+    fraction_alpha = out.fraction_alpha
+    fraction_beta = out.fraction_beta
+    b_dim, p, _ = target_logits.shape
+    assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
+
+    if deterministic:
+        target_idx = target_logits.argmax(dim=-1)
+        frac = fraction_alpha / (fraction_alpha + fraction_beta)
+    else:
+        target_dist = torch.distributions.Categorical(logits=target_logits)
+        target_idx = target_dist.sample()
+        frac = Beta(fraction_alpha, fraction_beta).sample()
+    frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+
+    fields_l = _packed_action_fields(
+        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+    return [
+        _build_action_lists_from_packed_fields_raw(
+            fields_l[k], raw_observations[k], max_moves
+        )
+        for k in range(b_dim)
+    ]
+
+
+def sample_batch_actions_context(
+    out: PolicyOutput,
+    contexts: list[ActionContext],
+    deterministic: bool = True,
+    max_moves: int = 16,
+) -> list[list[list]]:
+    """Batched moves-only sampler for fast env action contexts."""
+    target_logits = out.target_logits
+    fraction_alpha = out.fraction_alpha
+    fraction_beta = out.fraction_beta
+    b_dim, p, _ = target_logits.shape
+    assert len(contexts) == b_dim, (len(contexts), b_dim)
+
+    if deterministic:
+        target_idx = target_logits.argmax(dim=-1)
+        frac = fraction_alpha / (fraction_alpha + fraction_beta)
+    else:
+        target_dist = torch.distributions.Categorical(logits=target_logits)
+        target_idx = target_dist.sample()
+        frac = Beta(fraction_alpha, fraction_beta).sample()
+    frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+
+    fields_l = _packed_action_fields(
+        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+    return [
+        _build_action_lists_from_packed_fields_context(
+            fields_l[k], contexts[k], max_moves
+        )
         for k in range(b_dim)
     ]

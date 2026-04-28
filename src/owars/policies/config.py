@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 
 @dataclass
@@ -17,6 +18,10 @@ class OrbitPolicyConfig:
     depth: int = 3
     n_heads: int = 4
     dropout: float = 0.0
+    # Encoder dispatch. `dense` is the CUDA rollout default because PyTorch's
+    # nested-jagged subclass overhead dominates at our small rollout batch sizes.
+    # `nested` is retained for A/B benchmarks and larger-token experiments.
+    encoder_backend: Literal["dense", "nested"] = "dense"
 
     # Action factorization. For each owned planet we emit:
     #   - logits over (target_planet | no-op)

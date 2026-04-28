@@ -195,6 +195,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         depth=cfg.model.depth,
         n_heads=cfg.model.n_heads,
         dropout=cfg.model.dropout,
+        encoder_backend=cfg.model.encoder_backend,
         value_hidden=cfg.model.value_hidden,
         value_num_bins=cfg.model.value_num_bins,
         value_min=cfg.model.value_min,
@@ -440,7 +441,11 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             torch.set_num_interop_threads(max(1, cfg.run.torch_num_threads))
         except RuntimeError:
             pass
-    device = torch.device(cfg.run.device if torch.cuda.is_available() else "cpu")
+    if cfg.run.device != "cuda":
+        raise ValueError("training is CUDA-only; set run.device: cuda")
+    if not torch.cuda.is_available():
+        raise RuntimeError("training requires CUDA")
+    device = torch.device("cuda")
     # parameter-golf `sota_train_gpt.py:465` pins SDPA to flash-only. We
     # *do not* — the nested-jagged SDPA dispatcher (`torch/nested/_internal/
     # sdpa.py`) only has flash and math jagged kernels; mem_efficient and
@@ -538,18 +543,10 @@ def _ppo_loop(
     init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
     pool.add_snapshot("init", model, init_ckpt)
 
-    # Compile *only* the PPO-update forward+backward path. The minibatch
-    # shape there is fixed at `[minibatch_size, MAX_PLANETS, ...]` and gets
-    # called epochs × ⌈n/mb⌉ times per update (~32×200 invocations on the
-    # default config) — one-time inductor cost amortizes cleanly. We keep
-    # the *rollout* using the raw `model` because its bucket size varies
-    # per env-step (envs finish on different steps), which would force
-    # recompiles. Same module, same parameters — only the forward dispatch
-    # differs. Snapshotting (deepcopy) and `_value_pretrain_params` also
-    # operate on the raw module.
+    # Keep PPO eager for now. The dense encoder is fast enough that the
+    # current bottleneck is rollout stepping, and torch.compile backward has
+    # produced invalid gradients on the policy's summary-token parameters.
     train_model: OrbitPolicy = model
-    if device.type == "cuda":
-        train_model = torch.compile(model)  # type: ignore[assignment]
 
     # One rendered game per update lands here (env 0 is the recording
     # worker; see VecEnv(replay_env_idx=0) above). Pretrain disabled

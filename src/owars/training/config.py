@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -27,6 +27,7 @@ class ModelCfg:
     depth: int = 3
     n_heads: int = 4
     dropout: float = 0.0
+    encoder_backend: Literal["dense", "nested"] = "dense"
     value_hidden: int = 64
     value_num_bins: int = 51
     value_min: float = -2.0

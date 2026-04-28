@@ -2,6 +2,7 @@ import torch
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
+from owars.policies.model import restore_fp32_params
 
 
 def _obs():
@@ -96,3 +97,57 @@ def test_sample_actions_returns_legal_moves():
     for m in moves:
         assert m.from_planet_id in owned_ids
         assert 1 <= m.num_ships < 50  # less than current garrison
+
+
+def test_dense_cuda_encoder_matches_nested_valid_outputs():
+    if not torch.cuda.is_available():
+        return
+    dense_cfg = OrbitPolicyConfig(
+        dim=32, ff_dim=64, depth=2, n_heads=2, encoder_backend="dense"
+    )
+    nested_cfg = OrbitPolicyConfig(
+        dim=32, ff_dim=64, depth=2, n_heads=2, encoder_backend="nested"
+    )
+    dense = OrbitPolicy(dense_cfg).cuda().eval()
+    nested = OrbitPolicy(nested_cfg).cuda().eval()
+    nested.load_state_dict(dense.state_dict())
+    dense.bfloat16()
+    nested.bfloat16()
+    restore_fp32_params(dense)
+    restore_fp32_params(nested)
+
+    obs = parse_observation(_obs())
+    feats = encode_observation(obs, device="cuda")
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        dense_out = dense(feats)
+        nested_out = nested(feats)
+
+    valid_rows = dense_out.planet_mask
+    valid_targets = torch.cat(
+        [
+            dense_out.planet_mask,
+            torch.ones(
+                dense_out.planet_mask.shape[0],
+                1,
+                dtype=torch.bool,
+                device=dense_out.planet_mask.device,
+            ),
+        ],
+        dim=1,
+    )
+    assert torch.allclose(dense_out.value, nested_out.value, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(
+        dense_out.fraction_alpha[valid_rows],
+        nested_out.fraction_alpha[valid_rows],
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    assert torch.allclose(
+        dense_out.fraction_beta[valid_rows],
+        nested_out.fraction_beta[valid_rows],
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    dense_logits = dense_out.target_logits[valid_rows][:, valid_targets.squeeze(0)]
+    nested_logits = nested_out.target_logits[valid_rows][:, valid_targets.squeeze(0)]
+    assert torch.allclose(dense_logits, nested_logits, atol=2e-2, rtol=2e-2)

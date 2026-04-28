@@ -341,10 +341,13 @@ class TransformerBlock(nn.Module):
         mix = self.resid_mix.to(dt)
         x_in = mix[0] * x + mix[1] * x0
         a = self.attn(self.ln1(x_in) * self.ln_scale_factor, valid_mask)
-        x = x_in + self.attn_scale.to(dt) * self.drop(a)
-        x = x + self.ff_scale.to(dt) * self.drop(
-            self.ff(self.ln2(x) * self.ln_scale_factor)
-        )
+        if self.drop.p:
+            a = self.drop(a)
+        x = x_in + self.attn_scale.to(dt) * a
+        ff = self.ff(self.ln2(x) * self.ln_scale_factor)
+        if self.drop.p:
+            ff = self.drop(ff)
+        x = x + self.ff_scale.to(dt) * ff
         return x
 
 
@@ -474,6 +477,8 @@ class PolicyOutput:
 class OrbitPolicy(nn.Module):
     def __init__(self, cfg: OrbitPolicyConfig):
         super().__init__()
+        if cfg.encoder_backend not in {"dense", "nested"}:
+            raise ValueError(f"unknown encoder_backend: {cfg.encoder_backend!r}")
         self.cfg = cfg
         self.planet_embed = CastedLinear(cfg.planet_features, cfg.dim)
         self.fleet_embed = CastedLinear(cfg.fleet_features, cfg.dim)
@@ -603,27 +608,9 @@ class OrbitPolicy(nn.Module):
             persistent=False,
         )
 
-    @torch.compiler.disable
-    def encode(
+    def _embed_tokens(
         self, feats: EncodedObs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the transformer over [actor, critic, planets..., fleets...].
-
-        Returns `(planet_h, fleet_h, h_actor, h_critic, token_mask)` where
-        `token_mask` is the planets+fleets mask (excludes the two summary
-        tokens, which are always real and only consumed via the dedicated
-        `h_actor` / `h_critic` slices).
-
-        Decorated `@torch.compiler.disable` because the body uses
-        `torch.nested.nested_tensor_from_jagged` to pack variable-length
-        sets for FA-2 dispatch (no `attn_mask`, no padding waste). AOT
-        autograd's tangent metadata accounting for the jagged subclass
-        breaks during backward under `torch.compile` (raises
-        `AssertionError: expected len(meta.attrs) == len(runtime_subclass_keys)`).
-        Disabling compile here lets the encoder run eager-with-FA-2 while
-        the action heads / value head (fixed `[B, P, D]` shapes) still
-        compile cleanly.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
         # Promote to batch dim if not already.
         if feats.planet_feats.dim() == 2:
             planet_feats = feats.planet_feats.unsqueeze(0)
@@ -641,9 +628,17 @@ class OrbitPolicy(nn.Module):
 
         h_p = self.planet_embed(planet_feats)
         h_f = self.fleet_embed(fleet_feats)
-        # Prepend the two summary tokens, broadcast to batch dim.
-        actor_t = self.actor_token.expand(b, -1, -1)
-        critic_t = self.critic_token.expand(b, -1, -1)
+        # Prepend the two summary tokens, broadcast to batch dim. We use
+        # `.repeat(b, 1, 1)` (real allocation) instead of `.expand(b, -1, -1)`
+        # (strided view) because `torch.compile`'s AOT autograd reduces the
+        # gradient of an `.expand()`-broadcast `nn.Parameter` to the broadcast
+        # output shape `[d]` instead of summing back to the parameter's
+        # `[1, 1, d]` shape, raising "got [128] but expected shape compatible
+        # with [1, 1, 128]" at backward. `.repeat` materializes the broadcast
+        # so the gradient summation is unambiguous. Cost is trivial — both
+        # tokens are 128 floats.
+        actor_t = self.actor_token.repeat(b, 1, 1)
+        critic_t = self.critic_token.repeat(b, 1, 1)
         h = torch.cat([actor_t, critic_t, h_p, h_f], dim=1)
         # Normalize the residual-stream entry point. embed_norm runs on
         # padded `[B, T, D]` since LN is per-token — padded positions are
@@ -651,39 +646,62 @@ class OrbitPolicy(nn.Module):
         h = self.embed_norm(h)
         summary_mask = torch.ones(b, 2, dtype=torch.bool, device=planet_mask.device)
         full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
-        if h.device.type == "cpu":
-            # Nested-jagged dispatch is much slower than dense masked SDPA on
-            # CPU. Keep nested for CUDA, where it unlocks the flash path.
-            # On CPU, pack each batch row to the maximum real token count in
-            # the batch, run dense masked attention there, then scatter back
-            # to the canonical padded layout expected by the action heads.
-            t = full_mask.shape[1]
-            lengths = full_mask.sum(dim=-1)
-            max_len = int(lengths.max().item())
-            positions = torch.arange(t, device=h.device).expand(b, t)
-            positions = positions.masked_fill(~full_mask, t)
-            packed_pos = positions.sort(dim=1).values[:, :max_len]
-            packed_mask = packed_pos != t
-            safe_pos = packed_pos.clamp(max=t - 1)
-            gather_idx = safe_pos.unsqueeze(-1).expand(-1, -1, h.shape[-1])
-            h_packed = h.gather(1, gather_idx)
-            x0 = h_packed
-            for layer in self.layers:
-                h_packed = layer(h_packed, x0, packed_mask)
-            h_packed = self.final_norm(h_packed)
-            h = torch.zeros_like(h)
-            h.scatter_(1, gather_idx, h_packed * packed_mask.unsqueeze(-1))
-            h_actor = h[:, 0]
-            h_critic = h[:, 1]
-            planet_h = h[:, 2 : 2 + p]
-            fleet_h = h[:, 2 + p : 2 + p + f]
-            token_mask = torch.cat([planet_mask, fleet_mask], dim=1)
-            return planet_h, fleet_h, h_actor, h_critic, token_mask
+        return h, full_mask, planet_mask, fleet_mask, p, f
 
-        # Pack only the *valid* tokens into a nested-jagged tensor. This is
-        # the path that lets SDPA dispatch to real FA-2 (no attn_mask). The
-        # two summary tokens are always valid.
+    def _split_encoded(
+        self,
+        h: torch.Tensor,
+        planet_mask: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        p: int,
+        f: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        h_actor = h[:, 0]                   # [B, d]
+        h_critic = h[:, 1]                  # [B, d]
+        planet_h = h[:, 2 : 2 + p]          # [B, P, d]
+        fleet_h = h[:, 2 + p : 2 + p + f]   # [B, F, d]
+        token_mask = torch.cat([planet_mask, fleet_mask], dim=1)
+        return planet_h, fleet_h, h_actor, h_critic, token_mask
+
+    def _encode_dense(
+        self,
+        h: torch.Tensor,
+        full_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        p: int,
+        f: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Graphable padded encoder.
+
+        This is the default CUDA path. It intentionally spends a little extra
+        attention work on padded slots to avoid NestedTensor Python subclass
+        dispatch and jagged pack/unpack overhead.
+        """
+        x0 = h
+        for layer in self.layers:
+            h = layer(h, x0, full_mask)
+        h = self.final_norm(h)
+        return self._split_encoded(h, planet_mask, fleet_mask, p, f)
+
+    @torch.compiler.disable
+    def _encode_nested(
+        self,
+        h: torch.Tensor,
+        full_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        p: int,
+        f: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Nested-jagged encoder retained for A/B benchmarks.
+
+        This can dispatch SDPA to flash on valid packed tokens, but the PyTorch
+        NestedTensor subclass overhead is slower than dense masked attention in
+        our rollout profiles.
+        """
         lengths = full_mask.sum(dim=-1)  # [B]
+        b = int(lengths.shape[0])
         offsets = torch.zeros(b + 1, dtype=torch.int64, device=h.device)
         offsets[1:] = lengths.cumsum(0)
         # Boolean indexing flattens valid tokens row-major across the batch.
@@ -699,13 +717,22 @@ class OrbitPolicy(nn.Module):
         out_values = h_nt.values()  # [total_valid, D]
         h = torch.zeros_like(h)
         h[full_mask] = out_values
-        h_actor = h[:, 0]                 # [B, d]
-        h_critic = h[:, 1]                # [B, d]
-        planet_h = h[:, 2 : 2 + p]        # [B, P, d]
-        fleet_h = h[:, 2 + p : 2 + p + f]  # [B, F, d]
-        # Caller-facing mask is planets+fleets only.
-        token_mask = torch.cat([planet_mask, fleet_mask], dim=1)
-        return planet_h, fleet_h, h_actor, h_critic, token_mask
+        return self._split_encoded(h, planet_mask, fleet_mask, p, f)
+
+    def encode(
+        self, feats: EncodedObs
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the transformer over [actor, critic, planets..., fleets...].
+
+        Returns `(planet_h, fleet_h, h_actor, h_critic, token_mask)` where
+        `token_mask` is the planets+fleets mask. Dense padded CUDA is the
+        default because rollout profiling showed NestedTensor dispatch, not
+        attention compute, dominating model latency.
+        """
+        h, full_mask, planet_mask, fleet_mask, p, f = self._embed_tokens(feats)
+        if self.cfg.encoder_backend == "nested":
+            return self._encode_nested(h, full_mask, planet_mask, fleet_mask, p, f)
+        return self._encode_dense(h, full_mask, planet_mask, fleet_mask, p, f)
 
     def forward(self, feats: EncodedObs) -> PolicyOutput:
         planet_h, _fleet_h, h_actor, h_critic, _token_mask = self.encode(feats)

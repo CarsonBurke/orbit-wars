@@ -16,6 +16,18 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import torch
+
+from ..game import MAX_SHIP_SPEED
+from ..policies.features import (
+    FLEET_FEAT_DIM,
+    MAX_FLEETS,
+    MAX_OMEGA,
+    MAX_PLANETS,
+    PLANET_FEAT_DIM,
+    EncodedObs,
+)
+from ..policies.sampling import ActionContext
 
 BOARD_SIZE = 100.0
 CENTER = 50.0
@@ -144,6 +156,39 @@ def _fleet_row_to_list(row: np.ndarray) -> list[Any]:
         int(row[F_FROM]),
         int(row[F_SHIPS]),
     ]
+
+
+def _tensor_from_numpy(
+    array: np.ndarray,
+    device: str | torch.device,
+    *,
+    pin_memory: bool,
+) -> torch.Tensor:
+    tensor = torch.from_numpy(array)
+    target = torch.device(device)
+    if pin_memory and target.type == "cuda":
+        return tensor.pin_memory().to(target, non_blocking=True)
+    return tensor.to(target)
+
+
+def _fill_owner_features(
+    out: np.ndarray,
+    owner: np.ndarray,
+    player: int,
+    num_players: int,
+) -> None:
+    out[:, 0] = owner == player
+    out[:, 1] = owner == -1
+    enemy = (owner != player) & (owner != -1)
+    if not np.any(enemy):
+        return
+    diff = (owner[enemy].astype(np.int64) - int(player)) % max(2, int(num_players))
+    slots = diff - 1
+    enemy_rows = np.nonzero(enemy)[0]
+    for slot in range(3):
+        rows = enemy_rows[slots == slot]
+        if len(rows):
+            out[rows, 2 + slot] = 1.0
 
 
 class NumpyOrbitWarsEnv:
@@ -908,6 +953,8 @@ class NumpyVecEnv:
     arrays so active rollouts do not bounce through scalar env objects.
     """
 
+    fast_rollout = True
+
     def __init__(
         self,
         num_envs: int,
@@ -952,6 +999,8 @@ class NumpyVecEnv:
         self.angular_velocity = np.zeros(num_envs, dtype=np.float64)
         self.next_fleet_id = np.zeros(num_envs, dtype=np.int64)
         self.last_states: list[list[dict[str, Any]]] = []
+        self._planet_slot_cache: list[dict[int, int] | None] = [None] * num_envs
+        self._initial_planet_slot_cache: list[dict[int, int] | None] = [None] * num_envs
 
     def reset(self) -> list[list[dict[str, Any]]]:
         self.last_replay_html = None
@@ -967,6 +1016,8 @@ class NumpyVecEnv:
         self.step_count.fill(0)
         self.angular_velocity.fill(0.0)
         self.next_fleet_id.fill(0)
+        self._planet_slot_cache = [None] * self.num_envs
+        self._initial_planet_slot_cache = [None] * self.num_envs
         for i, env in enumerate(self.envs):
             self._store_env(i, env)
         self.last_states = states
@@ -975,23 +1026,49 @@ class NumpyVecEnv:
     def step_subset(
         self, indices: list[int], actions: list[Any]
     ) -> dict[int, tuple[list[dict[str, Any]], bool, list[SimpleNamespace] | None]]:
+        return self._step_subset_impl(indices, actions, materialize_state=True)
+
+    def step_subset_fast(
+        self, indices: list[int], actions: list[Any]
+    ) -> dict[int, tuple[list[dict[str, Any]] | None, bool, list[SimpleNamespace] | None]]:
+        """Step without materializing non-terminal Kaggle state dicts."""
+        return self._step_subset_impl(indices, actions, materialize_state=False)
+
+    def _step_subset_impl(
+        self,
+        indices: list[int],
+        actions: list[Any],
+        *,
+        materialize_state: bool,
+    ) -> dict[int, tuple[list[dict[str, Any]] | None, bool, list[SimpleNamespace] | None]]:
         assert len(indices) == len(actions), (len(indices), len(actions))
-        out: dict[int, tuple[list[dict[str, Any]], bool, list[SimpleNamespace] | None]] = {}
+        out: dict[
+            int, tuple[list[dict[str, Any]] | None, bool, list[SimpleNamespace] | None]
+        ] = {}
         active: list[int] = []
         active_actions: dict[int, list[Any]] = {}
         for idx, action in zip(indices, actions, strict=True):
+            normalized = self._normalize_actions(action)
             if self.done[idx]:
-                state = self.last_states[idx]
+                state = (
+                    self.last_states[idx]
+                    if idx < len(self.last_states) and self.last_states[idx]
+                    else self._state(idx, normalized)
+                )
                 out[idx] = (state, True, self._final_state_from_state(state))
                 continue
-            normalized = self._normalize_actions(action)
             if not self.initialized[idx]:
                 env = self.envs[idx]
                 env.step(normalized)
                 self._store_env(idx, env)
-                state = self._state(idx, normalized)
-                self.last_states[idx] = state
-                out[idx] = (state, bool(self.done[idx]), None)
+                state = self._state(idx, normalized) if materialize_state else None
+                final = None
+                if self.done[idx]:
+                    state = self._state(idx, normalized)
+                    final = self._final_state_from_state(state)
+                if state is not None:
+                    self.last_states[idx] = state
+                out[idx] = (state, bool(self.done[idx]), final)
                 continue
             self.step_count[idx] += 1
             active.append(idx)
@@ -1006,12 +1083,19 @@ class NumpyVecEnv:
             self._resolve_combat_batch(active, combat_lists)
             self._check_done_batch(active)
             for idx in active:
-                state = self._state(idx, active_actions[idx])
-                self.last_states[idx] = state
+                state = (
+                    self._state(idx, active_actions[idx])
+                    if materialize_state or self.done[idx]
+                    else None
+                )
+                if state is not None:
+                    self.last_states[idx] = state
                 out[idx] = (
                     state,
                     bool(self.done[idx]),
-                    self._final_state_from_state(state) if self.done[idx] else None,
+                    self._final_state_from_state(state)
+                    if self.done[idx] and state is not None
+                    else None,
                 )
         return out
 
@@ -1101,6 +1185,8 @@ class NumpyVecEnv:
         self.step_count[idx] = env._step
         self.angular_velocity[idx] = env.angular_velocity
         self.next_fleet_id[idx] = env.next_fleet_id
+        self._planet_slot_cache[idx] = None
+        self._initial_planet_slot_cache[idx] = None
 
     def _write_env(self, idx: int) -> NumpyOrbitWarsEnv:
         env = self.envs[idx]
@@ -1122,6 +1208,30 @@ class NumpyVecEnv:
         if len(rows):
             self.fleets[idx, : len(rows)] = rows
             self.fleet_mask[idx, : len(rows)] = True
+
+    def _planet_slot_by_id(self, idx: int) -> dict[int, int]:
+        cache = self._planet_slot_cache[idx]
+        if cache is None:
+            slots = np.nonzero(self.planet_mask[idx])[0]
+            ids = self.planets[idx, slots, P_ID].astype(np.int64)
+            cache = {int(pid): int(slot) for pid, slot in zip(ids, slots, strict=False)}
+            self._planet_slot_cache[idx] = cache
+        return cache
+
+    def _initial_planet_slot_by_id(self, idx: int) -> dict[int, int]:
+        cache = self._initial_planet_slot_cache[idx]
+        if cache is None:
+            slots = np.nonzero(self.initial_planet_mask[idx])[0]
+            ids = self.initial_planets[idx, slots, P_ID].astype(np.int64)
+            cache = {int(pid): int(slot) for pid, slot in zip(ids, slots, strict=False)}
+            self._initial_planet_slot_cache[idx] = cache
+        return cache
+
+    def _invalidate_planet_slots(self, idx: int) -> None:
+        self._planet_slot_cache[idx] = None
+
+    def _invalidate_initial_planet_slots(self, idx: int) -> None:
+        self._initial_planet_slot_cache[idx] = None
 
     def _normalize_actions(self, action: Any) -> list[Any]:
         actions = action if isinstance(action, list) else []
@@ -1181,6 +1291,215 @@ class NumpyVecEnv:
         obs["player"] = player
         return obs
 
+    def observation(self, idx: int, player: int) -> dict[str, Any]:
+        """Materialize one player observation for non-learner Python agents."""
+        return self._observation(idx, player, self._observation_base(idx))
+
+    def policy_batch(
+        self,
+        rows: list[tuple[int, int]],
+        *,
+        device: str = "cpu",
+        pin_memory: bool = False,
+    ) -> tuple[EncodedObs, list[ActionContext]]:
+        """Encode policy rows directly from dense simulator arrays."""
+        b = len(rows)
+        p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
+        p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
+        p_owned = np.zeros((b, MAX_PLANETS), dtype=bool)
+        p_ids = -np.ones((b, MAX_PLANETS), dtype=np.int64)
+        p_gar = np.zeros((b, MAX_PLANETS), dtype=np.float32)
+        f_feats = np.zeros((b, MAX_FLEETS, FLEET_FEAT_DIM), dtype=np.float32)
+        f_mask = np.zeros((b, MAX_FLEETS), dtype=bool)
+        contexts: list[ActionContext] = []
+
+        for row, (env_idx, player) in enumerate(rows):
+            planets = self.planets[env_idx, self.planet_mask[env_idx]].copy()
+            fleets = self.fleets[env_idx, self.fleet_mask[env_idx]].copy()
+            env = self.envs[env_idx]
+            self._fill_policy_planet_features(
+                row,
+                int(player),
+                env_idx,
+                planets[:MAX_PLANETS],
+                env,
+                p_feats,
+                p_mask,
+                p_owned,
+                p_ids,
+                p_gar,
+            )
+            self._fill_policy_fleet_features(
+                row,
+                int(player),
+                fleets[:MAX_FLEETS],
+                planets,
+                f_feats,
+                f_mask,
+            )
+            contexts.append(
+                ActionContext(
+                    planets=planets,
+                    angular_velocity=float(self.angular_velocity[env_idx]),
+                )
+            )
+        return (
+            EncodedObs(
+                planet_feats=_tensor_from_numpy(
+                    p_feats, device, pin_memory=pin_memory
+                ),
+                planet_mask=_tensor_from_numpy(p_mask, device, pin_memory=pin_memory),
+                planet_owned_mask=_tensor_from_numpy(
+                    p_owned, device, pin_memory=pin_memory
+                ),
+                planet_ids=_tensor_from_numpy(p_ids, device, pin_memory=pin_memory),
+                planet_garrison=_tensor_from_numpy(
+                    p_gar, device, pin_memory=pin_memory
+                ),
+                fleet_feats=_tensor_from_numpy(
+                    f_feats, device, pin_memory=pin_memory
+                ),
+                fleet_mask=_tensor_from_numpy(f_mask, device, pin_memory=pin_memory),
+            ),
+            contexts,
+        )
+
+    def _fill_policy_planet_features(
+        self,
+        row: int,
+        player: int,
+        env_idx: int,
+        planets: np.ndarray,
+        env: NumpyOrbitWarsEnv,
+        p_feats: np.ndarray,
+        p_mask: np.ndarray,
+        p_owned: np.ndarray,
+        p_ids: np.ndarray,
+        p_gar: np.ndarray,
+    ) -> None:
+        if len(planets) == 0:
+            return
+        n = len(planets)
+        feats = p_feats[row, :n]
+        owner = planets[:, P_OWNER].astype(np.int64)
+        x = planets[:, P_X]
+        y = planets[:, P_Y]
+        radius = planets[:, P_RADIUS]
+        ships = planets[:, P_SHIPS]
+        production = planets[:, P_PROD]
+        rx = x - CENTER
+        ry = y - CENTER
+        orbital_radius = np.hypot(rx, ry)
+        angular_velocity = float(self.angular_velocity[env_idx])
+        is_orbiting = (orbital_radius + radius) < ROTATION_RADIUS_LIMIT
+        moving_orbit = is_orbiting & (orbital_radius > 1e-9)
+        speed = np.zeros(n, dtype=np.float64)
+        if np.any(moving_orbit):
+            speed[moving_orbit] = np.hypot(
+                -ry[moving_orbit] * angular_velocity,
+                rx[moving_orbit] * angular_velocity,
+            )
+
+        feats[:, 0] = rx / BOARD_SIZE
+        feats[:, 1] = ry / BOARD_SIZE
+        feats[:, 2] = orbital_radius / BOARD_SIZE
+        feats[:, 3] = radius / 5.0
+        feats[:, 4] = np.log1p(ships) / 8.0
+        feats[:, 5] = production / 5.0
+        if np.any(moving_orbit):
+            denom = np.maximum(speed[moving_orbit], 1e-9)
+            feats[moving_orbit, 6] = (-ry[moving_orbit] * angular_velocity) / denom
+            feats[moving_orbit, 7] = (rx[moving_orbit] * angular_velocity) / denom
+            feats[moving_orbit, 8] = np.minimum(1.0, speed[moving_orbit] / MAX_SHIP_SPEED)
+        feats[:, 9] = orbital_radius / 50.0
+        feats[moving_orbit, 10] = abs(angular_velocity) / MAX_OMEGA
+        feats[is_orbiting, 11] = 1.0
+
+        comet_motion = self._comet_motion_by_id(env)
+        if comet_motion:
+            ids = planets[:, P_ID].astype(np.int64)
+            for local_idx, pid in enumerate(ids):
+                step = comet_motion.get(int(pid))
+                if step is None and int(pid) not in comet_motion:
+                    continue
+                feats[local_idx, 6:13] = 0.0
+                feats[local_idx, 12] = 1.0
+                if step is None:
+                    continue
+                dx, dy = step
+                norm = math.hypot(dx, dy)
+                if norm > 0.0:
+                    feats[local_idx, 6] = dx / norm
+                    feats[local_idx, 7] = dy / norm
+                    feats[local_idx, 8] = min(1.0, norm / MAX_SHIP_SPEED)
+
+        _fill_owner_features(feats[:, 13:18], owner, player, self.num_players)
+        feats[:, 18] = 1.0
+        p_mask[row, :n] = True
+        p_owned[row, :n] = owner == player
+        p_ids[row, :n] = planets[:, P_ID].astype(np.int64)
+        p_gar[row, :n] = ships.astype(np.float32)
+
+    def _fill_policy_fleet_features(
+        self,
+        row: int,
+        player: int,
+        fleets: np.ndarray,
+        planets: np.ndarray,
+        f_feats: np.ndarray,
+        f_mask: np.ndarray,
+    ) -> None:
+        if len(fleets) == 0:
+            return
+        n = len(fleets)
+        feats = f_feats[row, :n]
+        owner = fleets[:, F_OWNER].astype(np.int64)
+        ships = fleets[:, F_SHIPS]
+        feats[:, 0] = (fleets[:, F_X] - CENTER) / BOARD_SIZE
+        feats[:, 1] = (fleets[:, F_Y] - CENTER) / BOARD_SIZE
+        feats[:, 2] = np.cos(fleets[:, F_ANGLE])
+        feats[:, 3] = np.sin(fleets[:, F_ANGLE])
+        feats[:, 4] = np.log1p(ships) / 8.0
+        if len(planets):
+            pos_by_id = {
+                int(p[P_ID]): (float(p[P_X]), float(p[P_Y])) for p in planets
+            }
+            for local_idx, from_id in enumerate(fleets[:, F_FROM].astype(np.int64)):
+                src = pos_by_id.get(int(from_id))
+                if src is None:
+                    continue
+                feats[local_idx, 5] = (src[0] - CENTER) / BOARD_SIZE
+                feats[local_idx, 6] = (src[1] - CENTER) / BOARD_SIZE
+                feats[local_idx, 7] = 1.0
+        speeds = 1.0 + (MAX_SHIP_SPEED - 1.0) * (
+            np.log(ships) / math.log(1000.0)
+        ) ** 1.5
+        feats[:, 8] = np.minimum(1.0, np.minimum(speeds, MAX_SHIP_SPEED) / MAX_SHIP_SPEED)
+        _fill_owner_features(feats[:, 9:14], owner, player, self.num_players)
+        f_mask[row, :n] = True
+
+    @staticmethod
+    def _comet_motion_by_id(
+        env: NumpyOrbitWarsEnv,
+    ) -> dict[int, tuple[float, float] | None]:
+        out: dict[int, tuple[float, float] | None] = {
+            int(pid): None for pid in env.comet_planet_ids
+        }
+        for group in env.comets:
+            ids = group.get("planet_ids") or []
+            paths = group.get("paths") or []
+            idx = int(group.get("path_index", 0))
+            for k, pid in enumerate(ids):
+                if k >= len(paths):
+                    continue
+                path = paths[k]
+                if len(path) == 0 or idx + 1 >= len(path):
+                    continue
+                cur = path[idx]
+                nxt = path[idx + 1]
+                out[int(pid)] = (float(nxt[0]) - float(cur[0]), float(nxt[1]) - float(cur[1]))
+        return out
+
     @staticmethod
     def _final_state_from_state(state: list[dict[str, Any]]) -> list[SimpleNamespace]:
         return [
@@ -1222,10 +1541,7 @@ class NumpyVecEnv:
             actions = actions_by_env[idx]
             if not any(action and isinstance(action, list) for action in actions):
                 continue
-            ids = np.zeros(self.planet_cap, dtype=np.int64)
-            ids[self.planet_mask[idx]] = self.planets[
-                idx, self.planet_mask[idx], P_ID
-            ].astype(np.int64)
+            planet_idx_by_id = self._planet_slot_by_id(idx)
             rows: list[list[float]] = []
             for player_id in range(self.num_players):
                 action = actions[player_id]
@@ -1241,10 +1557,9 @@ class NumpyVecEnv:
                         angle = float(angle)
                     except (TypeError, ValueError):
                         continue
-                    matches = np.nonzero(self.planet_mask[idx] & (ids == from_id))[0]
-                    if len(matches) == 0:
+                    pidx = planet_idx_by_id.get(from_id)
+                    if pidx is None:
                         continue
-                    pidx = int(matches[0])
                     planet = self.planets[idx, pidx]
                     if int(planet[P_OWNER]) != player_id:
                         continue
@@ -1459,18 +1774,14 @@ class NumpyVecEnv:
     ) -> None:
         env = self.envs[idx]
         expired: list[int] = []
-        ids = np.zeros(self.planet_cap, dtype=np.int64)
-        ids[self.planet_mask[idx]] = self.planets[
-            idx, self.planet_mask[idx], P_ID
-        ].astype(np.int64)
+        planet_idx_by_id = self._planet_slot_by_id(idx)
         for group in env.comets:
             group["path_index"] += 1
             path_idx = int(group["path_index"])
             for i, pid in enumerate(list(group["planet_ids"])):
-                matches = np.nonzero(self.planet_mask[idx] & (ids == int(pid)))[0]
-                if len(matches) == 0:
+                pslot = planet_idx_by_id.get(int(pid))
+                if pslot is None:
                     continue
-                pslot = int(matches[0])
                 path = group["paths"][i]
                 if path_idx >= len(path):
                     expired.append(int(pid))
@@ -1506,6 +1817,8 @@ class NumpyVecEnv:
         ].astype(np.int64)
         self.planet_mask[idx] &= ~np.isin(ids, list(expired))
         self.initial_planet_mask[idx] &= ~np.isin(initial_ids, list(expired))
+        self._invalidate_planet_slots(idx)
+        self._invalidate_initial_planet_slots(idx)
         env = self.envs[idx]
         env.comet_planet_ids = [
             pid for pid in env.comet_planet_ids if pid not in expired
@@ -1558,15 +1871,11 @@ class NumpyVecEnv:
         for idx in active:
             if not combat_lists[idx]:
                 continue
-            ids = np.zeros(self.planet_cap, dtype=np.int64)
-            ids[self.planet_mask[idx]] = self.planets[
-                idx, self.planet_mask[idx], P_ID
-            ].astype(np.int64)
+            planet_idx_by_id = self._planet_slot_by_id(idx)
             for pid, planet_fleets in combat_lists[idx].items():
-                matches = np.nonzero(self.planet_mask[idx] & (ids == int(pid)))[0]
-                if len(matches) == 0:
+                pidx = planet_idx_by_id.get(int(pid))
+                if pidx is None:
                     continue
-                pidx = int(matches[0])
                 player_ships: dict[int, int] = {}
                 for fleet in planet_fleets:
                     owner = int(fleet[F_OWNER])

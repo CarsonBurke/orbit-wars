@@ -27,10 +27,15 @@ from typing import Any
 
 import torch
 
-from ..game import parse_observation
-from ..policies.features import EncodedObs, encode_observations
+from ..policies.features import EncodedObs, encode_raw_observations
 from ..policies.model import OrbitPolicy
-from ..policies.sampling import sample_batch_actions, sample_batch_with_records
+from ..policies.sampling import (
+    ActionContext,
+    sample_batch_actions_context,
+    sample_batch_actions_raw,
+    sample_batch_with_records_context,
+    sample_batch_with_records_raw,
+)
 from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
 from .rollout import Trajectory
@@ -136,6 +141,15 @@ def rollout_episodes_batched(
 
     states = vec.reset()
     dones = [False] * num_envs
+    fast_policy_batch = getattr(vec, "policy_batch", None)
+    fast_observation = getattr(vec, "observation", None)
+    fast_step_subset = getattr(vec, "step_subset_fast", None)
+    use_fast_numpy_path = (
+        bool(getattr(vec, "fast_rollout", False))
+        and callable(fast_policy_batch)
+        and callable(fast_observation)
+        and callable(fast_step_subset)
+    )
 
     while not all(dones):
         # 1. Bucket (env, seat, obs) tuples by agent identity.
@@ -146,14 +160,18 @@ def rollout_episodes_batched(
         for env_idx in range(num_envs):
             if dones[env_idx]:
                 continue
-            state = states[env_idx]
+            state = None if use_fast_numpy_path else states[env_idx]
             for seat in range(num_players):
-                seat_state = state[seat]
-                obs = seat_state["observation"]
                 slot = seat_agents[env_idx][seat]
                 if slot is None or slot.name == LEARNER_NAME:
+                    obs = None if use_fast_numpy_path else state[seat]["observation"]
                     learner_bucket.append((env_idx, seat, obs))
                 else:
+                    obs = (
+                        fast_observation(env_idx, seat)
+                        if use_fast_numpy_path
+                        else state[seat]["observation"]
+                    )
                     opp_buckets[slot.name].append((env_idx, seat, obs, slot))
 
         actions_per_env: dict[int, list[Any]] = {
@@ -172,6 +190,7 @@ def rollout_episodes_batched(
                 deterministic,
                 record_trajectories,
                 max_moves_per_turn,
+                fast_policy_batch if use_fast_numpy_path else None,
             )
 
         # 3. Per-snapshot inference. Learned snapshots expose `act_batch`;
@@ -191,9 +210,11 @@ def rollout_episodes_batched(
         # 4. Step alive envs in parallel.
         active = [i for i in range(num_envs) if not dones[i]]
         actions_list = [actions_per_env[i] for i in active]
-        results = vec.step_subset(active, actions_list)
+        step_subset = fast_step_subset if use_fast_numpy_path else vec.step_subset
+        results = step_subset(active, actions_list)
         for i, (state, done, final) in results.items():
-            states[i] = state
+            if state is not None:
+                states[i] = state
             if done:
                 dones[i] = True
                 finals[i] = final
@@ -217,6 +238,7 @@ def _step_learner_bucket(
     deterministic: bool,
     record_trajectories: bool,
     max_moves_per_turn: int,
+    policy_batch: Any | None = None,
 ) -> None:
     """Encode + batch-forward the learner identity across (env, seat) pairs.
 
@@ -224,19 +246,41 @@ def _step_learner_bucket(
     only the seat that == `learner_seat` gets recorded into its trajectory
     — PPO trains on the learner's transitions, not the self-play side's.
     """
-    parsed_list = [parse_observation(obs) for _, _, obs in bucket]
+    raw_obs_list = [obs for _, _, obs in bucket]
     target_device = torch.device(device)
     record_on_cpu = record_trajectories and target_device.type == "cuda"
-    cpu_stacked = encode_observations(parsed_list, device="cpu") if record_on_cpu else None
-    stacked = (
-        _encoded_to_device(cpu_stacked, target_device)
-        if cpu_stacked is not None
-        else encode_observations(
-            parsed_list,
-            device=device,
-            pin_memory=target_device.type == "cuda",
+    action_contexts: list[ActionContext] | None = None
+    if callable(policy_batch):
+        rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
+        if record_on_cpu:
+            cpu_stacked, action_contexts = policy_batch(
+                rows, device="cpu", pin_memory=False
+            )
+            stacked = _encoded_to_device(cpu_stacked, target_device)
+        else:
+            stacked, action_contexts = policy_batch(
+                rows,
+                device=device,
+                pin_memory=target_device.type == "cuda",
+            )
+            if stacked.planet_feats.device != target_device:
+                stacked = _encoded_to_device(stacked, target_device)
+            cpu_stacked = None
+    else:
+        cpu_stacked = (
+            encode_raw_observations(raw_obs_list, device="cpu")
+            if record_on_cpu
+            else None
         )
-    )
+        stacked = (
+            _encoded_to_device(cpu_stacked, target_device)
+            if cpu_stacked is not None
+            else encode_raw_observations(
+                raw_obs_list,
+                device=device,
+                pin_memory=target_device.type == "cuda",
+            )
+        )
     # bf16 autocast on CUDA is what unlocks FA-2 dispatch in
     # `SelfAttention.forward` — fp32 inputs make SDPA fall back to the
     # mem-efficient kernel. Same regime as `ppo_update`.
@@ -250,19 +294,35 @@ def _step_learner_bucket(
         out = model(stacked)
 
     if record_trajectories:
-        moves_list, records = sample_batch_with_records(
-            out,
-            parsed_list,
-            deterministic=deterministic,
-            max_moves=max_moves_per_turn,
-        )
+        if action_contexts is not None:
+            actions_list, records = sample_batch_with_records_context(
+                out,
+                action_contexts,
+                deterministic=deterministic,
+                max_moves=max_moves_per_turn,
+            )
+        else:
+            actions_list, records = sample_batch_with_records_raw(
+                out,
+                raw_obs_list,
+                deterministic=deterministic,
+                max_moves=max_moves_per_turn,
+            )
     else:
-        moves_list = sample_batch_actions(
-            out,
-            parsed_list,
-            deterministic=deterministic,
-            max_moves=max_moves_per_turn,
-        )
+        if action_contexts is not None:
+            actions_list = sample_batch_actions_context(
+                out,
+                action_contexts,
+                deterministic=deterministic,
+                max_moves=max_moves_per_turn,
+            )
+        else:
+            actions_list = sample_batch_actions_raw(
+                out,
+                raw_obs_list,
+                deterministic=deterministic,
+                max_moves=max_moves_per_turn,
+            )
         records = []
 
     if record_trajectories:
@@ -272,7 +332,7 @@ def _step_learner_bucket(
         learner_envs = [bucket[k][0] for k in learner_rows]
         if learner_rows:
             row_idx = torch.as_tensor(
-                learner_rows, device=stacked.planet_feats.device, dtype=torch.long
+                learner_rows, device=out.value.device, dtype=torch.long
             )
             rec = _materialize_records_cpu(
                 stacked,
@@ -306,7 +366,7 @@ def _step_learner_bucket(
                 traj.reward.append(0.0)
 
     for k, (env_idx, seat, _obs) in enumerate(bucket):
-        actions_per_env[env_idx][seat] = [m.as_list() for m in moves_list[k]]
+        actions_per_env[env_idx][seat] = actions_list[k]
 
 
 def _materialize_records_cpu(
