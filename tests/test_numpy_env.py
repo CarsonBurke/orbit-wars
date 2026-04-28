@@ -13,6 +13,7 @@ from owars.policies.sampling import (
     sample_batch_actions_raw,
 )
 from owars.training.numpy_env import NumpyOrbitWarsEnv, NumpyVecEnv
+from owars.training.sharded_numpy_env import ShardedNumpyVecEnv
 
 
 def _official_env(num_players: int = 2, episode_steps: int = 120):
@@ -339,6 +340,60 @@ def test_numpy_vec_env_matches_scalar_subset_stepping():
             vec_states[env_idx][0]["observation"],
             scalar_states[env_idx][0]["observation"],
         )
+
+
+def test_sharded_numpy_vec_env_matches_scalar_subset_stepping():
+    scalar = [
+        NumpyOrbitWarsEnv(
+            num_players=2,
+            episode_steps=50,
+            ship_speed=6.0,
+            random_seed=i,
+        )
+        for i in range(4)
+    ]
+    scalar_states = [env.reset() for env in scalar]
+    with ShardedNumpyVecEnv(
+        num_envs=4,
+        num_players=2,
+        episode_steps=50,
+        ship_speed=6.0,
+        random_seed=0,
+        num_workers=2,
+    ) as vec:
+        vec_states = vec.reset()
+
+        active = [0, 3]
+        actions = []
+        for env_idx in active:
+            action = _simple_actions(scalar_states[env_idx][0]["observation"], 2)
+            actions.append(action)
+            scalar_states[env_idx] = scalar[env_idx].step(action)
+        results = vec.step_subset(active, actions)
+        for env_idx in active:
+            vec_states[env_idx] = results[env_idx][0]
+            _assert_obs_close(
+                vec_states[env_idx][0]["observation"],
+                scalar_states[env_idx][0]["observation"],
+            )
+        assert (
+            vec_states[1][0]["observation"]["step"]
+            == scalar_states[1][0]["observation"]["step"]
+            == 0
+        )
+
+        all_actions = []
+        for env_idx, env in enumerate(scalar):
+            action = _simple_actions(scalar_states[env_idx][0]["observation"], 2)
+            all_actions.append(action)
+            scalar_states[env_idx] = env.step(action)
+        results = vec.step_subset([0, 1, 2, 3], all_actions)
+        for env_idx in range(4):
+            vec_states[env_idx] = results[env_idx][0]
+            _assert_obs_close(
+                vec_states[env_idx][0]["observation"],
+                scalar_states[env_idx][0]["observation"],
+            )
 
 
 def test_numpy_vec_env_matches_scalar_4p_noops():

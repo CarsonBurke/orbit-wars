@@ -151,15 +151,18 @@ class PPOCfg:
 class RolloutCfg:
     """Per-update rollout settings.
 
-    `num_envs` is the parallelism: each PPO update plays exactly this many
-    episodes in parallel via subprocess workers, and the policy forward
-    is batched across all alive envs each step. There's no separate
-    "workers" knob — workers == envs, one each.
+    `num_envs` is the total rollout parallelism: each PPO update plays
+    exactly this many episodes and batches policy forwards across all alive
+    envs each step.
+    `numpy` uses the in-process fast rollout path. `num_workers` is only
+    used by the `numpy_mp` backend. The official Kaggle backend already runs
+    one worker per env.
     """
 
     num_envs: int = 16
+    num_workers: int = 0  # 0 => backend default; for numpy_mp, leave a few cores free
     max_moves_per_turn: int = 16
-    env_backend: str = "numpy"  # "numpy" in-process or "kaggle" subprocesses
+    env_backend: str = "numpy"  # "numpy", "numpy_mp", or "kaggle"
 
 
 @dataclass

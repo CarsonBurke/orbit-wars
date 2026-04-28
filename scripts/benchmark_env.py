@@ -13,6 +13,7 @@ from time import perf_counter
 from typing import Any
 
 from owars.training.numpy_env import NumpyOrbitWarsEnv, NumpyVecEnv
+from owars.training.sharded_numpy_env import ShardedNumpyVecEnv
 from owars.training.vec_env import VecEnv
 
 
@@ -155,6 +156,44 @@ def bench_numpy_vec(
     return _summary("numpy_vec", steps, reset_s, step_s, wall_s)
 
 
+def bench_numpy_mp(
+    num_envs: int,
+    num_players: int,
+    episode_steps: int,
+    ship_speed: float,
+    workload: str,
+    num_workers: int = 0,
+) -> dict[str, float]:
+    reset_s = 0.0
+    step_s = 0.0
+    steps = 0
+    start = perf_counter()
+    with ShardedNumpyVecEnv(
+        num_envs=num_envs,
+        num_players=num_players,
+        episode_steps=episode_steps,
+        ship_speed=ship_speed,
+        random_seed=0,
+        num_workers=num_workers,
+    ) as vec:
+        t0 = perf_counter()
+        states = vec.reset()
+        reset_s += perf_counter() - t0
+        done = [False] * num_envs
+        while not all(done):
+            active = [i for i, is_done in enumerate(done) if not is_done]
+            actions = [_actions(states[i], num_players, workload) for i in active]
+            t0 = perf_counter()
+            results = vec.step_subset(active, actions)
+            step_s += perf_counter() - t0
+            steps += len(active)
+            for idx, (state, is_done, _final) in results.items():
+                states[idx] = state
+                done[idx] = is_done
+    wall_s = perf_counter() - start
+    return _summary("numpy_mp", steps, reset_s, step_s, wall_s)
+
+
 def bench_kaggle_vec(
     num_envs: int,
     num_players: int,
@@ -207,7 +246,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--backend",
-        choices=("all", "kaggle_single", "kaggle_vec", "numpy_single", "numpy_vec"),
+        choices=(
+            "all",
+            "kaggle_single",
+            "kaggle_vec",
+            "numpy_single",
+            "numpy_vec",
+            "numpy_mp",
+        ),
         default="all",
     )
     parser.add_argument("--num-envs", type=int, default=16)
@@ -215,6 +261,7 @@ def main() -> None:
     parser.add_argument("--episode-steps", type=int, default=500)
     parser.add_argument("--ship-speed", type=float, default=6.0)
     parser.add_argument("--workload", choices=("noop", "simple"), default="noop")
+    parser.add_argument("--num-workers", type=int, default=0)
     args = parser.parse_args()
 
     benches = {
@@ -222,16 +269,27 @@ def main() -> None:
         "kaggle_vec": bench_kaggle_vec,
         "numpy_single": bench_numpy_single,
         "numpy_vec": bench_numpy_vec,
+        "numpy_mp": bench_numpy_mp,
     }
     names = list(benches) if args.backend == "all" else [args.backend]
     for name in names:
-        result = benches[name](
-            args.num_envs,
-            args.num_players,
-            args.episode_steps,
-            args.ship_speed,
-            args.workload,
-        )
+        if name == "numpy_mp":
+            result = bench_numpy_mp(
+                args.num_envs,
+                args.num_players,
+                args.episode_steps,
+                args.ship_speed,
+                args.workload,
+                args.num_workers,
+            )
+        else:
+            result = benches[name](
+                args.num_envs,
+                args.num_players,
+                args.episode_steps,
+                args.ship_speed,
+                args.workload,
+            )
         print(
             f"{result['backend']:>14}: "
             f"steps={int(result['steps'])} "

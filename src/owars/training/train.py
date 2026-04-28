@@ -53,6 +53,7 @@ from .ppo import (
     value_only_update,
 )
 from .rollout import Trajectory
+from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
 from .vec_rollout import rollout_episodes_batched
 
@@ -505,16 +506,30 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     # `replay_env_idx=0` keeps env 0's full step history so the PPO loop
     # can dump one rendered game per update; the other workers trim
     # `env.steps` to save memory.
-    vec_cls = NumpyVecEnv if cfg.rollout.env_backend == "numpy" else VecEnv
-    if cfg.rollout.env_backend not in {"kaggle", "numpy"}:
+    if cfg.rollout.env_backend not in {"kaggle", "numpy", "numpy_mp"}:
         raise ValueError(f"unknown rollout.env_backend: {cfg.rollout.env_backend!r}")
-    with vec_cls(
+    vec_kwargs = dict(
         num_envs=cfg.rollout.num_envs,
         num_players=cfg.game.num_players,
         episode_steps=cfg.game.episode_steps,
         ship_speed=cfg.game.ship_speed,
-        replay_env_idx=None if cfg.rollout.env_backend == "numpy" else 0,
-    ) as vec:
+    )
+    if cfg.rollout.env_backend == "numpy":
+        vec = NumpyVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
+            random_seed=cfg.run.seed,
+        )
+    elif cfg.rollout.env_backend == "numpy_mp":
+        vec = ShardedNumpyVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
+            num_workers=cfg.rollout.num_workers,
+            random_seed=cfg.run.seed,
+        )
+    else:
+        vec = VecEnv(**vec_kwargs, replay_env_idx=0)
+    with vec:
         # Pretrain doesn't write replays — skip the per-episode render +
         # pipe-transfer cost. _ppo_loop re-enables before the first update.
         vec.set_recording(False)

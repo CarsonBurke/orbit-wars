@@ -17,6 +17,7 @@ from ..policies.model import OrbitPolicy
 from .league import BUILTIN, OpponentSlot
 from .numpy_env import NumpyVecEnv
 from .rollout import rollout_episode
+from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
 from .vec_rollout import rollout_episodes_batched
 
@@ -32,6 +33,7 @@ def evaluate_ckpt(
     baselines: tuple[str, ...] = ("random", "sniper", "heuristic"),
     num_envs: int = 16,
     env_backend: str = "kaggle",
+    num_workers: int = 0,
 ) -> dict:
     state = torch.load(ckpt_path, map_location=device)
     cfg = OrbitPolicyConfig(**state["config"])
@@ -39,7 +41,7 @@ def evaluate_ckpt(
     model.load_state_dict(state["model"])
     model.eval()
 
-    if env_backend not in {"kaggle", "numpy"}:
+    if env_backend not in {"kaggle", "numpy", "numpy_mp"}:
         raise ValueError(f"unknown env_backend: {env_backend!r}")
     out: dict[str, dict[str, float]] = {}
     for opp_name in baselines:
@@ -72,14 +74,20 @@ def evaluate_ckpt(
             [opp_slot] * (num_players - 1)
             for _ in range(envs)
         ]
-        vec_cls = NumpyVecEnv if env_backend == "numpy" else VecEnv
-        with vec_cls(
+        vec_kwargs = dict(
             num_envs=envs,
             num_players=num_players,
             episode_steps=episode_steps,
             ship_speed=ship_speed,
             replay_env_idx=None,
-        ) as vec:
+        )
+        if env_backend == "numpy":
+            vec = NumpyVecEnv(**vec_kwargs)
+        elif env_backend == "numpy_mp":
+            vec = ShardedNumpyVecEnv(**vec_kwargs, num_workers=num_workers)
+        else:
+            vec = VecEnv(**vec_kwargs)
+        with vec:
             while len(margins) < n_games:
                 trajs = rollout_episodes_batched(
                     model,
@@ -116,7 +124,10 @@ def main() -> None:
     )
     p.add_argument("--device", default="cpu")
     p.add_argument("--num-envs", type=int, default=16)
-    p.add_argument("--env-backend", choices=("kaggle", "numpy"), default="kaggle")
+    p.add_argument(
+        "--env-backend", choices=("kaggle", "numpy", "numpy_mp"), default="kaggle"
+    )
+    p.add_argument("--num-workers", type=int, default=0)
     args = p.parse_args()
 
     results = evaluate_ckpt(
@@ -125,6 +136,7 @@ def main() -> None:
         device=args.device,
         num_envs=args.num_envs,
         env_backend=args.env_backend,
+        num_workers=args.num_workers,
     )
     for k, v in results.items():
         print(f"{k}: {v}")
