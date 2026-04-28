@@ -39,11 +39,11 @@ from .vec_env import VecEnv
 
 def _empty_traj() -> Trajectory:
     return Trajectory(
-        encoded=[], target_idx=[], frac_z=[],
+        encoded=[], target_idx=[], fraction=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
         old_target_logits=[],
-        old_fraction_mu=[],
-        old_fraction_log_sigma=[],
+        old_fraction_alpha=[],
+        old_fraction_beta=[],
     )
 
 
@@ -225,10 +225,17 @@ def _step_learner_bucket(
     — PPO trains on the learner's transitions, not the self-play side's.
     """
     parsed_list = [parse_observation(obs) for _, _, obs in bucket]
-    stacked = encode_observations(
-        parsed_list,
-        device=device,
-        pin_memory=torch.device(device).type == "cuda",
+    target_device = torch.device(device)
+    record_on_cpu = record_trajectories and target_device.type == "cuda"
+    cpu_stacked = encode_observations(parsed_list, device="cpu") if record_on_cpu else None
+    stacked = (
+        _encoded_to_device(cpu_stacked, target_device)
+        if cpu_stacked is not None
+        else encode_observations(
+            parsed_list,
+            device=device,
+            pin_memory=target_device.type == "cuda",
+        )
     )
     # bf16 autocast on CUDA is what unlocks FA-2 dispatch in
     # `SelfAttention.forward` — fp32 inputs make SDPA fall back to the
@@ -241,6 +248,7 @@ def _step_learner_bucket(
         ),
     ):
         out = model(stacked)
+
     if record_trajectories:
         moves_list, records = sample_batch_with_records(
             out,
@@ -266,7 +274,14 @@ def _step_learner_bucket(
             row_idx = torch.as_tensor(
                 learner_rows, device=stacked.planet_feats.device, dtype=torch.long
             )
-            rec = _materialize_records_cpu(stacked, out, records, row_idx, learner_rows)
+            rec = _materialize_records_cpu(
+                stacked,
+                cpu_stacked,
+                out,
+                records,
+                row_idx,
+                learner_rows,
+            )
             for j, env_idx in enumerate(learner_envs):
                 traj = trajectories[env_idx]
                 traj.encoded.append(
@@ -281,13 +296,13 @@ def _step_learner_bucket(
                     )
                 )
                 traj.target_idx.append(rec["target_idx"][j])
-                traj.frac_z.append(rec["frac_z"][j])
+                traj.fraction.append(rec["fraction"][j])
                 traj.log_prob.append(rec["log_prob"][j])
                 traj.value.append(rec["value"][j])
                 traj.owned_mask.append(rec["owned_mask"][j])
                 traj.old_target_logits.append(rec["old_target_logits"][j])
-                traj.old_fraction_mu.append(rec["old_fraction_mu"][j])
-                traj.old_fraction_log_sigma.append(rec["old_fraction_log_sigma"][j])
+                traj.old_fraction_alpha.append(rec["old_fraction_alpha"][j])
+                traj.old_fraction_beta.append(rec["old_fraction_beta"][j])
                 traj.reward.append(0.0)
 
     for k, (env_idx, seat, _obs) in enumerate(bucket):
@@ -296,6 +311,7 @@ def _step_learner_bucket(
 
 def _materialize_records_cpu(
     stacked: EncodedObs,
+    cpu_stacked: EncodedObs | None,
     out: Any,
     records: list[Any],
     row_idx: torch.Tensor,
@@ -308,30 +324,98 @@ def _materialize_records_cpu(
     The action sampler already synchronizes for Python env actions, so this
     moves trajectory storage off VRAM at the same loop boundary.
     """
+    feature_source = cpu_stacked if cpu_stacked is not None else stacked
+    feature_rows = (
+        torch.as_tensor(rows, dtype=torch.long)
+        if feature_source.planet_feats.device.type == "cpu"
+        else row_idx
+    )
+    target_idx = torch.stack([records[k].target_idx for k in rows])
+    fraction = torch.stack([records[k].fraction for k in rows])
+    log_prob = torch.stack([records[k].log_prob for k in rows])
+    old_target_logits = torch.stack([records[k].target_logits for k in rows])
+    old_fraction_alpha = torch.stack([records[k].fraction_alpha for k in rows])
+    old_fraction_beta = torch.stack([records[k].fraction_beta for k in rows])
+    owned_mask = out.planet_owned_mask.index_select(0, row_idx)
+    value = out.value.index_select(0, row_idx)
+    b, p = target_idx.shape
+    flat = torch.cat(
+        (
+            target_idx.float(),
+            fraction.float(),
+            log_prob.float(),
+            value.float().unsqueeze(1),
+            owned_mask.float(),
+            old_target_logits.float().reshape(b, -1),
+            old_fraction_alpha.float(),
+            old_fraction_beta.float(),
+        ),
+        dim=1,
+    ).detach().cpu()
+    pos = 0
+    target_idx_cpu = flat[:, pos : pos + p].long()
+    pos += p
+    fraction_cpu = flat[:, pos : pos + p]
+    pos += p
+    log_prob_cpu = flat[:, pos : pos + p]
+    pos += p
+    value_cpu = flat[:, pos]
+    pos += 1
+    owned_mask_cpu = flat[:, pos : pos + p].bool()
+    pos += p
+    old_logits_width = p * (p + 1)
+    old_target_logits_cpu = flat[:, pos : pos + old_logits_width].reshape(b, p, p + 1)
+    pos += old_logits_width
+    old_fraction_alpha_cpu = flat[:, pos : pos + p]
+    pos += p
+    old_fraction_beta_cpu = flat[:, pos : pos + p]
+
     return {
-        "planet_feats": stacked.planet_feats.index_select(0, row_idx).detach().cpu(),
-        "planet_mask": stacked.planet_mask.index_select(0, row_idx).detach().cpu(),
-        "planet_owned_mask": stacked.planet_owned_mask.index_select(0, row_idx)
+        "planet_feats": feature_source.planet_feats.index_select(0, feature_rows)
         .detach()
         .cpu(),
-        "planet_ids": stacked.planet_ids.index_select(0, row_idx).detach().cpu(),
-        "planet_garrison": stacked.planet_garrison.index_select(0, row_idx)
+        "planet_mask": feature_source.planet_mask.index_select(0, feature_rows)
         .detach()
         .cpu(),
-        "fleet_feats": stacked.fleet_feats.index_select(0, row_idx).detach().cpu(),
-        "fleet_mask": stacked.fleet_mask.index_select(0, row_idx).detach().cpu(),
-        "target_idx": torch.stack([records[k].target_idx for k in rows]).detach().cpu(),
-        "frac_z": torch.stack([records[k].frac_z for k in rows]).detach().cpu(),
-        "log_prob": torch.stack([records[k].log_prob for k in rows]).detach().cpu(),
-        "value": out.value.index_select(0, row_idx).detach().cpu(),
-        "owned_mask": out.planet_owned_mask.index_select(0, row_idx).detach().cpu(),
-        "old_target_logits": torch.stack(
-            [records[k].target_logits for k in rows]
-        ).detach().cpu(),
-        "old_fraction_mu": torch.stack(
-            [records[k].fraction_mu for k in rows]
-        ).detach().cpu(),
-        "old_fraction_log_sigma": torch.stack(
-            [records[k].fraction_log_sigma for k in rows]
-        ).detach().cpu(),
+        "planet_owned_mask": feature_source.planet_owned_mask.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "planet_ids": feature_source.planet_ids.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "planet_garrison": feature_source.planet_garrison.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "fleet_feats": feature_source.fleet_feats.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "fleet_mask": feature_source.fleet_mask.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "target_idx": target_idx_cpu,
+        "fraction": fraction_cpu,
+        "log_prob": log_prob_cpu,
+        "value": value_cpu,
+        "owned_mask": owned_mask_cpu,
+        "old_target_logits": old_target_logits_cpu,
+        "old_fraction_alpha": old_fraction_alpha_cpu,
+        "old_fraction_beta": old_fraction_beta_cpu,
     }
+
+
+def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
+    if device.type != "cuda":
+        return feats.to(device)
+
+    def move(t: torch.Tensor) -> torch.Tensor:
+        return t.pin_memory().to(device, non_blocking=True)
+
+    return EncodedObs(
+        planet_feats=move(feats.planet_feats),
+        planet_mask=move(feats.planet_mask),
+        planet_owned_mask=move(feats.planet_owned_mask),
+        planet_ids=move(feats.planet_ids),
+        planet_garrison=move(feats.planet_garrison),
+        fleet_feats=move(feats.fleet_feats),
+        fleet_mask=move(feats.fleet_mask),
+    )

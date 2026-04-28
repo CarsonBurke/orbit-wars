@@ -22,25 +22,37 @@ having to go autoregressive.
 
 We deliberately do **not** down-project after the actor concat: target_query
 and fraction_head take 2d-wide inputs and project to their natural output
-dim (d for query/key, 2 for the Normal's (μ, log σ)). Down-projecting
+dim (d for query/key, 2 for the Beta's (head_α, head_β)). Down-projecting
 `[planet_h || h_actor]` back to d would discard exactly the global-context
 capacity the extra token was added to provide.
 
 **No angle head.** The launch angle is computed exactly via an iterative
-lead-intercept solver in `sampling.py`; a previous Beta(α,β) residual
-existed only to patch a one-pass approximation and was the dominant source
-of PPO ratio explosions when α or β collapsed below 1.
+lead-intercept solver in `sampling.py`.
 
-**Fraction head is a tanh-squashed Normal**, not a Beta. The two Beta
-params (α, β) couple "shift the mode" with "sharpen the peak," and the
-sharpen direction is unbounded — concentrations would creep into the
-hundreds and the policy log_prob would explode under small parameter
-changes (see VAPO §4 for the symptom; the diagnosis is α+β collapse). A
-Gaussian's μ (mode) and σ (spread) are independent gradient axes; cold-start
-KL is bounded by the gain=0.01 init on the μ readout + zeroed log_σ row
-(dreamer4 `dreamer4.py:1000` `* 1e-2`; cleanrl `ppo_continuous_action.py:127`
-`std=0.01`). log σ is left unclamped per dreamer4; if σ-collapse becomes
-a problem mid-training, deepen the head before reintroducing clamps.
+**Fraction head is a Beta(α, β)** on [0, 1] — the natural distribution for
+"fraction of garrison to send." Replaces the previous tanh-squashed Normal,
+which suffered from (a) tanh-saturation pathology if μ drifted past ±2.5
+(gradient through tanh dies, policy stuck at the action boundary), (b) hand-
+rolled tanh-Jacobian in log_prob, and (c) a recurring σ-collapse risk that
+needed clamps or strong PMPO KL to suppress. Beta avoids all three: native
+[0,1] support, no Jacobian, and concentration is **soft-capped** so the
+policy literally cannot freeze itself.
+
+Soft-cap (cleanrl `ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:200`):
+    α = 1 + α_max · tanh(softplus(head_α) / α_max)        (likewise β)
+properties:
+  • α ∈ [1, 1 + α_max] — explicit upper bound (1 + ALPHA_MAX = 21).
+  • α ≥ 1 makes Beta unimodal+concave (Chou et al. 2017).
+  • smooth everywhere (no clamp discontinuity), gradient-passing at the cap.
+  • near-init (head=0): softplus(0)=log 2≈0.69, tanh(log 2 / 20)≈0.0345 →
+    α ≈ 1.69. Mild bell on [0,1] centered at 0.5. Cold-start exploration is
+    near-uniform without being literally Beta(1,1).
+  • upper-bounded concentration ⇒ persistent exploration noise floor:
+    σ_action ≥ 0.075 on [0,1] regardless of training pressure.
+
+The +1 shift (vs raw softplus) keeps α,β ≥ 1, which is what makes Beta
+unimodal+concave; without it the policy can drive α or β toward 0 and the
+distribution becomes bimodal at the boundaries (Chou et al. 2017 §4).
 
 **Critic still shares the encoder backbone.** Value-loss gradients flow
 through the same transformer the actor uses. This is tamed by
@@ -328,11 +340,28 @@ class TransformerBlock(nn.Module):
         return x
 
 
+# Concentration cap for the soft-capped Beta(α, β) fraction head. α and β
+# are bounded to [1, 1 + ALPHA_MAX] — see module docstring for derivation.
+ALPHA_MAX: float = 20.0
+
+
+def _soft_cap_concentration(head: torch.Tensor) -> torch.Tensor:
+    """Map a real-valued head into [1, 1+ALPHA_MAX] smoothly.
+
+    `1 + ALPHA_MAX · tanh(softplus(h) / ALPHA_MAX)`:
+      - head → −∞: softplus → 0, tanh → 0, returns 1 (max-spread Beta).
+      - head → +∞: softplus → h, tanh → 1, returns 1 + ALPHA_MAX (cap).
+      - smooth, gradient-passing at the cap (sech² · sigmoid ≤ 1).
+    Same shape as cleanrl `ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:200`.
+    """
+    return 1.0 + ALPHA_MAX * torch.tanh(F.softplus(head) / ALPHA_MAX)
+
+
 @dataclass
 class PolicyOutput:
     target_logits: torch.Tensor       # [B, P, P+1]  +1 = no-op slot
-    fraction_mu: torch.Tensor         # [B, P]  pre-tanh Normal mean
-    fraction_log_sigma: torch.Tensor  # [B, P]  pre-tanh Normal log-std (unclamped)
+    fraction_alpha: torch.Tensor      # [B, P]  Beta α ∈ [1, 1+ALPHA_MAX] (post soft-cap)
+    fraction_beta: torch.Tensor       # [B, P]  Beta β ∈ [1, 1+ALPHA_MAX] (post soft-cap)
     value: torch.Tensor               # [B]
     planet_owned_mask: torch.Tensor   # [B, P] bool
     planet_mask: torch.Tensor         # [B, P] bool
@@ -420,19 +449,17 @@ class OrbitPolicy(nn.Module):
         self.noop_head = CastedLinear(2 * cfg.dim, 1)
         nn.init.zeros_(self.noop_head.weight)
         nn.init.constant_(self.noop_head.bias, 1.5)
-        # 2·dim input for the same reason as target_query. Outputs (μ, log σ)
-        # of a tanh-squashed Normal over [-1, 1]; sampling.py maps to [0, 1]
-        # to get the fraction-of-garrison-to-send.
+        # 2·dim input for the same reason as target_query. Outputs raw
+        # (head_α, head_β) which the soft-cap maps into [1, 1+ALPHA_MAX]
+        # for the Beta(α, β) fraction distribution on [0, 1].
         self.fraction_head = CastedLinear(2 * cfg.dim, 2, bias=False)
-        # μ row at gain=0.01 — cleanrl PPO's canonical actor-mean init
-        # (`ppo_continuous_action.py:127`, the "Implementation Matters"
-        # recipe). Initial pre-tanh μ ≈ 0 → fraction distribution is
-        # near-uniform on [0,1] regardless of feature magnitudes coming out
-        # of the trunk → first-update Δlog_prob is bounded by the trunk's
-        # update size, not the head's. log σ row is zeroed so σ ≡ 1 at init.
+        # gain=0.01 — cleanrl PPO's canonical actor-readout init
+        # (`ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:182`,
+        # `ppo_continuous_action.py:127`). At init, both heads ≈ 0 →
+        # softplus(0)=log 2 → soft-cap output ≈ 1.69 → Beta(1.69, 1.69)
+        # is mildly bell-shaped on [0,1] centered at 0.5, so first-update
+        # Δlog_prob is bounded by the trunk's update size, not the head's.
         nn.init.orthogonal_(self.fraction_head.weight, gain=0.01)
-        with torch.no_grad():
-            self.fraction_head.weight[1].zero_()
         self.value_head = nn.Sequential(
             CastedLinear(cfg.dim, cfg.value_hidden, bias=False),
             SquaredReLU(),
@@ -613,23 +640,20 @@ class OrbitPolicy(nn.Module):
         noop = self.noop_head(planet_with_ctx)  # [B, P, 1]
         target_logits = torch.cat([logits, noop], dim=-1)  # [B, P, P+1]
 
-        # Fraction head: pre-tanh Normal (μ, log σ). Unclamped per dreamer4
-        # (`dreamer4.py:398-404, 1102, 1130-1134`) — log σ is allowed to roam
-        # freely. Cold-start KL is bounded by the gain=0.01 init on the μ
-        # row + zeroed log_σ row, not by a clamp. If σ-collapse becomes a
-        # problem mid-training, deepen the head (dreamer4-style 4·d MLP)
-        # before reintroducing clamps.
-        offs = self.fraction_head(planet_with_ctx)
-        fraction_mu = offs[..., 0]
-        fraction_log_sigma = offs[..., 1]
+        # Fraction head: raw (head_α, head_β) → soft-cap to [1, 1+ALPHA_MAX]
+        # for Beta(α, β). Concentration cap = persistent exploration noise
+        # floor. See module docstring + `_soft_cap_concentration`.
+        offs = self.fraction_head(planet_with_ctx).float()
+        fraction_alpha = _soft_cap_concentration(offs[..., 0])
+        fraction_beta = _soft_cap_concentration(offs[..., 1])
 
         # Value: dedicated critic token (replaces mean-pool).
         value = self.value_head(h_critic).squeeze(-1)
 
         return PolicyOutput(
             target_logits=target_logits,
-            fraction_mu=fraction_mu,
-            fraction_log_sigma=fraction_log_sigma,
+            fraction_alpha=fraction_alpha,
+            fraction_beta=fraction_beta,
             value=value,
             planet_owned_mask=planet_owned,
             planet_mask=planet_mask,

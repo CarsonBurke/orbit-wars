@@ -2,7 +2,7 @@
 
 The policy emits, per owned planet:
   - a Categorical over `(target_planet, no-op)` with the no-op slot at index P
-  - a tanh-squashed Normal(μ, σ) on `z`, mapped to `fraction = (tanh z + 1)/2`
+  - a Beta(α, β) on [0, 1] for the fraction-of-garrison to send
 
 The simulator's action format is `[from_planet_id, angle_radians, num_ships]`.
 Fleets fly in *straight lines* at constant speed (`fleet_speed(num_ships)`),
@@ -11,13 +11,12 @@ mid-flight steering. We compute the angle deterministically by solving the
 intercept equation in closed form (see `_lead_angle`) — no fixed-point
 iteration that might oscillate.
 
-For PPO we need, *per owned planet*, the Categorical+tanh-Normal log-prob of
-the actually-sampled action. `sample_with_record` returns those alongside the
+For PPO we need, *per owned planet*, the Categorical+Beta log-prob of the
+actually-sampled action. `sample_with_record` returns those alongside the
 moves; `sample_actions` is the thin moves-only wrapper used by inference paths
-that don't care about log-probs. We store the **pre-squash** Normal sample `z`
-in the record (not the squashed fraction): recomputing log_prob from `z` is
-exact, while recovering `z = atanh(2·frac − 1)` from the squashed sample eats
-numerical precision near the bounds.
+that don't care about log-probs. The Beta sample is the action — there is no
+separate latent (vs the previous tanh-Gaussian, which had pre-squash `z` and
+post-squash fraction); `Beta.log_prob(fraction)` is direct and exact.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+from torch.distributions import Beta
 
 from ..game import angle_to
 from ..game.observation import Observation
@@ -33,10 +33,12 @@ from ..game.physics import fleet_speed
 from ..game.types import CENTER, ROTATION_RADIUS_LIMIT, Move
 from .model import PolicyOutput
 
-# Numerical floor for the tanh Jacobian `1 - tanh²(z)` term in log_prob —
-# matches the standard SAC implementation. Saturated tanh (|z|≥~6) drives
-# `1 − tanh²` toward 0; without the floor the log term blows to −∞.
-TANH_LOG_EPS: float = 1e-6
+# Sample clamp for digamma/log stability in `Beta.log_prob`. With α,β ≥ 1
+# (post-soft-cap) `log_prob` is finite on the closed [0, 1] but the Beta-
+# Jacobian `(α-1) log z + (β-1) log(1-z)` blows up if a sampled z hits
+# exactly 0 or 1 with α=1 or β=1 (where the corresponding term is 0·log 0).
+# Mirrors `cleanrl ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:47`.
+SAMPLE_EPS: float = 1e-7
 
 # Lead-intercept solver. The intercept condition for a fleet leaving source
 # `(sx, sy)` at speed `sp` to meet a target on a circular orbit (radius R,
@@ -64,21 +66,24 @@ LEAD_T_HORIZON_STEPS: float = 600.0  # episode is 500 steps; a bit of slack
 class SampleRecord:
     """Per-planet record of the sampled action — used by PPO rollouts.
 
-    The full distribution parameters (`target_logits`, `fraction_mu`,
-    `fraction_log_sigma`) are recorded alongside the sample so PPO can
-    compute the analytical KL divergence between the rollout-time policy
-    and the current policy (PMPO penalty, dreamer4 §`pmpo_kl_div_loss_weight`).
+    The full distribution parameters (`target_logits`, `fraction_alpha`,
+    `fraction_beta`) are recorded alongside the sample so PPO can compute
+    the analytical KL divergence between the rollout-time policy and the
+    current policy (PMPO penalty, dreamer4 §`pmpo_kl_div_loss_weight`).
     Importance-ratio PPO uses only `log_prob`, but the KL term needs the
     full distributions — hence both.
+
+    The Beta sample IS the action (no separate latent), so we only carry
+    `fraction` ∈ (eps, 1-eps); recomputing `log_prob` at that value uses
+    `Beta.log_prob` directly with no Jacobian gymnastics.
     """
 
     target_idx: torch.Tensor   # [P] long, in [0, P] (P = no-op slot)
-    fraction: torch.Tensor     # [P] float in [0, 1] — squashed action used to build the move
-    frac_z: torch.Tensor       # [P] float — pre-tanh Normal sample (used to recompute log_prob in PPO)
-    log_prob: torch.Tensor     # [P] float — Categorical + tanh-Normal
+    fraction: torch.Tensor     # [P] float in (eps, 1-eps) — Beta sample, used both for the move and for PPO's log_prob recompute
+    log_prob: torch.Tensor     # [P] float — Categorical + Beta
     target_logits: torch.Tensor       # [P, P+1] — old-policy categorical logits (PMPO KL input)
-    fraction_mu: torch.Tensor         # [P] — old-policy pre-tanh Normal mean
-    fraction_log_sigma: torch.Tensor  # [P] — old-policy pre-tanh Normal log σ
+    fraction_alpha: torch.Tensor      # [P] — old-policy Beta α (post soft-cap)
+    fraction_beta: torch.Tensor       # [P] — old-policy Beta β (post soft-cap)
 
 
 def _lead_angle(
@@ -315,43 +320,18 @@ def _build_moves(
     )
 
 
-def _tanh_normal_log_prob(
-    mu: torch.Tensor,
-    log_sigma: torch.Tensor,
-    z: torch.Tensor,
-    a: torch.Tensor,
-) -> torch.Tensor:
-    """log_prob of `frac = (tanh(z)+1)/2` under tanh-squashed Normal(μ, σ).
-
-    Change-of-variables for `g(z) = (tanh(z)+1)/2`, `g'(z) = (1−tanh²(z))/2`:
-        log p(frac) = log p(z) − log|g'(z)|
-                    = log p(z) − log(1 − tanh²(z)) + log 2
-
-    The `+ log 2` is constant per element so it cancels in PPO's importance
-    ratio, but we keep it for honest absolute log-probs (any external
-    diagnostic that compares them would see a `~1.4`-per-planet bias otherwise).
-    """
-    sigma = log_sigma.exp()
-    normal_lp = -0.5 * ((z - mu) / sigma).pow(2) - log_sigma - 0.5 * math.log(2.0 * math.pi)
-    # Numerically-stable `log(1 - tanh²(z))`: the naive form underflows for
-    # |z| > ~7. The equivalent `2·(log 2 - z - softplus(-2z))` stays finite.
-    # Used by SB3 / SAC.
-    tanh_correction = 2.0 * (math.log(2.0) - z - torch.nn.functional.softplus(-2.0 * z))
-    return normal_lp - tanh_correction + math.log(2.0)
-
-
 def _sample_distributions(
     target_logits: torch.Tensor,
-    fraction_mu: torch.Tensor,
-    fraction_log_sigma: torch.Tensor,
+    fraction_alpha: torch.Tensor,
+    fraction_beta: torch.Tensor,
     p: int,
     deterministic: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample (target_idx, fraction, frac_z, log_prob) from the heads.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample (target_idx, fraction, log_prob) from the heads.
 
     Works for both unbatched [P, ...] and batched [B, P, ...] shapes.
 
-    The Normal log-prob only counts when the discrete target is *not* no-op:
+    The Beta log-prob only counts when the discrete target is *not* no-op:
     on a no-op step the fraction sample is drawn but ignored downstream, so
     it shouldn't contribute to the importance ratio.
 
@@ -363,36 +343,30 @@ def _sample_distributions(
     (FA-2, autocast) while sampling and `old_log_prob` get fp32 precision.
     """
     target_logits = target_logits.float()
-    fraction_mu = fraction_mu.float()
-    fraction_log_sigma = fraction_log_sigma.float()
+    fraction_alpha = fraction_alpha.float()
+    fraction_beta = fraction_beta.float()
+    frac_dist = Beta(fraction_alpha, fraction_beta)
     if deterministic:
         target_idx = target_logits.argmax(dim=-1)
-        # μ is the mode of the Normal; tanh(μ) is the mode of the squashed
-        # distribution iff σ is small (otherwise the squashed mode shifts
-        # toward 0). For deterministic eval we accept that approximation —
-        # exact mode would need a 1-D root solve per element.
-        z = fraction_mu
-        a = torch.tanh(z)
-        frac = (a + 1.0) / 2.0
-        log_prob = torch.zeros_like(target_idx, dtype=fraction_mu.dtype)
-        return target_idx, frac, z, log_prob
+        # Mean of Beta — well-defined for all (α,β) ≥ 1 and equals the mode
+        # whenever α,β > 1 up to the (α-1)/(α+β-2) shift; using the mean
+        # avoids the α=β=1 (uniform) edge case where the mode is undefined.
+        frac = fraction_alpha / (fraction_alpha + fraction_beta)
+        frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+        log_prob = torch.zeros_like(target_idx, dtype=fraction_alpha.dtype)
+        return target_idx, frac, log_prob
 
     target_dist = torch.distributions.Categorical(logits=target_logits)
     target_idx = target_dist.sample()
     target_lp = target_dist.log_prob(target_idx)
 
-    sigma = fraction_log_sigma.exp()
-    # Reparameterization-style draw — matches the math used at PPO update time.
-    eps = torch.randn_like(fraction_mu)
-    z = fraction_mu + sigma * eps
-    a = torch.tanh(z)
-    frac = (a + 1.0) / 2.0
-    frac_lp = _tanh_normal_log_prob(fraction_mu, fraction_log_sigma, z, a)
+    frac = frac_dist.sample().clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+    frac_lp = frac_dist.log_prob(frac)
 
     is_noop = target_idx == p
     move_mask = (~is_noop).to(frac_lp.dtype)
     log_prob = target_lp + move_mask * frac_lp
-    return target_idx, frac, z, log_prob
+    return target_idx, frac, log_prob
 
 
 def sample_with_record(
@@ -402,30 +376,29 @@ def sample_with_record(
     max_moves: int = 16,
 ) -> tuple[list[Move], SampleRecord]:
     """Sample an action per planet, build the legal `Move` list, AND return
-    the per-planet (target_idx, fraction, frac_z, log_prob) record so PPO
-    can compute the importance ratio against the *actual* sampled action.
+    the per-planet (target_idx, fraction, log_prob) record so PPO can
+    compute the importance ratio against the *actual* sampled action.
     """
     target_logits = out.target_logits[0]  # [P, P+1]
-    fraction_mu = out.fraction_mu[0]
-    fraction_log_sigma = out.fraction_log_sigma[0]
+    fraction_alpha = out.fraction_alpha[0]
+    fraction_beta = out.fraction_beta[0]
     owned = out.planet_owned_mask[0]
     pmask = out.planet_mask[0]
     ids = out.planet_ids[0]
     p = target_logits.shape[0]
 
-    target_idx, frac, frac_z, log_prob = _sample_distributions(
-        target_logits, fraction_mu, fraction_log_sigma, p, deterministic
+    target_idx, frac, log_prob = _sample_distributions(
+        target_logits, fraction_alpha, fraction_beta, p, deterministic
     )
 
     moves = _build_moves(target_idx, frac, owned, pmask, ids, o, max_moves)
     record = SampleRecord(
         target_idx=target_idx,
         fraction=frac,
-        frac_z=frac_z,
         log_prob=log_prob,
         target_logits=target_logits,
-        fraction_mu=fraction_mu,
-        fraction_log_sigma=fraction_log_sigma,
+        fraction_alpha=fraction_alpha,
+        fraction_beta=fraction_beta,
     )
     return moves, record
 
@@ -438,17 +411,16 @@ def sample_actions(
 ) -> list[Move]:
     """Moves-only wrapper for inference paths (eval, agent submission)."""
     target_logits = out.target_logits[0]
-    fraction_mu = out.fraction_mu[0]
-    fraction_log_sigma = out.fraction_log_sigma[0]
-    p = target_logits.shape[0]
+    fraction_alpha = out.fraction_alpha[0]
+    fraction_beta = out.fraction_beta[0]
     if deterministic:
         target_idx = target_logits.argmax(dim=-1)
-        frac = (torch.tanh(fraction_mu) + 1.0) / 2.0
+        frac = fraction_alpha / (fraction_alpha + fraction_beta)
     else:
         target_dist = torch.distributions.Categorical(logits=target_logits)
         target_idx = target_dist.sample()
-        z = fraction_mu + fraction_log_sigma.exp() * torch.randn_like(fraction_mu)
-        frac = (torch.tanh(z) + 1.0) / 2.0
+        frac = Beta(fraction_alpha, fraction_beta).sample()
+    frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
     return _build_moves(
         target_idx,
         frac,
@@ -472,18 +444,18 @@ def sample_batch_with_records(
     `parsed_list` has length B with the parsed observation per element.
     Returns one move list and one `SampleRecord` per element.
 
-    The Categorical/Normal samples are drawn once over the full [B, P]
+    The Categorical/Beta samples are drawn once over the full [B, P]
     tensor — that's where the GPU win comes from. The per-element
     `_build_moves` walk is pure Python but cheap (one loop per env).
     """
     target_logits = out.target_logits      # [B, P, P+1]
-    fraction_mu = out.fraction_mu          # [B, P]
-    fraction_log_sigma = out.fraction_log_sigma  # [B, P]
+    fraction_alpha = out.fraction_alpha    # [B, P]
+    fraction_beta = out.fraction_beta      # [B, P]
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
-    target_idx, frac, frac_z, log_prob = _sample_distributions(
-        target_logits, fraction_mu, fraction_log_sigma, p, deterministic
+    target_idx, frac, log_prob = _sample_distributions(
+        target_logits, fraction_alpha, fraction_beta, p, deterministic
     )
 
     fields_l = _packed_action_fields(
@@ -499,11 +471,10 @@ def sample_batch_with_records(
             SampleRecord(
                 target_idx=target_idx[k],
                 fraction=frac[k],
-                frac_z=frac_z[k],
                 log_prob=log_prob[k],
                 target_logits=target_logits[k],
-                fraction_mu=fraction_mu[k],
-                fraction_log_sigma=fraction_log_sigma[k],
+                fraction_alpha=fraction_alpha[k],
+                fraction_beta=fraction_beta[k],
             )
         )
     return moves_list, records
@@ -517,19 +488,19 @@ def sample_batch_actions(
 ) -> list[list[Move]]:
     """Batched moves-only sampler for eval and opponent inference paths."""
     target_logits = out.target_logits
-    fraction_mu = out.fraction_mu
-    fraction_log_sigma = out.fraction_log_sigma
+    fraction_alpha = out.fraction_alpha
+    fraction_beta = out.fraction_beta
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
     if deterministic:
         target_idx = target_logits.argmax(dim=-1)
-        frac = (torch.tanh(fraction_mu) + 1.0) / 2.0
+        frac = fraction_alpha / (fraction_alpha + fraction_beta)
     else:
         target_dist = torch.distributions.Categorical(logits=target_logits)
         target_idx = target_dist.sample()
-        z = fraction_mu + fraction_log_sigma.exp() * torch.randn_like(fraction_mu)
-        frac = (torch.tanh(z) + 1.0) / 2.0
+        frac = Beta(fraction_alpha, fraction_beta).sample()
+    frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
 
     fields_l = _packed_action_fields(
         target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids

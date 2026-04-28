@@ -40,7 +40,11 @@ def _model() -> OrbitPolicy:
 
 
 def _forced_move_output(feats) -> PolicyOutput:
-    """PolicyOutput that deterministically launches from planet 0 to planet 1."""
+    """PolicyOutput that deterministically launches from planet 0 to planet 1.
+
+    Beta(α=20, β=1) on planet 0 has mean ≈ 0.95 → send most of the garrison.
+    All other planets get α=β=1.69 (the soft-cap value at head=0) — neutral.
+    """
     batched = feats.planet_ids.dim() == 2
     b = int(feats.planet_ids.shape[0]) if batched else 1
     p = int(feats.planet_ids.shape[-1])
@@ -48,13 +52,14 @@ def _forced_move_output(feats) -> PolicyOutput:
     target_logits[:, :, p] = 0.0
     target_logits[:, 0, :] = -100.0
     target_logits[:, 0, 1] = 100.0
-    fraction_mu = torch.zeros((b, p))
-    fraction_mu[:, 0] = 2.0
-    fraction_log_sigma = torch.zeros((b, p))
+    fraction_alpha = torch.full((b, p), 1.69)
+    fraction_alpha[:, 0] = 20.0
+    fraction_beta = torch.full((b, p), 1.69)
+    fraction_beta[:, 0] = 1.0
     if not batched:
         target_logits = target_logits[:1]
-        fraction_mu = fraction_mu[:1]
-        fraction_log_sigma = fraction_log_sigma[:1]
+        fraction_alpha = fraction_alpha[:1]
+        fraction_beta = fraction_beta[:1]
         planet_owned_mask = feats.planet_owned_mask.unsqueeze(0)
         planet_mask = feats.planet_mask.unsqueeze(0)
         planet_ids = feats.planet_ids.unsqueeze(0)
@@ -64,8 +69,8 @@ def _forced_move_output(feats) -> PolicyOutput:
         planet_ids = feats.planet_ids
     return PolicyOutput(
         target_logits=target_logits,
-        fraction_mu=fraction_mu,
-        fraction_log_sigma=fraction_log_sigma,
+        fraction_alpha=fraction_alpha,
+        fraction_beta=fraction_beta,
         value=torch.zeros(b),
         planet_owned_mask=planet_owned_mask,
         planet_mask=planet_mask,
@@ -102,7 +107,6 @@ def test_batched_sampler_shapes_and_record_lengths():
         assert isinstance(rec, SampleRecord)
         assert rec.target_idx.shape == (out.target_logits.shape[1],)
         assert rec.fraction.shape == (out.target_logits.shape[1],)
-        assert rec.frac_z.shape == (out.target_logits.shape[1],)
         assert rec.log_prob.shape == (out.target_logits.shape[1],)
 
 

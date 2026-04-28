@@ -204,7 +204,7 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
 
     Per-step records on Trajectory are already device tensors (see the
     Trajectory docstring) — we just gather and stack here. Encoder-only:
-    the actor-side records (target_idx / frac_z / old_log_prob /
+    the actor-side records (target_idx / fraction / old_log_prob /
     owned_mask) are added by `_stack_trajectories`, which lets
     `_pretrain_value_batch` skip them entirely.
     """
@@ -243,23 +243,23 @@ def _stack_trajectories(
     """
     batch = _stack_encoded(trajs)
 
-    tidx, fz, lp, owned = [], [], [], []
-    otl, omu, olsig = [], [], []
+    tidx, frac, lp, owned = [], [], [], []
+    otl, oalpha, obeta = [], [], []
     for t in trajs:
         tidx.extend(t.target_idx)
-        fz.extend(t.frac_z)
+        frac.extend(t.fraction)
         lp.extend(t.log_prob)
         owned.extend(t.owned_mask)
         otl.extend(t.old_target_logits)
-        omu.extend(t.old_fraction_mu)
-        olsig.extend(t.old_fraction_log_sigma)
+        oalpha.extend(t.old_fraction_alpha)
+        obeta.extend(t.old_fraction_beta)
     batch["target_idx"] = torch.stack(tidx).long()
-    batch["frac_z"] = torch.stack(fz).float()
+    batch["fraction"] = torch.stack(frac).float()
     batch["old_log_prob"] = torch.stack(lp).float()
     batch["owned_mask"] = torch.stack(owned).bool()
     batch["old_target_logits"] = torch.stack(otl).float()
-    batch["old_fraction_mu"] = torch.stack(omu).float()
-    batch["old_fraction_log_sigma"] = torch.stack(olsig).float()
+    batch["old_fraction_alpha"] = torch.stack(oalpha).float()
+    batch["old_fraction_beta"] = torch.stack(obeta).float()
 
     # Single global CPU pull of every per-step value across the batch —
     # one sync instead of one per trajectory.

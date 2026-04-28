@@ -40,8 +40,8 @@ def test_policy_forward_shapes():
     out = model(feats)
     # batch dim was added implicitly by the encoder fast path.
     assert out.target_logits.shape == (1, 64, 65)
-    assert out.fraction_mu.shape == (1, 64)
-    assert out.fraction_log_sigma.shape == (1, 64)
+    assert out.fraction_alpha.shape == (1, 64)
+    assert out.fraction_beta.shape == (1, 64)
     assert out.value.shape == (1,)
 
 
@@ -71,8 +71,8 @@ def test_policy_ignores_padded_token_features():
     ).unsqueeze(0)
     assert torch.allclose(clean_out.value, noisy_out.value)
     assert torch.allclose(
-        clean_out.fraction_mu[valid_planets],
-        noisy_out.fraction_mu[valid_planets],
+        clean_out.fraction_alpha[valid_planets],
+        noisy_out.fraction_alpha[valid_planets],
     )
     assert torch.allclose(
         clean_out.target_logits[valid_planets][:, valid_cols.squeeze(0)],

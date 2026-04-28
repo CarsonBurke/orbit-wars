@@ -36,7 +36,7 @@ class Trajectory:
 
     encoded: list[EncodedObs]
     target_idx: list[torch.Tensor]            # [P] long
-    frac_z: list[torch.Tensor]                # [P] float — pre-tanh Normal sample (PPO recomputes log_prob from this)
+    fraction: list[torch.Tensor]              # [P] float — Beta sample in (eps, 1-eps); PPO recomputes log_prob at this value
     log_prob: list[torch.Tensor]              # [P] float
     value: list[torch.Tensor]                 # scalar tensors (no .item() in the hot loop)
     reward: list[float]
@@ -44,8 +44,8 @@ class Trajectory:
     # Old-policy distribution parameters captured at rollout time. Used by
     # PMPO's analytical KL(new ‖ old) penalty (`ppo.py::ppo_update`).
     old_target_logits: list[torch.Tensor]     # [P, P+1] float
-    old_fraction_mu: list[torch.Tensor]       # [P] float
-    old_fraction_log_sigma: list[torch.Tensor]  # [P] float
+    old_fraction_alpha: list[torch.Tensor]    # [P] float — Beta α (post soft-cap)
+    old_fraction_beta: list[torch.Tensor]     # [P] float — Beta β (post soft-cap)
     final_score: float = 0.0
     won: bool = False
     drawn: bool = False
@@ -129,9 +129,9 @@ def rollout_episode(
     state = env.reset(num_agents=num_players)
 
     traj = Trajectory(
-        encoded=[], target_idx=[], frac_z=[],
+        encoded=[], target_idx=[], fraction=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
-        old_target_logits=[], old_fraction_mu=[], old_fraction_log_sigma=[],
+        old_target_logits=[], old_fraction_alpha=[], old_fraction_beta=[],
     )
 
     while not env.done:
@@ -183,13 +183,13 @@ def record_step(
     """
     traj.encoded.append(feats)
     traj.target_idx.append(record.target_idx.detach().clone())
-    traj.frac_z.append(record.frac_z.detach().clone())
+    traj.fraction.append(record.fraction.detach().clone())
     traj.log_prob.append(record.log_prob.detach().clone())
     traj.value.append(value_t.detach().clone())
     traj.owned_mask.append(owned_mask_t.detach().clone())
     traj.old_target_logits.append(record.target_logits.detach().clone())
-    traj.old_fraction_mu.append(record.fraction_mu.detach().clone())
-    traj.old_fraction_log_sigma.append(record.fraction_log_sigma.detach().clone())
+    traj.old_fraction_alpha.append(record.fraction_alpha.detach().clone())
+    traj.old_fraction_beta.append(record.fraction_beta.detach().clone())
     traj.reward.append(0.0)
 
 

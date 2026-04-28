@@ -1,9 +1,10 @@
-"""End-to-end smoke test for `ppo_update` after the tanh-Gaussian rewrite.
+"""End-to-end smoke test for `ppo_update` after the Beta-policy rewrite.
 
-Exercises the new `frac_z` recompute path: builds a tiny synthetic batch
+Exercises the new `fraction` recompute path: builds a tiny synthetic batch
 that mirrors the keys `_stack_trajectories` produces, runs one PPO update,
 and asserts the returned metrics are finite. Mainly a regression guard
-against the old Beta-keys leaking back in (`fraction`, `angle_offset`).
+against the old tanh-Gaussian keys leaking back in (`frac_z`,
+`fraction_mu`, `fraction_log_sigma`).
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from owars.training.ppo import ppo_update
 def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FLEETS) -> dict[str, torch.Tensor]:
     """Forward the model once on synthetic obs, sample, and pack a PPO batch.
 
-    We use the *real* sampler to get a `frac_z` whose log_prob exactly
+    We use the *real* sampler to get a `fraction` whose log_prob exactly
     matches what `ppo_update` will recompute — i.e. ratio ≈ 1 at step 0,
     which is the only invariant we want to assert at this scale.
     """
@@ -46,8 +47,9 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
     )
     with torch.no_grad():
         out = model(feats)
-    # Build a SampleRecord per env via the real batched sampler so frac_z and
-    # log_prob are mutually consistent with the model's current heads.
+    # Build a SampleRecord per env via the real batched sampler so the
+    # `fraction` sample and `log_prob` are mutually consistent with the
+    # model's current heads.
     from owars.game.observation import Observation
     from owars.game.types import Planet
     obs = [
@@ -60,11 +62,11 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
     ]
     _, records = sample_batch_with_records(out, obs, deterministic=False)
     target_idx = torch.stack([r.target_idx for r in records])
-    frac_z = torch.stack([r.frac_z for r in records])
+    fraction = torch.stack([r.fraction for r in records])
     log_prob = torch.stack([r.log_prob for r in records])
     old_target_logits = torch.stack([r.target_logits for r in records])
-    old_fraction_mu = torch.stack([r.fraction_mu for r in records])
-    old_fraction_log_sigma = torch.stack([r.fraction_log_sigma for r in records])
+    old_fraction_alpha = torch.stack([r.fraction_alpha for r in records])
+    old_fraction_beta = torch.stack([r.fraction_beta for r in records])
 
     return {
         "planet_feats": planet_feats,
@@ -75,14 +77,14 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
         "fleet_feats": fleet_feats,
         "fleet_mask": fleet_mask,
         "target_idx": target_idx,
-        "frac_z": frac_z,
+        "fraction": fraction,
         "old_log_prob": log_prob,
         "owned_mask": planet_owned,
         "advantage": torch.randn(B),
         "return": torch.randn(B),
         "old_target_logits": old_target_logits,
-        "old_fraction_mu": old_fraction_mu,
-        "old_fraction_log_sigma": old_fraction_log_sigma,
+        "old_fraction_alpha": old_fraction_alpha,
+        "old_fraction_beta": old_fraction_beta,
     }
 
 
@@ -109,12 +111,10 @@ def test_ppo_update_runs_and_returns_finite_metrics():
 
 
 def test_log_prob_recompute_matches_sample_time():
-    """Re-evaluating log_prob at the recorded `frac_z` with the same
+    """Re-evaluating log_prob at the recorded `fraction` with the same
     parameters (no gradient step yet) must reproduce the recorded `log_prob`
-    — this is the invariant that makes PPO's importance ratio ≈ 1 on epoch 0
-    and the actual unit test for the tanh-Jacobian sign convention.
+    — this is the invariant that makes PPO's importance ratio ≈ 1 on epoch 0.
     """
-    import math
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
     model = OrbitPolicy(cfg)
     batch = _toy_batch(model, B=4)
@@ -122,6 +122,7 @@ def test_log_prob_recompute_matches_sample_time():
     # Re-run forward (no-grad) and recompute log_prob exactly the way
     # ppo_update does — without taking any optimizer step.
     from owars.policies.features import EncodedObs
+    from torch.distributions import Beta
     feats = EncodedObs(
         planet_feats=batch["planet_feats"], planet_mask=batch["planet_mask"],
         planet_owned_mask=batch["planet_owned_mask"], planet_ids=batch["planet_ids"],
@@ -134,21 +135,13 @@ def test_log_prob_recompute_matches_sample_time():
     p = out.target_logits.shape[1]
     target_log_probs = torch.log_softmax(out.target_logits, dim=-1)
     target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-    z = batch["frac_z"]
-    sigma = out.fraction_log_sigma.exp()
-    normal_lp = (
-        -0.5 * ((z - out.fraction_mu) / sigma).pow(2)
-        - out.fraction_log_sigma
-        - 0.5 * math.log(2.0 * math.pi)
-    )
-    tanh_correction = 2.0 * (math.log(2.0) - z - torch.nn.functional.softplus(-2.0 * z))
-    frac_lp = normal_lp - tanh_correction + math.log(2.0)
+    frac_lp = Beta(out.fraction_alpha, out.fraction_beta).log_prob(batch["fraction"])
     move_mask = (target != p).float()
     chosen = target_lp + move_mask * frac_lp
 
     owned = batch["owned_mask"].float()
     diff = (chosen - batch["old_log_prob"]) * owned
-    # Should be exactly zero up to numerical noise — same params, same z.
+    # Should be exactly zero up to numerical noise — same params, same fraction.
     assert diff.abs().max().item() < 1e-4, diff.abs().max().item()
 
 
