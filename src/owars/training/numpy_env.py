@@ -941,6 +941,9 @@ class NumpyVecEnv:
         self.initial_planets = np.empty((num_envs, self.planet_cap, 7), dtype=np.float64)
         self.planet_mask = np.zeros((num_envs, self.planet_cap), dtype=bool)
         self.initial_planet_mask = np.zeros((num_envs, self.planet_cap), dtype=bool)
+        self.initial_orbit_radius = np.zeros((num_envs, self.planet_cap), dtype=np.float64)
+        self.initial_orbit_angle = np.zeros((num_envs, self.planet_cap), dtype=np.float64)
+        self.initial_orbiting = np.zeros((num_envs, self.planet_cap), dtype=bool)
         self.fleets = np.empty((num_envs, self.fleet_cap, 7), dtype=np.float64)
         self.fleet_mask = np.zeros((num_envs, self.fleet_cap), dtype=bool)
         self.done = np.zeros(num_envs, dtype=bool)
@@ -955,6 +958,9 @@ class NumpyVecEnv:
         states = [env.reset() for env in self.envs]
         self.planet_mask.fill(False)
         self.initial_planet_mask.fill(False)
+        self.initial_orbit_radius.fill(0.0)
+        self.initial_orbit_angle.fill(0.0)
+        self.initial_orbiting.fill(False)
         self.fleet_mask.fill(False)
         self.done.fill(False)
         self.initialized.fill(False)
@@ -1032,15 +1038,24 @@ class NumpyVecEnv:
         initial = np.empty((self.num_envs, new_cap, 7), dtype=np.float64)
         pm = np.zeros((self.num_envs, new_cap), dtype=bool)
         im = np.zeros((self.num_envs, new_cap), dtype=bool)
+        orbit_radius = np.zeros((self.num_envs, new_cap), dtype=np.float64)
+        orbit_angle = np.zeros((self.num_envs, new_cap), dtype=np.float64)
+        orbiting = np.zeros((self.num_envs, new_cap), dtype=bool)
         planets[:, : self.planet_cap] = self.planets
         initial[:, : self.planet_cap] = self.initial_planets
         pm[:, : self.planet_cap] = self.planet_mask
         im[:, : self.planet_cap] = self.initial_planet_mask
+        orbit_radius[:, : self.planet_cap] = self.initial_orbit_radius
+        orbit_angle[:, : self.planet_cap] = self.initial_orbit_angle
+        orbiting[:, : self.planet_cap] = self.initial_orbiting
         self.planet_cap = new_cap
         self.planets = planets
         self.initial_planets = initial
         self.planet_mask = pm
         self.initial_planet_mask = im
+        self.initial_orbit_radius = orbit_radius
+        self.initial_orbit_angle = orbit_angle
+        self.initial_orbiting = orbiting
 
     def _ensure_fleet_capacity(self, needed: int) -> None:
         if needed <= self.fleet_cap:
@@ -1059,6 +1074,9 @@ class NumpyVecEnv:
         self._ensure_fleet_capacity(max(1, len(env.fleets)))
         self.planet_mask[idx].fill(False)
         self.initial_planet_mask[idx].fill(False)
+        self.initial_orbit_radius[idx].fill(0.0)
+        self.initial_orbit_angle[idx].fill(0.0)
+        self.initial_orbiting[idx].fill(False)
         self.fleet_mask[idx].fill(False)
         if len(env.planets):
             self.planets[idx, : len(env.planets)] = env.planets
@@ -1066,6 +1084,15 @@ class NumpyVecEnv:
         if len(env.initial_planets):
             self.initial_planets[idx, : len(env.initial_planets)] = env.initial_planets
             self.initial_planet_mask[idx, : len(env.initial_planets)] = True
+            init = self.initial_planets[idx, : len(env.initial_planets)]
+            dx = init[:, P_X] - CENTER
+            dy = init[:, P_Y] - CENTER
+            radius = np.hypot(dx, dy)
+            self.initial_orbit_radius[idx, : len(env.initial_planets)] = radius
+            self.initial_orbit_angle[idx, : len(env.initial_planets)] = np.arctan2(dy, dx)
+            self.initial_orbiting[idx, : len(env.initial_planets)] = (
+                radius + init[:, P_RADIUS] < ROTATION_RADIUS_LIMIT
+            )
         if len(env.fleets):
             self.fleets[idx, : len(env.fleets)] = env.fleets
             self.fleet_mask[idx, : len(env.fleets)] = True
@@ -1172,6 +1199,8 @@ class NumpyVecEnv:
         for idx in active:
             env = self.envs[idx]
             spawn_step = int(self.step_count[idx])
+            if not env.comets and spawn_step not in COMET_SPAWN_STEPS:
+                continue
             expired: list[int] = []
             for group in env.comets:
                 path_idx = int(group["path_index"])
@@ -1260,75 +1289,74 @@ class NumpyVecEnv:
             defaultdict(list) for _ in range(self.num_envs)
         ]
         remove = np.zeros_like(self.fleet_mask)
-        active_arr = np.asarray(active, dtype=np.int64)
-        active_fleet_mask = np.zeros_like(self.fleet_mask)
-        active_fleet_mask[active_arr] = self.fleet_mask[active_arr]
-        env_ids, fleet_slots = np.nonzero(active_fleet_mask)
-        if len(env_ids) == 0:
-            return combat_lists, remove
 
-        old = self.fleets[env_ids, fleet_slots][:, [F_X, F_Y]].copy()
-        ships = self.fleets[env_ids, fleet_slots, F_SHIPS]
-        speeds = 1.0 + (self.ship_speed - 1.0) * (
-            np.log(ships) / math.log(1000.0)
-        ) ** 1.5
-        speeds = np.minimum(speeds, self.ship_speed)
-        self.fleets[env_ids, fleet_slots, F_X] += (
-            np.cos(self.fleets[env_ids, fleet_slots, F_ANGLE]) * speeds
-        )
-        self.fleets[env_ids, fleet_slots, F_Y] += (
-            np.sin(self.fleets[env_ids, fleet_slots, F_ANGLE]) * speeds
-        )
-        new = self.fleets[env_ids, fleet_slots][:, [F_X, F_Y]].copy()
-        rem_flat = (
-            (new[:, 0] < 0)
-            | (new[:, 0] > BOARD_SIZE)
-            | (new[:, 1] < 0)
-            | (new[:, 1] > BOARD_SIZE)
-        )
-        active_flat = ~rem_flat
-        if np.any(active_flat):
-            center = np.repeat(
-                np.asarray([[CENTER, CENTER]], dtype=np.float64),
-                int(np.sum(active_flat)),
-                axis=0,
+        for env_idx in active:
+            fleet_slots = np.nonzero(self.fleet_mask[env_idx])[0]
+            if len(fleet_slots) == 0:
+                continue
+            old = self.fleets[env_idx, fleet_slots][:, [F_X, F_Y]].copy()
+            ships = self.fleets[env_idx, fleet_slots, F_SHIPS]
+            speeds = 1.0 + (self.ship_speed - 1.0) * (
+                np.log(ships) / math.log(1000.0)
+            ) ** 1.5
+            speeds = np.minimum(speeds, self.ship_speed)
+            angles = self.fleets[env_idx, fleet_slots, F_ANGLE]
+            self.fleets[env_idx, fleet_slots, F_X] += np.cos(angles) * speeds
+            self.fleets[env_idx, fleet_slots, F_Y] += np.sin(angles) * speeds
+            new = self.fleets[env_idx, fleet_slots][:, [F_X, F_Y]].copy()
+            rem = (
+                (new[:, 0] < 0)
+                | (new[:, 0] > BOARD_SIZE)
+                | (new[:, 1] < 0)
+                | (new[:, 1] > BOARD_SIZE)
             )
-            sun_dist = _points_to_segments_distance(
-                center, old[active_flat], new[active_flat]
-            )
-            active_ix = np.nonzero(active_flat)[0]
-            rem_flat[active_ix[sun_dist < SUN_RADIUS]] = True
-        active_flat = ~rem_flat
-        if np.any(active_flat):
-            local = np.nonzero(active_flat)[0]
-            e = env_ids[local]
-            points = self.planets[e, :, :][:, :, [P_X, P_Y]].copy()
-            points[~self.planet_mask[e]] = 0.0
+
+            active_local = ~rem
+            if np.any(active_local):
+                center = np.repeat(
+                    np.asarray([[CENTER, CENTER]], dtype=np.float64),
+                    int(np.sum(active_local)),
+                    axis=0,
+                )
+                sun_dist = _points_to_segments_distance(
+                    center, old[active_local], new[active_local]
+                )
+                active_ix = np.nonzero(active_local)[0]
+                rem[active_ix[sun_dist < SUN_RADIUS]] = True
+
+            active_local = ~rem
+            planet_slots = np.nonzero(self.planet_mask[env_idx])[0]
+            if not np.any(active_local) or len(planet_slots) == 0:
+                remove[env_idx, fleet_slots] = rem
+                continue
+            local = np.nonzero(active_local)[0]
+            points = self.planets[env_idx, planet_slots][:, [P_X, P_Y]]
+            radii = self.planets[env_idx, planet_slots, P_RADIUS]
             starts = old[local]
             ends = new[local]
             seg = ends - starts
             l2 = np.einsum("ij,ij->i", seg, seg)
-            diff = points - starts[:, None, :]
+            diff = points[None, :, :] - starts[:, None, :]
             with np.errstate(divide="ignore", invalid="ignore"):
                 t = np.einsum("mpd,md->mp", diff, seg) / l2[:, None]
             t = np.clip(
                 np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0
             )
             proj = starts[:, None, :] + t[:, :, None] * seg[:, None, :]
-            dists = np.linalg.norm(points - proj, axis=2)
-            hits = self.planet_mask[e] & (dists < self.planets[e, :, P_RADIUS])
+            dists = np.linalg.norm(points[None, :, :] - proj, axis=2)
+            hits = dists < radii[None, :]
             has_hit = hits.any(axis=1)
             first = np.argmax(hits, axis=1)
             for row, pslot in zip(np.nonzero(has_hit)[0], first[has_hit], strict=False):
-                flat_idx = int(local[int(row)])
-                env_idx = int(env_ids[flat_idx])
-                fleet_slot = int(fleet_slots[flat_idx])
-                pid = int(self.planets[env_idx, int(pslot), P_ID])
+                local_idx = int(local[int(row)])
+                fleet_slot = int(fleet_slots[local_idx])
+                planet_slot = int(planet_slots[int(pslot)])
+                pid = int(self.planets[env_idx, planet_slot, P_ID])
                 combat_lists[env_idx][pid].append(
                     self.fleets[env_idx, fleet_slot].copy()
                 )
-                rem_flat[flat_idx] = True
-        remove[env_ids, fleet_slots] = rem_flat
+                rem[local_idx] = True
+            remove[env_idx, fleet_slots] = rem
         return combat_lists, remove
 
     def _move_planets_and_sweep_batch(
@@ -1341,14 +1369,49 @@ class NumpyVecEnv:
         for idx in active:
             track_sweep = self.fleet_mask[idx].any()
             comet_ids = set(self.envs[idx].comet_planet_ids)
-            for pslot in np.nonzero(self.planet_mask[idx])[0]:
-                pid = int(self.planets[idx, pslot, P_ID])
-                if pid in comet_ids:
-                    continue
-                if not self.initial_planet_mask[idx, pslot]:
-                    continue
-                init = self.initial_planets[idx, pslot]
-                if int(init[P_ID]) != pid:
+            pslots = np.nonzero(self.planet_mask[idx] & self.initial_planet_mask[idx])[0]
+            if len(pslots):
+                planet_ids = self.planets[idx, pslots, P_ID].astype(np.int64)
+                initial_ids = self.initial_planets[idx, pslots, P_ID].astype(np.int64)
+                aligned = planet_ids == initial_ids
+                if comet_ids:
+                    aligned &= ~np.isin(planet_ids, list(comet_ids))
+
+                orbit_local = aligned & self.initial_orbiting[idx, pslots]
+                if np.any(orbit_local):
+                    orbit_slots = pslots[orbit_local]
+                    old_xy = self.planets[idx, orbit_slots][:, [P_X, P_Y]].copy()
+                    angle = (
+                        self.initial_orbit_angle[idx, orbit_slots]
+                        + self.angular_velocity[idx] * (self.step_count[idx] - 1)
+                    )
+                    radius = self.initial_orbit_radius[idx, orbit_slots]
+                    self.planets[idx, orbit_slots, P_X] = CENTER + radius * np.cos(angle)
+                    self.planets[idx, orbit_slots, P_Y] = CENTER + radius * np.sin(angle)
+                    if track_sweep:
+                        new_xy = self.planets[idx, orbit_slots][:, [P_X, P_Y]]
+                        for slot, old, new in zip(
+                            orbit_slots, old_xy, new_xy, strict=False
+                        ):
+                            if old[0] == new[0] and old[1] == new[1]:
+                                continue
+                            moving.append(
+                                (
+                                    idx,
+                                    int(self.planets[idx, int(slot), P_ID]),
+                                    float(self.planets[idx, int(slot), P_RADIUS]),
+                                    float(old[0]),
+                                    float(old[1]),
+                                    float(new[0]),
+                                    float(new[1]),
+                                )
+                            )
+
+                fallback_slots = pslots[~aligned]
+                for pslot in fallback_slots:
+                    pid = int(self.planets[idx, pslot, P_ID])
+                    if pid in comet_ids:
+                        continue
                     matches = np.nonzero(
                         self.initial_planet_mask[idx]
                         & (
@@ -1359,31 +1422,28 @@ class NumpyVecEnv:
                     if len(matches) == 0:
                         continue
                     init = self.initial_planets[idx, int(matches[0])]
-                dx = init[P_X] - CENTER
-                dy = init[P_Y] - CENTER
-                radius = math.sqrt(dx**2 + dy**2)
-                old_x = float(self.planets[idx, pslot, P_X])
-                old_y = float(self.planets[idx, pslot, P_Y])
-                if radius + self.planets[idx, pslot, P_RADIUS] < ROTATION_RADIUS_LIMIT:
-                    angle = math.atan2(dy, dx) + self.angular_velocity[idx] * (
-                        self.step_count[idx] - 1
-                    )
-                    self.planets[idx, pslot, P_X] = CENTER + radius * math.cos(angle)
-                    self.planets[idx, pslot, P_Y] = CENTER + radius * math.sin(angle)
-                new_x = float(self.planets[idx, pslot, P_X])
-                new_y = float(self.planets[idx, pslot, P_Y])
-                if track_sweep and (old_x, old_y) != (new_x, new_y):
-                    moving.append(
-                        (
-                            idx,
-                            pid,
-                            float(self.planets[idx, pslot, P_RADIUS]),
-                            old_x,
-                            old_y,
-                            new_x,
-                            new_y,
+                    radius = math.hypot(init[P_X] - CENTER, init[P_Y] - CENTER)
+                    old_x = float(self.planets[idx, pslot, P_X])
+                    old_y = float(self.planets[idx, pslot, P_Y])
+                    if radius + self.planets[idx, pslot, P_RADIUS] < ROTATION_RADIUS_LIMIT:
+                        angle = math.atan2(init[P_Y] - CENTER, init[P_X] - CENTER)
+                        angle += self.angular_velocity[idx] * (self.step_count[idx] - 1)
+                        self.planets[idx, pslot, P_X] = CENTER + radius * math.cos(angle)
+                        self.planets[idx, pslot, P_Y] = CENTER + radius * math.sin(angle)
+                    new_x = float(self.planets[idx, pslot, P_X])
+                    new_y = float(self.planets[idx, pslot, P_Y])
+                    if track_sweep and (old_x, old_y) != (new_x, new_y):
+                        moving.append(
+                            (
+                                idx,
+                                pid,
+                                float(self.planets[idx, pslot, P_RADIUS]),
+                                old_x,
+                                old_y,
+                                new_x,
+                                new_y,
+                            )
                         )
-                    )
             self._move_comets_for_env(idx, moving)
 
         self._sweep_moving_batch(moving, combat_lists, remove)
