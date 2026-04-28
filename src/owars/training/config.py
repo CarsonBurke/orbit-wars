@@ -27,6 +27,10 @@ class ModelCfg:
     depth: int = 3
     n_heads: int = 4
     dropout: float = 0.0
+    value_hidden: int = 64
+    value_num_bins: int = 51
+    value_min: float = -2.0
+    value_max: float = 2.0
 
 
 @dataclass
@@ -92,11 +96,12 @@ class OptimCfg:
 
 @dataclass
 class PPOCfg:
-    """PPO + VAPO-style decoupled critic.
+    """PMPO + dreamer4-aligned distributional critic.
 
     `gamma` defaults to 1.0 because Orbit Wars is finite-horizon (≤500 steps)
-    with terminal-only reward — there's no infinite-horizon variance issue
-    and discounting just decays the only signal we have.
+    with terminal-only reward — no infinite-horizon variance issue, no
+    reason to decay the only signal we have. dreamer4 defaults to 0.997;
+    we deliberately diverge here because of the finite-horizon structure.
 
     `lambda_critic = 1.0` makes the value target a Monte-Carlo return
     (unbiased; the cold-start regime where bootstrapping hurts most). The
@@ -108,21 +113,32 @@ class PPOCfg:
     lambda_critic: float = 1.0
     lambda_policy: float = 0.95
     lambda_policy_alpha: float = 0.0   # 0 ⇒ use fixed `lambda_policy`
-    # Asymmetric PPO clipping (VAPO §4.4 / DAPO): a wider upper bound lets
-    # the policy lean into beneficial moves while a tight lower bound limits
-    # catastrophic policy jumps on negative advantage. The 0.2/0.28 default
-    # is the VAPO recommendation; setting them equal recovers vanilla PPO.
-    clip_eps_low: float = 0.2
-    clip_eps_high: float = 0.28
-    value_coef: float = 0.5
-    entropy_coef: float = 0.01
-    # dreamer4 PMPO-style soft trust region: add `coef · KL(new ‖ old)` to
-    # the policy loss using the rollout-time distribution as reference.
-    # Replaces the (now-removed) hard `LOG_SIGMA` clamp — the Normal-Normal
-    # KL contains a `log(σ_old/σ_new)` term that diverges as σ_new collapses,
-    # giving a smooth σ-floor that adapts to the old policy's σ.
-    # dreamer4's default is 0.3 (`dreamer4.py:3083`); set to 0 to disable.
+    # PMPO surrogate replaces the clipped PPO surrogate (dreamer4
+    # `dreamer4.py:4265-4296`). `tanh(adv).abs()` magnitude shaping plus a
+    # pos/neg-advantage split with weight α gives a softer trust region
+    # than ratio clipping. There is no `clip_eps` knob — the analytical
+    # KL term below is the only trust-region signal.
+    pmpo_pos_to_neg_weight: float = 0.5    # equal weight on pos and neg advantage (dreamer4 default)
+    pmpo_reverse_kl: bool = True            # dreamer4 default — KL(old ‖ new); False → forward KL(new ‖ old)
+    # Analytical reverse KL penalty `coef · KL(old ‖ new)` (dreamer4
+    # `pmpo_kl_div_loss_weight=0.3`). Categorical(target) + Beta(fraction)
+    # closed-form per owned planet. Combined with the soft-cap on (α, β),
+    # this provides a structural-and-soft trust region without a hard clamp.
     pmpo_kl_coef: float = 0.3
+    # Distributional CE gradients are naturally bounded (per-bin
+    # `softmax − target_probs` has ‖∇‖ ~ O(1)), unlike MSE which blew
+    # up under bad predictions. dreamer4 effectively runs the equivalent
+    # of `value_coef=1.0` (separate `value_optim`, `dreamer4.py:4543`).
+    # Value clipping at `value_clip` caps per-update value movement on top.
+    value_coef: float = 1.0
+    entropy_coef: float = 0.01              # dreamer4 default; the categorical-target entropy has no structural floor (unlike the soft-capped Beta), so this keeps it from collapsing
+    # Value clipping (dreamer4 `dreamer4.py:4511-4515`): `clipped_v = old_v
+    # + (v - old_v).clamp(±value_clip)`, re-encoded through HL-Gauss and
+    # CE'd against the same return target; final loss is `max(loss,
+    # clipped_loss)`. Bounds per-update value-head movement away from the
+    # rollout-time prediction.
+    clip_values: bool = True
+    value_clip: float = 0.4
     # --- Value pretraining (cold-start the critic before PPO turns on). ---
     pretrain_updates: int = 0
     pretrain_episodes: int = 64

@@ -72,6 +72,7 @@ def _forced_move_output(feats) -> PolicyOutput:
         fraction_alpha=fraction_alpha,
         fraction_beta=fraction_beta,
         value=torch.zeros(b),
+        value_logits=torch.zeros(b, 51),
         planet_owned_mask=planet_owned_mask,
         planet_mask=planet_mask,
         planet_ids=planet_ids,

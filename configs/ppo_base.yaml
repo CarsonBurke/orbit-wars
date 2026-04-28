@@ -4,14 +4,15 @@
 # the model architecture is the same; only the opponent pool composition
 # and reward shaping should be tuned per-mode.
 #
-# VAPO defaults baked in:
-#   - γ = 1.0 (finite-horizon, terminal-only reward — no discounting)
+# Defaults baked in:
+#   - PMPO surrogate (dreamer4-aligned) instead of clipped PPO. No
+#     `clip_eps` knob; trust region is the analytical reverse-KL penalty.
+#   - γ = 1.0 (finite-horizon, terminal-only ±1 reward — no discounting)
 #   - λ_critic = 1.0 (Monte-Carlo target, unbiased)
-#   - λ_policy = 0.95 (variance-reduced advantage)
-#   - 50 critic-only pretraining updates against the heuristic baseline
-#     before PPO turns on (cold-starts the value head).
-#   - Token-level policy loss (sum-then-divide-by-step-count) — built
-#     into ppo.py, not a flag.
+#   - λ_policy = 0.95 (variance-reduced advantage; raw, not z-scored —
+#     PMPO's tanh|adv| shaping bounds magnitude on its own)
+#   - Distributional value head (HL-Gauss CE on [-2, 2] / 51 bins) with
+#     value clipping at 0.4.
 
 run:
   name: ppo_base
@@ -62,24 +63,14 @@ ppo:
   lambda_critic: 1.0
   lambda_policy: 0.95
   lambda_policy_alpha: 0.0
-  clip_eps_low: 0.2    # tight lower bound — limits catastrophic policy
-                       # jumps when advantage is negative.
-  clip_eps_high: 0.28  # wider upper bound (VAPO §4.4 / DAPO default) — lets
-                       # the policy lean into beneficial moves more freely.
-                       # Set equal to clip_eps_low to recover vanilla PPO.
-  value_coef: 0.5
-  entropy_coef: 0.0   # cleanrl `ppo_continuous_action.py:69` default. With
-                       # the LOG_SIGMA_MIN floor, low-init μ head (gain=0.01),
-                       # and zeroed log_σ row, the cold-start policy is already
-                       # near-uniform — the entropy bonus mainly fights the
-                       # value gradient over log_σ during early updates.
-  pmpo_kl_coef: 0.3   # dreamer4 default (`dreamer4.py:3083`). Adds an
-                       # analytical KL(new ‖ old) penalty to the policy loss
-                       # using the rollout-time distribution as the reference.
-                       # The Normal-Normal KL's `log(σ_old/σ_new)` term gives
-                       # a smooth σ-floor in place of the removed hard clamp,
-                       # while the categorical KL keeps the target distribution
-                       # from sharpening per-update past the old policy.
+  pmpo_pos_to_neg_weight: 0.5   # dreamer4 default — equal weight pos/neg advantage in the PMPO loss
+  pmpo_reverse_kl: true         # dreamer4 default — KL(old ‖ new). false ⇒ KL(new ‖ old).
+  pmpo_kl_coef: 0.3             # analytical reverse-KL penalty weight (dreamer4 `dreamer4.py:3083`)
+  value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
+
+  entropy_coef: 0.01            # dreamer4 default. Beta head has structural exploration floor; the categorical target distribution does not — this keeps it from collapsing.
+  clip_values: true             # value clipping (dreamer4 `dreamer4.py:4511-4515`)
+  value_clip: 0.4               # max per-update Δ between rollout-time and current value scalar before clipping kicks in
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`
                         # warms V on a state distribution PPO immediately

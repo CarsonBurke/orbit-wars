@@ -1,10 +1,9 @@
-"""End-to-end smoke test for `ppo_update` after the Beta-policy rewrite.
+"""End-to-end smoke test for `ppo_update` after the dreamer4-aligned rewrite.
 
-Exercises the new `fraction` recompute path: builds a tiny synthetic batch
-that mirrors the keys `_stack_trajectories` produces, runs one PPO update,
-and asserts the returned metrics are finite. Mainly a regression guard
-against the old tanh-Gaussian keys leaking back in (`frac_z`,
-`fraction_mu`, `fraction_log_sigma`).
+Exercises the PMPO surrogate + reverse-KL + distributional value head: builds
+a tiny synthetic batch that mirrors the keys `_stack_trajectories` produces,
+runs one PPO update, and asserts the returned metrics are finite. Also keeps
+a regression guard on the log_prob recompute invariant (ratio ≈ 1 on epoch 0).
 """
 
 from __future__ import annotations
@@ -68,6 +67,10 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
     old_fraction_alpha = torch.stack([r.fraction_alpha for r in records])
     old_fraction_beta = torch.stack([r.fraction_beta for r in records])
 
+    # Recover the scalar value at rollout time from the model's
+    # value_logits, mirroring what the rollout records.
+    out_value = out.value.detach().clone()
+
     return {
         "planet_feats": planet_feats,
         "planet_mask": planet_mask,
@@ -81,7 +84,9 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
         "old_log_prob": log_prob,
         "owned_mask": planet_owned,
         "advantage": torch.randn(B),
-        "return": torch.randn(B),
+        # Returns stay inside the default value-head support [-2, 2].
+        "return": torch.randn(B).clamp(-1.0, 1.0),
+        "old_value": out_value,
         "old_target_logits": old_target_logits,
         "old_fraction_alpha": old_fraction_alpha,
         "old_fraction_beta": old_fraction_beta,
@@ -96,18 +101,20 @@ def test_ppo_update_runs_and_returns_finite_metrics():
 
     log = ppo_update(
         model, optim, batch,
-        clip_eps_low=0.2, clip_eps_high=0.28,
         value_coef=0.5, entropy_coef=0.01, pmpo_kl_coef=0.3,
+        pmpo_pos_to_neg_weight=0.5, pmpo_reverse_kl=True,
+        value_clip=0.4, clip_values=True,
         epochs=2, minibatch_size=4, grad_clip=0.5,
     )
 
-    for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_frac", "pmpo_kl"):
+    for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "pmpo_kl", "pos_frac"):
         v = getattr(log, name)
         assert math.isfinite(v), f"{name}={v!r}"
-    # On epoch 0 the new policy ≡ old policy, so KL must start at exactly 0.
-    # The reported number is the running mean across all (epoch, minibatch)
+    # Reported number is the running mean across all (epoch, minibatch)
     # updates, so we just sanity-check non-negativity here.
     assert log.pmpo_kl >= 0.0, log.pmpo_kl
+    assert 0.0 <= log.pos_frac <= 1.0, log.pos_frac
+    assert log.value_loss >= 0.0, log.value_loss
 
 
 def test_log_prob_recompute_matches_sample_time():

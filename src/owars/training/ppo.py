@@ -1,28 +1,40 @@
-"""PPO update with VAPO-style critic — decoupled-GAE + token-level loss.
+"""PPO update — dreamer4-aligned PMPO surrogate + distributional critic.
 
-VAPO (arxiv 2504.05118) and its prerequisite VC-PPO (arxiv 2503.01491) make
-two changes that matter most for sparse-terminal-reward, finite-horizon
-self-play:
+This file is **not** vanilla clipped PPO. It mirrors dreamer4's
+`learn_from_experience` pipeline (`dreamer4.py:4258–4548`) with the small
+adaptations the Orbit Wars action structure imposes:
 
-  1. **Decoupled GAE**: the *critic* regresses on Monte-Carlo returns (λ=1,
-     unbiased), while the *actor* uses a variance-reduced advantage with a
-     smaller λ. Mixing-λ in the value target biases the critic toward 0
-     during the cold start; using λ=1 for V_target is provably non-biasing
-     for the policy gradient (VC-PPO §3.3, eqs. 7–8).
-  2. **Token-level (step-level) policy loss**: instead of mean-of-means
-     across episodes, sum across all (episode, step) pairs and divide by
-     the total number of active steps. Stops long episodes from being
-     down-weighted (VAPO §4.2, eq. 7). For Orbit Wars the gain is small
-     (episodes are bounded ≤500) but it's free.
+  1. **PMPO policy loss** (no PPO clip). On a per-action log-prob `lp`:
+        scaled_lp = lp · |tanh(adv)|
+     split by sign of `adv`:
+        policy_loss = −α · mean(scaled_lp[adv ≥ 0])
+                      + (1−α) · mean(scaled_lp[adv < 0])
+     with `α = pmpo_pos_to_neg_weight = 0.5` (dreamer4 default).
+     This is the principled replacement for the clipped surrogate when
+     PMPO is on — running both at once double-counts the trust region.
 
-Continuous fraction action: Beta(α, β) per owned planet — natively on [0, 1],
-no tanh squashing, no Jacobian gymnastics. We re-evaluate log_prob via
-`Beta.log_prob(fraction)` at the recorded sample. The PMPO KL term uses
-`kl_divergence(Beta_new, Beta_old)` directly (closed-form via torch).
+  2. **Reverse PMPO KL penalty** `λ · KL(old ‖ new)` (dreamer4
+     `pmpo_reverse_kl=True`, `dreamer4.py:4323-4324`):
+        Categorical: Σ p_old · (log p_old − log p_new)
+        Beta:        kl_divergence(old, new)
+     The reverse direction punishes the *new* policy putting low mass
+     where the *old* policy put high mass — mass-covering w.r.t. old.
 
-The cold-start fix — value pretraining with a frozen behavior policy — is
-in `train.py::pretrain_value`, not here. This file is just the per-update
-math.
+  3. **Decoupled GAE** stays — critic targets are λ_critic-weighted
+     returns (typically λ=1 → MC outcome) while the actor advantage uses
+     `λ_policy < 1`. Advantages are *not* z-score normalized — PMPO's
+     `tanh(adv).abs()` already bounds advantage magnitude (dreamer4
+     deliberately disables advantage normalization when `use_pmpo`).
+
+  4. **Distributional value loss** (HL-Gauss CE, `dreamer4.py:4509-4515`).
+     The critic emits `value_logits` over a fixed bin support; the loss
+     is cross-entropy against `target_probs(returns)`. Optional value
+     clipping (`clip_values=True`): `clipped_v = old_v + Δ.clamp(±value_clip)`,
+     re-encoded through `transform_to_logprobs` and CE'd against the
+     same target_probs; `value_loss = max(loss, clipped_loss)`.
+
+The cold-start fix — value pretraining with a frozen behavior policy —
+is in `train.py::pretrain_value`. This file is just the per-update math.
 """
 
 from __future__ import annotations
@@ -57,9 +69,9 @@ class PPOLog:
     policy_loss: float
     value_loss: float
     entropy: float
-    approx_kl: float       # importance-ratio approximation E[old_lp − new_lp]
-    clip_frac: float
-    pmpo_kl: float         # analytical KL(new ‖ old) over the full distributions
+    approx_kl: float       # importance-ratio diagnostic E[old_lp − new_lp]; PMPO does not use this for the loss
+    pmpo_kl: float         # analytical KL(old ‖ new) over the full distributions (the regularizer)
+    pos_frac: float        # fraction of owned-planet samples whose advantage was ≥ 0
 
 
 def compute_gae(
@@ -122,11 +134,13 @@ def ppo_update(
     optimizer: torch.optim.Optimizer,
     batch: dict[str, torch.Tensor],
     *,
-    clip_eps_low: float,
-    clip_eps_high: float,
     value_coef: float,
     entropy_coef: float,
-    pmpo_kl_coef: float = 0.0,
+    pmpo_kl_coef: float,
+    pmpo_pos_to_neg_weight: float,
+    pmpo_reverse_kl: bool,
+    value_clip: float,
+    clip_values: bool,
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
@@ -140,30 +154,19 @@ def ppo_update(
       `old_log_prob` [B,P], `advantage` [B], `return` [B],
       `owned_mask` [B,P],
       `old_target_logits` [B,P,P+1],
-      `old_fraction_alpha` [B,P], `old_fraction_beta` [B,P].
+      `old_fraction_alpha` [B,P], `old_fraction_beta` [B,P],
+      `old_value` [B] — scalar value at rollout time, for value clipping.
 
-    `pmpo_kl_coef` adds `coef · KL(new_policy ‖ old_policy)` to the policy
-    loss (dreamer4 `dreamer4.py:4298-4336`). KL is computed analytically per
-    owned planet — Categorical(target) + Beta(fraction) — using the
-    rollout-time distribution parameters as the reference. With α,β ∈
-    [1, 1+ALPHA_MAX] structurally bounded by the head's soft-cap, the KL
-    term mainly damps per-update Δ(α, β) drift; the structural cap is what
-    actually prevents concentration-collapse (cleanrl
-    `ppo_continuous_action_pmpo_d4_beta_relusq_v3.py` discussion). Set to
-    0 to disable.
+    PMPO surrogate: `policy_loss = −α·mean(scaled[pos]) + (1−α)·mean(scaled[neg])`
+    where `scaled = chosen_log_prob · |tanh(advantage)|`. No PPO clip.
+    Trust region is purely the analytical reverse KL term
+    `pmpo_kl_coef · KL(old ‖ new)` (`pmpo_reverse_kl=True` matches
+    dreamer4 default; setting `False` flips to forward KL).
 
-    `fraction` is the recorded Beta sample in (eps, 1-eps). The new
-    policy's log_prob is `Beta(α, β).log_prob(fraction)` evaluated under
-    the current head — direct, no Jacobian.
-
-    Policy loss is *token-level* (VAPO §4.2): summed over all
-    (sample, owned-planet) pairs and divided by the count of active
-    pairs in the minibatch. Standard PPO would average per-sample first.
-
-    Trust region: PPO ratio clip + (when `pmpo_kl_coef > 0`) an analytical
-    PMPO-style KL penalty against the rollout-time distribution. We do
-    *not* run a KL early-stop; `approx_kl` is the importance-ratio
-    approximation, logged for diagnostics.
+    Distributional value loss: cross-entropy against HL-Gauss-encoded
+    returns (`value_encoder.target_probs(returns)`). When `clip_values`
+    is true, re-encode `old_v + (v − old_v).clamp(±value_clip)` and take
+    the elementwise max of the two CE losses.
     """
     n = batch["planet_feats"].shape[0]
     device = batch["planet_feats"].device
@@ -171,17 +174,24 @@ def ppo_update(
     metric_sum: torch.Tensor | None = None
     n_steps = 0
 
+    # `model` may be the torch.compile wrapper around the live OrbitPolicy.
+    # `value_encoder` lives on the underlying module; reach through `_orig_mod`
+    # if compiled, otherwise use the model directly.
+    orig_model = getattr(model, "_orig_mod", model)
+    value_encoder = orig_model.value_encoder
+    num_bins = value_encoder.num_bins
+
     # bf16 autocast unlocks the SDPA Flash-Attention 2 kernel (head_dim must
     # also be FA-eligible — see model config). bf16 has fp32-equivalent range
     # so no GradScaler is needed; AdamW keeps fp32 master weights via
     # PyTorch's autocast handling. Outside cuda we stay in fp32.
     #
-    # Autocast wraps ONLY the model forward — log_softmax / log_prob / ratio
-    # / value_loss all run in fp32 after the cast, mirroring pg's
+    # Autocast wraps ONLY the model forward — log_softmax / log_prob / KL /
+    # value loss all run in fp32 after the cast, mirroring pg's
     # `F.cross_entropy(logits.float(), …)` pattern (sota_train_gpt.py:163).
     # bf16's 7 mantissa bits put a noise floor on log-prob differences
-    # (~0.01 nats per update is below bf16 precision); computing the
-    # importance ratio in bf16 amplifies that noise into approx_kl.
+    # (~0.01 nats per update is below bf16 precision); doing distribution
+    # math in bf16 amplifies that noise into the regularizers.
     autocast_enabled = (
         next(model.parameters()).is_cuda
         if any(True for _ in model.parameters())
@@ -201,6 +211,7 @@ def ppo_update(
             fraction_alpha = out.fraction_alpha.float()
             fraction_beta = out.fraction_beta.float()
             value = out.value.float()
+            value_logits = out.value_logits.float()
 
             owned_f = batch["owned_mask"][mb].float()
             p = target_logits.shape[1]
@@ -221,32 +232,45 @@ def ppo_update(
             chosen = target_lp + move_mask * frac_lp
 
             old_log_prob = batch["old_log_prob"][mb].float()  # [B, P]
-            # Advantages were normalized once over the whole batch in
-            # `_stack_trajectories`; standard PPO does this rather than
-            # per-minibatch (per-mb adds noise from each minibatch's own
-            # mean/std).
-            advantage = batch["advantage"][mb].float()
+            advantage = batch["advantage"][mb].float()         # [B]
+            adv_b = advantage.unsqueeze(-1).expand_as(chosen)  # [B, P]
 
-            # Token-level (per-owned-planet) PPO ratio. We broadcast the
-            # per-trajectory advantage over the planet axis.
-            ratio = (chosen - old_log_prob).exp()  # [B, P]
-            adv_b = advantage.unsqueeze(-1).expand_as(ratio)
-            unclipped = ratio * adv_b
-            # Asymmetric clip — `1 - eps_low` on the lower bound, `1 +
-            # eps_high` on the upper. Equal eps recovers symmetric PPO.
-            clipped = (
-                torch.clamp(ratio, 1.0 - clip_eps_low, 1.0 + clip_eps_high) * adv_b
-            )
-            per_token = -torch.min(unclipped, clipped)
-            denom = owned_f.sum().clamp_min(1.0)
-            policy_loss = (per_token * owned_f).sum() / denom
+            # PMPO policy loss (dreamer4.py:4265-4296). Replaces the clipped
+            # PPO surrogate. Magnitude shaping `tanh(adv).abs()` ∈ [0, 1)
+            # bounds the per-step contribution regardless of advantage scale,
+            # which is why dreamer4 deliberately *does not* z-score advantages
+            # under PMPO.
+            scaled_lp = chosen * adv_b.tanh().abs()
+            mask = owned_f.bool()
+            pos_mask = mask & (adv_b >= 0.0)
+            neg_mask = mask & (adv_b < 0.0)
 
-            value_loss = (value - batch["return"][mb].float()).pow(2).mean()
+            if pos_mask.any():
+                pos_loss = scaled_lp[pos_mask].mean()
+            else:
+                pos_loss = scaled_lp.sum() * 0.0
+            if neg_mask.any():
+                neg_loss = scaled_lp[neg_mask].mean()
+            else:
+                neg_loss = scaled_lp.sum() * 0.0
+            α = pmpo_pos_to_neg_weight
+            policy_loss = -α * pos_loss + (1.0 - α) * neg_loss
 
-            # Entropy bonus is the sum of per-axis entropies: Categorical
-            # over targets + Beta over the fraction sample. `Beta.entropy()`
-            # is the closed-form differential entropy on (0,1) (negative
-            # for sharp Betas, positive when concentration < ~1).
+            # ---------------- distributional value loss ----------------
+            ret = batch["return"][mb].float()
+            target_probs = value_encoder.target_probs(ret)            # [B, num_bins]
+            log_v_probs = F.log_softmax(value_logits, dim=-1)         # [B, num_bins]
+            value_ce = -(target_probs * log_v_probs).sum(dim=-1)       # [B]
+            if clip_values and value_clip > 0.0:
+                old_v = batch["old_value"][mb].float()
+                clipped_v = old_v + (value - old_v).clamp(-value_clip, value_clip)
+                clipped_logp = value_encoder.transform_to_logprobs(clipped_v)
+                clipped_ce = -(target_probs * clipped_logp).sum(dim=-1)
+                value_loss = torch.maximum(value_ce, clipped_ce).mean()
+            else:
+                value_loss = value_ce.mean()
+
+            # ---------------- entropy bonus (categorical + Beta) -------
             min_real = torch.finfo(target_log_probs.dtype).min
             log_probs_safe = target_log_probs.clamp_min(min_real)
             target_entropy = -(target_log_probs.exp() * log_probs_safe).sum(dim=-1)
@@ -257,38 +281,42 @@ def ppo_update(
             # rewarding its entropy would pay the policy to be uncertain
             # about an action it doesn't take.
             planet_entropy = target_entropy + move_mask * beta_entropy
+            denom = owned_f.sum().clamp_min(1.0)
             entropy = (planet_entropy * owned_f).sum() / denom
 
+            # ---------------- PMPO analytical KL ----------------------
             pmpo_kl = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
             if pmpo_kl_coef != 0.0:
-                # PMPO analytical KL(new ‖ old), per owned planet, summed over
-                # the categorical target axis and added to the Normal-fraction
-                # KL. Both KLs are exact closed forms; no Monte-Carlo estimator.
                 old_target_logits = batch["old_target_logits"][mb].float()
                 old_target_log_probs = F.log_softmax(old_target_logits, dim=-1)
                 # Self-target slots have `target_logits = -inf` (`model.py`
                 # `_self_target_mask`), so `log_softmax` yields `-inf` there.
-                # Naive `(-inf) − (-inf) = NaN` in the subtraction; clamp
-                # log-probs to dtype-min first. At masked slots `p_new = 0`
-                # so the contribution is 0 by construction, but the
-                # subtraction is now finite. Same trick the entropy block
-                # below uses.
+                # `(-inf) − (-inf) = NaN`; clamp log-probs to dtype-min before
+                # the subtraction. At masked slots the corresponding `p_old`
+                # (or `p_new`) is 0 so the contribution is 0 by construction.
                 kl_min = torch.finfo(target_log_probs.dtype).min
                 log_p_new_safe = target_log_probs.clamp_min(kl_min)
                 log_p_old_safe = old_target_log_probs.clamp_min(kl_min)
-                target_probs = target_log_probs.exp()
-                target_kl = (
-                    target_probs * (log_p_new_safe - log_p_old_safe)
-                ).sum(dim=-1)  # [B, P]
 
                 old_alpha = batch["old_fraction_alpha"][mb].float()
                 old_beta = batch["old_fraction_beta"][mb].float()
-                # Closed-form Beta-Beta KL via torch.distributions. Both
-                # distributions live on the same (0,1) support and have
-                # α, β ∈ [1, 1+ALPHA_MAX] from the head's soft-cap, so the
-                # KL is well-conditioned everywhere — no clamps needed.
                 old_beta_dist = Beta(old_alpha, old_beta)
-                frac_kl = kl_divergence(new_beta, old_beta_dist)  # [B, P]
+
+                if pmpo_reverse_kl:
+                    # KL(old ‖ new) — dreamer4 default; mass-covering w.r.t.
+                    # the rollout policy.
+                    target_probs_old = old_target_log_probs.exp()
+                    target_kl = (
+                        target_probs_old * (log_p_old_safe - log_p_new_safe)
+                    ).sum(dim=-1)  # [B, P]
+                    frac_kl = kl_divergence(old_beta_dist, new_beta)
+                else:
+                    # KL(new ‖ old) — forward direction; mode-seeking.
+                    target_probs_new = target_log_probs.exp()
+                    target_kl = (
+                        target_probs_new * (log_p_new_safe - log_p_old_safe)
+                    ).sum(dim=-1)
+                    frac_kl = kl_divergence(new_beta, old_beta_dist)
                 # Apply the fraction KL on every owned planet, not only the ones
                 # whose old sample was a move: concentration-collapse on a
                 # no-op planet is still a regression in policy quality, and
@@ -314,14 +342,14 @@ def ppo_update(
             optimizer.step()
 
             with torch.no_grad():
+                # Importance-ratio diagnostic. Even though PMPO doesn't use it
+                # for the loss, watching `approx_kl` is the cleanest proxy for
+                # per-update policy drift — an order-of-magnitude jump here is
+                # exactly the cold-start signal we want to catch.
                 kl = ((old_log_prob - chosen) * owned_f).sum() / denom
-                # Count tokens whose ratio drifted past *either* asymmetric
-                # bound — preserves the diagnostic of "fraction clipped" even
-                # when eps_low ≠ eps_high.
-                clip_low = ratio < (1.0 - clip_eps_low)
-                clip_high = ratio > (1.0 + clip_eps_high)
-                clipped_mask = (clip_low | clip_high).float()
-                clip_frac = (clipped_mask * owned_f).sum() / denom
+                pos_count = (pos_mask).float().sum()
+                total_owned = owned_f.sum().clamp_min(1.0)
+                pos_frac = pos_count / total_owned
 
             metrics = torch.stack(
                 [
@@ -329,8 +357,8 @@ def ppo_update(
                     value_loss.detach(),
                     entropy.detach(),
                     kl.detach(),
-                    clip_frac.detach(),
                     pmpo_kl.detach(),
+                    pos_frac.detach(),
                 ]
             ).float()
             if metric_sum is None:
@@ -348,8 +376,8 @@ def ppo_update(
         value_loss=float(logs[1]),
         entropy=float(logs[2]),
         approx_kl=float(logs[3]),
-        clip_frac=float(logs[4]),
-        pmpo_kl=float(logs[5]),
+        pmpo_kl=float(logs[4]),
+        pos_frac=float(logs[5]),
     )
 
 
@@ -362,11 +390,13 @@ def value_only_update(
     minibatch_size: int,
     grad_clip: float,
 ) -> float:
-    """Critic-only MSE update for the value-pretraining phase.
+    """Critic-only distributional CE update for the value-pretraining phase.
 
-    `batch["return"]` here should be Monte-Carlo returns (γ=1 for terminal-
-    only reward → just the trajectory outcome). Run this for a few hundred
-    steps against a frozen behavior policy before turning on PPO.
+    `batch["return"]` should be Monte-Carlo returns (γ=1 for terminal-only
+    reward → just the trajectory outcome). Run this for a few hundred
+    steps against a frozen behavior policy before turning on PPO. Mirrors
+    the same HL-Gauss CE loss `ppo_update` uses, so the cold-start critic
+    sees the same target distribution it'll be trained against later.
 
     Reports mean value loss over the pass.
     """
@@ -374,6 +404,9 @@ def value_only_update(
     device = batch["planet_feats"].device
     total: torch.Tensor | None = None
     n_steps = 0
+
+    orig_model = getattr(model, "_orig_mod", model)
+    value_encoder = orig_model.value_encoder
 
     autocast_enabled = (
         next(model.parameters()).is_cuda
@@ -388,10 +421,11 @@ def value_only_update(
                 device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
             ):
                 out = model(_slice_feats(batch, mb))
-            # fp32 loss math (same rationale as `ppo_update`).
-            value_loss = (
-                out.value.float() - batch["return"][mb].float()
-            ).pow(2).mean()
+            value_logits = out.value_logits.float()
+            ret = batch["return"][mb].float()
+            target_probs = value_encoder.target_probs(ret)
+            log_probs = F.log_softmax(value_logits, dim=-1)
+            value_loss = -(target_probs * log_probs).sum(dim=-1).mean()
 
             optimizer.zero_grad(set_to_none=True)
             value_loss.backward()

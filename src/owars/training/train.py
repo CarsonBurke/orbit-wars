@@ -195,6 +195,10 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         depth=cfg.model.depth,
         n_heads=cfg.model.n_heads,
         dropout=cfg.model.dropout,
+        value_hidden=cfg.model.value_hidden,
+        value_num_bins=cfg.model.value_num_bins,
+        value_min=cfg.model.value_min,
+        value_max=cfg.model.value_max,
     )
     return OrbitPolicy(pcfg)
 
@@ -287,9 +291,17 @@ def _stack_trajectories(
 
     advs = torch.from_numpy(np.concatenate(advs_all)).float()
     rets = torch.from_numpy(np.concatenate(rets_all)).float()
-    # Normalize once over the full batch — see ppo_update for why.
-    batch["advantage"] = (advs - advs.mean()) / (advs.std() + 1e-8)
+    # PMPO uses `tanh(adv).abs()` magnitude shaping, which is bounded in
+    # [0, 1) regardless of advantage scale — so we deliberately do *not*
+    # z-score advantages here (dreamer4 `dreamer4.py:4130` makes the same
+    # choice: `normalize_advantages = default(None, not use_pmpo)`). The
+    # raw advantage signal carries through to PMPO's pos/neg split.
+    batch["advantage"] = advs
     batch["return"] = rets
+    # Old scalar value at rollout time — used by `ppo_update` for value
+    # clipping (re-encodes `old_v + (v - old_v).clamp(±value_clip)` and
+    # CE's the clipped distribution against the same return target).
+    batch["old_value"] = torch.from_numpy(all_values).float()
     return batch
 
 
@@ -594,11 +606,13 @@ def _ppo_loop(
             train_model,
             optimizer,
             batch,
-            clip_eps_low=cfg.ppo.clip_eps_low,
-            clip_eps_high=cfg.ppo.clip_eps_high,
             value_coef=cfg.ppo.value_coef,
             entropy_coef=cfg.ppo.entropy_coef,
             pmpo_kl_coef=cfg.ppo.pmpo_kl_coef,
+            pmpo_pos_to_neg_weight=cfg.ppo.pmpo_pos_to_neg_weight,
+            pmpo_reverse_kl=cfg.ppo.pmpo_reverse_kl,
+            value_clip=cfg.ppo.value_clip,
+            clip_values=cfg.ppo.clip_values,
             epochs=cfg.optim.epochs_per_update,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
@@ -614,8 +628,8 @@ def _ppo_loop(
                 "value_loss": log.value_loss,
                 "entropy": log.entropy,
                 "approx_kl": log.approx_kl,
-                "clip_frac": log.clip_frac,
                 "pmpo_kl": log.pmpo_kl,
+                "pos_frac": log.pos_frac,
                 "win_rate": win_rate,
                 "margin": margin,
                 "elo_learner": elo.get(LEARNER_NAME),

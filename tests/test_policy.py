@@ -43,6 +43,10 @@ def test_policy_forward_shapes():
     assert out.fraction_alpha.shape == (1, 64)
     assert out.fraction_beta.shape == (1, 64)
     assert out.value.shape == (1,)
+    # Distributional value head: per-bin logits over the configured support.
+    assert out.value_logits.shape == (1, cfg.value_num_bins)
+    # Recovered scalar value lives inside the bin support.
+    assert cfg.value_min <= float(out.value.item()) <= cfg.value_max
 
 
 def test_policy_ignores_padded_token_features():

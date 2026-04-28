@@ -40,10 +40,13 @@ ppo:
   lambda_critic: 1.0
   lambda_policy: 0.95
   lambda_policy_alpha: 0.0
-  clip_eps_low: 0.2
-  clip_eps_high: 0.28
-  value_coef: 0.5
-  entropy_coef: 0.015   # a touch higher to keep diverse strategies alive
+  pmpo_pos_to_neg_weight: 0.5
+  pmpo_reverse_kl: true
+  pmpo_kl_coef: 0.3
+  value_coef: 1.0
+  entropy_coef: 0.015   # a touch higher to keep diverse strategies alive in FFA
+  clip_values: true
+  value_clip: 0.4
   pretrain_updates: 75
   pretrain_episodes: 32
   pretrain_lr: 1.0e-3

@@ -8,7 +8,7 @@ Architecture:
               │
               ├─► h_actor (broadcast)  ─► concat onto each planet rep ─►
               │                             target attention + fraction head
-              ├─► h_critic             ─► value MLP (replaces mean-pool)
+              ├─► h_critic             ─► distributional value head (HL-Gauss)
               ├─► planet_h             ─► target_key (per-planet rep stays d-dim)
               └─► fleet_h              ─► (consumed only by encoder cross-attention)
 
@@ -30,15 +30,12 @@ capacity the extra token was added to provide.
 lead-intercept solver in `sampling.py`.
 
 **Fraction head is a Beta(α, β)** on [0, 1] — the natural distribution for
-"fraction of garrison to send." Replaces the previous tanh-squashed Normal,
-which suffered from (a) tanh-saturation pathology if μ drifted past ±2.5
-(gradient through tanh dies, policy stuck at the action boundary), (b) hand-
-rolled tanh-Jacobian in log_prob, and (c) a recurring σ-collapse risk that
-needed clamps or strong PMPO KL to suppress. Beta avoids all three: native
-[0,1] support, no Jacobian, and concentration is **soft-capped** so the
-policy literally cannot freeze itself.
-
-Soft-cap (cleanrl `ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:200`):
+"fraction of garrison to send." dreamer4 uses an *unbounded* diagonal
+Normal for continuous actions; we deliberately diverge to Beta because
+(a) the action lives natively on [0,1] so no tanh squashing is needed,
+(b) the soft-cap on (α, β) gives a structural exploration floor that
+dreamer4 has to enforce via entropy bonus alone, (c) no Jacobian
+gymnastics. Soft-cap (cleanrl `ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:200`):
     α = 1 + α_max · tanh(softplus(head_α) / α_max)        (likewise β)
 properties:
   • α ∈ [1, 1 + α_max] — explicit upper bound (1 + ALPHA_MAX = 21).
@@ -53,6 +50,24 @@ properties:
 The +1 shift (vs raw softplus) keeps α,β ≥ 1, which is what makes Beta
 unimodal+concave; without it the policy can drive α or β toward 0 and the
 distribution becomes bimodal at the boundaries (Chou et al. 2017 §4).
+
+**Distributional value head (HL-Gauss).** dreamer4 (`dreamer4.py:722–805`)
+predicts a categorical over a fixed bin support and trains it with
+cross-entropy against a Gaussian-kernel-smoothed target distribution
+(Imani et al. 2018, Farebrother et al. 2024). The expected value
+E[V|s] = Σ p_i · center_i is the recovered scalar; the learning gradient
+is bounded by 1 (CE) instead of unbounded (MSE on a possibly-misscaled
+scalar), which makes the critic dramatically more robust to early
+mis-prediction.
+
+We deliberately drop dreamer4's symlog transform — our reward is
+terminal-only ±1 with γ=1, so unshaped returns live in [-1, 1]. We
+default the bin support to [-2, 2] (51 bins) so margin shaping
+(`RewardCfg.margin_scale > 0` adds up to ±2·margin_scale) has 1.0 of
+headroom on each side; configs that go past that should widen via
+`OrbitPolicyConfig.value_min/max`. σ = 0.5 × bin_size (dreamer4
+default), and `target_probs` clips out-of-range targets to the
+boundary bin so the head degrades gracefully rather than producing NaN.
 
 **Critic still shares the encoder backbone.** Value-loss gradients flow
 through the same transformer the actor uses. This is tamed by
@@ -164,13 +179,6 @@ def restore_fp32_params(model: nn.Module) -> None:
         )
         if wants_fp32 and param.dtype != torch.float32:
             param.data = param.data.float()
-
-# Reserved for re-enabling a log-σ clamp if PPO σ-collapse re-emerges.
-# Currently unused — see the fraction-head construction in `OrbitPolicy.forward`
-# for the dreamer4-style unclamped policy.
-LOG_SIGMA_MIN: float = -2.0
-LOG_SIGMA_MAX: float = 2.0
-
 
 class SelfAttention(nn.Module):
     """Multi-head self-attention with QK-norm + per-head q_gain on a
@@ -345,6 +353,100 @@ class TransformerBlock(nn.Module):
 ALPHA_MAX: float = 20.0
 
 
+class HLGaussLoss(nn.Module):
+    """Histogram-loss-Gaussian distributional regression head.
+
+    Lifted in spirit from dreamer4 (`dreamer4.py:722–805` `SymExpHLGauss`)
+    and the underlying Imani et al. 2018 / Farebrother et al. 2024 design.
+    For our [-1, 1] return range we drop the symlog transform.
+
+    Forward semantics:
+      - `target_probs(value)` encodes a scalar to a per-bin probability
+        vector via the truncated-Gaussian CDF over the bin support, with
+        renormalization so the truncated tails don't bias the target.
+      - `transform_to_logprobs(value)` is the same path returning log-probs
+        directly (used for value clipping where we re-encode the clipped
+        scalar and compute its CE against the *unclipped* target).
+      - `bins_to_scalar(logits)` recovers E[V] = Σ softmax(logits)_i · c_i.
+      - `loss(logits, target_probs)` is just F.cross_entropy on a per-element
+        basis (caller is responsible for masking/reduction).
+
+    All math casts to fp32 internally — the support buffer is bf16 after
+    `model.bfloat16()` but bin edges in [-1, 1] need more than 7 mantissa
+    bits to be useful as targets.
+    """
+
+    def __init__(
+        self,
+        min_value: float = -1.0,
+        max_value: float = 1.0,
+        num_bins: int = 41,
+        sigma_to_bin_ratio: float = 0.5,
+    ):
+        super().__init__()
+        if num_bins < 2:
+            raise ValueError(f"num_bins must be ≥ 2, got {num_bins}")
+        self.num_bins = num_bins
+        self.min_value = min_value
+        self.max_value = max_value
+        self.bin_size = (max_value - min_value) / num_bins
+        self.sigma = sigma_to_bin_ratio * self.bin_size
+        self.sigma_times_sqrt_two = (2.0 ** 0.5) * self.sigma
+
+    def _support(self, ref: torch.Tensor) -> torch.Tensor:
+        """Bin-edge tensor `[num_bins+1]` in fp32 on `ref`'s device.
+
+        We deliberately do *not* `register_buffer` the support — `model.bfloat16()`
+        casts buffers to bf16, but bin edges in [-2, 2] need fp32 (bf16 step
+        ≈ 0.016 vs 0.08 bin spacing → ~20% bin shift). Recomputing per call
+        on the input device is trivial (tens of floats).
+        """
+        return torch.linspace(
+            self.min_value,
+            self.max_value,
+            self.num_bins + 1,
+            dtype=torch.float32,
+            device=ref.device,
+        )
+
+    def _centers(self, support: torch.Tensor) -> torch.Tensor:
+        return (support[:-1] + support[1:]) / 2
+
+    def target_probs(self, values: torch.Tensor) -> torch.Tensor:
+        """Encode scalar `values` (any leading shape) into [..., num_bins]
+        probabilities under a Gaussian centered at each value.
+
+        We deliberately diverge from dreamer4's library default
+        (`hl_gauss_pytorch/hl_gauss.py:131-146`, `clamp_to_range=False`)
+        and clamp the target to `[min_value, max_value]` upfront. Their
+        255-bin symlog [-20, 20] support corresponds to ±5e8 in raw units
+        — effectively never out-of-range. Our compact [-2, 2] support
+        could be exceeded if a config dials margin shaping past 0.5;
+        without the clamp the truncated-Gaussian collapses (cdf saturates
+        on both ends, z ≈ 0, divide by `clamp_min(1e-10)` yields an
+        all-zero target distribution → zero CE gradient). The clamp
+        concentrates mass at the boundary bin instead, degrading
+        gracefully rather than silently no-op'ing the value loss.
+        """
+        v = values.float().clamp(self.min_value, self.max_value)
+        support = self._support(v)  # [num_bins+1]
+        # cdf[..., i] = erf((support_i − v) / (σ√2))
+        cdf = torch.erf((support - v.unsqueeze(-1)) / self.sigma_times_sqrt_two)
+        bin_probs = cdf[..., 1:] - cdf[..., :-1]
+        z = (cdf[..., -1] - cdf[..., 0]).clamp_min(1e-10)
+        return bin_probs / z.unsqueeze(-1)
+
+    def transform_to_logprobs(self, values: torch.Tensor) -> torch.Tensor:
+        return self.target_probs(values).clamp_min(1e-20).log()
+
+    def bins_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
+        probs = F.softmax(logits.float(), dim=-1)
+        support = self._support(probs)
+        centers = self._centers(support)
+        return (probs * centers).sum(dim=-1)
+
+
+
 def _soft_cap_concentration(head: torch.Tensor) -> torch.Tensor:
     """Map a real-valued head into [1, 1+ALPHA_MAX] smoothly.
 
@@ -362,7 +464,8 @@ class PolicyOutput:
     target_logits: torch.Tensor       # [B, P, P+1]  +1 = no-op slot
     fraction_alpha: torch.Tensor      # [B, P]  Beta α ∈ [1, 1+ALPHA_MAX] (post soft-cap)
     fraction_beta: torch.Tensor       # [B, P]  Beta β ∈ [1, 1+ALPHA_MAX] (post soft-cap)
-    value: torch.Tensor               # [B]
+    value: torch.Tensor               # [B] — scalar value E[V] recovered from value_logits
+    value_logits: torch.Tensor        # [B, num_bins] — distributional value head logits
     planet_owned_mask: torch.Tensor   # [B, P] bool
     planet_mask: torch.Tensor         # [B, P] bool
     planet_ids: torch.Tensor          # [B, P] long
@@ -460,10 +563,20 @@ class OrbitPolicy(nn.Module):
         # is mildly bell-shaped on [0,1] centered at 0.5, so first-update
         # Δlog_prob is bounded by the trunk's update size, not the head's.
         nn.init.orthogonal_(self.fraction_head.weight, gain=0.01)
+        # Distributional value head — emits logits over `value_num_bins`
+        # bins on the [-1, 1] support. Scalar V is recovered from these
+        # via `HLGaussLoss.bins_to_scalar`. dreamer4 uses 255 bins on a
+        # symlog'd support; with our terminal-only ±1 reward (returns ∈
+        # [-1, 1]) we use a coarser linear bin set.
+        self.value_encoder = HLGaussLoss(
+            min_value=cfg.value_min,
+            max_value=cfg.value_max,
+            num_bins=cfg.value_num_bins,
+        )
         self.value_head = nn.Sequential(
             CastedLinear(cfg.dim, cfg.value_hidden, bias=False),
             SquaredReLU(),
-            CastedLinear(cfg.value_hidden, 1, bias=False),
+            CastedLinear(cfg.value_hidden, cfg.value_num_bins, bias=False),
         )
         # Orthogonal init for the value-head input projection (both dims
         # ≥64 if `value_hidden ≥ 64`).
@@ -472,10 +585,11 @@ class OrbitPolicy(nn.Module):
             and self.value_head[0].weight.shape[1] >= 64
         ):
             nn.init.orthogonal_(self.value_head[0].weight, gain=0.1)
-        # Zero-init the value head's last layer so V(s) ≡ 0 before any
-        # gradient step — same parameter-golf lever as the action heads.
-        # This stops cold-start critic noise from injecting spurious
-        # advantage signal into the actor's first few updates.
+        # Zero-init the value head's last layer so V(s) is the *uniform*
+        # distribution over bins at step 0 — same parameter-golf lever as
+        # the action heads. Recovered scalar starts at 0 (mean of bin
+        # centers on the symmetric [-1, 1] support) so cold-start advantage
+        # is not corrupted by a random bin distribution.
         nn.init.zeros_(self.value_head[-1].weight)
         # Cached on-device self-target mask. P is bounded by MAX_PLANETS,
         # so we allocate once at module init and slice per-forward instead
@@ -647,14 +761,18 @@ class OrbitPolicy(nn.Module):
         fraction_alpha = _soft_cap_concentration(offs[..., 0])
         fraction_beta = _soft_cap_concentration(offs[..., 1])
 
-        # Value: dedicated critic token (replaces mean-pool).
-        value = self.value_head(h_critic).squeeze(-1)
+        # Value: distributional head over the dedicated critic token.
+        # Logits are returned for distributional CE loss + value clipping;
+        # the scalar `value` is recovered via E[V] = Σ p_i · center_i.
+        value_logits = self.value_head(h_critic)  # [B, num_bins]
+        value = self.value_encoder.bins_to_scalar(value_logits)
 
         return PolicyOutput(
             target_logits=target_logits,
             fraction_alpha=fraction_alpha,
             fraction_beta=fraction_beta,
             value=value,
+            value_logits=value_logits,
             planet_owned_mask=planet_owned,
             planet_mask=planet_mask,
             planet_ids=planet_ids,
