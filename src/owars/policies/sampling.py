@@ -96,6 +96,14 @@ class ActionContext:
     comet_planet_ids: Any = ()
 
 
+@dataclass(slots=True)
+class LeadSolution:
+    angle: float
+    time: float
+    x: float
+    y: float
+
+
 def _point_to_segment_distance(
     px: float,
     py: float,
@@ -134,21 +142,23 @@ def _is_inside_board(x: float, y: float) -> bool:
     return 0.0 <= x <= BOARD_SIZE and 0.0 <= y <= BOARD_SIZE
 
 
-def _safe_launch_angle(
+def _safe_flight_segment(
     mine_x: float,
     mine_y: float,
     mine_radius: float,
-    target_x: float,
-    target_y: float,
     angle: float,
+    end_x: float,
+    end_y: float,
 ) -> bool:
     start_x, start_y = _launch_start(mine_x, mine_y, mine_radius, angle)
     if not _is_inside_board(start_x, start_y):
         return False
-    return not _segment_crosses_sun(start_x, start_y, target_x, target_y)
+    if not _is_inside_board(end_x, end_y):
+        return False
+    return not _segment_crosses_sun(start_x, start_y, end_x, end_y)
 
 
-def _lead_angle_from_point(
+def _lead_solution_from_point(
     mine_x: float,
     mine_y: float,
     target_x: float,
@@ -156,8 +166,8 @@ def _lead_angle_from_point(
     target_radius: float,
     angular_velocity: float,
     send: int,
-) -> float | None:
-    """Closed-form first-intercept angle from an exact fleet start point.
+) -> LeadSolution | None:
+    """Closed-form first-intercept solution from an exact fleet start point.
 
     Solves `sp²·t² + 2Rρ·cos(θ₀ + ωt − φ) = R² + ρ²` for the smallest
     `t ≥ 0` via coarse Nyquist scan + bisection (see module docstring).
@@ -186,7 +196,12 @@ def _lead_angle_from_point(
         d = math.hypot(target_x - mine_x, target_y - mine_y)
         if d / sp > LEAD_T_HORIZON_STEPS:
             return None
-        return angle_to(mine_x, mine_y, target_x, target_y)
+        return LeadSolution(
+            angle=angle_to(mine_x, mine_y, target_x, target_y),
+            time=d / sp,
+            x=target_x,
+            y=target_y,
+        )
 
     a = mine_x - cx
     b = mine_y - cy
@@ -205,7 +220,12 @@ def _lead_angle_from_point(
 
     # Source coincident with target (dist=0) ⇒ t* = 0; aim direct.
     if f(0.0) >= -1e-9:
-        return angle_to(mine_x, mine_y, target_x, target_y)
+        return LeadSolution(
+            angle=angle_to(mine_x, mine_y, target_x, target_y),
+            time=0.0,
+            x=target_x,
+            y=target_y,
+        )
 
     # Nyquist for the cosine: dt < π/|ω| guarantees we see every sign change.
     # T/16 is a comfortable factor-of-8 safety margin; cost is trivial (a
@@ -243,7 +263,71 @@ def _lead_angle_from_point(
     psi = theta0 + angular_velocity * t_star
     tx = cx + orbit_radius * math.cos(psi)
     ty = cy + orbit_radius * math.sin(psi)
-    return angle_to(mine_x, mine_y, tx, ty)
+    return LeadSolution(angle=angle_to(mine_x, mine_y, tx, ty), time=t_star, x=tx, y=ty)
+
+
+def _lead_angle_from_point(
+    mine_x: float,
+    mine_y: float,
+    target_x: float,
+    target_y: float,
+    target_radius: float,
+    angular_velocity: float,
+    send: int,
+) -> float | None:
+    solution = _lead_solution_from_point(
+        mine_x, mine_y, target_x, target_y, target_radius, angular_velocity, send
+    )
+    return None if solution is None else solution.angle
+
+
+def _lead_solution(
+    mine_x: float,
+    mine_y: float,
+    mine_radius: float,
+    target_x: float,
+    target_y: float,
+    target_radius: float,
+    angular_velocity: float,
+    send: int,
+) -> LeadSolution | None:
+    """First-intercept launch solution for the official action semantics.
+
+    The simulator does not spawn a fleet at the source center. It starts the
+    fleet just outside the planet along the submitted angle, so the start
+    point itself depends on the angle. Iterating the point-solver a few times
+    accounts for that offset and prevents small-radius targets from being
+    missed by a centerline shot.
+    """
+    solution = _lead_solution_from_point(
+        mine_x, mine_y, target_x, target_y, target_radius, angular_velocity, send
+    )
+    if solution is None:
+        return None
+    angle = solution.angle
+    launch_offset = max(0.0, float(mine_radius) + 0.1)
+    if launch_offset <= 0.0:
+        return solution
+
+    for _ in range(4):
+        start_x = mine_x + math.cos(angle) * launch_offset
+        start_y = mine_y + math.sin(angle) * launch_offset
+        refined = _lead_solution_from_point(
+            start_x,
+            start_y,
+            target_x,
+            target_y,
+            target_radius,
+            angular_velocity,
+            send,
+        )
+        if refined is None:
+            return None
+        if abs(math.atan2(math.sin(refined.angle - angle), math.cos(refined.angle - angle))) < 1e-6:
+            return refined
+        angle = refined.angle
+        solution = refined
+    return solution
 
 
 def _lead_angle(
@@ -256,41 +340,17 @@ def _lead_angle(
     angular_velocity: float,
     send: int,
 ) -> float | None:
-    """First-intercept launch angle for the official action semantics.
-
-    The simulator does not spawn a fleet at the source center. It starts the
-    fleet just outside the planet along the submitted angle, so the start
-    point itself depends on the angle. Iterating the point-solver a few times
-    accounts for that offset and prevents small-radius targets from being
-    missed by a centerline shot.
-    """
-    angle = _lead_angle_from_point(
-        mine_x, mine_y, target_x, target_y, target_radius, angular_velocity, send
+    solution = _lead_solution(
+        mine_x,
+        mine_y,
+        mine_radius,
+        target_x,
+        target_y,
+        target_radius,
+        angular_velocity,
+        send,
     )
-    if angle is None:
-        return None
-    launch_offset = max(0.0, float(mine_radius) + 0.1)
-    if launch_offset <= 0.0:
-        return angle
-
-    for _ in range(4):
-        start_x = mine_x + math.cos(angle) * launch_offset
-        start_y = mine_y + math.sin(angle) * launch_offset
-        refined = _lead_angle_from_point(
-            start_x,
-            start_y,
-            target_x,
-            target_y,
-            target_radius,
-            angular_velocity,
-            send,
-        )
-        if refined is None:
-            return None
-        if abs(math.atan2(math.sin(refined - angle), math.cos(refined - angle))) < 1e-6:
-            return refined
-        angle = refined
-    return angle
+    return None if solution is None else solution.angle
 
 
 def _build_moves_from_lists(
@@ -329,7 +389,7 @@ def _build_moves_from_lists(
         if send <= 0:
             continue
 
-        ang = _lead_angle(
+        solution = _lead_solution(
             mine.x,
             mine.y,
             mine.radius,
@@ -339,11 +399,13 @@ def _build_moves_from_lists(
             omega,
             send,
         )
-        if ang is None:
+        if solution is None:
             continue  # solver couldn't find a feasible intercept — silently no-op
-        if not _safe_launch_angle(mine.x, mine.y, mine.radius, target.x, target.y, ang):
+        if not _safe_flight_segment(
+            mine.x, mine.y, mine.radius, solution.angle, solution.x, solution.y
+        ):
             continue
-        moves.append(Move(mine.id, ang, send))
+        moves.append(Move(mine.id, solution.angle, send))
         remaining_by_id[mine.id] = remaining - send
         if len(moves) >= max_moves:
             break
@@ -383,7 +445,7 @@ def _build_moves_from_packed_fields(
         if send <= 0:
             continue
 
-        ang = _lead_angle(
+        solution = _lead_solution(
             mine.x,
             mine.y,
             mine.radius,
@@ -393,11 +455,13 @@ def _build_moves_from_packed_fields(
             omega,
             send,
         )
-        if ang is None:
+        if solution is None:
             continue
-        if not _safe_launch_angle(mine.x, mine.y, mine.radius, target.x, target.y, ang):
+        if not _safe_flight_segment(
+            mine.x, mine.y, mine.radius, solution.angle, solution.x, solution.y
+        ):
             continue
-        moves.append(Move(mine.id, ang, send))
+        moves.append(Move(mine.id, solution.angle, send))
         remaining_by_id[mine.id] = remaining - send
         if len(moves) >= max_moves:
             break
@@ -444,7 +508,7 @@ def _build_action_lists_from_packed_fields_raw(
         if send <= 0:
             continue
 
-        ang = _lead_angle(
+        solution = _lead_solution(
             float(mine[2]),
             float(mine[3]),
             float(mine[4]),
@@ -454,18 +518,18 @@ def _build_action_lists_from_packed_fields_raw(
             omega,
             send,
         )
-        if ang is None:
+        if solution is None:
             continue
-        if not _safe_launch_angle(
+        if not _safe_flight_segment(
             float(mine[2]),
             float(mine[3]),
             float(mine[4]),
-            float(target[2]),
-            float(target[3]),
-            ang,
+            solution.angle,
+            solution.x,
+            solution.y,
         ):
             continue
-        actions.append([int(mine[0]), float(ang), int(send)])
+        actions.append([int(mine[0]), float(solution.angle), int(send)])
         remaining_by_id[int(mine[0])] = mine_ships - send
         if len(actions) >= max_moves:
             break
@@ -506,7 +570,7 @@ def _build_action_lists_from_packed_fields_context(
         if send <= 0:
             continue
 
-        ang = _lead_angle(
+        solution = _lead_solution(
             float(mine[2]),
             float(mine[3]),
             float(mine[4]),
@@ -516,18 +580,18 @@ def _build_action_lists_from_packed_fields_context(
             omega,
             send,
         )
-        if ang is None:
+        if solution is None:
             continue
-        if not _safe_launch_angle(
+        if not _safe_flight_segment(
             float(mine[2]),
             float(mine[3]),
             float(mine[4]),
-            float(target[2]),
-            float(target[3]),
-            ang,
+            solution.angle,
+            solution.x,
+            solution.y,
         ):
             continue
-        actions.append([int(mine[0]), float(ang), int(send)])
+        actions.append([int(mine[0]), float(solution.angle), int(send)])
         remaining_by_id[int(mine[0])] = mine_ships - send
         if len(actions) >= max_moves:
             break

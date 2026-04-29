@@ -7,7 +7,12 @@ import math
 import pytest
 
 from owars.game.types import CENTER
-from owars.policies.sampling import _lead_angle, _lead_angle_from_point
+from owars.policies.sampling import (
+    _lead_angle,
+    _lead_angle_from_point,
+    _lead_solution,
+    _safe_flight_segment,
+)
 
 
 def _simulate_intercept(
@@ -154,3 +159,24 @@ def test_solver_accounts_for_official_launch_surface_offset():
     )
     assert center_closest is not None and center_closest > target_radius
     assert offset_closest is not None and offset_closest < target_radius
+
+
+def test_safety_filter_checks_future_intercept_segment_not_current_target():
+    """For orbiting targets, the actual ray goes to the future intercept point.
+    Checking only the current target coordinate can miss sun collisions."""
+    sx, sy, source_radius = 42.09, 18.80, 1.04
+    target_x, target_y, target_radius = 37.11, 59.39, 1.66
+    omega = -0.0491
+    send = 111
+
+    solution = _lead_solution(
+        sx, sy, source_radius, target_x, target_y, target_radius, omega, send
+    )
+
+    assert solution is not None
+    assert _safe_flight_segment(
+        sx, sy, source_radius, solution.angle, target_x, target_y
+    )
+    assert not _safe_flight_segment(
+        sx, sy, source_radius, solution.angle, solution.x, solution.y
+    )
