@@ -28,10 +28,12 @@ adaptations the Orbit Wars action structure imposes:
 
   4. **Distributional value loss** (HL-Gauss CE, `dreamer4.py:4509-4515`).
      The critic emits `value_logits` over a fixed bin support; the loss
-     is cross-entropy against `target_probs(returns)`. Optional value
-     clipping (`clip_values=True`): `clipped_v = old_v + Δ.clamp(±value_clip)`,
-     re-encoded through `transform_to_logprobs` and CE'd against the
-     same target_probs; `value_loss = max(loss, clipped_loss)`.
+     is cross-entropy against `target_probs(returns)`. No value clipping —
+     distributional CE has bounded per-element gradients
+     (`softmax_i − target_i ∈ [-1, 1]`), and dreamer4's
+     `max(ce, ce_of_clipped_v)` clip degenerates with our narrow HL-Gauss
+     σ (the re-encoded clipped scalar doesn't overlap with the return target,
+     so clipped CE saturates at `−log(eps) ≈ 46` and dominates the loss).
 
 The cold-start fix — value pretraining with a frozen behavior policy —
 is in `train.py::pretrain_value`. This file is just the per-update math.
@@ -62,6 +64,86 @@ def _slice_feats(batch: dict[str, torch.Tensor], mb) -> EncodedObs:
         fleet_feats=batch["fleet_feats"][mb],
         fleet_mask=batch["fleet_mask"][mb],
     )
+
+
+def _fixed_minibatches(
+    n: int,
+    minibatch_size: int,
+    device: torch.device,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Return shuffled fixed-size minibatches plus per-row loss weights.
+
+    `torch.compile(dynamic=False, fullgraph=True)` specializes on batch
+    dimension. A short tail minibatch would force another graph, and enough
+    distinct rollout lengths eventually hit Dynamo's recompile limit. Pad the
+    final chunk by reusing shuffled rows so every PPO model call sees the same
+    leading dimension, but assign padding rows zero weight so every rollout row
+    contributes once per epoch.
+    """
+    if n <= 0:
+        return []
+    size = max(1, int(minibatch_size))
+    idx = torch.randperm(n, device=device)
+    if n < size:
+        extra = idx[torch.randint(n, (size - n,), device=device)]
+        mb = torch.cat((idx, extra), dim=0)
+        weight = torch.cat(
+            (
+                torch.ones(n, device=device, dtype=torch.float32),
+                torch.zeros(size - n, device=device, dtype=torch.float32),
+            ),
+            dim=0,
+        )
+        return [(mb, weight)]
+
+    batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for start in range(0, n, size):
+        mb = idx[start : start + size]
+        real = mb.shape[0]
+        weight = torch.ones(real, device=device, dtype=torch.float32)
+        if mb.shape[0] < size:
+            mb = torch.cat((mb, idx[: size - mb.shape[0]]), dim=0)
+            weight = torch.cat(
+                (
+                    weight,
+                    torch.zeros(size - real, device=device, dtype=torch.float32),
+                ),
+                dim=0,
+            )
+        batches.append((mb, weight))
+    return batches
+
+
+def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.to(device=values.device, dtype=values.dtype)
+    return (values * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def _move_probability(target_probs: torch.Tensor, noop_idx: int) -> torch.Tensor:
+    return 1.0 - target_probs[..., noop_idx]
+
+
+def _conditional_action_entropy(
+    target_log_probs: torch.Tensor,
+    beta_entropy: torch.Tensor,
+    noop_idx: int,
+) -> torch.Tensor:
+    """Entropy of target + fraction, where fraction exists only on moves."""
+    min_real = torch.finfo(target_log_probs.dtype).min
+    target_probs = target_log_probs.exp()
+    target_entropy = -(target_probs * target_log_probs.clamp_min(min_real)).sum(
+        dim=-1
+    )
+    return target_entropy + _move_probability(target_probs, noop_idx) * beta_entropy
+
+
+def _conditional_fraction_kl(
+    frac_kl: torch.Tensor,
+    source_target_probs: torch.Tensor,
+    noop_idx: int,
+) -> torch.Tensor:
+    """Beta KL contribution for a fraction head conditional on making a move."""
+    return _move_probability(source_target_probs, noop_idx) * frac_kl
 
 
 @dataclass
@@ -139,8 +221,6 @@ def ppo_update(
     pmpo_kl_coef: float,
     pmpo_pos_to_neg_weight: float,
     pmpo_reverse_kl: bool,
-    value_clip: float,
-    clip_values: bool,
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
@@ -154,8 +234,7 @@ def ppo_update(
       `old_log_prob` [B,P], `advantage` [B], `return` [B],
       `owned_mask` [B,P],
       `old_target_logits` [B,P,P+1],
-      `old_fraction_alpha` [B,P], `old_fraction_beta` [B,P],
-      `old_value` [B] — scalar value at rollout time, for value clipping.
+      `old_fraction_alpha` [B,P], `old_fraction_beta` [B,P].
 
     PMPO surrogate: `policy_loss = −α·mean(scaled[pos]) + (1−α)·mean(scaled[neg])`
     where `scaled = chosen_log_prob · |tanh(advantage)|`. No PPO clip.
@@ -164,9 +243,7 @@ def ppo_update(
     dreamer4 default; setting `False` flips to forward KL).
 
     Distributional value loss: cross-entropy against HL-Gauss-encoded
-    returns (`value_encoder.target_probs(returns)`). When `clip_values`
-    is true, re-encode `old_v + (v − old_v).clamp(±value_clip)` and take
-    the elementwise max of the two CE losses.
+    returns (`value_encoder.target_probs(returns)`). No value clipping.
     """
     n = batch["planet_feats"].shape[0]
     device = batch["planet_feats"].device
@@ -198,9 +275,7 @@ def ppo_update(
         else False
     )
     for _ in range(epochs):
-        idx = torch.randperm(n, device=device)
-        for start in range(0, n, minibatch_size):
-            mb = idx[start : start + minibatch_size]
+        for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
 
             with torch.autocast(
                 device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
@@ -210,13 +285,13 @@ def ppo_update(
             target_logits = out.target_logits.float()
             fraction_alpha = out.fraction_alpha.float()
             fraction_beta = out.fraction_beta.float()
-            value = out.value.float()
             value_logits = out.value_logits.float()
 
             owned_f = batch["owned_mask"][mb].float()
             p = target_logits.shape[1]
             target = batch["target_idx"][mb].clamp(0, p)
             target_log_probs = F.log_softmax(target_logits, dim=-1)
+            target_dist_probs = target_log_probs.exp()
             target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
 
             # Beta log-prob at the recorded sample. The fraction component
@@ -241,18 +316,14 @@ def ppo_update(
             # which is why dreamer4 deliberately *does not* z-score advantages
             # under PMPO.
             scaled_lp = chosen * adv_b.tanh().abs()
-            mask = owned_f.bool()
-            pos_mask = mask & (adv_b >= 0.0)
-            neg_mask = mask & (adv_b < 0.0)
+            row_w = row_weight.to(device=owned_f.device, dtype=owned_f.dtype)
+            row_w_b = row_w.unsqueeze(-1)
+            owned_w = owned_f * row_w_b
+            pos_w = owned_w * (adv_b >= 0.0).to(owned_f.dtype)
+            neg_w = owned_w * (adv_b < 0.0).to(owned_f.dtype)
 
-            if pos_mask.any():
-                pos_loss = scaled_lp[pos_mask].mean()
-            else:
-                pos_loss = scaled_lp.sum() * 0.0
-            if neg_mask.any():
-                neg_loss = scaled_lp[neg_mask].mean()
-            else:
-                neg_loss = scaled_lp.sum() * 0.0
+            pos_loss = _weighted_mean(scaled_lp, pos_w)
+            neg_loss = _weighted_mean(scaled_lp, neg_w)
             α = pmpo_pos_to_neg_weight
             policy_loss = -α * pos_loss + (1.0 - α) * neg_loss
 
@@ -260,29 +331,19 @@ def ppo_update(
             ret = batch["return"][mb].float()
             target_probs = value_encoder.target_probs(ret)            # [B, num_bins]
             log_v_probs = F.log_softmax(value_logits, dim=-1)         # [B, num_bins]
-            value_ce = -(target_probs * log_v_probs).sum(dim=-1)       # [B]
-            if clip_values and value_clip > 0.0:
-                old_v = batch["old_value"][mb].float()
-                clipped_v = old_v + (value - old_v).clamp(-value_clip, value_clip)
-                clipped_logp = value_encoder.transform_to_logprobs(clipped_v)
-                clipped_ce = -(target_probs * clipped_logp).sum(dim=-1)
-                value_loss = torch.maximum(value_ce, clipped_ce).mean()
-            else:
-                value_loss = value_ce.mean()
+            value_ce = -(target_probs * log_v_probs).sum(dim=-1)
+            value_loss = _weighted_mean(value_ce, row_w)
 
             # ---------------- entropy bonus (categorical + Beta) -------
-            min_real = torch.finfo(target_log_probs.dtype).min
-            log_probs_safe = target_log_probs.clamp_min(min_real)
-            target_entropy = -(target_log_probs.exp() * log_probs_safe).sum(dim=-1)
             beta_entropy = new_beta.entropy()
-            # Only count the Beta entropy where the action would actually
-            # use it — i.e. on owned planets that *aren't* no-op. For owned
-            # no-op planets the fraction sample is drawn but ignored, so
-            # rewarding its entropy would pay the policy to be uncertain
-            # about an action it doesn't take.
-            planet_entropy = target_entropy + move_mask * beta_entropy
-            denom = owned_f.sum().clamp_min(1.0)
-            entropy = (planet_entropy * owned_f).sum() / denom
+            # Fraction is conditional on the categorical selecting a move, so
+            # its analytical entropy is weighted by current P(target != no-op),
+            # not by the old sampled action.
+            planet_entropy = _conditional_action_entropy(
+                target_log_probs, beta_entropy, p
+            )
+            denom = owned_w.sum().clamp_min(1.0)
+            entropy = (planet_entropy * owned_w).sum() / denom
 
             # ---------------- PMPO analytical KL ----------------------
             pmpo_kl = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
@@ -310,24 +371,23 @@ def ppo_update(
                         target_probs_old * (log_p_old_safe - log_p_new_safe)
                     ).sum(dim=-1)  # [B, P]
                     frac_kl = kl_divergence(old_beta_dist, new_beta)
+                    frac_kl = _conditional_fraction_kl(frac_kl, target_probs_old, p)
                 else:
                     # KL(new ‖ old) — forward direction; mode-seeking.
-                    target_probs_new = target_log_probs.exp()
                     target_kl = (
-                        target_probs_new * (log_p_new_safe - log_p_old_safe)
+                        target_dist_probs * (log_p_new_safe - log_p_old_safe)
                     ).sum(dim=-1)
                     frac_kl = kl_divergence(new_beta, old_beta_dist)
-                # Apply the fraction KL on every owned planet, not only the ones
-                # whose old sample was a move: concentration-collapse on a
-                # no-op planet is still a regression in policy quality, and
-                # the regularizer should bind regardless of which action was
-                # sampled.
+                    frac_kl = _conditional_fraction_kl(frac_kl, target_dist_probs, p)
+                # The fraction distribution is conditional on selecting a real
+                # target. The joint action KL is therefore categorical KL plus
+                # source-policy P(move) times the Beta KL.
                 planet_kl = target_kl + frac_kl
                 # KL is non-negative analytically; bf16-forward → fp32-cast
                 # leaves last-bit noise that can dip slightly below zero
                 # when new ≈ old (first PPO minibatch). Clamp to keep the
                 # logged scalar honest and avoid surprising consumers.
-                pmpo_kl = ((planet_kl * owned_f).sum() / denom).clamp_min(0.0)
+                pmpo_kl = ((planet_kl * owned_w).sum() / denom).clamp_min(0.0)
 
             loss = (
                 policy_loss
@@ -346,9 +406,9 @@ def ppo_update(
                 # for the loss, watching `approx_kl` is the cleanest proxy for
                 # per-update policy drift — an order-of-magnitude jump here is
                 # exactly the cold-start signal we want to catch.
-                kl = ((old_log_prob - chosen) * owned_f).sum() / denom
-                pos_count = (pos_mask).float().sum()
-                total_owned = owned_f.sum().clamp_min(1.0)
+                kl = ((old_log_prob - chosen) * owned_w).sum() / denom
+                pos_count = pos_w.sum()
+                total_owned = owned_w.sum().clamp_min(1.0)
                 pos_frac = pos_count / total_owned
 
             metrics = torch.stack(
@@ -414,9 +474,7 @@ def value_only_update(
         else False
     )
     for _ in range(epochs):
-        idx = torch.randperm(n, device=device)
-        for start in range(0, n, minibatch_size):
-            mb = idx[start : start + minibatch_size]
+        for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
             with torch.autocast(
                 device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
             ):
@@ -425,7 +483,8 @@ def value_only_update(
             ret = batch["return"][mb].float()
             target_probs = value_encoder.target_probs(ret)
             log_probs = F.log_softmax(value_logits, dim=-1)
-            value_loss = -(target_probs * log_probs).sum(dim=-1).mean()
+            value_ce = -(target_probs * log_probs).sum(dim=-1)
+            value_loss = _weighted_mean(value_ce, row_weight.to(value_ce.device))
 
             optimizer.zero_grad(set_to_none=True)
             value_loss.backward()

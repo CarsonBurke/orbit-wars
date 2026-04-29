@@ -300,10 +300,6 @@ def _stack_trajectories(
     # raw advantage signal carries through to PMPO's pos/neg split.
     batch["advantage"] = advs
     batch["return"] = rets
-    # Old scalar value at rollout time — used by `ppo_update` for value
-    # clipping (re-encodes `old_v + (v - old_v).clamp(±value_clip)` and
-    # CE's the clipped distribution against the same return target).
-    batch["old_value"] = torch.from_numpy(all_values).float()
     return batch
 
 
@@ -558,10 +554,12 @@ def _ppo_loop(
     init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
     pool.add_snapshot("init", model, init_ckpt)
 
-    # Keep PPO eager for now. The dense encoder is fast enough that the
-    # current bottleneck is rollout stepping, and torch.compile backward has
-    # produced invalid gradients on the policy's summary-token parameters.
+    # Compile only the PPO-update model forward/backward path. The summary
+    # tokens are stored flat so AOTAutograd's broadcast reductions match the
+    # parameter shapes at larger PPO batch sizes.
     train_model: OrbitPolicy = model
+    if device.type == "cuda":
+        train_model = torch.compile(model, dynamic=False, fullgraph=True)  # type: ignore[assignment]
 
     # One rendered game per update lands here (env 0 is the recording
     # worker; see VecEnv(replay_env_idx=0) above). Pretrain disabled
@@ -623,8 +621,6 @@ def _ppo_loop(
             pmpo_kl_coef=cfg.ppo.pmpo_kl_coef,
             pmpo_pos_to_neg_weight=cfg.ppo.pmpo_pos_to_neg_weight,
             pmpo_reverse_kl=cfg.ppo.pmpo_reverse_kl,
-            value_clip=cfg.ppo.value_clip,
-            clip_values=cfg.ppo.clip_values,
             epochs=cfg.optim.epochs_per_update,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,

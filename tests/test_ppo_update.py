@@ -9,14 +9,23 @@ a regression guard on the log_prob recompute invariant (ratio ≈ 1 on epoch 0).
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
+from torch.distributions import Beta, Categorical, kl_divergence
 
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.features import EncodedObs, MAX_FLEETS, MAX_PLANETS
-from owars.policies.model import OrbitPolicy
+from owars.policies.model import HLGaussLoss, OrbitPolicy
 from owars.policies.sampling import sample_batch_with_records
-from owars.training.ppo import ppo_update
+from owars.training.ppo import (
+    _conditional_action_entropy,
+    _conditional_fraction_kl,
+    _fixed_minibatches,
+    ppo_update,
+    value_only_update,
+)
 
 
 def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FLEETS) -> dict[str, torch.Tensor]:
@@ -67,10 +76,6 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
     old_fraction_alpha = torch.stack([r.fraction_alpha for r in records])
     old_fraction_beta = torch.stack([r.fraction_beta for r in records])
 
-    # Recover the scalar value at rollout time from the model's
-    # value_logits, mirroring what the rollout records.
-    out_value = out.value.detach().clone()
-
     return {
         "planet_feats": planet_feats,
         "planet_mask": planet_mask,
@@ -86,7 +91,6 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
         "advantage": torch.randn(B),
         # Returns stay inside the default value-head support [-2, 2].
         "return": torch.randn(B).clamp(-1.0, 1.0),
-        "old_value": out_value,
         "old_target_logits": old_target_logits,
         "old_fraction_alpha": old_fraction_alpha,
         "old_fraction_beta": old_fraction_beta,
@@ -103,7 +107,6 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         model, optim, batch,
         value_coef=0.5, entropy_coef=0.01, pmpo_kl_coef=0.3,
         pmpo_pos_to_neg_weight=0.5, pmpo_reverse_kl=True,
-        value_clip=0.4, clip_values=True,
         epochs=2, minibatch_size=4, grad_clip=0.5,
     )
 
@@ -152,3 +155,179 @@ def test_log_prob_recompute_matches_sample_time():
     assert diff.abs().max().item() < 1e-4, diff.abs().max().item()
 
 
+def test_conditional_fraction_kl_vanishes_when_noop_is_certain():
+    source_target_probs = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.25, 0.25, 0.50],
+        ],
+        dtype=torch.float32,
+    )
+    frac_kl = torch.tensor([7.0, 7.0])
+
+    weighted = _conditional_fraction_kl(frac_kl, source_target_probs, noop_idx=2)
+
+    assert torch.allclose(weighted, torch.tensor([0.0, 3.5]))
+
+
+def test_conditional_entropy_weights_fraction_by_current_move_probability():
+    # Uniform categorical over target0, target1, no-op -> H=log(3), P(move)=2/3.
+    target_log_probs = torch.log_softmax(torch.zeros(1, 3), dim=-1)
+    beta_entropy = torch.tensor([1.5])
+
+    entropy = _conditional_action_entropy(target_log_probs, beta_entropy, noop_idx=2)
+
+    assert torch.allclose(entropy, torch.tensor([math.log(3.0) + 1.0]), atol=1e-6)
+
+
+def test_fixed_minibatches_zero_weight_padding_rows():
+    torch.manual_seed(0)
+    batches = _fixed_minibatches(3, 5, torch.device("cpu"))
+
+    assert len(batches) == 1
+    mb, weight = batches[0]
+    assert mb.shape == (5,)
+    assert weight.shape == (5,)
+    assert weight.sum().item() == 3.0
+
+    counts = torch.zeros(3)
+    counts.scatter_add_(0, mb, weight)
+    assert torch.equal(counts, torch.ones(3))
+
+
+def test_fixed_minibatches_tail_padding_does_not_reweight_head_rows():
+    torch.manual_seed(0)
+    batches = _fixed_minibatches(7, 5, torch.device("cpu"))
+
+    assert [mb.shape[0] for mb, _ in batches] == [5, 5]
+
+    counts = torch.zeros(7)
+    for mb, weight in batches:
+        counts.scatter_add_(0, mb, weight)
+    assert torch.equal(counts, torch.ones(7))
+
+
+class _FixedPolicy(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(()))
+        self.value_encoder = HLGaussLoss(min_value=-1.0, max_value=1.0, num_bins=5)
+        self.new_target_logits = torch.log(torch.tensor([[[0.20, 0.80]]]))
+        self.new_alpha = torch.tensor([[4.0]])
+        self.new_beta = torch.tensor([[3.0]])
+
+    def forward(self, feats):
+        b = feats.planet_feats.shape[0]
+        return SimpleNamespace(
+            target_logits=(
+                self.new_target_logits.expand(b, -1, -1).to(feats.planet_feats.device)
+                + self.dummy * 0.0
+            ),
+            fraction_alpha=(
+                self.new_alpha.expand(b, -1).to(feats.planet_feats.device)
+                + self.dummy * 0.0
+            ),
+            fraction_beta=(
+                self.new_beta.expand(b, -1).to(feats.planet_feats.device)
+                + self.dummy * 0.0
+            ),
+            value_logits=(
+                torch.zeros(b, 5, device=feats.planet_feats.device)
+                + self.dummy * 0.0
+            ),
+        )
+
+
+def test_forward_pmpo_kl_weights_fraction_by_new_move_probability():
+    model = _FixedPolicy()
+    old_target_probs = torch.tensor([[[0.60, 0.40]]])
+    old_alpha = torch.tensor([[2.0]])
+    old_beta = torch.tensor([[5.0]])
+    batch = {
+        "planet_feats": torch.zeros(1, 1, 19),
+        "planet_mask": torch.ones(1, 1, dtype=torch.bool),
+        "planet_owned_mask": torch.ones(1, 1, dtype=torch.bool),
+        "planet_ids": torch.zeros(1, 1, dtype=torch.long),
+        "planet_garrison": torch.ones(1, 1),
+        "fleet_feats": torch.zeros(1, 1, 15),
+        "fleet_mask": torch.zeros(1, 1, dtype=torch.bool),
+        "target_idx": torch.ones(1, 1, dtype=torch.long),
+        "fraction": torch.full((1, 1), 0.5),
+        "old_log_prob": old_target_probs.log()
+        .gather(-1, torch.ones(1, 1, 1, dtype=torch.long))
+        .squeeze(-1),
+        "owned_mask": torch.ones(1, 1, dtype=torch.bool),
+        "advantage": torch.zeros(1),
+        "return": torch.zeros(1),
+        "old_target_logits": old_target_probs.log(),
+        "old_fraction_alpha": old_alpha,
+        "old_fraction_beta": old_beta,
+    }
+    optim = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    log = ppo_update(
+        model, optim, batch,
+        value_coef=0.0, entropy_coef=0.0, pmpo_kl_coef=1.0,
+        pmpo_pos_to_neg_weight=0.5, pmpo_reverse_kl=False,
+        epochs=1, minibatch_size=1, grad_clip=1.0,
+    )
+
+    new_target_probs = model.new_target_logits.exp()
+    expected_target = kl_divergence(
+        Categorical(probs=new_target_probs[0, 0]),
+        Categorical(probs=old_target_probs[0, 0]),
+    )
+    expected_fraction = (1.0 - new_target_probs[0, 0, 1]) * kl_divergence(
+        Beta(model.new_alpha[0, 0], model.new_beta[0, 0]),
+        Beta(old_alpha[0, 0], old_beta[0, 0]),
+    )
+    assert math.isclose(
+        log.pmpo_kl,
+        float(expected_target + expected_fraction),
+        rel_tol=1e-6,
+    )
+
+
+class _ValueOnlyPolicy(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(()))
+        self.value_encoder = HLGaussLoss(min_value=-1.0, max_value=1.0, num_bins=5)
+
+    def forward(self, feats):
+        x = feats.planet_feats[:, 0, 0]
+        value_logits = torch.stack((x, -x, x * 0.0, x * 0.5, -x * 0.5), dim=-1)
+        return SimpleNamespace(value_logits=value_logits + self.dummy * 0.0)
+
+
+def test_value_only_update_ignores_zero_weight_padding_rows():
+    model = _ValueOnlyPolicy()
+    batch = {
+        "planet_feats": torch.zeros(3, 1, 19),
+        "planet_mask": torch.ones(3, 1, dtype=torch.bool),
+        "planet_owned_mask": torch.ones(3, 1, dtype=torch.bool),
+        "planet_ids": torch.zeros(3, 1, dtype=torch.long),
+        "planet_garrison": torch.ones(3, 1),
+        "fleet_feats": torch.zeros(3, 1, 15),
+        "fleet_mask": torch.zeros(3, 1, dtype=torch.bool),
+        "return": torch.tensor([-1.0, 0.0, 1.0]),
+    }
+    batch["planet_feats"][:, 0, 0] = torch.tensor([0.0, 1.0, 2.0])
+
+    with torch.no_grad():
+        logits = model(EncodedObs(
+            planet_feats=batch["planet_feats"],
+            planet_mask=batch["planet_mask"],
+            planet_owned_mask=batch["planet_owned_mask"],
+            planet_ids=batch["planet_ids"],
+            planet_garrison=batch["planet_garrison"],
+            fleet_feats=batch["fleet_feats"],
+            fleet_mask=batch["fleet_mask"],
+        )).value_logits
+        target_probs = model.value_encoder.target_probs(batch["return"])
+        expected = float((-(target_probs * F.log_softmax(logits, dim=-1)).sum(dim=-1)).mean())
+
+    optim = torch.optim.AdamW(model.parameters(), lr=0.0)
+    got = value_only_update(model, optim, batch, epochs=1, minibatch_size=5, grad_clip=1.0)
+
+    assert math.isclose(got, expected, rel_tol=1e-6)

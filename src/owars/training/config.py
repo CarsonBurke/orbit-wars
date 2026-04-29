@@ -130,16 +130,16 @@ class PPOCfg:
     # `softmax − target_probs` has ‖∇‖ ~ O(1)), unlike MSE which blew
     # up under bad predictions. dreamer4 effectively runs the equivalent
     # of `value_coef=1.0` (separate `value_optim`, `dreamer4.py:4543`).
-    # Value clipping at `value_clip` caps per-update value movement on top.
     value_coef: float = 1.0
     entropy_coef: float = 0.01              # dreamer4 default; the categorical-target entropy has no structural floor (unlike the soft-capped Beta), so this keeps it from collapsing
-    # Value clipping (dreamer4 `dreamer4.py:4511-4515`): `clipped_v = old_v
-    # + (v - old_v).clamp(±value_clip)`, re-encoded through HL-Gauss and
-    # CE'd against the same return target; final loss is `max(loss,
-    # clipped_loss)`. Bounds per-update value-head movement away from the
-    # rollout-time prediction.
-    clip_values: bool = True
-    value_clip: float = 0.4
+    # No value clipping. dreamer4-style clipping (`max(ce, ce_of_clipped_v)`)
+    # only behaves sensibly when the HL-Gauss σ is wide enough that the
+    # re-encoded clipped scalar overlaps with the return-encoded target.
+    # Our σ = 0.5·bin_size is single-bin-narrow, so the clipped CE saturates
+    # at `−log(eps) ≈ 46` whenever `|clipped_v − return| ≳ σ` (i.e. always at
+    # cold start). Distributional CE has bounded per-element gradients
+    # (`softmax_i − target_i ∈ [-1, 1]`), so the safety rationale for
+    # clipping doesn't apply the way it does to scalar MSE.
     # --- Value pretraining (cold-start the critic before PPO turns on). ---
     pretrain_updates: int = 0
     pretrain_episodes: int = 64

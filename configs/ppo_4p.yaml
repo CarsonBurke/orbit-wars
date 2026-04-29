@@ -45,8 +45,6 @@ ppo:
   pmpo_kl_coef: 0.3
   value_coef: 1.0
   entropy_coef: 0.015   # a touch higher to keep diverse strategies alive in FFA
-  clip_values: true
-  value_clip: 0.4
   pretrain_updates: 75
   pretrain_episodes: 32
   pretrain_lr: 1.0e-3

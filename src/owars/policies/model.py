@@ -367,9 +367,6 @@ class HLGaussLoss(nn.Module):
       - `target_probs(value)` encodes a scalar to a per-bin probability
         vector via the truncated-Gaussian CDF over the bin support, with
         renormalization so the truncated tails don't bias the target.
-      - `transform_to_logprobs(value)` is the same path returning log-probs
-        directly (used for value clipping where we re-encode the clipped
-        scalar and compute its CE against the *unclipped* target).
       - `bins_to_scalar(logits)` recovers E[V] = Σ softmax(logits)_i · c_i.
       - `loss(logits, target_probs)` is just F.cross_entropy on a per-element
         basis (caller is responsible for masking/reduction).
@@ -439,9 +436,6 @@ class HLGaussLoss(nn.Module):
         z = (cdf[..., -1] - cdf[..., 0]).clamp_min(1e-10)
         return bin_probs / z.unsqueeze(-1)
 
-    def transform_to_logprobs(self, values: torch.Tensor) -> torch.Tensor:
-        return self.target_probs(values).clamp_min(1e-20).log()
-
     def bins_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
         probs = F.softmax(logits.float(), dim=-1)
         support = self._support(probs)
@@ -485,8 +479,12 @@ class OrbitPolicy(nn.Module):
         # Two learnable summary tokens (PMA-style). Initialized small so
         # they don't dominate the encoder at step 0 — gradient flow alone
         # will scale them up as the heads start using their output.
-        self.actor_token = nn.Parameter(torch.zeros(1, 1, cfg.dim))
-        self.critic_token = nn.Parameter(torch.zeros(1, 1, cfg.dim))
+        # Store summary tokens flat. AOTAutograd can reduce broadcasted
+        # `[1, 1, d]` parameters to `[d]` gradients in compiled backward at
+        # larger PPO batch sizes; making the parameter itself `[d]` keeps the
+        # expected gradient shape aligned with the reduction.
+        self.actor_token = nn.Parameter(torch.zeros(cfg.dim))
+        self.critic_token = nn.Parameter(torch.zeros(cfg.dim))
         nn.init.trunc_normal_(self.actor_token, std=0.02)
         nn.init.trunc_normal_(self.critic_token, std=0.02)
         # Embed-LN normalizes the residual-stream entry point. The per-token
@@ -628,17 +626,11 @@ class OrbitPolicy(nn.Module):
 
         h_p = self.planet_embed(planet_feats)
         h_f = self.fleet_embed(fleet_feats)
-        # Prepend the two summary tokens, broadcast to batch dim. We use
-        # `.repeat(b, 1, 1)` (real allocation) instead of `.expand(b, -1, -1)`
-        # (strided view) because `torch.compile`'s AOT autograd reduces the
-        # gradient of an `.expand()`-broadcast `nn.Parameter` to the broadcast
-        # output shape `[d]` instead of summing back to the parameter's
-        # `[1, 1, d]` shape, raising "got [128] but expected shape compatible
-        # with [1, 1, 128]" at backward. `.repeat` materializes the broadcast
-        # so the gradient summation is unambiguous. Cost is trivial — both
-        # tokens are 128 floats.
-        actor_t = self.actor_token.repeat(b, 1, 1)
-        critic_t = self.critic_token.repeat(b, 1, 1)
+        # Prepend the two summary tokens, broadcast to batch dim. Parameters
+        # are stored flat so compiled backward's broadcast reduction returns
+        # `[d]`, matching the actual parameter shape.
+        actor_t = self.actor_token.view(1, 1, -1).expand(b, 1, -1)
+        critic_t = self.critic_token.view(1, 1, -1).expand(b, 1, -1)
         h = torch.cat([actor_t, critic_t, h_p, h_f], dim=1)
         # Normalize the residual-stream entry point. embed_norm runs on
         # padded `[B, T, D]` since LN is per-token — padded positions are
