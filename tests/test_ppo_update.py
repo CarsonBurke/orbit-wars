@@ -45,7 +45,7 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
     planet_ids[:, :8] = torch.arange(8)
     planet_garrison = torch.zeros(B, P)
     planet_garrison[:, :8] = 50
-    fleet_feats = torch.zeros(B, F, 15)
+    fleet_feats = torch.zeros(B, F, 20)
     fleet_mask = torch.zeros(B, F, dtype=torch.bool)
     feats = EncodedObs(
         planet_feats=planet_feats, planet_mask=planet_mask,
@@ -266,7 +266,7 @@ def test_forward_pmpo_kl_weights_fraction_by_new_move_probability():
         "planet_owned_mask": torch.ones(1, 1, dtype=torch.bool),
         "planet_ids": torch.zeros(1, 1, dtype=torch.long),
         "planet_garrison": torch.ones(1, 1),
-        "fleet_feats": torch.zeros(1, 1, 15),
+        "fleet_feats": torch.zeros(1, 1, 20),
         "fleet_mask": torch.zeros(1, 1, dtype=torch.bool),
         "target_idx": torch.ones(1, 1, dtype=torch.long),
         "fraction": torch.full((1, 1), 0.5),
@@ -325,7 +325,7 @@ def test_value_only_update_ignores_zero_weight_padding_rows():
         "planet_owned_mask": torch.ones(3, 1, dtype=torch.bool),
         "planet_ids": torch.zeros(3, 1, dtype=torch.long),
         "planet_garrison": torch.ones(3, 1),
-        "fleet_feats": torch.zeros(3, 1, 15),
+        "fleet_feats": torch.zeros(3, 1, 20),
         "fleet_mask": torch.zeros(3, 1, dtype=torch.bool),
         "return": torch.tensor([-1.0, 0.0, 1.0]),
     }

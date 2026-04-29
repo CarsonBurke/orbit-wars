@@ -1,6 +1,7 @@
 import math
 
 from owars.agents import HeuristicAgent, random_agent, sniper_agent
+from owars.agents.learned import _FleetTargetTracker
 
 
 def _obs(my_planet, enemy_planet, my_ships=50, enemy_ships=10):
@@ -56,3 +57,25 @@ def test_heuristic_keeps_reserve():
     # 15 - 10 reserve = 5 budget; need 4 ships, so this is allowed and we send 4.
     assert len(moves) == 1
     assert moves[0][2] <= 5
+
+
+def test_fleet_target_tracker_resets_and_expires_eta():
+    tracker = _FleetTargetTracker()
+    obs0 = _obs((10, 10), (90, 90))
+    tracker.annotate(obs0)
+    tracker.record(obs0, [[0, 0.5, 10, 1, 2.0, 90.0, 90.0]])
+
+    obs1 = _obs((10, 10), (90, 90))
+    obs1["step"] = 1
+    obs1["fleets"] = [[0, 0, 11.0, 11.0, 0.5, 0, 10]]
+    annotated = tracker.annotate(obs1)
+    assert annotated["fleet_targets"] == {"0": [1, 1.0, 90.0, 90.0]}
+
+    obs2 = dict(obs1)
+    obs2["step"] = 2
+    assert tracker.annotate(obs2)["fleet_targets"] == {}
+
+    tracker.by_fleet_id[0] = [1, 5.0, 90.0, 90.0]
+    reset_obs = _obs((10, 10), (90, 90))
+    reset_obs["fleets"] = [[0, 0, 11.0, 11.0, 0.5, 0, 10]]
+    assert tracker.annotate(reset_obs)["fleet_targets"] == {}

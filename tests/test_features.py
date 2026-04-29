@@ -5,14 +5,15 @@ from __future__ import annotations
 import math
 
 from owars.game import parse_observation
+from owars.game.types import CENTER, Planet
 from owars.policies.features import (
     FLEET_FEAT_DIM,
     PLANET_FEAT_DIM,
     _owner_onehot,
     _planet_motion,
     encode_observation,
+    encode_raw_observations,
 )
-from owars.game.types import CENTER, Planet
 
 
 def test_owner_onehot_self_neutral():
@@ -121,3 +122,34 @@ def test_fleet_features_handle_missing_source():
     fleet_row = feats.fleet_feats[0].tolist()
     assert fleet_row[5] == 0.0 and fleet_row[6] == 0.0
     assert fleet_row[7] == 0.0  # has_from bit
+
+
+def test_raw_fleet_features_include_intended_target_metadata():
+    obs = _toy_obs_with_fleet()
+    obs["fleet_targets"] = {"42": [7, 12.0, 80.0, 20.0]}
+    feats = encode_raw_observations([obs])
+    fleet_row = feats.fleet_feats[0, 0].tolist()
+
+    assert math.isclose(fleet_row[9], 7 / 128.0, abs_tol=1e-6)
+    assert math.isclose(fleet_row[10], 12 / 500.0, abs_tol=1e-6)
+    assert math.isclose(fleet_row[11], 0.3, abs_tol=1e-6)
+    assert math.isclose(fleet_row[12], -0.3, abs_tol=1e-6)
+    assert fleet_row[13] == 1.0
+
+
+def test_raw_fleet_features_ignore_non_official_extra_fleet_columns():
+    obs = _toy_obs_with_fleet()
+    obs["fleets"] = [[42, 0, 30.0, 30.0, 0.5, 0, 20, 7, 12.0, 80.0, 20.0]]
+    feats = encode_raw_observations([obs])
+    fleet_row = feats.fleet_feats[0, 0].tolist()
+
+    assert fleet_row[9:14] == [0.0, 0.0, 0.0, 0.0, 0.0]
+
+
+def test_raw_fleet_features_ignore_opponent_target_metadata():
+    obs = _toy_obs_with_fleet()
+    obs["fleets"] = [[42, 1, 30.0, 30.0, 0.5, 0, 20]]
+    obs["fleet_targets"] = {"42": [7, 12.0, 80.0, 20.0]}
+    feats = encode_raw_observations([obs])
+
+    assert feats.fleet_feats[0, 0, 9:14].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]

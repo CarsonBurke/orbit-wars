@@ -211,6 +211,77 @@ def test_numpy_vec_fast_policy_batch_matches_raw_observations():
     )
 
 
+def test_numpy_vec_fleet_target_metadata_matches_raw_observation_features():
+    base_obs = {
+        "player": 0,
+        "step": 1,
+        "planets": [
+            [0, 0, 10.0, 10.0, 1.0, 50, 1],
+            [1, 1, 90.0, 90.0, 1.0, 50, 1],
+        ],
+        "fleets": [],
+        "angular_velocity": 0.0,
+        "initial_planets": [
+            [0, 0, 10.0, 10.0, 1.0, 50, 1],
+            [1, 1, 90.0, 90.0, 1.0, 50, 1],
+        ],
+        "next_fleet_id": 0,
+        "comets": [],
+        "comet_planet_ids": [],
+    }
+    env = NumpyOrbitWarsEnv(num_players=2, episode_steps=20, ship_speed=6.0)
+    env.load_observation(base_obs)
+    vec = NumpyVecEnv(num_envs=1, num_players=2, episode_steps=20, ship_speed=6.0)
+    vec.reset()
+    vec._store_env(0, env)
+
+    action = [[[0, 0.0, 10, 1, 3.0, 90.0, 90.0]], []]
+    state = vec.step_subset([0], [action])[0][0]
+    obs = state[0]["observation"]
+    enemy_obs = state[1]["observation"]
+
+    assert all(len(fleet) == 7 for fleet in obs["fleets"])
+    assert obs["fleet_targets"] == {"0": [1, 2.0, 90.0, 90.0]}
+    assert enemy_obs["fleet_targets"] == {}
+
+    fast, _ = vec.policy_batch([(0, 0), (0, 1)], device="cpu")
+    expected = encode_raw_observations([obs, enemy_obs], device="cpu")
+    assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
+    row = fast.fleet_feats[0, 0].tolist()
+    assert math.isclose(row[9], 1 / 128.0, abs_tol=1e-6)
+    assert math.isclose(row[10], 2 / 500.0, abs_tol=1e-6)
+    assert row[13] == 1.0
+    assert fast.fleet_feats[1, 0, 9:14].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+
+    state = vec.step_subset([0], [[[], []]])[0][0]
+    assert state[0]["observation"]["fleet_targets"] == {"0": [1, 1.0, 90.0, 90.0]}
+    state = vec.step_subset([0], [[[], []]])[0][0]
+    assert state[0]["observation"]["fleet_targets"] == {}
+
+
+def test_numpy_env_load_observation_ignores_non_official_fleet_columns():
+    obs = {
+        "player": 0,
+        "step": 1,
+        "planets": [
+            [0, 0, 10.0, 10.0, 1.0, 50, 1],
+            [1, 1, 90.0, 90.0, 1.0, 50, 1],
+        ],
+        "fleets": [[0, 0, 30.0, 30.0, 0.5, 0, 10, 1, 5.0, 90.0, 90.0]],
+        "angular_velocity": 0.0,
+        "initial_planets": [],
+        "next_fleet_id": 1,
+        "comets": [],
+        "comet_planet_ids": [],
+    }
+    env = NumpyOrbitWarsEnv(num_players=2, episode_steps=20, ship_speed=6.0)
+    env.load_observation(obs)
+    visible = env._observation(0, env._observation_base())
+
+    assert visible["fleets"] == [[0, 0, 30.0, 30.0, 0.5, 0, 10]]
+    assert visible["fleet_targets"] == {}
+
+
 def test_numpy_vec_fast_step_matches_materialized_step():
     normal = NumpyVecEnv(
         num_envs=2,

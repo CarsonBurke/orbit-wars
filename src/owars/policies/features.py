@@ -6,9 +6,9 @@ Two parallel set-of-tokens streams:
     angular velocity) and a *direction-of-motion* unit vector. The model
     can project to any horizon it wants from these — we don't bake a
     fixed-horizon predicted position into the input.
-  - fleets:  per-fleet vector with position, heading, ships, owner, and
-    the source planet's position (provenance — "where did this come
-    from").
+  - fleets:  per-fleet vector with position, heading, ships, owner, the
+    source planet's position (provenance), and optional intended-target
+    metadata when the training env can preserve it.
 
 Owner is encoded *seat-relative* with one slot per enemy ID `(owner -
 player) mod 4`, so a 4-player FFA sees three stable enemy slots and a
@@ -44,7 +44,7 @@ MAX_PLANETS: int = 64
 MAX_FLEETS: int = 384
 
 PLANET_FEAT_DIM: int = 19
-FLEET_FEAT_DIM: int = 15
+FLEET_FEAT_DIM: int = 20
 
 MAX_OMEGA: float = 0.05  # spec: ω ∈ [0.025, 0.05]
 
@@ -168,6 +168,7 @@ def _fleet_features(
         math.log1p(f.ships) / 8.0,
         from_nx, from_ny, has_from,
         sp,
+        0.0, 0.0, 0.0, 0.0, 0.0,
         s, n_, e0, e1, e2,
         0.0,  # planet-token marker (= fleet)
     ]
@@ -329,6 +330,7 @@ def _fleet_features_raw(
     player: int,
     num_players: int,
     planet_pos_by_id: dict[int, tuple[float, float]],
+    target_meta: tuple[int, float, float, float] | None = None,
 ) -> list[float]:
     owner = int(f[1])
     x = float(f[2])
@@ -336,6 +338,17 @@ def _fleet_features_raw(
     angle = float(f[4])
     from_planet_id = int(f[5])
     ships = int(f[6])
+    if target_meta is not None:
+        target_id, eta, target_x, target_y = target_meta
+        has_target = 1.0 if target_id >= 0 else 0.0
+        target_id_norm = target_id / 128.0 if target_id >= 0 else 0.0
+        eta_norm = min(1.0, max(0.0, eta / 500.0)) if target_id >= 0 else 0.0
+        target_nx = (target_x - CENTER[0]) / BOARD_SIZE if target_id >= 0 else 0.0
+        target_ny = (target_y - CENTER[1]) / BOARD_SIZE if target_id >= 0 else 0.0
+    else:
+        target_id_norm, eta_norm, target_nx, target_ny, has_target = (
+            0.0, 0.0, 0.0, 0.0, 0.0
+        )
     src = planet_pos_by_id.get(from_planet_id)
     if src is None:
         from_nx, from_ny, has_from = 0.0, 0.0, 0.0
@@ -353,9 +366,49 @@ def _fleet_features_raw(
         math.log1p(ships) / 8.0,
         from_nx, from_ny, has_from,
         sp,
+        target_id_norm, eta_norm, target_nx, target_ny, has_target,
         s, n_, e0, e1, e2,
         0.0,
     ]
+
+
+def _fleet_target_metadata_raw(
+    o: Any,
+) -> dict[int, tuple[int, float, float, float]]:
+    raw = _get_raw(o, "fleet_targets", None)
+    if raw is None:
+        raw = _get_raw(o, "fleet_target_metadata", None)
+    if raw is None:
+        return {}
+
+    out: dict[int, tuple[int, float, float, float]] = {}
+    if isinstance(raw, dict):
+        items = raw.items()
+    else:
+        items = []
+        for row in raw or []:
+            try:
+                items.append((row[0], row[1:]))
+            except (TypeError, IndexError):
+                continue
+
+    for fleet_id, meta in items:
+        try:
+            fid = int(fleet_id)
+            if isinstance(meta, dict):
+                target_id = int(meta.get("target_id", -1))
+                eta = float(meta.get("eta", 0.0))
+                target_x = float(meta.get("target_x", meta.get("x", 0.0)))
+                target_y = float(meta.get("target_y", meta.get("y", 0.0)))
+            else:
+                target_id = int(meta[0])
+                eta = float(meta[1])
+                target_x = float(meta[2])
+                target_y = float(meta[3])
+        except (TypeError, IndexError, ValueError):
+            continue
+        out[fid] = (target_id, eta, target_x, target_y)
+    return out
 
 
 @dataclass
@@ -368,7 +421,7 @@ class EncodedObs:
     fleet_feats: torch.Tensor       # [F_max, fleet_dim]
     fleet_mask: torch.Tensor        # [F_max] bool
 
-    def to(self, device: str | torch.device) -> "EncodedObs":
+    def to(self, device: str | torch.device) -> EncodedObs:
         return EncodedObs(
             planet_feats=self.planet_feats.to(device),
             planet_mask=self.planet_mask.to(device),
@@ -485,6 +538,7 @@ def _fill_encoded_arrays_raw(
     angular_velocity = float(_get_raw(o, "angular_velocity", 0.0) or 0.0)
     comet_motion = _comet_motion_by_id_raw(o)
     planet_pos = {int(p[0]): (float(p[2]), float(p[3])) for p in planets}
+    fleet_targets = _fleet_target_metadata_raw(o)
     num_players = _infer_num_players_raw(o)
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
@@ -497,7 +551,14 @@ def _fill_encoded_arrays_raw(
         p_gar_r[i] = int(p[5])
 
     for j, f in enumerate(fleets[:MAX_FLEETS]):
-        f_feats_r[j] = _fleet_features_raw(f, player, num_players, planet_pos)
+        target_meta = fleet_targets.get(int(f[0])) if int(f[1]) == player else None
+        f_feats_r[j] = _fleet_features_raw(
+            f,
+            player,
+            num_players,
+            planet_pos,
+            target_meta,
+        )
         f_mask_r[j] = True
 
 

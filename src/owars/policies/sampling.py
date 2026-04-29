@@ -199,7 +199,7 @@ def _lead_solution_from_point(
             return None
         return LeadSolution(
             angle=angle_to(mine_x, mine_y, target_x, target_y),
-            time=d / sp,
+            time=float(max(1, math.ceil(max(0.0, d - target_radius) / sp))),
             x=target_x,
             y=target_y,
         )
@@ -220,7 +220,7 @@ def _lead_solution_from_point(
             if d >= prev_dist - target_radius:
                 return LeadSolution(
                     angle=angle_to(mine_x, mine_y, tx, ty),
-                    time=d / sp,
+                    time=float(k),
                     x=tx,
                     y=ty,
                 )
@@ -588,7 +588,17 @@ def _build_action_lists_from_packed_fields_raw(
             solution.y,
         ):
             continue
-        actions.append([int(mine[0]), float(solution.angle), int(send)])
+        actions.append(
+            [
+                int(mine[0]),
+                float(solution.angle),
+                int(send),
+                int(target_id),
+                float(solution.time),
+                float(solution.x),
+                float(solution.y),
+            ]
+        )
         remaining_by_id[int(mine[0])] = mine_ships - send
         if len(actions) >= max_moves:
             break
@@ -650,7 +660,17 @@ def _build_action_lists_from_packed_fields_context(
             solution.y,
         ):
             continue
-        actions.append([int(mine[0]), float(solution.angle), int(send)])
+        actions.append(
+            [
+                int(mine[0]),
+                float(solution.angle),
+                int(send),
+                int(target_id),
+                float(solution.time),
+                float(solution.x),
+                float(solution.y),
+            ]
+        )
         remaining_by_id[int(mine[0])] = mine_ships - send
         if len(actions) >= max_moves:
             break

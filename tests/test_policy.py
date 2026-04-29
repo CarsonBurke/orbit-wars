@@ -27,7 +27,7 @@ def test_encode_shapes():
     o = parse_observation(_obs())
     feats = encode_observation(o)
     assert feats.planet_feats.shape == (64, 19)
-    assert feats.fleet_feats.shape == (384, 15)
+    assert feats.fleet_feats.shape == (384, 20)
     assert int(feats.planet_mask.sum()) == 3
     assert int(feats.fleet_mask.sum()) == 1
     assert bool(feats.planet_owned_mask[0]) and not bool(feats.planet_owned_mask[1])
@@ -48,6 +48,15 @@ def test_policy_forward_shapes():
     assert out.value_logits.shape == (1, cfg.value_num_bins)
     # Recovered scalar value lives inside the bin support.
     assert cfg.value_min <= float(out.value.item()) <= cfg.value_max
+
+
+def test_policy_accepts_legacy_fleet_feature_width():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2, fleet_features=15)
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(parse_observation(_obs()))
+    out = model(feats)
+
+    assert out.target_logits.shape == (1, 64, 65)
 
 
 def test_policy_ignores_padded_token_features():

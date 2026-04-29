@@ -10,7 +10,7 @@ from typing import Literal
 class OrbitPolicyConfig:
     # Per-token feature widths (set by `features.encode_observation`).
     planet_features: int = 19
-    fleet_features: int = 15
+    fleet_features: int = 20
 
     # Set-transformer encoder hyperparameters.
     dim: int = 96

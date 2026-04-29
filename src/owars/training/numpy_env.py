@@ -59,6 +59,11 @@ F_Y = 3
 F_ANGLE = 4
 F_FROM = 5
 F_SHIPS = 6
+F_TARGET = 7
+F_ETA = 8
+F_TARGET_X = 9
+F_TARGET_Y = 10
+FLEET_ROW_WIDTH = 11
 
 
 @dataclass(slots=True)
@@ -158,6 +163,55 @@ def _fleet_row_to_list(row: np.ndarray) -> list[Any]:
     ]
 
 
+def _fleet_target_metadata(rows: np.ndarray) -> dict[str, list[float]]:
+    out: dict[str, list[float]] = {}
+    if len(rows) == 0 or rows.shape[1] <= F_TARGET:
+        return out
+    for row in rows:
+        target_id = int(row[F_TARGET])
+        if target_id < 0 or row[F_ETA] <= 0.0:
+            continue
+        out[str(int(row[F_ID]))] = [
+            target_id,
+            float(max(0.0, row[F_ETA])),
+            float(row[F_TARGET_X]),
+            float(row[F_TARGET_Y]),
+        ]
+    return out
+
+
+def _visible_fleet_targets(
+    fleet_targets: dict[str, list[float]],
+    fleets: list[list[Any]],
+    player: int,
+) -> dict[str, list[float]]:
+    if not fleet_targets:
+        return {}
+    owned = {str(int(fleet[F_ID])) for fleet in fleets if int(fleet[F_OWNER]) == player}
+    return {fid: meta for fid, meta in fleet_targets.items() if fid in owned}
+
+
+def _fleet_rows(
+    rows: list[list[float]] | np.ndarray,
+    *,
+    preserve_metadata: bool = False,
+) -> np.ndarray:
+    if isinstance(rows, np.ndarray):
+        arr = rows.astype(np.float64, copy=True)
+    elif rows:
+        arr = np.asarray(rows, dtype=np.float64)
+    else:
+        arr = np.empty((0, 7), dtype=np.float64)
+    arr = arr.reshape((-1, arr.shape[-1] if arr.ndim > 1 else 7))
+    out = np.zeros((len(arr), FLEET_ROW_WIDTH), dtype=np.float64)
+    if len(arr):
+        cols = min(arr.shape[1], FLEET_ROW_WIDTH if preserve_metadata else 7)
+        out[:, :cols] = arr[:, :cols]
+        if cols <= F_TARGET:
+            out[:, F_TARGET] = -1
+    return out
+
+
 def _tensor_from_numpy(
     array: np.ndarray,
     device: str | torch.device,
@@ -217,7 +271,7 @@ class NumpyOrbitWarsEnv:
         self.angular_velocity = 0.0
         self.planets = np.empty((0, 7), dtype=np.float64)
         self.initial_planets = np.empty((0, 7), dtype=np.float64)
-        self.fleets = np.empty((0, 7), dtype=np.float64)
+        self.fleets = np.empty((0, FLEET_ROW_WIDTH), dtype=np.float64)
         self.next_fleet_id = 0
         self.comets: list[dict[str, Any]] = []
         self.comet_planet_ids: list[int] = []
@@ -231,7 +285,7 @@ class NumpyOrbitWarsEnv:
         episode_steps: int = 500,
         ship_speed: float = 6.0,
         comet_speed: float = 4.0,
-    ) -> "NumpyOrbitWarsEnv":
+    ) -> NumpyOrbitWarsEnv:
         """Create an env from a visible observation.
 
         This is deterministic for future non-random transitions. It cannot
@@ -257,7 +311,7 @@ class NumpyOrbitWarsEnv:
         self.angular_velocity = 0.0
         self.planets = np.empty((0, 7), dtype=np.float64)
         self.initial_planets = np.empty((0, 7), dtype=np.float64)
-        self.fleets = np.empty((0, 7), dtype=np.float64)
+        self.fleets = np.empty((0, FLEET_ROW_WIDTH), dtype=np.float64)
         self.next_fleet_id = 0
         self.comets = []
         self.comet_planet_ids = []
@@ -278,7 +332,7 @@ class NumpyOrbitWarsEnv:
         self.initial_planets = _as_array(
             [list(p) for p in (get("initial_planets", []) or [])], 7
         )
-        self.fleets = _as_array([list(f) for f in (get("fleets", []) or [])], 7)
+        self.fleets = _fleet_rows([list(f) for f in (get("fleets", []) or [])])
         self.next_fleet_id = int(get("next_fleet_id", 0) or 0)
         self.comet_planet_ids = [int(pid) for pid in (get("comet_planet_ids", []) or [])]
         self.comets = []
@@ -373,6 +427,7 @@ class NumpyOrbitWarsEnv:
             "step": self._step,
             "planets": [_planet_row_to_list(row) for row in self.planets],
             "fleets": [_fleet_row_to_list(row) for row in self.fleets],
+            "fleet_targets": _fleet_target_metadata(self.fleets),
             "angular_velocity": self.angular_velocity,
             "initial_planets": [_planet_row_to_list(row) for row in self.initial_planets],
             "next_fleet_id": self.next_fleet_id,
@@ -383,6 +438,11 @@ class NumpyOrbitWarsEnv:
     def _observation(self, player: int, base: dict[str, Any]) -> dict[str, Any]:
         obs = dict(base)
         obs["player"] = player
+        obs["fleet_targets"] = _visible_fleet_targets(
+            base.get("fleet_targets", {}),
+            base.get("fleets", []),
+            player,
+        )
         return obs
 
     def _comets_to_lists(self) -> list[dict[str, Any]]:
@@ -428,7 +488,7 @@ class NumpyOrbitWarsEnv:
                     planets[base + j][P_SHIPS] = 10
         self.planets = _as_array(planets, 7)
         self.initial_planets = _as_array(initial_planets, 7)
-        self.fleets = np.empty((0, 7), dtype=np.float64)
+        self.fleets = np.empty((0, FLEET_ROW_WIDTH), dtype=np.float64)
         self.next_fleet_id = 0
         self.comets = []
         self.comet_planet_ids = []
@@ -708,13 +768,17 @@ class NumpyOrbitWarsEnv:
             return
         for move in action:
             try:
-                if len(move) != 3:
+                if len(move) < 3:
                     continue
-                from_id, angle, ships = move
+                from_id, angle, ships = move[:3]
                 ships = int(ships)
                 angle = float(angle)
             except (TypeError, ValueError):
                 continue
+            target_id = int(move[3]) if len(move) >= 4 else -1
+            eta = float(move[4]) if len(move) >= 5 else 0.0
+            target_x = float(move[5]) if len(move) >= 6 else 0.0
+            target_y = float(move[6]) if len(move) >= 7 else 0.0
             idx = planet_idx_by_id.get(int(from_id))
             if idx is None:
                 continue
@@ -734,6 +798,10 @@ class NumpyOrbitWarsEnv:
                         angle,
                         int(from_id),
                         ships,
+                        target_id,
+                        eta,
+                        target_x,
+                        target_y,
                     ]
                 )
                 self.next_fleet_id += 1
@@ -752,6 +820,13 @@ class NumpyOrbitWarsEnv:
         speeds = np.minimum(speeds, self.cfg.ship_speed)
         self.fleets[:, F_X] += np.cos(self.fleets[:, F_ANGLE]) * speeds
         self.fleets[:, F_Y] += np.sin(self.fleets[:, F_ANGLE]) * speeds
+        has_target = self.fleets[:, F_TARGET] >= 0
+        if np.any(has_target):
+            self.fleets[has_target, F_ETA] = np.maximum(
+                0.0, self.fleets[has_target, F_ETA] - 1.0
+            )
+            expired = has_target & (self.fleets[:, F_ETA] <= 0.0)
+            self.fleets[expired, F_TARGET] = -1
         new = self.fleets[:, [F_X, F_Y]].copy()
         remove = np.zeros(len(self.fleets), dtype=bool)
         remove |= (
@@ -991,7 +1066,7 @@ class NumpyVecEnv:
         self.initial_orbit_radius = np.zeros((num_envs, self.planet_cap), dtype=np.float64)
         self.initial_orbit_angle = np.zeros((num_envs, self.planet_cap), dtype=np.float64)
         self.initial_orbiting = np.zeros((num_envs, self.planet_cap), dtype=bool)
-        self.fleets = np.empty((num_envs, self.fleet_cap, 7), dtype=np.float64)
+        self.fleets = np.empty((num_envs, self.fleet_cap, FLEET_ROW_WIDTH), dtype=np.float64)
         self.fleet_mask = np.zeros((num_envs, self.fleet_cap), dtype=bool)
         self.done = np.zeros(num_envs, dtype=bool)
         self.initialized = np.zeros(num_envs, dtype=bool)
@@ -1106,7 +1181,7 @@ class NumpyVecEnv:
     def close(self) -> None:
         return
 
-    def __enter__(self) -> "NumpyVecEnv":
+    def __enter__(self) -> NumpyVecEnv:
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -1145,7 +1220,7 @@ class NumpyVecEnv:
         if needed <= self.fleet_cap:
             return
         new_cap = max(needed, self.fleet_cap * 2)
-        fleets = np.empty((self.num_envs, new_cap, 7), dtype=np.float64)
+        fleets = np.empty((self.num_envs, new_cap, FLEET_ROW_WIDTH), dtype=np.float64)
         fm = np.zeros((self.num_envs, new_cap), dtype=bool)
         fleets[:, : self.fleet_cap] = self.fleets
         fm[:, : self.fleet_cap] = self.fleet_mask
@@ -1269,6 +1344,9 @@ class NumpyVecEnv:
                 _fleet_row_to_list(row)
                 for row in self.fleets[idx, self.fleet_mask[idx]]
             ],
+            "fleet_targets": _fleet_target_metadata(
+                self.fleets[idx, self.fleet_mask[idx]]
+            ),
             "angular_velocity": float(self.angular_velocity[idx]),
             "initial_planets": [
                 _planet_row_to_list(row)
@@ -1289,6 +1367,11 @@ class NumpyVecEnv:
     def _observation(self, idx: int, player: int, base: dict[str, Any]) -> dict[str, Any]:
         obs = dict(base)
         obs["player"] = player
+        obs["fleet_targets"] = _visible_fleet_targets(
+            base.get("fleet_targets", {}),
+            base.get("fleets", []),
+            player,
+        )
         return obs
 
     def observation(self, idx: int, player: int) -> dict[str, Any]:
@@ -1461,6 +1544,16 @@ class NumpyVecEnv:
         feats[:, 2] = np.cos(fleets[:, F_ANGLE])
         feats[:, 3] = np.sin(fleets[:, F_ANGLE])
         feats[:, 4] = np.log1p(ships) / 8.0
+        target_ids = fleets[:, F_TARGET].astype(np.int64)
+        has_target = (target_ids >= 0) & (owner == player)
+        if np.any(has_target):
+            feats[has_target, 9] = target_ids[has_target].astype(np.float32) / 128.0
+            feats[has_target, 10] = np.minimum(
+                1.0, np.maximum(0.0, fleets[has_target, F_ETA] / 500.0)
+            )
+            feats[has_target, 11] = (fleets[has_target, F_TARGET_X] - CENTER) / BOARD_SIZE
+            feats[has_target, 12] = (fleets[has_target, F_TARGET_Y] - CENTER) / BOARD_SIZE
+            feats[has_target, 13] = 1.0
         if len(planets):
             pos_by_id = {
                 int(p[P_ID]): (float(p[P_X]), float(p[P_Y])) for p in planets
@@ -1476,7 +1569,7 @@ class NumpyVecEnv:
             np.log(ships) / math.log(1000.0)
         ) ** 1.5
         feats[:, 8] = np.minimum(1.0, np.minimum(speeds, MAX_SHIP_SPEED) / MAX_SHIP_SPEED)
-        _fill_owner_features(feats[:, 9:14], owner, player, self.num_players)
+        _fill_owner_features(feats[:, 14:19], owner, player, self.num_players)
         f_mask[row, :n] = True
 
     @staticmethod
@@ -1550,14 +1643,18 @@ class NumpyVecEnv:
                     continue
                 for move in action:
                     try:
-                        if len(move) != 3:
+                        if len(move) < 3:
                             continue
-                        from_id, angle, ships = move
+                        from_id, angle, ships = move[:3]
                         from_id = int(from_id)
                         ships = int(ships)
                         angle = float(angle)
                     except (TypeError, ValueError):
                         continue
+                    target_id = int(move[3]) if len(move) >= 4 else -1
+                    eta = float(move[4]) if len(move) >= 5 else 0.0
+                    target_x = float(move[5]) if len(move) >= 6 else 0.0
+                    target_y = float(move[6]) if len(move) >= 7 else 0.0
                     pidx = planet_idx_by_id.get(from_id)
                     if pidx is None:
                         continue
@@ -1581,6 +1678,10 @@ class NumpyVecEnv:
                                 angle,
                                 from_id,
                                 ships,
+                                target_id,
+                                eta,
+                                target_x,
+                                target_y,
                             ]
                         )
                         self.next_fleet_id[idx] += 1
@@ -1619,6 +1720,14 @@ class NumpyVecEnv:
             angles = self.fleets[env_idx, fleet_slots, F_ANGLE]
             self.fleets[env_idx, fleet_slots, F_X] += np.cos(angles) * speeds
             self.fleets[env_idx, fleet_slots, F_Y] += np.sin(angles) * speeds
+            has_target = self.fleets[env_idx, fleet_slots, F_TARGET] >= 0
+            if np.any(has_target):
+                target_slots = fleet_slots[has_target]
+                self.fleets[env_idx, target_slots, F_ETA] = np.maximum(
+                    0.0, self.fleets[env_idx, target_slots, F_ETA] - 1.0
+                )
+                expired = target_slots[self.fleets[env_idx, target_slots, F_ETA] <= 0.0]
+                self.fleets[env_idx, expired, F_TARGET] = -1
             new = self.fleets[env_idx, fleet_slots][:, [F_X, F_Y]].copy()
             rem = (
                 (new[:, 0] < 0)

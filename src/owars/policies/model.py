@@ -468,6 +468,13 @@ class PolicyOutput:
     planet_ids: torch.Tensor          # [B, P] long
 
 
+def _match_feature_width(x: torch.Tensor, expected: int) -> torch.Tensor:
+    actual = x.shape[-1]
+    if actual > expected:
+        return x[..., :expected]
+    return F.pad(x, (0, expected - actual))
+
+
 class OrbitPolicy(nn.Module):
     def __init__(self, cfg: OrbitPolicyConfig):
         super().__init__()
@@ -623,6 +630,12 @@ class OrbitPolicy(nn.Module):
 
         b, p, _ = planet_feats.shape
         f = fleet_feats.shape[1]
+        if planet_feats.shape[-1] != self.planet_embed.in_features:
+            planet_feats = _match_feature_width(
+                planet_feats, self.planet_embed.in_features
+            )
+        if fleet_feats.shape[-1] != self.fleet_embed.in_features:
+            fleet_feats = _match_feature_width(fleet_feats, self.fleet_embed.in_features)
 
         h_p = self.planet_embed(planet_feats)
         h_f = self.fleet_embed(fleet_feats)
