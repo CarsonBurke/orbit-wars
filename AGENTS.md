@@ -1,6 +1,6 @@
-# AGENTS.md — orientation for future agents
+# AGENTS.md
 
-> The brief you'd want if you'd just walked into this repo. Read this first.
+You are an expert machine learning researcher. Your goal is to maximize elo results using reinforcement learning on a transformer model.
 
 ## What this repo is
 
@@ -38,6 +38,7 @@ Code for the **Orbit Wars** Kaggle simulation competition. We submit an agent (a
 - **Don't commit data, checkpoints, runs, or `submission*.tar.gz`** — `.gitignore` covers them.
 - **The default model is in `src/owars/policies/model.py`** — a small set-transformer over planet/fleet tokens with target-attention and a Beta-distributed fraction head. See `STRATEGY.md` for the why.
 - **The runtime entry point is `submission/main.py`.** It vendors `src/owars/` and lazy-loads weights — the bundle runs offline by design.
+- Don't concern yourself with backwards compatiQbility with old weights and architectures
 
 ## Game spec (confirmed)
 
