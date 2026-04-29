@@ -9,9 +9,12 @@ from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation
 from owars.policies.features import stack_encoded
 from owars.policies.model import PolicyOutput
 from owars.policies.sampling import (
+    ActionContext,
     SampleRecord,
     sample_actions,
     sample_batch_actions,
+    sample_batch_actions_context,
+    sample_batch_actions_raw,
     sample_batch_with_records,
     sample_with_record,
 )
@@ -23,16 +26,23 @@ def _obs(player: int = 0):
         "step": 0,
         "planets": [
             [0, 0, 10.0, 10.0, 1.0, 50, 3],
-            [1, 1, 90.0, 90.0, 1.0, 30, 2],
+            [1, 1, 10.0, 90.0, 1.0, 30, 2],
             [2, -1, 50.0, 90.0, 1.0, 10, 1],
         ],
         "fleets": [[0, 0, 30.0, 30.0, 0.5, 0, 20]],
         "angular_velocity": 0.04,
-        "initial_planets": [[0, 0, 10.0, 10.0, 1.0, 50, 3], [1, 1, 90.0, 90.0, 1.0, 30, 2]],
+        "initial_planets": [[0, 0, 10.0, 10.0, 1.0, 50, 3], [1, 1, 10.0, 90.0, 1.0, 30, 2]],
         "comet_planet_ids": [],
         "comets": [],
         "remainingOverageTime": 60.0,
     }
+
+
+def _sun_crossing_obs():
+    obs = _obs()
+    obs["planets"][1] = [1, 1, 90.0, 90.0, 1.0, 30, 2]
+    obs["initial_planets"][1] = [1, 1, 90.0, 90.0, 1.0, 30, 2]
+    return obs
 
 
 def _model() -> OrbitPolicy:
@@ -77,6 +87,32 @@ def _forced_move_output(feats) -> PolicyOutput:
         planet_mask=planet_mask,
         planet_ids=planet_ids,
     )
+
+
+def _duplicate_source_output() -> PolicyOutput:
+    target_logits = torch.full((1, 3, 4), -100.0)
+    target_logits[:, :, 3] = 0.0
+    target_logits[:, 0, :] = -100.0
+    target_logits[:, 1, :] = -100.0
+    target_logits[:, 0, 2] = 100.0
+    target_logits[:, 1, 2] = 100.0
+    return PolicyOutput(
+        target_logits=target_logits,
+        fraction_alpha=torch.full((1, 3), 20.0),
+        fraction_beta=torch.ones((1, 3)),
+        value=torch.zeros(1),
+        value_logits=torch.zeros(1, 51),
+        planet_owned_mask=torch.tensor([[True, True, False]]),
+        planet_mask=torch.tensor([[True, True, True]]),
+        planet_ids=torch.tensor([[0, 0, 1]]),
+    )
+
+
+def _assert_duplicate_source_actions_do_not_overlaunch(actions: list[list]) -> None:
+    assert len(actions) == 2
+    assert {int(a[0]) for a in actions} == {0}
+    assert sum(int(a[2]) for a in actions) == 49
+    assert all(1 <= int(a[2]) < 50 for a in actions)
 
 
 def test_stack_encoded_preserves_fields():
@@ -198,3 +234,54 @@ def test_batched_moves_only_sampler_matches_record_path_under_fixed_seed():
     assert [[m.as_list() for m in row] for row in moves] == [
         [m.as_list() for m in row] for row in moves_with_records
     ]
+
+
+def test_sampler_caps_duplicate_source_actions_to_remaining_garrison():
+    o = parse_observation(_obs())
+    actions = sample_batch_actions(_duplicate_source_output(), [o])[0]
+
+    _assert_duplicate_source_actions_do_not_overlaunch([m.as_list() for m in actions])
+
+
+def test_raw_and_context_samplers_cap_duplicate_source_actions():
+    obs = _obs()
+    out = _duplicate_source_output()
+    raw_actions = sample_batch_actions_raw(out, [obs])[0]
+    context_actions = sample_batch_actions_context(
+        out,
+        [ActionContext(planets=obs["planets"], angular_velocity=obs["angular_velocity"])],
+    )[0]
+
+    _assert_duplicate_source_actions_do_not_overlaunch(raw_actions)
+    _assert_duplicate_source_actions_do_not_overlaunch(context_actions)
+
+
+def test_sampler_skips_sun_crossing_launches():
+    obs = _sun_crossing_obs()
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+
+    assert sample_actions(out, o, deterministic=True) == []
+    assert sample_batch_actions_raw(out, [obs], deterministic=True) == [[]]
+
+
+def test_sampler_skips_comet_targets_without_path_lead():
+    obs = _obs()
+    obs["comet_planet_ids"] = [1]
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+
+    assert sample_actions(out, o, deterministic=True) == []
+    assert sample_batch_actions_context(
+        out,
+        [
+            ActionContext(
+                planets=obs["planets"],
+                angular_velocity=obs["angular_velocity"],
+                comet_planet_ids=obs["comet_planet_ids"],
+            )
+        ],
+        deterministic=True,
+    ) == [[]]

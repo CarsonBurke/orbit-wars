@@ -1341,6 +1341,7 @@ class NumpyVecEnv:
                 ActionContext(
                     planets=planets,
                     angular_velocity=float(self.angular_velocity[env_idx]),
+                    comet_planet_ids=tuple(self.envs[env_idx].comet_planet_ids),
                 )
             )
         return (

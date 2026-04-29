@@ -7,11 +7,16 @@ import math
 import pytest
 
 from owars.game.types import CENTER
-from owars.policies.sampling import _lead_angle
+from owars.policies.sampling import _lead_angle, _lead_angle_from_point
 
 
 def _simulate_intercept(
-    sx: float, sy: float, target_x: float, target_y: float, target_radius: float,
+    sx: float,
+    sy: float,
+    source_radius: float,
+    target_x: float,
+    target_y: float,
+    target_radius: float,
     omega: float, send: int, angle: float, max_steps: int = 600,
 ) -> float | None:
     """Run the simulator's straight-line fleet motion vs orbiting target;
@@ -20,17 +25,26 @@ def _simulate_intercept(
     from owars.game.physics import fleet_speed
     sp = fleet_speed(send)
     cx, cy = CENTER
-    R = math.hypot(target_x - cx, target_y - cy)
+    orbit_radius = math.hypot(target_x - cx, target_y - cy)
     theta0 = math.atan2(target_y - cy, target_x - cx)
-    fx, fy = sx, sy
+    fx = sx + math.cos(angle) * (source_radius + 0.1)
+    fy = sy + math.sin(angle) * (source_radius + 0.1)
     best = float("inf")
     for step in range(1, max_steps + 1):
+        old_fx, old_fy = fx, fy
         fx += math.cos(angle) * sp
         fy += math.sin(angle) * sp
         psi = theta0 + omega * step
-        tx = cx + R * math.cos(psi)
-        ty = cy + R * math.sin(psi)
-        d = math.hypot(fx - tx, fy - ty)
+        tx = cx + orbit_radius * math.cos(psi)
+        ty = cy + orbit_radius * math.sin(psi)
+        dx = fx - old_fx
+        dy = fy - old_fy
+        denom = dx * dx + dy * dy
+        if denom == 0.0:
+            d = math.hypot(fx - tx, fy - ty)
+        else:
+            t = max(0.0, min(1.0, ((tx - old_fx) * dx + (ty - old_fy) * dy) / denom))
+            d = math.hypot(tx - (old_fx + t * dx), ty - (old_fy + t * dy))
         if d < best:
             best = d
         # Exit if the fleet exits the board AFTER recording closest approach
@@ -61,10 +75,13 @@ def test_solver_lands_inside_planet_radius(src, target, omega, send):
     it within `target_radius` of the target at the predicted intercept
     time. Uses radius=1.0 (typical planet radius)."""
     radius = 1.0
-    angle = _lead_angle(src[0], src[1], target[0], target[1], radius, omega, send)
+    source_radius = 2.1
+    angle = _lead_angle(
+        src[0], src[1], source_radius, target[0], target[1], radius, omega, send
+    )
     assert angle is not None, "expected a feasible intercept for this case"
     closest = _simulate_intercept(
-        src[0], src[1], target[0], target[1], radius, omega, send, angle
+        src[0], src[1], source_radius, target[0], target[1], radius, omega, send, angle
     )
     assert closest is not None, "fleet flew off-board — solver returned a bad angle"
     # Closest approach should land inside the planet's collision radius.
@@ -79,6 +96,7 @@ def test_solver_returns_none_on_infeasible_far_horizon():
     # set ω so the orbit period is small enough that intercept is far.
     angle = _lead_angle(
         mine_x=10.0, mine_y=10.0,
+        mine_radius=2.1,
         target_x=50.0 + 30.0, target_y=50.0,
         target_radius=1.0,
         angular_velocity=0.05,
@@ -88,7 +106,7 @@ def test_solver_returns_none_on_infeasible_far_horizon():
     # The point is: the result is well-defined and the fleet, if launched,
     # cannot fly off-board (handled by the caller skipping None).
     if angle is not None:
-        closest = _simulate_intercept(10.0, 10.0, 80.0, 50.0, 1.0, 0.05, 1, angle)
+        closest = _simulate_intercept(10.0, 10.0, 2.1, 80.0, 50.0, 1.0, 0.05, 1, angle)
         assert closest is None or closest < 2.0
 
 
@@ -97,7 +115,7 @@ def test_static_target_is_aimed_direct():
     corner of the board) should be aimed at directly, no lead."""
     # Orbital radius from center (50,50) to (90,90) is √(40²+40²) ≈ 56.5,
     # exceeding ROTATION_RADIUS_LIMIT=50, so this planet is static.
-    angle = _lead_angle(10.0, 10.0, 90.0, 90.0, 1.0, 0.05, 30)
+    angle = _lead_angle(10.0, 10.0, 2.1, 90.0, 90.0, 1.0, 0.05, 30)
     expected = math.atan2(90.0 - 10.0, 90.0 - 10.0)
     assert abs(angle - expected) < 1e-6
 
@@ -106,7 +124,33 @@ def test_solver_respects_orbit_direction():
     """ω positive (CCW) and ω negative (CW) should give different lead
     angles for the same target — the solver must respect the direction."""
     target_x, target_y = 50.0 + 20.0, 50.0
-    a_ccw = _lead_angle(10.0, 50.0, target_x, target_y, 1.0, 0.04, 30)
-    a_cw = _lead_angle(10.0, 50.0, target_x, target_y, 1.0, -0.04, 30)
+    a_ccw = _lead_angle(10.0, 50.0, 2.1, target_x, target_y, 1.0, 0.04, 30)
+    a_cw = _lead_angle(10.0, 50.0, 2.1, target_x, target_y, 1.0, -0.04, 30)
     assert a_ccw is not None and a_cw is not None
     assert abs(a_ccw - a_cw) > 1e-3, "lead should differ across orbit directions"
+
+
+def test_solver_accounts_for_official_launch_surface_offset():
+    """A centerline solution can miss small targets once the official launch
+    offset is applied. `_lead_angle` must solve for that real launch point."""
+    sx, sy, source_radius = 63.739581113015426, 15.741528408044212, 2.1
+    target_x, target_y, target_radius = 11.639918383373761, 36.84108803746605, 1.0
+    omega = -0.041859494766865096
+    send = 9
+
+    center_angle = _lead_angle_from_point(
+        sx, sy, target_x, target_y, target_radius, omega, send
+    )
+    offset_angle = _lead_angle(
+        sx, sy, source_radius, target_x, target_y, target_radius, omega, send
+    )
+
+    assert center_angle is not None and offset_angle is not None
+    center_closest = _simulate_intercept(
+        sx, sy, source_radius, target_x, target_y, target_radius, omega, send, center_angle
+    )
+    offset_closest = _simulate_intercept(
+        sx, sy, source_radius, target_x, target_y, target_radius, omega, send, offset_angle
+    )
+    assert center_closest is not None and center_closest > target_radius
+    assert offset_closest is not None and offset_closest < target_radius
