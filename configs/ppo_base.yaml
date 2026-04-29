@@ -88,9 +88,8 @@ opponents:
                       # UCB-based eviction in `OpponentPool._trim_to_top_k`
                       # handles prioritization toward strong+well-measured
                       # snapshots and culls the rest.
-  top_k: 24           # ~24 updates of historical diversity before eviction
-                      # kicks in — wide enough to dodge near-Nash collapse
-                      # against very recent self.
+  top_k: 10           # ~10 updates of historical diversity before eviction
+                      # kicks in — compact enough to keep the league focused.
   self_play_prob: 0.8
   initial_rating: 1500.0
   k_factor: 32.0

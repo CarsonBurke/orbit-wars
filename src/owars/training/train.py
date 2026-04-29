@@ -630,30 +630,60 @@ def _ppo_loop(
         margin = float(np.mean([t.final_score for t in trajs]))
         snapshot_elos = [elo.get(n) for n in pool.snapshot_names()]
         logger.scalars(
-            "train",
+            "loss",
             {
-                "policy_loss": log.policy_loss,
-                "value_loss": log.value_loss,
+                "policy": log.policy_loss,
+                "value": log.value_loss,
+            },
+            update,
+        )
+        logger.scalars(
+            "kl",
+            {
+                "approx": log.approx_kl,
+                "pmpo": log.pmpo_kl,
+                "pmpo_target": log.pmpo_target_kl,
+                "pmpo_fraction": log.pmpo_fraction_kl,
+            },
+            update,
+        )
+        logger.scalars(
+            "policy",
+            {
                 "entropy": log.entropy,
-                "approx_kl": log.approx_kl,
-                "pmpo_kl": log.pmpo_kl,
-                "pmpo_target_kl": log.pmpo_target_kl,
-                "pmpo_fraction_kl": log.pmpo_fraction_kl,
-                "pos_frac": log.pos_frac,
                 "target_entropy": log.target_entropy,
                 "fraction_entropy": log.fraction_entropy,
-                "move_prob": log.move_prob,
                 "target_confidence": log.target_confidence,
-                "fraction_alpha_mean": log.fraction_alpha_mean,
-                "fraction_alpha_max": log.fraction_alpha_max,
-                "fraction_beta_mean": log.fraction_beta_mean,
-                "fraction_beta_max": log.fraction_beta_max,
+                "move_prob": log.move_prob,
+                "pos_advantage_frac": log.pos_frac,
+            },
+            update,
+        )
+        logger.scalars(
+            "fraction",
+            {
+                "alpha_mean": log.fraction_alpha_mean,
+                "alpha_max": log.fraction_alpha_max,
+                "beta_mean": log.fraction_beta_mean,
+                "beta_max": log.fraction_beta_max,
+            },
+            update,
+        )
+        logger.scalars(
+            "rollout",
+            {
                 "win_rate": win_rate,
                 "margin": margin,
+            },
+            update,
+        )
+        logger.scalars(
+            "league",
+            {
                 "elo_learner": elo.get(LEARNER_NAME),
-                "elo_pool_size": float(len(snapshot_elos)),
-                "elo_pool_max": max(snapshot_elos) if snapshot_elos else float("nan"),
-                "elo_pool_min": min(snapshot_elos) if snapshot_elos else float("nan"),
+                "pool_size": float(len(snapshot_elos)),
+                "pool_elo_max": max(snapshot_elos) if snapshot_elos else float("nan"),
+                "pool_elo_min": min(snapshot_elos) if snapshot_elos else float("nan"),
             },
             update,
         )

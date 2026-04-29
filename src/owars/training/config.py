@@ -176,7 +176,7 @@ class OpponentsCfg:
     """
 
     snapshot_every: int = 25      # save a frozen snapshot for the pool every N updates
-    top_k: int = 8                # max live snapshots; lowest-Elo evicted past this
+    top_k: int = 10               # max live snapshots; lowest-Elo evicted past this
     self_play_prob: float = 0.8   # P(opponent slot = current learner) per slot
     snapshot_device: str = "train"  # "cpu", "cuda", or "train" to mirror run.device
     initial_rating: float = 1500.0
@@ -192,7 +192,7 @@ class RewardCfg:
     bootstrap the value function back through the game from the terminal
     sign alone — adding shaping injects non-stationary noise into
     intermediate returns that fights the value head. If pure terminal
-    fails to learn we'll know from the train/win_rate scalar; turn the
+    fails to learn we'll know from the rollout/win_rate scalar; turn the
     shaping knobs on then."""
 
     win_value: float = 1.0
