@@ -28,13 +28,12 @@ opponent pool — see `STRATEGY.md`.
 from __future__ import annotations
 
 import argparse
+import random
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
-
-import random
 
 from ..policies.config import OrbitPolicyConfig
 from ..policies.model import OrbitPolicy, restore_fp32_params
@@ -55,7 +54,7 @@ from .ppo import (
 from .rollout import Trajectory
 from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
-from .vec_rollout import rollout_episodes_batched
+from .vec_rollout import alternating_learner_seats, rollout_episodes_batched
 
 # Parameter-name patterns that should *never* go to Muon even when shape
 # is 2D. These are control tensors (per-channel scales, residual mixes)
@@ -93,7 +92,7 @@ _HEAD_LR_PATTERNS: tuple[str, ...] = (
     "target_query",
     "target_key",
     "fraction_head",
-    "noop_head",
+    "launch_head",
 )
 
 
@@ -113,7 +112,7 @@ def _split_params(
     embeds, value-head matrices.
 
     Muon (head): action-head readout matrices — `target_query`,
-    `target_key`, `fraction_head`, `noop_head`. Same Muon optimizer
+    `target_key`, `fraction_head`, `launch_head`. Same Muon optimizer
     state, slower LR.
 
     AdamW (control-lr): per-channel residual scales and `q_gain`s — need
@@ -210,7 +209,7 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
 
     Per-step records on Trajectory are already device tensors (see the
     Trajectory docstring) — we just gather and stack here. Encoder-only:
-    the actor-side records (target_idx / fraction / old_log_prob /
+    the actor-side records (launch / target_idx / fraction / old_log_prob /
     owned_mask) are added by `_stack_trajectories`, which lets
     `_pretrain_value_batch` skip them entirely.
     """
@@ -249,20 +248,24 @@ def _stack_trajectories(
     """
     batch = _stack_encoded(trajs)
 
-    tidx, frac, lp, owned = [], [], [], []
-    otl, oalpha, obeta = [], [], []
+    launch, tidx, frac, lp, owned = [], [], [], [], []
+    olaunch, otl, oalpha, obeta = [], [], [], []
     for t in trajs:
+        launch.extend(t.launch)
         tidx.extend(t.target_idx)
         frac.extend(t.fraction)
         lp.extend(t.log_prob)
         owned.extend(t.owned_mask)
+        olaunch.extend(t.old_launch_logits)
         otl.extend(t.old_target_logits)
         oalpha.extend(t.old_fraction_alpha)
         obeta.extend(t.old_fraction_beta)
+    batch["launch"] = torch.stack(launch).float()
     batch["target_idx"] = torch.stack(tidx).long()
     batch["fraction"] = torch.stack(frac).float()
     batch["old_log_prob"] = torch.stack(lp).float()
     batch["owned_mask"] = torch.stack(owned).bool()
+    batch["old_launch_logits"] = torch.stack(olaunch).float()
     batch["old_target_logits"] = torch.stack(otl).float()
     batch["old_fraction_alpha"] = torch.stack(oalpha).float()
     batch["old_fraction_beta"] = torch.stack(obeta).float()
@@ -348,12 +351,18 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
         # Round episode count up to the nearest num_envs batch.
         batches = max(1, cfg.ppo.pretrain_episodes // cfg.rollout.num_envs)
         trajs: list[Trajectory] = []
-        for _ in range(batches):
+        for batch_idx in range(batches):
+            learner_seats = alternating_learner_seats(
+                cfg.rollout.num_envs,
+                cfg.game.num_players,
+                offset=step * batches + batch_idx,
+            )
             trajs.extend(rollout_episodes_batched(
                 model,
                 vec,
                 opponents_per_env,
                 num_players=cfg.game.num_players,
+                learner_seat=learner_seats,
                 device=str(device),
                 deterministic=False,
                 reward_cfg=cfg.reward,
@@ -417,7 +426,7 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     Includes the encoder (shared backbone), both summary tokens (actor_token
     feeds the encoder self-attention so h_critic depends on it; critic_token
     feeds the value head directly), and the value head. Excludes the actor
-    heads (target_query/key, noop_head, fraction_head) — they receive zero
+    heads (target_query/key, launch_head, fraction_head) — they receive zero
     gradient from the value loss, and including them would let AdamW's
     weight-decay pull them toward zero with no learning signal, leaving PPO
     to start from a worse-than-init policy.
@@ -579,11 +588,15 @@ def _ppo_loop(
             pool.sample(cfg.game.num_players - 1)
             for _ in range(cfg.rollout.num_envs)
         ]
+        learner_seats = alternating_learner_seats(
+            cfg.rollout.num_envs, cfg.game.num_players, offset=update
+        )
         trajs = rollout_episodes_batched(
             model,
             vec,
             opponents_per_env,
             num_players=cfg.game.num_players,
+            learner_seat=learner_seats,
             device=str(device),
             reward_cfg=cfg.reward,
             max_moves_per_turn=cfg.rollout.max_moves_per_turn,
@@ -597,7 +610,7 @@ def _ppo_loop(
         for env_idx, traj in enumerate(trajs):
             slots = opponents_per_env[env_idx]
             seat_names = _seat_names(traj.learner_seat, slots)
-            elo.update_from_game(list(zip(seat_names, traj.seat_rewards)))
+            elo.update_from_game(list(zip(seat_names, traj.seat_rewards, strict=True)))
             for s in slots:
                 play_count[s.name] += 1
                 if traj.won:
@@ -617,7 +630,8 @@ def _ppo_loop(
             optimizer,
             batch,
             value_coef=cfg.ppo.value_coef,
-            entropy_coef=cfg.ppo.entropy_coef,
+            target_entropy_coef=cfg.ppo.target_entropy_coef,
+            fraction_entropy_coef=cfg.ppo.fraction_entropy_coef,
             pmpo_kl_coef=cfg.ppo.pmpo_kl_coef,
             pmpo_pos_to_neg_weight=cfg.ppo.pmpo_pos_to_neg_weight,
             pmpo_reverse_kl=cfg.ppo.pmpo_reverse_kl,
@@ -666,6 +680,9 @@ def _ppo_loop(
                 "alpha_max": log.fraction_alpha_max,
                 "beta_mean": log.fraction_beta_mean,
                 "beta_max": log.fraction_beta_max,
+                "mode_mean": log.fraction_mode_mean,
+                "concentration_mean": log.fraction_concentration_mean,
+                "concentration_max": log.fraction_concentration_max,
             },
             update,
         )

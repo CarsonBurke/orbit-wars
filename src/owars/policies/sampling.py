@@ -1,8 +1,10 @@
 """Convert raw `PolicyOutput` into a list of legal `Move`s.
 
 The policy emits, per owned planet:
-  - a Categorical over `(target_planet, no-op)` with the no-op slot at index P
-  - a Beta(α, β) on [0, 1] for the fraction-of-garrison to send
+  - a Bernoulli launch decision
+  - a masked Categorical over target planets, conditional on launch
+  - a Beta(α, β) on [0, 1] for the fraction-of-garrison to send, conditional
+    on launch
 
 The simulator's action format is `[from_planet_id, angle_radians, num_ships]`.
 Fleets fly in *straight lines* at constant speed (`fleet_speed(num_ships)`),
@@ -11,12 +13,13 @@ mid-flight steering. We compute the angle deterministically by solving the
 intercept equation in closed form (see `_lead_angle`) — no fixed-point
 iteration that might oscillate.
 
-For PPO we need, *per owned planet*, the Categorical+Beta log-prob of the
-actually-sampled action. `sample_with_record` returns those alongside the
-moves; `sample_actions` is the thin moves-only wrapper used by inference paths
-that don't care about log-probs. The Beta sample is the action — there is no
-separate latent (vs the previous tanh-Gaussian, which had pre-squash `z` and
-post-squash fraction); `Beta.log_prob(fraction)` is direct and exact.
+For PPO we need, *per owned planet*, the Bernoulli + conditional
+Categorical/Beta log-prob of the actually-sampled action. `sample_with_record`
+returns those alongside the moves; `sample_actions` is the thin moves-only
+wrapper used by inference paths that don't care about log-probs. The Beta
+sample is the action — there is no separate latent (vs the previous
+tanh-Gaussian, which had pre-squash `z` and post-squash fraction);
+`Beta.log_prob(fraction)` is direct and exact.
 """
 
 from __future__ import annotations
@@ -35,11 +38,28 @@ from ..game.types import BOARD_SIZE, CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS, 
 from .model import PolicyOutput
 
 # Sample clamp for digamma/log stability in `Beta.log_prob`. With α,β ≥ 1
-# (post-soft-cap) `log_prob` is finite on the closed [0, 1] but the Beta-
+# (post-parameterization) `log_prob` is finite on the closed [0, 1] but the Beta-
 # Jacobian `(α-1) log z + (β-1) log(1-z)` blows up if a sampled z hits
 # exactly 0 or 1 with α=1 or β=1 (where the corresponding term is 0·log 0).
 # Mirrors `cleanrl ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:47`.
 SAMPLE_EPS: float = 1e-7
+
+
+def _deterministic_fraction(
+    fraction_alpha: torch.Tensor,
+    fraction_beta: torch.Tensor,
+) -> torch.Tensor:
+    """Return the deterministic fraction represented by the Beta head.
+
+    The policy parameterizes α=1+c·μ and β=1+c·(1−μ), so μ is recoverable as
+    the Beta mode `(α−1)/(α+β−2)`. This is the intended deterministic action;
+    the ordinary Beta mean is deliberately pulled toward 0.5 by the +1 floor.
+    """
+    concentration = (fraction_alpha + fraction_beta - 2.0).clamp_min(SAMPLE_EPS)
+    return ((fraction_alpha - 1.0) / concentration).clamp(
+        SAMPLE_EPS, 1.0 - SAMPLE_EPS
+    )
+
 
 # Lead-intercept solver. The intercept condition for a fleet leaving source
 # `(sx, sy)` at speed `sp` to meet a target on a circular orbit (radius R,
@@ -68,24 +88,26 @@ LEAD_MAX_TURNS: int = int(LEAD_T_HORIZON_STEPS)
 class SampleRecord:
     """Per-planet record of the sampled action — used by PPO rollouts.
 
-    The full distribution parameters (`target_logits`, `fraction_alpha`,
-    `fraction_beta`) are recorded alongside the sample so PPO can compute
-    the analytical KL divergence between the rollout-time policy and the
-    current policy (PMPO penalty, dreamer4 §`pmpo_kl_div_loss_weight`).
-    Importance-ratio PPO uses only `log_prob`, but the KL term needs the
-    full distributions — hence both.
+    The full distribution parameters (`launch_logits`, `target_logits`,
+    `fraction_alpha`, `fraction_beta`) are recorded alongside the sample so
+    PPO can compute the analytical KL divergence between the rollout-time
+    policy and the current policy (PMPO penalty, dreamer4
+    §`pmpo_kl_div_loss_weight`). Importance-ratio PPO uses only `log_prob`,
+    but the KL term needs the full distributions — hence both.
 
     The Beta sample IS the action (no separate latent), so we only carry
     `fraction` ∈ (eps, 1-eps); recomputing `log_prob` at that value uses
     `Beta.log_prob` directly with no Jacobian gymnastics.
     """
 
-    target_idx: torch.Tensor   # [P] long, in [0, P] (P = no-op slot)
+    launch: torch.Tensor       # [P] float 0/1 Bernoulli sample
+    target_idx: torch.Tensor   # [P] long, in [0, P)
     fraction: torch.Tensor     # [P] float in (eps, 1-eps) — Beta sample, used both for the move and for PPO's log_prob recompute
-    log_prob: torch.Tensor     # [P] float — Categorical + Beta
-    target_logits: torch.Tensor       # [P, P+1] — old-policy categorical logits (PMPO KL input)
-    fraction_alpha: torch.Tensor      # [P] — old-policy Beta α (post soft-cap)
-    fraction_beta: torch.Tensor       # [P] — old-policy Beta β (post soft-cap)
+    log_prob: torch.Tensor     # [P] float — Bernoulli + launch*(Categorical + Beta)
+    launch_logits: torch.Tensor       # [P] — old-policy Bernoulli logits (PMPO KL input)
+    target_logits: torch.Tensor       # [P, P] — old-policy categorical logits (PMPO KL input)
+    fraction_alpha: torch.Tensor      # [P] — old-policy Beta α
+    fraction_beta: torch.Tensor       # [P] — old-policy Beta β
 
 
 @dataclass(slots=True)
@@ -413,6 +435,7 @@ def _lead_angle(
 
 
 def _build_moves_from_lists(
+    launch_l: list[float],
     target_idx_l: list[int],
     frac_l: list[float],
     owned_l: list[bool],
@@ -429,9 +452,11 @@ def _build_moves_from_lists(
     for i in range(p):
         if not (owned_l[i] and pmask_l[i]):
             continue
+        if launch_l[i] < 0.5:
+            continue
         ti = target_idx_l[i]
-        if ti in (p, i):
-            continue  # no-op slot or self-target (the latter is also masked at logits-time)
+        if ti == i:
+            continue  # self-target is also masked at logits-time
         target_id = ids_l[ti]
         if target_id < 0 or target_id in o.comet_planet_ids:
             continue
@@ -484,14 +509,14 @@ def _build_moves_from_packed_fields(
     p = len(fields_l)
     for i, fields in enumerate(fields_l):
         ti = int(fields[0])
-        if fields[2] < 0.5 or fields[3] < 0.5:
+        if fields[2] < 0.5 or fields[3] < 0.5 or fields[4] < 0.5:
             continue
-        if ti in (p, i):
+        if ti == i:
             continue
-        target_id = int(fields_l[ti][4]) if 0 <= ti < p else -1
+        target_id = int(fields_l[ti][5]) if 0 <= ti < p else -1
         if target_id < 0 or target_id in o.comet_planet_ids:
             continue
-        mine = by_id.get(int(fields[4]))
+        mine = by_id.get(int(fields[5]))
         target = by_id.get(target_id)
         if mine is None or target is None:
             continue
@@ -547,14 +572,14 @@ def _build_action_lists_from_packed_fields_raw(
     p = len(fields_l)
     for i, fields in enumerate(fields_l):
         ti = int(fields[0])
-        if fields[2] < 0.5 or fields[3] < 0.5:
+        if fields[2] < 0.5 or fields[3] < 0.5 or fields[4] < 0.5:
             continue
-        if ti in (p, i):
+        if ti == i:
             continue
-        target_id = int(fields_l[ti][4]) if 0 <= ti < p else -1
+        target_id = int(fields_l[ti][5]) if 0 <= ti < p else -1
         if target_id < 0 or target_id in comet_planet_ids:
             continue
-        mine = by_id.get(int(fields[4]))
+        mine = by_id.get(int(fields[5]))
         target = by_id.get(target_id)
         if mine is None or target is None:
             continue
@@ -619,14 +644,14 @@ def _build_action_lists_from_packed_fields_context(
     p = len(fields_l)
     for i, fields in enumerate(fields_l):
         ti = int(fields[0])
-        if fields[2] < 0.5 or fields[3] < 0.5:
+        if fields[2] < 0.5 or fields[3] < 0.5 or fields[4] < 0.5:
             continue
-        if ti in (p, i):
+        if ti == i:
             continue
-        target_id = int(fields_l[ti][4]) if 0 <= ti < p else -1
+        target_id = int(fields_l[ti][5]) if 0 <= ti < p else -1
         if target_id < 0 or target_id in comet_planet_ids:
             continue
-        mine = by_id.get(int(fields[4]))
+        mine = by_id.get(int(fields[5]))
         target = by_id.get(target_id)
         if mine is None or target is None:
             continue
@@ -679,6 +704,7 @@ def _build_action_lists_from_packed_fields_context(
 
 
 def _packed_action_fields(
+    launch: torch.Tensor,
     target_idx: torch.Tensor,
     frac: torch.Tensor,
     owned: torch.Tensor,
@@ -695,6 +721,7 @@ def _packed_action_fields(
         (
             target_idx.float(),
             frac.float(),
+            launch.float(),
             owned.float(),
             pmask.float(),
             ids.float(),
@@ -705,6 +732,7 @@ def _packed_action_fields(
 
 
 def _build_moves(
+    launch: torch.Tensor,
     target_idx: torch.Tensor,
     frac: torch.Tensor,
     owned: torch.Tensor,
@@ -713,7 +741,7 @@ def _build_moves(
     o: Observation,
     max_moves: int,
 ) -> list[Move]:
-    """Translate a single env's sampled (target_idx, frac) into legal Moves.
+    """Translate a single env's sampled (launch, target_idx, frac) into legal Moves.
 
     All five tensors come from one batch element: one CPU pull to Python
     lists at the top of the function avoids `.item()` calls inside the
@@ -721,6 +749,7 @@ def _build_moves(
     so a P=64 planet loop was 64×4+ syncs per call).
     """
     return _build_moves_from_lists(
+        launch.tolist(),
         target_idx.tolist(),
         frac.tolist(),
         owned.tolist(),
@@ -731,20 +760,26 @@ def _build_moves(
     )
 
 
+def _safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
+    """Make target categorical rows finite even when no legal target exists."""
+    finite = torch.isfinite(target_logits).any(dim=-1, keepdim=True)
+    return torch.where(finite, target_logits, torch.zeros_like(target_logits))
+
+
 def _sample_distributions(
+    launch_logits: torch.Tensor,
     target_logits: torch.Tensor,
     fraction_alpha: torch.Tensor,
     fraction_beta: torch.Tensor,
-    p: int,
     deterministic: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample (target_idx, fraction, log_prob) from the heads.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample (launch, target_idx, fraction, log_prob) from the heads.
 
     Works for both unbatched [P, ...] and batched [B, P, ...] shapes.
 
-    The Beta log-prob only counts when the discrete target is *not* no-op:
-    on a no-op step the fraction sample is drawn but ignored downstream, so
-    it shouldn't contribute to the importance ratio.
+    The target and Beta log-probs only count when `launch=1`: on a no-launch
+    step those samples are drawn but ignored downstream, so they should not
+    contribute to the importance ratio.
 
     All distribution math runs in fp32 (parameter-golf `sota_train_gpt.py:163`
     `F.cross_entropy(logits.float(), …)`). bf16 has only 7 mantissa bits, and
@@ -753,20 +788,22 @@ def _sample_distributions(
     that swamps real signal. Casting here keeps the model forward in bf16
     (FA-2, autocast) while sampling and `old_log_prob` get fp32 precision.
     """
+    launch_logits = launch_logits.float()
     target_logits = target_logits.float()
+    target_logits = _safe_target_logits(target_logits)
     fraction_alpha = fraction_alpha.float()
     fraction_beta = fraction_beta.float()
     frac_dist = Beta(fraction_alpha, fraction_beta)
     if deterministic:
+        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
         target_idx = target_logits.argmax(dim=-1)
-        # Mean of Beta — well-defined for all (α,β) ≥ 1 and equals the mode
-        # whenever α,β > 1 up to the (α-1)/(α+β-2) shift; using the mean
-        # avoids the α=β=1 (uniform) edge case where the mode is undefined.
-        frac = fraction_alpha / (fraction_alpha + fraction_beta)
-        frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
         log_prob = torch.zeros_like(target_idx, dtype=fraction_alpha.dtype)
-        return target_idx, frac, log_prob
+        return launch, target_idx, frac, log_prob
 
+    launch_dist = torch.distributions.Bernoulli(logits=launch_logits)
+    launch = launch_dist.sample()
+    launch_lp = launch_dist.log_prob(launch)
     target_dist = torch.distributions.Categorical(logits=target_logits)
     target_idx = target_dist.sample()
     target_lp = target_dist.log_prob(target_idx)
@@ -774,10 +811,8 @@ def _sample_distributions(
     frac = frac_dist.sample().clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
     frac_lp = frac_dist.log_prob(frac)
 
-    is_noop = target_idx == p
-    move_mask = (~is_noop).to(frac_lp.dtype)
-    log_prob = target_lp + move_mask * frac_lp
-    return target_idx, frac, log_prob
+    log_prob = launch_lp + launch.to(frac_lp.dtype) * (target_lp + frac_lp)
+    return launch, target_idx, frac, log_prob
 
 
 def sample_with_record(
@@ -787,26 +822,28 @@ def sample_with_record(
     max_moves: int = 16,
 ) -> tuple[list[Move], SampleRecord]:
     """Sample an action per planet, build the legal `Move` list, AND return
-    the per-planet (target_idx, fraction, log_prob) record so PPO can
+    the per-planet (launch, target_idx, fraction, log_prob) record so PPO can
     compute the importance ratio against the *actual* sampled action.
     """
-    target_logits = out.target_logits[0]  # [P, P+1]
+    launch_logits = out.launch_logits[0]
+    target_logits = out.target_logits[0]  # [P, P]
     fraction_alpha = out.fraction_alpha[0]
     fraction_beta = out.fraction_beta[0]
     owned = out.planet_owned_mask[0]
     pmask = out.planet_mask[0]
     ids = out.planet_ids[0]
-    p = target_logits.shape[0]
 
-    target_idx, frac, log_prob = _sample_distributions(
-        target_logits, fraction_alpha, fraction_beta, p, deterministic
+    launch, target_idx, frac, log_prob = _sample_distributions(
+        launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
     )
 
-    moves = _build_moves(target_idx, frac, owned, pmask, ids, o, max_moves)
+    moves = _build_moves(launch, target_idx, frac, owned, pmask, ids, o, max_moves)
     record = SampleRecord(
+        launch=launch,
         target_idx=target_idx,
         fraction=frac,
         log_prob=log_prob,
+        launch_logits=launch_logits,
         target_logits=target_logits,
         fraction_alpha=fraction_alpha,
         fraction_beta=fraction_beta,
@@ -821,18 +858,23 @@ def sample_actions(
     max_moves: int = 16,
 ) -> list[Move]:
     """Moves-only wrapper for inference paths (eval, agent submission)."""
+    launch_logits = out.launch_logits[0]
     target_logits = out.target_logits[0]
     fraction_alpha = out.fraction_alpha[0]
     fraction_beta = out.fraction_beta[0]
+    target_logits = _safe_target_logits(target_logits)
     if deterministic:
+        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
         target_idx = target_logits.argmax(dim=-1)
-        frac = fraction_alpha / (fraction_alpha + fraction_beta)
+        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
     else:
+        launch = torch.distributions.Bernoulli(logits=launch_logits.float()).sample()
         target_dist = torch.distributions.Categorical(logits=target_logits)
         target_idx = target_dist.sample()
         frac = Beta(fraction_alpha, fraction_beta).sample()
     frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
     return _build_moves(
+        launch,
         target_idx,
         frac,
         out.planet_owned_mask[0],
@@ -855,22 +897,23 @@ def sample_batch_with_records(
     `parsed_list` has length B with the parsed observation per element.
     Returns one move list and one `SampleRecord` per element.
 
-    The Categorical/Beta samples are drawn once over the full [B, P]
+    The Bernoulli/Categorical/Beta samples are drawn once over the full [B, P]
     tensor — that's where the GPU win comes from. The per-element
     `_build_moves` walk is pure Python but cheap (one loop per env).
     """
-    target_logits = out.target_logits      # [B, P, P+1]
+    launch_logits = out.launch_logits      # [B, P]
+    target_logits = out.target_logits      # [B, P, P]
     fraction_alpha = out.fraction_alpha    # [B, P]
     fraction_beta = out.fraction_beta      # [B, P]
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
-    target_idx, frac, log_prob = _sample_distributions(
-        target_logits, fraction_alpha, fraction_beta, p, deterministic
+    launch, target_idx, frac, log_prob = _sample_distributions(
+        launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
     )
 
     fields_l = _packed_action_fields(
-        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
     )
 
     moves_list: list[list[Move]] = []
@@ -880,9 +923,11 @@ def sample_batch_with_records(
         moves_list.append(moves)
         records.append(
             SampleRecord(
+                launch=launch[k],
                 target_idx=target_idx[k],
                 fraction=frac[k],
                 log_prob=log_prob[k],
+                launch_logits=launch_logits[k],
                 target_logits=target_logits[k],
                 fraction_alpha=fraction_alpha[k],
                 fraction_beta=fraction_beta[k],
@@ -898,17 +943,18 @@ def sample_batch_with_records_raw(
     max_moves: int = 16,
 ) -> tuple[list[list[list]], list[SampleRecord]]:
     """Batched sampler that builds Kaggle action lists from raw obs dicts."""
+    launch_logits = out.launch_logits
     target_logits = out.target_logits
     fraction_alpha = out.fraction_alpha
     fraction_beta = out.fraction_beta
     b_dim, p, _ = target_logits.shape
     assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
 
-    target_idx, frac, log_prob = _sample_distributions(
-        target_logits, fraction_alpha, fraction_beta, p, deterministic
+    launch, target_idx, frac, log_prob = _sample_distributions(
+        launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
     )
     fields_l = _packed_action_fields(
-        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
     )
 
     actions_list: list[list[list]] = []
@@ -921,9 +967,11 @@ def sample_batch_with_records_raw(
         )
         records.append(
             SampleRecord(
+                launch=launch[k],
                 target_idx=target_idx[k],
                 fraction=frac[k],
                 log_prob=log_prob[k],
+                launch_logits=launch_logits[k],
                 target_logits=target_logits[k],
                 fraction_alpha=fraction_alpha[k],
                 fraction_beta=fraction_beta[k],
@@ -939,17 +987,18 @@ def sample_batch_with_records_context(
     max_moves: int = 16,
 ) -> tuple[list[list[list]], list[SampleRecord]]:
     """Batched sampler that builds action lists from fast env contexts."""
+    launch_logits = out.launch_logits
     target_logits = out.target_logits
     fraction_alpha = out.fraction_alpha
     fraction_beta = out.fraction_beta
     b_dim, p, _ = target_logits.shape
     assert len(contexts) == b_dim, (len(contexts), b_dim)
 
-    target_idx, frac, log_prob = _sample_distributions(
-        target_logits, fraction_alpha, fraction_beta, p, deterministic
+    launch, target_idx, frac, log_prob = _sample_distributions(
+        launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
     )
     fields_l = _packed_action_fields(
-        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
     )
 
     actions_list: list[list[list]] = []
@@ -962,9 +1011,11 @@ def sample_batch_with_records_context(
         )
         records.append(
             SampleRecord(
+                launch=launch[k],
                 target_idx=target_idx[k],
                 fraction=frac[k],
                 log_prob=log_prob[k],
+                launch_logits=launch_logits[k],
                 target_logits=target_logits[k],
                 fraction_alpha=fraction_alpha[k],
                 fraction_beta=fraction_beta[k],
@@ -980,23 +1031,27 @@ def sample_batch_actions(
     max_moves: int = 16,
 ) -> list[list[Move]]:
     """Batched moves-only sampler for eval and opponent inference paths."""
+    launch_logits = out.launch_logits
     target_logits = out.target_logits
     fraction_alpha = out.fraction_alpha
     fraction_beta = out.fraction_beta
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
+    target_logits = _safe_target_logits(target_logits)
     if deterministic:
+        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
         target_idx = target_logits.argmax(dim=-1)
-        frac = fraction_alpha / (fraction_alpha + fraction_beta)
+        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
     else:
+        launch = torch.distributions.Bernoulli(logits=launch_logits.float()).sample()
         target_dist = torch.distributions.Categorical(logits=target_logits)
         target_idx = target_dist.sample()
         frac = Beta(fraction_alpha, fraction_beta).sample()
     frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
 
     fields_l = _packed_action_fields(
-        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
     )
 
     return [
@@ -1012,23 +1067,27 @@ def sample_batch_actions_raw(
     max_moves: int = 16,
 ) -> list[list[list]]:
     """Batched moves-only sampler for raw Kaggle-style observations."""
+    launch_logits = out.launch_logits
     target_logits = out.target_logits
     fraction_alpha = out.fraction_alpha
     fraction_beta = out.fraction_beta
     b_dim, p, _ = target_logits.shape
     assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
 
+    target_logits = _safe_target_logits(target_logits)
     if deterministic:
+        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
         target_idx = target_logits.argmax(dim=-1)
-        frac = fraction_alpha / (fraction_alpha + fraction_beta)
+        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
     else:
+        launch = torch.distributions.Bernoulli(logits=launch_logits.float()).sample()
         target_dist = torch.distributions.Categorical(logits=target_logits)
         target_idx = target_dist.sample()
         frac = Beta(fraction_alpha, fraction_beta).sample()
     frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
 
     fields_l = _packed_action_fields(
-        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
     )
     return [
         _build_action_lists_from_packed_fields_raw(
@@ -1045,23 +1104,27 @@ def sample_batch_actions_context(
     max_moves: int = 16,
 ) -> list[list[list]]:
     """Batched moves-only sampler for fast env action contexts."""
+    launch_logits = out.launch_logits
     target_logits = out.target_logits
     fraction_alpha = out.fraction_alpha
     fraction_beta = out.fraction_beta
     b_dim, p, _ = target_logits.shape
     assert len(contexts) == b_dim, (len(contexts), b_dim)
 
+    target_logits = _safe_target_logits(target_logits)
     if deterministic:
+        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
         target_idx = target_logits.argmax(dim=-1)
-        frac = fraction_alpha / (fraction_alpha + fraction_beta)
+        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
     else:
+        launch = torch.distributions.Bernoulli(logits=launch_logits.float()).sample()
         target_dist = torch.distributions.Categorical(logits=target_logits)
         target_idx = target_dist.sample()
         frac = Beta(fraction_alpha, fraction_beta).sample()
     frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
 
     fields_l = _packed_action_fields(
-        target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
     )
     return [
         _build_action_lists_from_packed_fields_context(

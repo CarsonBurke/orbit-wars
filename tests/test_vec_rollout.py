@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import pytest
+
+from owars.policies.config import OrbitPolicyConfig
+from owars.policies.model import OrbitPolicy
+from owars.training.league import LEARNER_NAME, OpponentSlot
+from owars.training.numpy_env import NumpyVecEnv
+from owars.training.vec_rollout import (
+    _normalize_learner_seats,
+    _resolve_seat_agents,
+    alternating_learner_seats,
+    rollout_episodes_batched,
+)
+
+
+def test_alternating_learner_seats_by_env():
+    assert alternating_learner_seats(6, 2) == [0, 1, 0, 1, 0, 1]
+    assert alternating_learner_seats(6, 2, offset=1) == [1, 0, 1, 0, 1, 0]
+    assert alternating_learner_seats(7, 4) == [0, 1, 2, 3, 0, 1, 2]
+
+
+def test_resolve_seat_agents_uses_per_env_learner_seat():
+    snapshot = OpponentSlot("frozen:a", agent=lambda _obs: [])
+    self_play = OpponentSlot(LEARNER_NAME, agent=None)
+    opponents_per_env = [
+        [snapshot],
+        [snapshot],
+        [self_play],
+    ]
+    seats = _resolve_seat_agents(opponents_per_env, num_players=2, learner_seats=[0, 1, 0])
+
+    assert seats[0][0] is None
+    assert seats[0][1] is snapshot
+    assert seats[1][0] is snapshot
+    assert seats[1][1] is None
+    assert seats[2][0] is None
+    assert seats[2][1] is self_play
+
+
+def test_normalize_learner_seats_validates_length_and_range():
+    assert _normalize_learner_seats(1, num_envs=3, num_players=2) == [1, 1, 1]
+    assert _normalize_learner_seats([0, 1, 0], num_envs=3, num_players=2) == [0, 1, 0]
+    with pytest.raises(ValueError):
+        _normalize_learner_seats([0, 1], num_envs=3, num_players=2)
+    with pytest.raises(ValueError):
+        _normalize_learner_seats([0, 2, 1], num_envs=3, num_players=2)
+
+
+def test_numpy_fast_rollout_records_configured_learner_seats():
+    model = OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
+    opponent = OpponentSlot("noop", agent=lambda _obs: [])
+    vec = NumpyVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=12,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+
+    with vec:
+        trajs = rollout_episodes_batched(
+            model,
+            vec,
+            [[opponent], [opponent]],
+            num_players=2,
+            learner_seat=[0, 1],
+            device="cpu",
+            max_moves_per_turn=2,
+        )
+
+    assert [traj.learner_seat for traj in trajs] == [0, 1]
+    assert all(traj.seat_rewards for traj in trajs)
+    assert all(traj.encoded for traj in trajs)
+    for traj in trajs:
+        assert any(mask.any() for mask in traj.owned_mask)
+        for owned, obs in zip(traj.owned_mask, traj.encoded, strict=True):
+            assert owned.equal(obs.planet_owned_mask)

@@ -11,10 +11,10 @@ base: configs/ppo_base.yaml
 name: opponents_v0
 
 cells:
-  - { run.name: pool_self_only,    opponents.pool: ["self"] }
-  - { run.name: pool_self_heavy,   opponents.pool: ["self", "self", "self", "heuristic"] }
-  - { run.name: pool_balanced,     opponents.pool: ["self", "heuristic", "sniper", "random"] }
-  - { run.name: pool_baselines,    opponents.pool: ["heuristic", "sniper", "random"] }
-  - { run.name: pool_heuristic,    opponents.pool: ["heuristic"] }
-  - { run.name: pool_no_random,    opponents.pool: ["self", "heuristic", "sniper"] }
-  - { run.name: pool_with_frozen,  opponents.pool: ["self", "heuristic", "sniper", "random"], opponents.snapshot_every: 10 }
+  - { run.name: self_only,      opponents.self_play_prob: 1.0 }
+  - { run.name: snapshots_only, opponents.self_play_prob: 0.0 }
+  - { run.name: self_50,        opponents.self_play_prob: 0.5 }
+  - { run.name: self_80,        opponents.self_play_prob: 0.8 }
+  - { run.name: top_k_4,        opponents.top_k: 4 }
+  - { run.name: top_k_10,       opponents.top_k: 10 }
+  - { run.name: snap_every_10,  opponents.snapshot_every: 10 }

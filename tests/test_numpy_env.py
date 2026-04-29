@@ -192,11 +192,13 @@ def test_numpy_vec_fast_policy_batch_matches_raw_observations():
     assert len(contexts) == 2
 
     b, p = fast.planet_ids.shape
-    logits = torch.full((b, p, p + 1), -100.0)
-    logits[:, :, p] = 0.0
+    launch_logits = torch.full((b, p), -100.0)
+    launch_logits[:, 0] = 100.0
+    logits = torch.full((b, p, p), -100.0)
     logits[:, 0, :] = -100.0
     logits[:, 0, 1] = 100.0
     out = PolicyOutput(
+        launch_logits=launch_logits,
         target_logits=logits,
         fraction_alpha=torch.full((b, p), 20.0),
         fraction_beta=torch.ones((b, p)),

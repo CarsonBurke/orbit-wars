@@ -19,7 +19,7 @@ from .numpy_env import NumpyVecEnv
 from .rollout import rollout_episode
 from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
-from .vec_rollout import rollout_episodes_batched
+from .vec_rollout import alternating_learner_seats, rollout_episodes_batched
 
 
 def evaluate_ckpt(
@@ -52,11 +52,12 @@ def evaluate_ckpt(
         margins: list[float] = []
         if envs == 1 and env_backend == "kaggle":
             opps = [opp] * (num_players - 1)
-            for _ in range(n_games):
+            for game_idx in range(n_games):
                 traj = rollout_episode(
                     model, opps,
                     num_players=num_players, episode_steps=episode_steps,
                     ship_speed=ship_speed, device=device, deterministic=False,
+                    learner_seat=game_idx % num_players,
                 )
                 wins += int(traj.won)
                 draws += int(traj.drawn)
@@ -88,12 +89,17 @@ def evaluate_ckpt(
         else:
             vec = VecEnv(**vec_kwargs)
         with vec:
+            batch_idx = 0
             while len(margins) < n_games:
+                learner_seats = alternating_learner_seats(
+                    envs, num_players, offset=batch_idx
+                )
                 trajs = rollout_episodes_batched(
                     model,
                     vec,
                     opponents_per_env,
                     num_players=num_players,
+                    learner_seat=learner_seats,
                     device=device,
                     deterministic=False,
                     record_trajectories=False,
@@ -102,6 +108,7 @@ def evaluate_ckpt(
                     wins += int(traj.won)
                     draws += int(traj.drawn)
                     margins.append(traj.final_score)
+                batch_idx += 1
         out[opp_name] = {
             "win_rate": wins / max(1, n_games),
             "draw_rate": draws / max(1, n_games),

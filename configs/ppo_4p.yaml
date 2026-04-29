@@ -44,7 +44,8 @@ ppo:
   pmpo_reverse_kl: true
   pmpo_kl_coef: 0.3
   value_coef: 1.0
-  entropy_coef: 0.015   # a touch higher to keep diverse strategies alive in FFA
+  target_entropy_coef: 0.015   # a touch higher to keep diverse strategies alive in FFA
+  fraction_entropy_coef: 0.0
   pretrain_updates: 75
   pretrain_episodes: 32
   pretrain_lr: 1.0e-3

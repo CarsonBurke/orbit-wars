@@ -14,15 +14,15 @@ cells:
   - { run.name: lr_3em4, optim.lr: 3.0e-4 }
   - { run.name: lr_1em3, optim.lr: 1.0e-3 }
 
-  # clip range
-  - { run.name: clip_010, ppo.clip_eps: 0.10 }
-  - { run.name: clip_020, ppo.clip_eps: 0.20 }
-  - { run.name: clip_030, ppo.clip_eps: 0.30 }
+  # analytical PMPO KL penalty
+  - { run.name: pmpo_kl_010, ppo.pmpo_kl_coef: 0.10 }
+  - { run.name: pmpo_kl_030, ppo.pmpo_kl_coef: 0.30 }
+  - { run.name: pmpo_kl_100, ppo.pmpo_kl_coef: 1.00 }
 
-  # entropy coef
-  - { run.name: ent_001,  ppo.entropy_coef: 0.001 }
-  - { run.name: ent_010,  ppo.entropy_coef: 0.01 }
-  - { run.name: ent_030,  ppo.entropy_coef: 0.03 }
+  # target entropy coef; fraction entropy stays disabled in the base config
+  - { run.name: ent_001,  ppo.target_entropy_coef: 0.001 }
+  - { run.name: ent_010,  ppo.target_entropy_coef: 0.01 }
+  - { run.name: ent_030,  ppo.target_entropy_coef: 0.03 }
 
   # value coef
   - { run.name: vc_025,   ppo.value_coef: 0.25 }
@@ -34,10 +34,10 @@ cells:
   - { run.name: gamma_995,  ppo.gamma: 0.995 }
   - { run.name: gamma_999,  ppo.gamma: 0.999 }
 
-  # gae lambda
-  - { run.name: lam_080, ppo.gae_lambda: 0.80 }
-  - { run.name: lam_095, ppo.gae_lambda: 0.95 }
-  - { run.name: lam_098, ppo.gae_lambda: 0.98 }
+  # actor GAE lambda
+  - { run.name: lam_080, ppo.lambda_policy: 0.80 }
+  - { run.name: lam_095, ppo.lambda_policy: 0.95 }
+  - { run.name: lam_098, ppo.lambda_policy: 0.98 }
 
   # epochs / minibatches
   - { run.name: epochs_2,  optim.epochs_per_update: 2 }

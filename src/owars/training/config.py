@@ -58,7 +58,7 @@ class OptimCfg:
     # for matrix params on a 512-dim transformer.
     muon_lr: float = 0.022
     # Slower Muon LR for the action-head readout matrices (target_query,
-    # target_key, fraction_head, noop_head). parameter-golf gives the LM
+    # target_key, fraction_head, launch_head). parameter-golf gives the LM
     # head ~3× slower LR than the trunk (`head_lr=0.008` vs `matrix_lr=0.022`,
     # `sota_train_gpt.py:10,211`). The readout is the only path between
     # encoder shifts and policy logits/μ — slowing it dampens ratio drift
@@ -122,16 +122,21 @@ class PPOCfg:
     pmpo_pos_to_neg_weight: float = 0.5    # equal weight on pos and neg advantage (dreamer4 default)
     pmpo_reverse_kl: bool = True            # dreamer4 default — KL(old ‖ new); False → forward KL(new ‖ old)
     # Analytical reverse KL penalty `coef · KL(old ‖ new)` (dreamer4
-    # `pmpo_kl_div_loss_weight=0.3`). Categorical(target) + Beta(fraction)
-    # closed-form per owned planet. Combined with the soft-cap on (α, β),
-    # this provides a structural-and-soft trust region without a hard clamp.
+    # `pmpo_kl_div_loss_weight=0.3`). Bernoulli(launch) +
+    # P(launch)·(Categorical(target) + Beta(fraction)) closed-form per owned
+    # planet. Combined with bounded Beta concentration, this provides a
+    # structural-and-soft trust region without a hard clamp.
     pmpo_kl_coef: float = 0.3
     # Distributional CE gradients are naturally bounded (per-bin
     # `softmax − target_probs` has ‖∇‖ ~ O(1)), unlike MSE which blew
     # up under bad predictions. dreamer4 effectively runs the equivalent
     # of `value_coef=1.0` (separate `value_optim`, `dreamer4.py:4543`).
     value_coef: float = 1.0
-    entropy_coef: float = 0.01              # dreamer4 default; the categorical-target entropy has no structural floor (unlike the soft-capped Beta), so this keeps it from collapsing
+    # Categorical target entropy has no structural floor, so keep it from
+    # collapsing. The Beta fraction already has a concentration floor; do not
+    # reward collapse toward max-entropy Beta(1,1).
+    target_entropy_coef: float = 0.01
+    fraction_entropy_coef: float = 0.0
     # No value clipping. dreamer4-style clipping (`max(ce, ce_of_clipped_v)`)
     # only behaves sensibly when the HL-Gauss σ is wide enough that the
     # re-encoded clipped scalar overlaps with the return-encoded target.

@@ -23,6 +23,7 @@ Per env-step the orchestrator does:
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -44,25 +45,52 @@ from .vec_env import VecEnv
 
 def _empty_traj() -> Trajectory:
     return Trajectory(
-        encoded=[], target_idx=[], fraction=[],
+        encoded=[], launch=[], target_idx=[], fraction=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
+        old_launch_logits=[],
         old_target_logits=[],
         old_fraction_alpha=[],
         old_fraction_beta=[],
     )
 
 
+def alternating_learner_seats(
+    num_envs: int, num_players: int, *, offset: int = 0
+) -> list[int]:
+    return [(env_idx + offset) % num_players for env_idx in range(num_envs)]
+
+
+def _normalize_learner_seats(
+    learner_seat: int | Sequence[int],
+    num_envs: int,
+    num_players: int,
+) -> list[int]:
+    if isinstance(learner_seat, int):
+        seats = [learner_seat] * num_envs
+    else:
+        seats = [int(seat) for seat in learner_seat]
+        if len(seats) != num_envs:
+            raise ValueError(
+                f"learner_seat has {len(seats)} entries for {num_envs} envs"
+            )
+    bad = [seat for seat in seats if not 0 <= seat < num_players]
+    if bad:
+        raise ValueError(f"invalid learner seat(s) for {num_players} players: {bad}")
+    return seats
+
+
 def _resolve_seat_agents(
     opponents_per_env: list[list[OpponentSlot]],
     num_players: int,
-    learner_seat: int,
+    learner_seats: Sequence[int],
 ) -> list[list[OpponentSlot | None]]:
     """For each env, return a list indexed by seat. `None` marks the
     learner's own seat; self-play opponent seats keep an OpponentSlot
     whose name is LEARNER_NAME (so they batch into the learner forward).
     """
     out: list[list[OpponentSlot | None]] = []
-    for slots in opponents_per_env:
+    for env_idx, slots in enumerate(opponents_per_env):
+        learner_seat = int(learner_seats[env_idx])
         per_seat: list[OpponentSlot | None] = [None] * num_players
         op_ix = 0
         for seat in range(num_players):
@@ -110,7 +138,7 @@ def rollout_episodes_batched(
     *,
     num_players: int,
     device: str = "cpu",
-    learner_seat: int = 0,
+    learner_seat: int | Sequence[int] = 0,
     deterministic: bool = False,
     reward_cfg: RewardCfg | None = None,
     record_trajectories: bool = True,
@@ -124,9 +152,10 @@ def rollout_episodes_batched(
     the pool once and reuses it.
 
     `opponents_per_env[i]` is a list of `num_players-1` `OpponentSlot`s for
-    env `i` (the seat order skips `learner_seat`). The opponent assignment
-    is fixed for the whole episode — sampled once by the caller before the
-    rollout.
+    env `i` (the seat order skips that env's learner seat). `learner_seat`
+    can be a scalar for legacy single-seat rollouts or a per-env list. The
+    opponent assignment is fixed for the whole episode — sampled once by the
+    caller before the rollout.
     """
     num_envs = len(opponents_per_env)
     assert num_envs == vec.num_envs, (
@@ -134,7 +163,8 @@ def rollout_episodes_batched(
     )
     if reward_cfg is None:
         reward_cfg = RewardCfg()
-    seat_agents = _resolve_seat_agents(opponents_per_env, num_players, learner_seat)
+    learner_seats = _normalize_learner_seats(learner_seat, num_envs, num_players)
+    seat_agents = _resolve_seat_agents(opponents_per_env, num_players, learner_seats)
 
     trajectories = [_empty_traj() for _ in range(num_envs)]
     finals: list[Any] = [None] * num_envs
@@ -185,7 +215,7 @@ def rollout_episodes_batched(
                 learner_bucket,
                 actions_per_env,
                 trajectories,
-                learner_seat,
+                learner_seats,
                 device,
                 deterministic,
                 record_trajectories,
@@ -201,7 +231,9 @@ def rollout_episodes_batched(
             if callable(act_batch):
                 obs_list = [obs for _env_idx, _seat, obs, _slot in bucket]
                 batched_actions = act_batch(obs_list)
-                for (env_idx, seat, _obs, _slot), acts in zip(bucket, batched_actions):
+                for (env_idx, seat, _obs, _slot), acts in zip(
+                    bucket, batched_actions, strict=True
+                ):
                     actions_per_env[env_idx][seat] = acts
             else:
                 for env_idx, seat, obs, slot in bucket:
@@ -222,7 +254,7 @@ def rollout_episodes_batched(
     # 5. Apply terminal reward + record seat_rewards on each trajectory.
     for env_idx in range(num_envs):
         _finalize_trajectory(
-            trajectories[env_idx], finals[env_idx], learner_seat, reward_cfg
+            trajectories[env_idx], finals[env_idx], learner_seats[env_idx], reward_cfg
         )
 
     return trajectories
@@ -233,7 +265,7 @@ def _step_learner_bucket(
     bucket: list[tuple[int, int, Any]],
     actions_per_env: dict[int, list[Any]],
     trajectories: list[Trajectory],
-    learner_seat: int,
+    learner_seats: Sequence[int],
     device: str,
     deterministic: bool,
     record_trajectories: bool,
@@ -243,8 +275,8 @@ def _step_learner_bucket(
     """Encode + batch-forward the learner identity across (env, seat) pairs.
 
     Self-play opponent seats batch in here too for compute efficiency, but
-    only the seat that == `learner_seat` gets recorded into its trajectory
-    — PPO trains on the learner's transitions, not the self-play side's.
+    only each env's configured learner seat gets recorded into its trajectory
+    — PPO trains on the learner-seat transitions, not the self-play side's.
     """
     raw_obs_list = [obs for _, _, obs in bucket]
     target_device = torch.device(device)
@@ -327,7 +359,9 @@ def _step_learner_bucket(
 
     if record_trajectories:
         learner_rows = [
-            k for k, (_env_idx, seat, _obs) in enumerate(bucket) if seat == learner_seat
+            k
+            for k, (env_idx, seat, _obs) in enumerate(bucket)
+            if seat == learner_seats[env_idx]
         ]
         learner_envs = [bucket[k][0] for k in learner_rows]
         if learner_rows:
@@ -355,11 +389,13 @@ def _step_learner_bucket(
                         fleet_mask=rec["fleet_mask"][j],
                     )
                 )
+                traj.launch.append(rec["launch"][j])
                 traj.target_idx.append(rec["target_idx"][j])
                 traj.fraction.append(rec["fraction"][j])
                 traj.log_prob.append(rec["log_prob"][j])
                 traj.value.append(rec["value"][j])
                 traj.owned_mask.append(rec["owned_mask"][j])
+                traj.old_launch_logits.append(rec["old_launch_logits"][j])
                 traj.old_target_logits.append(rec["old_target_logits"][j])
                 traj.old_fraction_alpha.append(rec["old_fraction_alpha"][j])
                 traj.old_fraction_beta.append(rec["old_fraction_beta"][j])
@@ -390,9 +426,11 @@ def _materialize_records_cpu(
         if feature_source.planet_feats.device.type == "cpu"
         else row_idx
     )
+    launch = torch.stack([records[k].launch for k in rows])
     target_idx = torch.stack([records[k].target_idx for k in rows])
     fraction = torch.stack([records[k].fraction for k in rows])
     log_prob = torch.stack([records[k].log_prob for k in rows])
+    old_launch_logits = torch.stack([records[k].launch_logits for k in rows])
     old_target_logits = torch.stack([records[k].target_logits for k in rows])
     old_fraction_alpha = torch.stack([records[k].fraction_alpha for k in rows])
     old_fraction_beta = torch.stack([records[k].fraction_beta for k in rows])
@@ -402,10 +440,12 @@ def _materialize_records_cpu(
     flat = torch.cat(
         (
             target_idx.float(),
+            launch.float(),
             fraction.float(),
             log_prob.float(),
             value.float().unsqueeze(1),
             owned_mask.float(),
+            old_launch_logits.float(),
             old_target_logits.float().reshape(b, -1),
             old_fraction_alpha.float(),
             old_fraction_beta.float(),
@@ -415,6 +455,8 @@ def _materialize_records_cpu(
     pos = 0
     target_idx_cpu = flat[:, pos : pos + p].long()
     pos += p
+    launch_cpu = flat[:, pos : pos + p]
+    pos += p
     fraction_cpu = flat[:, pos : pos + p]
     pos += p
     log_prob_cpu = flat[:, pos : pos + p]
@@ -423,8 +465,10 @@ def _materialize_records_cpu(
     pos += 1
     owned_mask_cpu = flat[:, pos : pos + p].bool()
     pos += p
-    old_logits_width = p * (p + 1)
-    old_target_logits_cpu = flat[:, pos : pos + old_logits_width].reshape(b, p, p + 1)
+    old_launch_logits_cpu = flat[:, pos : pos + p]
+    pos += p
+    old_logits_width = p * p
+    old_target_logits_cpu = flat[:, pos : pos + old_logits_width].reshape(b, p, p)
     pos += old_logits_width
     old_fraction_alpha_cpu = flat[:, pos : pos + p]
     pos += p
@@ -453,10 +497,12 @@ def _materialize_records_cpu(
         .detach()
         .cpu(),
         "target_idx": target_idx_cpu,
+        "launch": launch_cpu,
         "fraction": fraction_cpu,
         "log_prob": log_prob_cpu,
         "value": value_cpu,
         "owned_mask": owned_mask_cpu,
+        "old_launch_logits": old_launch_logits_cpu,
         "old_target_logits": old_target_logits_cpu,
         "old_fraction_alpha": old_fraction_alpha_cpu,
         "old_fraction_beta": old_fraction_beta_cpu,
@@ -468,7 +514,11 @@ def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
         return feats.to(device)
 
     def move(t: torch.Tensor) -> torch.Tensor:
-        return t.pin_memory().to(device, non_blocking=True)
+        if t.device == device:
+            return t
+        if t.device.type == "cpu":
+            return t.pin_memory().to(device, non_blocking=True)
+        return t.to(device, non_blocking=True)
 
     return EncodedObs(
         planet_feats=move(feats.planet_feats),

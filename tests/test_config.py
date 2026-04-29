@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import yaml
 
 from owars.training.config import RunConfig, deep_override
@@ -32,3 +34,18 @@ def test_real_yaml_loads():
     assert cfg.game.episode_steps == 500
     assert 0.0 <= cfg.opponents.self_play_prob <= 1.0
     assert cfg.opponents.top_k > 0
+
+
+def test_ablation_yaml_keys_load():
+    for matrix_path in Path("ablations").glob("*.yaml"):
+        matrix = yaml.safe_load(matrix_path.read_text())
+        base = yaml.safe_load(Path(matrix["base"]).read_text()) or {}
+        for cell in matrix["cells"]:
+            nested = {}
+            for key, value in cell.items():
+                cursor = nested
+                parts = key.split(".")
+                for part in parts[:-1]:
+                    cursor = cursor.setdefault(part, {})
+                cursor[parts[-1]] = value
+            RunConfig.from_dict(deep_override(base, nested))

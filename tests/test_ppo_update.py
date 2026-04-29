@@ -16,19 +16,23 @@ import torch.nn.functional as F
 from torch.distributions import Beta, Categorical, kl_divergence
 
 from owars.policies.config import OrbitPolicyConfig
-from owars.policies.features import EncodedObs, MAX_FLEETS, MAX_PLANETS
+from owars.policies.features import MAX_FLEETS, MAX_PLANETS, EncodedObs
 from owars.policies.model import HLGaussLoss, OrbitPolicy
 from owars.policies.sampling import sample_batch_with_records
 from owars.training.ppo import (
     _conditional_action_entropy,
-    _conditional_fraction_kl,
     _fixed_minibatches,
     ppo_update,
     value_only_update,
 )
 
 
-def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FLEETS) -> dict[str, torch.Tensor]:
+def _toy_batch(
+    model: OrbitPolicy,
+    batch_size: int,
+    num_planets: int = MAX_PLANETS,
+    num_fleets: int = MAX_FLEETS,
+) -> dict[str, torch.Tensor]:
     """Forward the model once on synthetic obs, sample, and pack a PPO batch.
 
     We use the *real* sampler to get a `fraction` whose log_prob exactly
@@ -36,17 +40,17 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
     which is the only invariant we want to assert at this scale.
     """
     torch.manual_seed(0)
-    planet_feats = torch.randn(B, P, 19) * 0.3
-    planet_mask = torch.zeros(B, P, dtype=torch.bool)
+    planet_feats = torch.randn(batch_size, num_planets, 19) * 0.3
+    planet_mask = torch.zeros(batch_size, num_planets, dtype=torch.bool)
     planet_mask[:, :8] = True
-    planet_owned = torch.zeros(B, P, dtype=torch.bool)
+    planet_owned = torch.zeros(batch_size, num_planets, dtype=torch.bool)
     planet_owned[:, :3] = True
-    planet_ids = torch.full((B, P), -1, dtype=torch.long)
+    planet_ids = torch.full((batch_size, num_planets), -1, dtype=torch.long)
     planet_ids[:, :8] = torch.arange(8)
-    planet_garrison = torch.zeros(B, P)
+    planet_garrison = torch.zeros(batch_size, num_planets)
     planet_garrison[:, :8] = 50
-    fleet_feats = torch.zeros(B, F, 20)
-    fleet_mask = torch.zeros(B, F, dtype=torch.bool)
+    fleet_feats = torch.zeros(batch_size, num_fleets, 20)
+    fleet_mask = torch.zeros(batch_size, num_fleets, dtype=torch.bool)
     feats = EncodedObs(
         planet_feats=planet_feats, planet_mask=planet_mask,
         planet_owned_mask=planet_owned, planet_ids=planet_ids,
@@ -66,12 +70,14 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
             planets=[Planet(i, 0, 0.0, 0.0, 1.0, 10, 1) for i in range(8)],
             fleets=[], angular_velocity=0.04, initial_planets=[],
             comet_planet_ids=set(), comets=[], remaining_overage_time=60.0,
-        ) for _ in range(B)
+        ) for _ in range(batch_size)
     ]
     _, records = sample_batch_with_records(out, obs, deterministic=False)
+    launch = torch.stack([r.launch for r in records])
     target_idx = torch.stack([r.target_idx for r in records])
     fraction = torch.stack([r.fraction for r in records])
     log_prob = torch.stack([r.log_prob for r in records])
+    old_launch_logits = torch.stack([r.launch_logits for r in records])
     old_target_logits = torch.stack([r.target_logits for r in records])
     old_fraction_alpha = torch.stack([r.fraction_alpha for r in records])
     old_fraction_beta = torch.stack([r.fraction_beta for r in records])
@@ -84,13 +90,15 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
         "planet_garrison": planet_garrison,
         "fleet_feats": fleet_feats,
         "fleet_mask": fleet_mask,
+        "launch": launch,
         "target_idx": target_idx,
         "fraction": fraction,
         "old_log_prob": log_prob,
         "owned_mask": planet_owned,
-        "advantage": torch.randn(B),
+        "advantage": torch.randn(batch_size),
         # Returns stay inside the default value-head support [-2, 2].
-        "return": torch.randn(B).clamp(-1.0, 1.0),
+        "return": torch.randn(batch_size).clamp(-1.0, 1.0),
+        "old_launch_logits": old_launch_logits,
         "old_target_logits": old_target_logits,
         "old_fraction_alpha": old_fraction_alpha,
         "old_fraction_beta": old_fraction_beta,
@@ -100,12 +108,15 @@ def _toy_batch(model: OrbitPolicy, B: int, P: int = MAX_PLANETS, F: int = MAX_FL
 def test_ppo_update_runs_and_returns_finite_metrics():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
     model = OrbitPolicy(cfg)
-    batch = _toy_batch(model, B=8)
+    batch = _toy_batch(model, batch_size=8)
     optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     log = ppo_update(
         model, optim, batch,
-        value_coef=0.5, entropy_coef=0.01, pmpo_kl_coef=0.3,
+        value_coef=0.5,
+        target_entropy_coef=0.01,
+        fraction_entropy_coef=0.0,
+        pmpo_kl_coef=0.3,
         pmpo_pos_to_neg_weight=0.5, pmpo_reverse_kl=True,
         epochs=2, minibatch_size=4, grad_clip=0.5,
     )
@@ -125,6 +136,9 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         "fraction_alpha_max",
         "fraction_beta_mean",
         "fraction_beta_max",
+        "fraction_mode_mean",
+        "fraction_concentration_mean",
+        "fraction_concentration_max",
         "pmpo_target_kl",
         "pmpo_fraction_kl",
     ):
@@ -144,12 +158,10 @@ def test_log_prob_recompute_matches_sample_time():
     """
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
     model = OrbitPolicy(cfg)
-    batch = _toy_batch(model, B=4)
+    batch = _toy_batch(model, batch_size=4)
 
     # Re-run forward (no-grad) and recompute log_prob exactly the way
     # ppo_update does — without taking any optimizer step.
-    from owars.policies.features import EncodedObs
-    from torch.distributions import Beta
     feats = EncodedObs(
         planet_feats=batch["planet_feats"], planet_mask=batch["planet_mask"],
         planet_owned_mask=batch["planet_owned_mask"], planet_ids=batch["planet_ids"],
@@ -158,13 +170,15 @@ def test_log_prob_recompute_matches_sample_time():
     )
     with torch.no_grad():
         out = model(feats)
+    launch = batch["launch"]
     target = batch["target_idx"]
-    p = out.target_logits.shape[1]
     target_log_probs = torch.log_softmax(out.target_logits, dim=-1)
     target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
     frac_lp = Beta(out.fraction_alpha, out.fraction_beta).log_prob(batch["fraction"])
-    move_mask = (target != p).float()
-    chosen = target_lp + move_mask * frac_lp
+    launch_lp = -F.binary_cross_entropy_with_logits(
+        out.launch_logits, launch, reduction="none"
+    )
+    chosen = launch_lp + launch * (target_lp + frac_lp)
 
     owned = batch["owned_mask"].float()
     diff = (chosen - batch["old_log_prob"]) * owned
@@ -172,29 +186,17 @@ def test_log_prob_recompute_matches_sample_time():
     assert diff.abs().max().item() < 1e-4, diff.abs().max().item()
 
 
-def test_conditional_fraction_kl_vanishes_when_noop_is_certain():
-    source_target_probs = torch.tensor(
-        [
-            [0.0, 0.0, 1.0],
-            [0.25, 0.25, 0.50],
-        ],
-        dtype=torch.float32,
-    )
-    frac_kl = torch.tensor([7.0, 7.0])
-
-    weighted = _conditional_fraction_kl(frac_kl, source_target_probs, noop_idx=2)
-
-    assert torch.allclose(weighted, torch.tensor([0.0, 3.5]))
-
-
 def test_conditional_entropy_weights_fraction_by_current_move_probability():
-    # Uniform categorical over target0, target1, no-op -> H=log(3), P(move)=2/3.
-    target_log_probs = torch.log_softmax(torch.zeros(1, 3), dim=-1)
+    # P(launch)=0.25, uniform categorical over two targets -> H=log(2).
+    launch_logits = torch.logit(torch.tensor([0.25]))
+    target_log_probs = torch.log_softmax(torch.zeros(1, 2), dim=-1)
     beta_entropy = torch.tensor([1.5])
 
-    entropy = _conditional_action_entropy(target_log_probs, beta_entropy, noop_idx=2)
+    entropy = _conditional_action_entropy(launch_logits, target_log_probs, beta_entropy)
 
-    assert torch.allclose(entropy, torch.tensor([math.log(3.0) + 1.0]), atol=1e-6)
+    expected_launch_entropy = -(0.25 * math.log(0.25) + 0.75 * math.log(0.75))
+    expected = expected_launch_entropy + 0.25 * (math.log(2.0) + 1.5)
+    assert torch.allclose(entropy, torch.tensor([expected]), atol=1e-6)
 
 
 def test_fixed_minibatches_zero_weight_padding_rows():
@@ -229,6 +231,7 @@ class _FixedPolicy(torch.nn.Module):
         super().__init__()
         self.dummy = torch.nn.Parameter(torch.zeros(()))
         self.value_encoder = HLGaussLoss(min_value=-1.0, max_value=1.0, num_bins=5)
+        self.new_launch_logits = torch.logit(torch.tensor([[0.25]]))
         self.new_target_logits = torch.log(torch.tensor([[[0.20, 0.80]]]))
         self.new_alpha = torch.tensor([[4.0]])
         self.new_beta = torch.tensor([[3.0]])
@@ -238,6 +241,10 @@ class _FixedPolicy(torch.nn.Module):
         return SimpleNamespace(
             target_logits=(
                 self.new_target_logits.expand(b, -1, -1).to(feats.planet_feats.device)
+                + self.dummy * 0.0
+            ),
+            launch_logits=(
+                self.new_launch_logits.expand(b, -1).to(feats.planet_feats.device)
                 + self.dummy * 0.0
             ),
             fraction_alpha=(
@@ -257,6 +264,7 @@ class _FixedPolicy(torch.nn.Module):
 
 def test_forward_pmpo_kl_weights_fraction_by_new_move_probability():
     model = _FixedPolicy()
+    old_launch_logits = torch.logit(torch.tensor([[0.75]]))
     old_target_probs = torch.tensor([[[0.60, 0.40]]])
     old_alpha = torch.tensor([[2.0]])
     old_beta = torch.tensor([[5.0]])
@@ -268,14 +276,22 @@ def test_forward_pmpo_kl_weights_fraction_by_new_move_probability():
         "planet_garrison": torch.ones(1, 1),
         "fleet_feats": torch.zeros(1, 1, 20),
         "fleet_mask": torch.zeros(1, 1, dtype=torch.bool),
+        "launch": torch.ones(1, 1),
         "target_idx": torch.ones(1, 1, dtype=torch.long),
         "fraction": torch.full((1, 1), 0.5),
-        "old_log_prob": old_target_probs.log()
-        .gather(-1, torch.ones(1, 1, 1, dtype=torch.long))
-        .squeeze(-1),
+        "old_log_prob": (
+            -F.binary_cross_entropy_with_logits(
+                old_launch_logits, torch.ones(1, 1), reduction="none"
+            )
+            + old_target_probs.log()
+            .gather(-1, torch.ones(1, 1, 1, dtype=torch.long))
+            .squeeze(-1)
+            + Beta(old_alpha, old_beta).log_prob(torch.full((1, 1), 0.5))
+        ),
         "owned_mask": torch.ones(1, 1, dtype=torch.bool),
         "advantage": torch.zeros(1),
         "return": torch.zeros(1),
+        "old_launch_logits": old_launch_logits,
         "old_target_logits": old_target_probs.log(),
         "old_fraction_alpha": old_alpha,
         "old_fraction_beta": old_beta,
@@ -284,23 +300,32 @@ def test_forward_pmpo_kl_weights_fraction_by_new_move_probability():
 
     log = ppo_update(
         model, optim, batch,
-        value_coef=0.0, entropy_coef=0.0, pmpo_kl_coef=1.0,
+        value_coef=0.0,
+        target_entropy_coef=0.0,
+        fraction_entropy_coef=0.0,
+        pmpo_kl_coef=1.0,
         pmpo_pos_to_neg_weight=0.5, pmpo_reverse_kl=False,
         epochs=1, minibatch_size=1, grad_clip=1.0,
     )
 
     new_target_probs = model.new_target_logits.exp()
+    new_launch_prob = model.new_launch_logits.sigmoid()[0, 0]
+    old_launch_prob = old_launch_logits.sigmoid()[0, 0]
+    expected_launch = new_launch_prob * torch.log(new_launch_prob / old_launch_prob) + (
+        1.0 - new_launch_prob
+    ) * torch.log((1.0 - new_launch_prob) / (1.0 - old_launch_prob))
     expected_target = kl_divergence(
         Categorical(probs=new_target_probs[0, 0]),
         Categorical(probs=old_target_probs[0, 0]),
     )
-    expected_fraction = (1.0 - new_target_probs[0, 0, 1]) * kl_divergence(
+    expected_fraction = new_launch_prob * kl_divergence(
         Beta(model.new_alpha[0, 0], model.new_beta[0, 0]),
         Beta(old_alpha[0, 0], old_beta[0, 0]),
     )
+    expected_target = new_launch_prob * expected_target
     assert math.isclose(
         log.pmpo_kl,
-        float(expected_target + expected_fraction),
+        float(expected_launch + expected_target + expected_fraction),
         rel_tol=1e-6,
     )
 

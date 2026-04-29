@@ -67,7 +67,8 @@ ppo:
   pmpo_kl_coef: 0.3             # analytical reverse-KL penalty weight (dreamer4 `dreamer4.py:3083`)
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
 
-  entropy_coef: 0.01            # dreamer4 default. Beta head has structural exploration floor; the categorical target distribution does not — this keeps it from collapsing.
+  target_entropy_coef: 0.01     # categorical target distribution has no structural floor, so keep it from collapsing
+  fraction_entropy_coef: 0.0    # do not reward the Beta fraction head toward max-entropy Beta(1,1)
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`
                         # warms V on a state distribution PPO immediately

@@ -39,7 +39,8 @@ ppo:
   pmpo_reverse_kl: true
   pmpo_kl_coef: 0.3
   value_coef: 1.0
-  entropy_coef: 0.01
+  target_entropy_coef: 0.01
+  fraction_entropy_coef: 0.0
   pretrain_updates: 0
 
 rollout:

@@ -15,8 +15,9 @@ adaptations the Orbit Wars action structure imposes:
 
   2. **Reverse PMPO KL penalty** `λ · KL(old ‖ new)` (dreamer4
      `pmpo_reverse_kl=True`, `dreamer4.py:4323-4324`):
-        Categorical: Σ p_old · (log p_old − log p_new)
-        Beta:        kl_divergence(old, new)
+        Bernoulli launch: Σ p_old · (log p_old − log p_new)
+        Categorical target | launch: same, weighted by P(launch)
+        Beta fraction | launch: kl_divergence(old, new), weighted by P(launch)
      The reverse direction punishes the *new* policy putting low mass
      where the *old* policy put high mass — mass-covering w.r.t. old.
 
@@ -126,31 +127,50 @@ def _weighted_max(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return torch.where(torch.isfinite(out), out, values.sum() * 0.0)
 
 
-def _move_probability(target_probs: torch.Tensor, noop_idx: int) -> torch.Tensor:
-    return 1.0 - target_probs[..., noop_idx]
+def _safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
+    finite = torch.isfinite(target_logits).any(dim=-1, keepdim=True)
+    return torch.where(finite, target_logits, torch.zeros_like(target_logits))
+
+
+def _bernoulli_log_probs(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    log_p1 = -F.softplus(-logits)
+    log_p0 = -F.softplus(logits)
+    return log_p0, log_p1
+
+
+def _bernoulli_kl(
+    source_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+) -> torch.Tensor:
+    source_p = source_logits.sigmoid()
+    source_log_p0, source_log_p1 = _bernoulli_log_probs(source_logits)
+    target_log_p0, target_log_p1 = _bernoulli_log_probs(target_logits)
+    return source_p * (source_log_p1 - target_log_p1) + (1.0 - source_p) * (
+        source_log_p0 - target_log_p0
+    )
+
+
+def _bernoulli_entropy(logits: torch.Tensor) -> torch.Tensor:
+    p = logits.sigmoid()
+    log_p0, log_p1 = _bernoulli_log_probs(logits)
+    return -(p * log_p1 + (1.0 - p) * log_p0)
 
 
 def _conditional_action_entropy(
+    launch_logits: torch.Tensor,
     target_log_probs: torch.Tensor,
     beta_entropy: torch.Tensor,
-    noop_idx: int,
 ) -> torch.Tensor:
-    """Entropy of target + fraction, where fraction exists only on moves."""
+    """Entropy of launch + P(launch) * (target + fraction)."""
     min_real = torch.finfo(target_log_probs.dtype).min
     target_probs = target_log_probs.exp()
     target_entropy = -(target_probs * target_log_probs.clamp_min(min_real)).sum(
         dim=-1
     )
-    return target_entropy + _move_probability(target_probs, noop_idx) * beta_entropy
-
-
-def _conditional_fraction_kl(
-    frac_kl: torch.Tensor,
-    source_target_probs: torch.Tensor,
-    noop_idx: int,
-) -> torch.Tensor:
-    """Beta KL contribution for a fraction head conditional on making a move."""
-    return _move_probability(source_target_probs, noop_idx) * frac_kl
+    launch_prob = launch_logits.sigmoid()
+    return _bernoulli_entropy(launch_logits) + launch_prob * (
+        target_entropy + beta_entropy
+    )
 
 
 @dataclass
@@ -169,6 +189,9 @@ class PPOLog:
     fraction_alpha_max: float = 0.0
     fraction_beta_mean: float = 0.0
     fraction_beta_max: float = 0.0
+    fraction_mode_mean: float = 0.0
+    fraction_concentration_mean: float = 0.0
+    fraction_concentration_max: float = 0.0
     pmpo_target_kl: float = 0.0
     pmpo_fraction_kl: float = 0.0
 
@@ -234,7 +257,8 @@ def ppo_update(
     batch: dict[str, torch.Tensor],
     *,
     value_coef: float,
-    entropy_coef: float,
+    target_entropy_coef: float,
+    fraction_entropy_coef: float,
     pmpo_kl_coef: float,
     pmpo_pos_to_neg_weight: float,
     pmpo_reverse_kl: bool,
@@ -247,10 +271,11 @@ def ppo_update(
     Expected keys:
       `planet_feats`, `planet_mask`, `planet_owned_mask`, `planet_ids`,
       `planet_garrison`, `fleet_feats`, `fleet_mask`,
-      `target_idx` [B,P], `fraction` [B,P],
+      `launch` [B,P], `target_idx` [B,P], `fraction` [B,P],
       `old_log_prob` [B,P], `advantage` [B], `return` [B],
       `owned_mask` [B,P],
-      `old_target_logits` [B,P,P+1],
+      `old_launch_logits` [B,P],
+      `old_target_logits` [B,P,P],
       `old_fraction_alpha` [B,P], `old_fraction_beta` [B,P].
 
     PMPO surrogate: `policy_loss = −α·mean(scaled[pos]) + (1−α)·mean(scaled[neg])`
@@ -273,7 +298,6 @@ def ppo_update(
     # if compiled, otherwise use the model directly.
     orig_model = getattr(model, "_orig_mod", model)
     value_encoder = orig_model.value_encoder
-    num_bins = value_encoder.num_bins
 
     # bf16 autocast unlocks the SDPA Flash-Attention 2 kernel (head_dim must
     # also be FA-eligible — see model config). bf16 has fp32-equivalent range
@@ -299,29 +323,32 @@ def ppo_update(
             ):
                 out = model(_slice_feats(batch, mb))
 
-            target_logits = out.target_logits.float()
+            launch_logits = out.launch_logits.float()
+            target_logits = _safe_target_logits(out.target_logits.float())
             fraction_alpha = out.fraction_alpha.float()
             fraction_beta = out.fraction_beta.float()
             value_logits = out.value_logits.float()
 
             owned_f = batch["owned_mask"][mb].float()
             p = target_logits.shape[1]
-            target = batch["target_idx"][mb].clamp(0, p)
+            launch = batch["launch"][mb].float().clamp(0.0, 1.0)
+            target = batch["target_idx"][mb].clamp(0, p - 1)
+            launch_lp = -F.binary_cross_entropy_with_logits(
+                launch_logits, launch, reduction="none"
+            )
             target_log_probs = F.log_softmax(target_logits, dim=-1)
             target_dist_probs = target_log_probs.exp()
             target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
 
-            # Beta log-prob at the recorded sample. The fraction component
-            # is only counted when the action wasn't no-op (target slot == p),
-            # mirroring what `sample_with_record` stored in `old_log_prob`.
+            # Beta log-prob at the recorded sample. Target and fraction are
+            # conditional on launch, mirroring what `sample_with_record`
+            # stored in `old_log_prob`.
             # `fraction` is already clamped into (eps, 1-eps) at sample time,
             # so `Beta.log_prob` is finite for all (α, β) ≥ 1.
             fraction = batch["fraction"][mb].float()
             new_beta = Beta(fraction_alpha, fraction_beta)
             frac_lp = new_beta.log_prob(fraction)
-            is_noop = (target == p).float()
-            move_mask = 1.0 - is_noop
-            chosen = target_lp + move_mask * frac_lp
+            chosen = launch_lp + launch * (target_lp + frac_lp)
 
             old_log_prob = batch["old_log_prob"][mb].float()  # [B, P]
             advantage = batch["advantage"][mb].float()         # [B]
@@ -351,22 +378,22 @@ def ppo_update(
             value_ce = -(target_probs * log_v_probs).sum(dim=-1)
             value_loss = _weighted_mean(value_ce, row_w)
 
-            # ---------------- entropy bonus (categorical + Beta) -------
+            # ---------------- entropy bonus (Bernoulli + categorical + Beta) -------
             beta_entropy = new_beta.entropy()
-            # Fraction is conditional on the categorical selecting a move, so
-            # its analytical entropy is weighted by current P(target != no-op),
-            # not by the old sampled action.
-            p_move_current = _move_probability(target_dist_probs, p)
+            p_move_current = launch_logits.sigmoid()
             planet_entropy = _conditional_action_entropy(
-                target_log_probs, beta_entropy, p
+                launch_logits, target_log_probs, beta_entropy
             )
             denom = owned_w.sum().clamp_min(1.0)
             entropy = (planet_entropy * owned_w).sum() / denom
+            launch_entropy = (_bernoulli_entropy(launch_logits) * owned_w).sum() / denom
             target_entropy_per_planet = -(
                 target_dist_probs
                 * target_log_probs.clamp_min(torch.finfo(target_log_probs.dtype).min)
             ).sum(dim=-1)
-            target_entropy = (target_entropy_per_planet * owned_w).sum() / denom
+            target_entropy = (
+                (p_move_current * target_entropy_per_planet) * owned_w
+            ).sum() / denom
             fraction_entropy = ((p_move_current * beta_entropy) * owned_w).sum() / denom
             move_prob = (p_move_current * owned_w).sum() / denom
             target_confidence = (target_dist_probs.amax(dim=-1) * owned_w).sum() / denom
@@ -374,13 +401,30 @@ def ppo_update(
             fraction_alpha_max = _weighted_max(fraction_alpha, owned_w)
             fraction_beta_mean = (fraction_beta * owned_w).sum() / denom
             fraction_beta_max = _weighted_max(fraction_beta, owned_w)
+            fraction_concentration = fraction_alpha + fraction_beta - 2.0
+            fraction_mode = (
+                (fraction_alpha - 1.0)
+                / fraction_concentration.clamp_min(torch.finfo(fraction_alpha.dtype).eps)
+            )
+            fraction_mode_mean = (fraction_mode * owned_w).sum() / denom
+            fraction_concentration_mean = (
+                fraction_concentration * owned_w
+            ).sum() / denom
+            fraction_concentration_max = _weighted_max(fraction_concentration, owned_w)
+            entropy_bonus = (
+                target_entropy_coef * (launch_entropy + target_entropy)
+                + fraction_entropy_coef * fraction_entropy
+            )
 
             # ---------------- PMPO analytical KL ----------------------
             pmpo_kl = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
             pmpo_target_kl = torch.zeros_like(pmpo_kl)
             pmpo_fraction_kl = torch.zeros_like(pmpo_kl)
             if pmpo_kl_coef != 0.0:
-                old_target_logits = batch["old_target_logits"][mb].float()
+                old_launch_logits = batch["old_launch_logits"][mb].float()
+                old_target_logits = _safe_target_logits(
+                    batch["old_target_logits"][mb].float()
+                )
                 old_target_log_probs = F.log_softmax(old_target_logits, dim=-1)
                 # Self-target slots have `target_logits = -inf` (`model.py`
                 # `_self_target_mask`), so `log_softmax` yields `-inf` there.
@@ -398,35 +442,39 @@ def ppo_update(
                 if pmpo_reverse_kl:
                     # KL(old ‖ new) — dreamer4 default; mass-covering w.r.t.
                     # the rollout policy.
+                    launch_kl = _bernoulli_kl(old_launch_logits, launch_logits)
+                    launch_weight = old_launch_logits.sigmoid()
                     target_probs_old = old_target_log_probs.exp()
                     target_kl = (
                         target_probs_old * (log_p_old_safe - log_p_new_safe)
                     ).sum(dim=-1)  # [B, P]
                     frac_kl = kl_divergence(old_beta_dist, new_beta)
-                    frac_kl = _conditional_fraction_kl(frac_kl, target_probs_old, p)
                 else:
                     # KL(new ‖ old) — forward direction; mode-seeking.
+                    launch_kl = _bernoulli_kl(launch_logits, old_launch_logits)
+                    launch_weight = launch_logits.sigmoid()
                     target_kl = (
                         target_dist_probs * (log_p_new_safe - log_p_old_safe)
                     ).sum(dim=-1)
                     frac_kl = kl_divergence(new_beta, old_beta_dist)
-                    frac_kl = _conditional_fraction_kl(frac_kl, target_dist_probs, p)
-                # The fraction distribution is conditional on selecting a real
-                # target. The joint action KL is therefore categorical KL plus
-                # source-policy P(move) times the Beta KL.
-                planet_kl = target_kl + frac_kl
+                # Target and fraction distributions are conditional on launch.
+                planet_kl = launch_kl + launch_weight * (target_kl + frac_kl)
                 # KL is non-negative analytically; bf16-forward → fp32-cast
                 # leaves last-bit noise that can dip slightly below zero
                 # when new ≈ old (first PPO minibatch). Clamp to keep the
                 # logged scalar honest and avoid surprising consumers.
                 pmpo_kl = ((planet_kl * owned_w).sum() / denom).clamp_min(0.0)
-                pmpo_target_kl = ((target_kl * owned_w).sum() / denom).clamp_min(0.0)
-                pmpo_fraction_kl = ((frac_kl * owned_w).sum() / denom).clamp_min(0.0)
+                pmpo_target_kl = (
+                    ((launch_weight * target_kl) * owned_w).sum() / denom
+                ).clamp_min(0.0)
+                pmpo_fraction_kl = (
+                    ((launch_weight * frac_kl) * owned_w).sum() / denom
+                ).clamp_min(0.0)
 
             loss = (
                 policy_loss
                 + value_coef * value_loss
-                - entropy_coef * entropy
+                - entropy_bonus
                 + pmpo_kl_coef * pmpo_kl
             )
 
@@ -461,6 +509,9 @@ def ppo_update(
                     fraction_alpha_max.detach(),
                     fraction_beta_mean.detach(),
                     fraction_beta_max.detach(),
+                    fraction_mode_mean.detach(),
+                    fraction_concentration_mean.detach(),
+                    fraction_concentration_max.detach(),
                     pmpo_target_kl.detach(),
                     pmpo_fraction_kl.detach(),
                 ]
@@ -472,7 +523,7 @@ def ppo_update(
 
     n_steps = max(1, n_steps)
     if metric_sum is None:
-        logs = [0.0] * 16
+        logs = [0.0] * 19
     else:
         logs = (metric_sum / n_steps).detach().cpu().tolist()
     return PPOLog(
@@ -490,8 +541,11 @@ def ppo_update(
         fraction_alpha_max=float(logs[11]),
         fraction_beta_mean=float(logs[12]),
         fraction_beta_max=float(logs[13]),
-        pmpo_target_kl=float(logs[14]),
-        pmpo_fraction_kl=float(logs[15]),
+        fraction_mode_mean=float(logs[14]),
+        fraction_concentration_mean=float(logs[15]),
+        fraction_concentration_max=float(logs[16]),
+        pmpo_target_kl=float(logs[17]),
+        pmpo_fraction_kl=float(logs[18]),
     )
 
 

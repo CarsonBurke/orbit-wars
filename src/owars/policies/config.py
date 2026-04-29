@@ -24,8 +24,9 @@ class OrbitPolicyConfig:
     encoder_backend: Literal["dense", "nested"] = "dense"
 
     # Action factorization. For each owned planet we emit:
-    #   - logits over (target_planet | no-op)
-    #   - a soft-capped Beta(α, β) on the fraction of garrison to send.
+    #   - a Bernoulli launch logit
+    #   - masked categorical target logits, conditional on launching
+    #   - a mode+concentration Beta(α, β) fraction, conditional on launching.
     # Launch angle is derived from the chosen target via an iterative
     # lead-intercept solver in `sampling.py` — no learned angle component.
 

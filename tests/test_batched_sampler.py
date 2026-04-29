@@ -52,14 +52,15 @@ def _model() -> OrbitPolicy:
 def _forced_move_output(feats) -> PolicyOutput:
     """PolicyOutput that deterministically launches from planet 0 to planet 1.
 
-    Beta(α=20, β=1) on planet 0 has mean ≈ 0.95 → send most of the garrison.
-    All other planets get α=β=1.69 (the soft-cap value at head=0) — neutral.
+    Beta(α=20, β=1) on planet 0 has mode at 1 → send most of the garrison.
+    All other planets get α=β=1.69 — neutral, mildly spread fractions.
     """
     batched = feats.planet_ids.dim() == 2
     b = int(feats.planet_ids.shape[0]) if batched else 1
     p = int(feats.planet_ids.shape[-1])
-    target_logits = torch.full((b, p, p + 1), -100.0)
-    target_logits[:, :, p] = 0.0
+    launch_logits = torch.full((b, p), -100.0)
+    launch_logits[:, 0] = 100.0
+    target_logits = torch.full((b, p, p), -100.0)
     target_logits[:, 0, :] = -100.0
     target_logits[:, 0, 1] = 100.0
     fraction_alpha = torch.full((b, p), 1.69)
@@ -67,6 +68,7 @@ def _forced_move_output(feats) -> PolicyOutput:
     fraction_beta = torch.full((b, p), 1.69)
     fraction_beta[:, 0] = 1.0
     if not batched:
+        launch_logits = launch_logits[:1]
         target_logits = target_logits[:1]
         fraction_alpha = fraction_alpha[:1]
         fraction_beta = fraction_beta[:1]
@@ -78,6 +80,7 @@ def _forced_move_output(feats) -> PolicyOutput:
         planet_mask = feats.planet_mask
         planet_ids = feats.planet_ids
     return PolicyOutput(
+        launch_logits=launch_logits,
         target_logits=target_logits,
         fraction_alpha=fraction_alpha,
         fraction_beta=fraction_beta,
@@ -90,16 +93,19 @@ def _forced_move_output(feats) -> PolicyOutput:
 
 
 def _duplicate_source_output() -> PolicyOutput:
-    target_logits = torch.full((1, 3, 4), -100.0)
-    target_logits[:, :, 3] = 0.0
+    launch_logits = torch.full((1, 3), -100.0)
+    launch_logits[:, 0] = 100.0
+    launch_logits[:, 1] = 100.0
+    target_logits = torch.full((1, 3, 3), -100.0)
     target_logits[:, 0, :] = -100.0
     target_logits[:, 1, :] = -100.0
     target_logits[:, 0, 2] = 100.0
     target_logits[:, 1, 2] = 100.0
     return PolicyOutput(
+        launch_logits=launch_logits,
         target_logits=target_logits,
         fraction_alpha=torch.full((1, 3), 20.0),
-        fraction_beta=torch.ones((1, 3)),
+        fraction_beta=torch.full((1, 3), 2.0),
         value=torch.zeros(1),
         value_logits=torch.zeros(1, 51),
         planet_owned_mask=torch.tensor([[True, True, False]]),
@@ -142,6 +148,7 @@ def test_batched_sampler_shapes_and_record_lengths():
     assert len(records) == 3
     for rec in records:
         assert isinstance(rec, SampleRecord)
+        assert rec.launch.shape == (out.target_logits.shape[1],)
         assert rec.target_idx.shape == (out.target_logits.shape[1],)
         assert rec.fraction.shape == (out.target_logits.shape[1],)
         assert rec.log_prob.shape == (out.target_logits.shape[1],)
@@ -175,6 +182,7 @@ def test_batched_matches_single_under_fixed_seed():
         batched_out, [o], deterministic=False
     )
     assert torch.equal(single_rec.target_idx, batched_recs[0].target_idx)
+    assert torch.allclose(single_rec.launch, batched_recs[0].launch)
     assert torch.allclose(single_rec.fraction, batched_recs[0].fraction)
     assert torch.allclose(single_rec.log_prob, batched_recs[0].log_prob, atol=1e-6)
 
@@ -187,6 +195,9 @@ def test_batched_deterministic_argmax_matches_logits():
     out = model(stacked)
     _, records = sample_batch_with_records(out, [o, o], deterministic=True)
     expected = out.target_logits.argmax(dim=-1)
+    expected_launch = (out.launch_logits > 0.0).to(records[0].launch.dtype)
+    assert torch.equal(records[0].launch, expected_launch[0])
+    assert torch.equal(records[1].launch, expected_launch[1])
     assert torch.equal(records[0].target_idx, expected[0])
     assert torch.equal(records[1].target_idx, expected[1])
 

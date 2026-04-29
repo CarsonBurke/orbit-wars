@@ -7,7 +7,7 @@ Architecture:
   [N × Transformer block] ─► token reps
               │
               ├─► h_actor (broadcast)  ─► concat onto each planet rep ─►
-              │                             target attention + fraction head
+              │                             launch/target/fraction heads
               ├─► h_critic             ─► distributional value head (HL-Gauss)
               ├─► planet_h             ─► target_key (per-planet rep stays d-dim)
               └─► fleet_h              ─► (consumed only by encoder cross-attention)
@@ -22,34 +22,29 @@ having to go autoregressive.
 
 We deliberately do **not** down-project after the actor concat: target_query
 and fraction_head take 2d-wide inputs and project to their natural output
-dim (d for query/key, 2 for the Beta's (head_α, head_β)). Down-projecting
+dim (d for query/key, 2 for the Beta's mean/concentration heads). Down-projecting
 `[planet_h || h_actor]` back to d would discard exactly the global-context
 capacity the extra token was added to provide.
+
+**Action factorization.** Per source planet, the actor emits a Bernoulli
+launch decision, a masked categorical target distribution conditional on
+launching, and a Beta fraction distribution conditional on launching. This
+keeps "should this planet act?" independent of the number of legal target
+planets; target count should affect *where* probability mass goes, not whether
+the source launches at all.
 
 **No angle head.** The launch angle is computed exactly via an iterative
 lead-intercept solver in `sampling.py`.
 
 **Fraction head is a Beta(α, β)** on [0, 1] — the natural distribution for
-"fraction of garrison to send." dreamer4 uses an *unbounded* diagonal
-Normal for continuous actions; we deliberately diverge to Beta because
-(a) the action lives natively on [0,1] so no tanh squashing is needed,
-(b) the soft-cap on (α, β) gives a structural exploration floor that
-dreamer4 has to enforce via entropy bonus alone, (c) no Jacobian
-gymnastics. Soft-cap (cleanrl `ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:200`):
-    α = 1 + α_max · tanh(softplus(head_α) / α_max)        (likewise β)
-properties:
-  • α ∈ [1, 1 + α_max] — explicit upper bound (1 + ALPHA_MAX = 21).
-  • α ≥ 1 makes Beta unimodal+concave (Chou et al. 2017).
-  • smooth everywhere (no clamp discontinuity), gradient-passing at the cap.
-  • near-init (head=0): softplus(0)=log 2≈0.69, tanh(log 2 / 20)≈0.0345 →
-    α ≈ 1.69. Mild bell on [0,1] centered at 0.5. Cold-start exploration is
-    near-uniform without being literally Beta(1,1).
-  • upper-bounded concentration ⇒ persistent exploration noise floor:
-    σ_action ≥ 0.075 on [0,1] regardless of training pressure.
-
-The +1 shift (vs raw softplus) keeps α,β ≥ 1, which is what makes Beta
-unimodal+concave; without it the policy can drive α or β toward 0 and the
-distribution becomes bimodal at the boundaries (Chou et al. 2017 §4).
+"fraction of garrison to send." The network predicts Beta mode μ and extra
+concentration c, then derives:
+    α = 1 + c · μ
+    β = 1 + c · (1 − μ)
+This keeps α,β ≥ 1 (unimodal/concave; Chou et al. 2017) without letting the
+max-spread floor become an absorbing state. If concentration bottoms out,
+the mode still has a direct gradient through both α and β. Concentration is
+bounded, giving a persistent exploration floor without an entropy bonus.
 
 **Distributional value head (HL-Gauss).** dreamer4 (`dreamer4.py:722–805`)
 predicts a categorical over a fixed bin support and trains it with
@@ -85,6 +80,7 @@ action space wants.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -351,9 +347,12 @@ class TransformerBlock(nn.Module):
         return x
 
 
-# Concentration cap for the soft-capped Beta(α, β) fraction head. α and β
-# are bounded to [1, 1 + ALPHA_MAX] — see module docstring for derivation.
-ALPHA_MAX: float = 20.0
+# Bounds for the mode+concentration Beta fraction head. Extra concentration
+# c is bounded to [min, max]; α=1+c·μ and β=1+c·(1−μ), so α,β stay ≥1.
+FRACTION_MEAN_EPS: float = 1e-4
+FRACTION_CONCENTRATION_MIN: float = 1.0
+FRACTION_CONCENTRATION_INIT: float = 1.4
+FRACTION_CONCENTRATION_MAX: float = 20.0
 
 
 class HLGaussLoss(nn.Module):
@@ -442,25 +441,38 @@ class HLGaussLoss(nn.Module):
         centers = self._centers(support)
         return (probs * centers).sum(dim=-1)
 
+def _logit(p: float) -> float:
+    return math.log(p / (1.0 - p))
 
 
-def _soft_cap_concentration(head: torch.Tensor) -> torch.Tensor:
-    """Map a real-valued head into [1, 1+ALPHA_MAX] smoothly.
+def _fraction_beta_params(
+    mode_logit: torch.Tensor,
+    concentration_logit: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map raw fraction heads to Beta(α, β) through mode+concentration.
 
-    `1 + ALPHA_MAX · tanh(softplus(h) / ALPHA_MAX)`:
-      - head → −∞: softplus → 0, tanh → 0, returns 1 (max-spread Beta).
-      - head → +∞: softplus → h, tanh → 1, returns 1 + ALPHA_MAX (cap).
-      - smooth, gradient-passing at the cap (sech² · sigmoid ≤ 1).
-    Same shape as cleanrl `ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:200`.
+    Mode uses a sigmoid range instead of a clamp, preserving gradients until
+    true logit saturation. Concentration may saturate at its floor, but μ can
+    still move α and β, so the lower-concentration state is not absorbing.
     """
-    return 1.0 + ALPHA_MAX * torch.tanh(F.softplus(head) / ALPHA_MAX)
+    mode = FRACTION_MEAN_EPS + (1.0 - 2.0 * FRACTION_MEAN_EPS) * torch.sigmoid(
+        mode_logit
+    )
+    span = FRACTION_CONCENTRATION_MAX - FRACTION_CONCENTRATION_MIN
+    concentration = FRACTION_CONCENTRATION_MIN + span * torch.sigmoid(
+        concentration_logit
+    )
+    alpha = 1.0 + concentration * mode
+    beta = 1.0 + concentration * (1.0 - mode)
+    return alpha, beta
 
 
 @dataclass
 class PolicyOutput:
-    target_logits: torch.Tensor       # [B, P, P+1]  +1 = no-op slot
-    fraction_alpha: torch.Tensor      # [B, P]  Beta α ∈ [1, 1+ALPHA_MAX] (post soft-cap)
-    fraction_beta: torch.Tensor       # [B, P]  Beta β ∈ [1, 1+ALPHA_MAX] (post soft-cap)
+    launch_logits: torch.Tensor       # [B, P] Bernoulli logits
+    target_logits: torch.Tensor       # [B, P, P] masked target categorical logits
+    fraction_alpha: torch.Tensor      # [B, P]  Beta α from mode+concentration
+    fraction_beta: torch.Tensor       # [B, P]  Beta β from mode+concentration
     value: torch.Tensor               # [B] — scalar value E[V] recovered from value_logits
     value_logits: torch.Tensor        # [B, num_bins] — distributional value head logits
     planet_owned_mask: torch.Tensor   # [B, P] bool
@@ -551,28 +563,27 @@ class OrbitPolicy(nn.Module):
         # weight magnitude on these doesn't translate to logit magnitude.
         nn.init.orthogonal_(self.target_query.weight, gain=0.05)
         nn.init.orthogonal_(self.target_key.weight, gain=0.05)
-        # Per-planet no-op head — gives every owned planet its own no-op
-        # logit conditioned on local context, instead of a single shared
-        # scalar. Empirically the shared-scalar version led the policy to
-        # express "do nothing" via tiny `fraction` samples (sending fleets
-        # of 1 ship) because the global no-op slot couldn't compete with
-        # the per-planet attention logits. Bias init to a positive value
-        # so cold-start prefers no-op per planet — the policy must earn
-        # the right to attack via advantage.
-        self.noop_head = CastedLinear(2 * cfg.dim, 1)
-        nn.init.zeros_(self.noop_head.weight)
-        nn.init.constant_(self.noop_head.bias, 1.5)
+        # Per-planet launch Bernoulli. It sees the same local+global context
+        # as the fraction head, but is independent of target count; target
+        # selection is a separate conditional categorical below. Bias negative
+        # so cold-start prefers not launching until advantage says otherwise.
+        self.launch_head = CastedLinear(2 * cfg.dim, 1)
+        nn.init.zeros_(self.launch_head.weight)
+        nn.init.constant_(self.launch_head.bias, -1.5)
         # 2·dim input for the same reason as target_query. Outputs raw
-        # (head_α, head_β) which the soft-cap maps into [1, 1+ALPHA_MAX]
-        # for the Beta(α, β) fraction distribution on [0, 1].
-        self.fraction_head = CastedLinear(2 * cfg.dim, 2, bias=False)
+        # (mode_logit, concentration_logit) for the Beta fraction distribution.
+        self.fraction_head = CastedLinear(2 * cfg.dim, 2)
         # gain=0.01 — cleanrl PPO's canonical actor-readout init
         # (`ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:182`,
-        # `ppo_continuous_action.py:127`). At init, both heads ≈ 0 →
-        # softplus(0)=log 2 → soft-cap output ≈ 1.69 → Beta(1.69, 1.69)
-        # is mildly bell-shaped on [0,1] centered at 0.5, so first-update
-        # Δlog_prob is bounded by the trunk's update size, not the head's.
+        # `ppo_continuous_action.py:127`). Bias the concentration head so
+        # init is Beta(1.7, 1.7), matching the old near-uniform cold start.
         nn.init.orthogonal_(self.fraction_head.weight, gain=0.01)
+        nn.init.zeros_(self.fraction_head.bias)
+        conc_p = (
+            (FRACTION_CONCENTRATION_INIT - FRACTION_CONCENTRATION_MIN)
+            / (FRACTION_CONCENTRATION_MAX - FRACTION_CONCENTRATION_MIN)
+        )
+        nn.init.constant_(self.fraction_head.bias[1], _logit(conc_p))
         # Distributional value head — emits logits over `value_num_bins`
         # bins on the [-1, 1] support. Scalar V is recovered from these
         # via `HLGaussLoss.bins_to_scalar`. dreamer4 uses 255 bins on a
@@ -781,17 +792,21 @@ class OrbitPolicy(nn.Module):
         logits = logits.masked_fill(
             self._self_target_mask[:p, :p].unsqueeze(0), float("-inf")
         )
-        # Per-planet no-op logit (conditioned on local context + h_actor),
-        # concatenated as the (P+1)-th target slot.
-        noop = self.noop_head(planet_with_ctx)  # [B, P, 1]
-        target_logits = torch.cat([logits, noop], dim=-1)  # [B, P, P+1]
+        # Per-planet launch logits are a Bernoulli sibling of target/fraction,
+        # not an extra target slot. Rows with no legal target get a very low
+        # launch logit; the target categorical is still sanitized downstream
+        # for distribution APIs, but such rows are behaviorally no-launch.
+        valid_target_count = (planet_mask.sum(dim=-1, keepdim=True) - 1).clamp_min(0)
+        launch_logits = self.launch_head(planet_with_ctx).squeeze(-1)
+        launch_logits = launch_logits.masked_fill(valid_target_count <= 0, -20.0)
+        target_logits = logits  # [B, P, P]
 
-        # Fraction head: raw (head_α, head_β) → soft-cap to [1, 1+ALPHA_MAX]
-        # for Beta(α, β). Concentration cap = persistent exploration noise
-        # floor. See module docstring + `_soft_cap_concentration`.
+        # Fraction head: raw (mode_logit, concentration_logit) → Beta(α, β).
+        # Mode remains trainable even when concentration hits its floor.
         offs = self.fraction_head(planet_with_ctx).float()
-        fraction_alpha = _soft_cap_concentration(offs[..., 0])
-        fraction_beta = _soft_cap_concentration(offs[..., 1])
+        fraction_alpha, fraction_beta = _fraction_beta_params(
+            offs[..., 0], offs[..., 1]
+        )
 
         # Value: distributional head over the dedicated critic token.
         # Logits are returned for distributional CE loss + value clipping;
@@ -800,6 +815,7 @@ class OrbitPolicy(nn.Module):
         value = self.value_encoder.bins_to_scalar(value_logits)
 
         return PolicyOutput(
+            launch_logits=launch_logits,
             target_logits=target_logits,
             fraction_alpha=fraction_alpha,
             fraction_beta=fraction_beta,
