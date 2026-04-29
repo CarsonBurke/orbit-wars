@@ -61,6 +61,7 @@ SAMPLE_EPS: float = 1e-7
 # ends." That signals the move builder to silently skip the launch.
 LEAD_BISECT_ITERS: int = 24
 LEAD_T_HORIZON_STEPS: float = 600.0  # episode is 500 steps; a bit of slack
+LEAD_MAX_TURNS: int = int(LEAD_T_HORIZON_STEPS)
 
 
 @dataclass
@@ -187,6 +188,64 @@ def _lead_solution_from_point(
     orbit_radius = math.hypot(target_x - cx, target_y - cy)
     # Static target (matches `geometry.predicted_position`'s rule) or zero
     # angular velocity → no orbital motion → aim direct, t = d/sp.
+    is_orbiting = (
+        orbit_radius + target_radius < ROTATION_RADIUS_LIMIT
+        and abs(angular_velocity) > 1e-12
+        and orbit_radius > 1e-9
+    )
+    if not is_orbiting:
+        d = math.hypot(target_x - mine_x, target_y - mine_y)
+        if d / sp > LEAD_T_HORIZON_STEPS:
+            return None
+        return LeadSolution(
+            angle=angle_to(mine_x, mine_y, target_x, target_y),
+            time=d / sp,
+            x=target_x,
+            y=target_y,
+        )
+
+    # Official collision checks are turn-discrete: on turn k, the fleet segment
+    # is checked against the planet's pre-move position at phase k-1. Aim at
+    # one of those exact checked positions, not a continuous-time interpolation.
+    theta0 = math.atan2(target_y - cy, target_x - cx)
+    previous_error: float | None = None
+    for k in range(1, LEAD_MAX_TURNS + 1):
+        theta = theta0 + angular_velocity * (k - 1)
+        tx = cx + orbit_radius * math.cos(theta)
+        ty = cy + orbit_radius * math.sin(theta)
+        d = math.hypot(tx - mine_x, ty - mine_y)
+        error = d - k * sp
+        if error <= target_radius:
+            prev_dist = max(0.0, (k - 1) * sp)
+            if d >= prev_dist - target_radius:
+                return LeadSolution(
+                    angle=angle_to(mine_x, mine_y, tx, ty),
+                    time=d / sp,
+                    x=tx,
+                    y=ty,
+                )
+        if previous_error is not None and previous_error < -target_radius and error > target_radius:
+            break
+        previous_error = error
+
+    return None
+
+
+def _continuous_lead_solution_from_point(
+    mine_x: float,
+    mine_y: float,
+    target_x: float,
+    target_y: float,
+    target_radius: float,
+    angular_velocity: float,
+    send: int,
+) -> LeadSolution | None:
+    """Continuous-time lead solution retained for geometry regression tests."""
+    sp = fleet_speed(send)
+    if sp <= 0.0:
+        return None
+    cx, cy = CENTER
+    orbit_radius = math.hypot(target_x - cx, target_y - cy)
     is_orbiting = (
         orbit_radius + target_radius < ROTATION_RADIUS_LIMIT
         and abs(angular_velocity) > 1e-12

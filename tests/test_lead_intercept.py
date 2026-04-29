@@ -8,8 +8,8 @@ import pytest
 
 from owars.game.types import CENTER
 from owars.policies.sampling import (
+    _continuous_lead_solution_from_point,
     _lead_angle,
-    _lead_angle_from_point,
     _lead_solution,
     _safe_flight_segment,
 )
@@ -58,6 +58,55 @@ def _simulate_intercept(
         if not (0 <= fx <= 100 and 0 <= fy <= 100):
             break
     return best
+
+
+def _point_to_segment_distance(
+    px: float,
+    py: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+) -> float:
+    dx = bx - ax
+    dy = by - ay
+    denom = dx * dx + dy * dy
+    if denom == 0.0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / denom))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _official_pre_move_hit(
+    sx: float,
+    sy: float,
+    source_radius: float,
+    target_x: float,
+    target_y: float,
+    target_radius: float,
+    omega: float,
+    send: int,
+    angle: float,
+    max_steps: int = 600,
+) -> bool:
+    from owars.game.physics import fleet_speed
+
+    sp = fleet_speed(send)
+    cx, cy = CENTER
+    orbit_radius = math.hypot(target_x - cx, target_y - cy)
+    theta0 = math.atan2(target_y - cy, target_x - cx)
+    fx = sx + math.cos(angle) * (source_radius + 0.1)
+    fy = sy + math.sin(angle) * (source_radius + 0.1)
+    for step in range(1, max_steps + 1):
+        old_fx, old_fy = fx, fy
+        fx += math.cos(angle) * sp
+        fy += math.sin(angle) * sp
+        theta = theta0 + omega * (step - 1)
+        tx = cx + orbit_radius * math.cos(theta)
+        ty = cy + orbit_radius * math.sin(theta)
+        if _point_to_segment_distance(tx, ty, old_fx, old_fy, fx, fy) < target_radius:
+            return True
+    return False
 
 
 @pytest.mark.parametrize(
@@ -143,22 +192,21 @@ def test_solver_accounts_for_official_launch_surface_offset():
     omega = -0.041859494766865096
     send = 9
 
-    center_angle = _lead_angle_from_point(
+    center_solution = _continuous_lead_solution_from_point(
         sx, sy, target_x, target_y, target_radius, omega, send
     )
+    center_angle = None if center_solution is None else center_solution.angle
     offset_angle = _lead_angle(
         sx, sy, source_radius, target_x, target_y, target_radius, omega, send
     )
 
     assert center_angle is not None and offset_angle is not None
-    center_closest = _simulate_intercept(
+    assert not _official_pre_move_hit(
         sx, sy, source_radius, target_x, target_y, target_radius, omega, send, center_angle
     )
-    offset_closest = _simulate_intercept(
+    assert _official_pre_move_hit(
         sx, sy, source_radius, target_x, target_y, target_radius, omega, send, offset_angle
     )
-    assert center_closest is not None and center_closest > target_radius
-    assert offset_closest is not None and offset_closest < target_radius
 
 
 def test_safety_filter_checks_future_intercept_segment_not_current_target():
