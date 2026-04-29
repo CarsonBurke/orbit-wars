@@ -119,6 +119,13 @@ def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(1.0)
 
 
+def _weighted_max(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.to(device=values.device, dtype=values.dtype)
+    masked = values.masked_fill(weights <= 0, float("-inf"))
+    out = masked.max()
+    return torch.where(torch.isfinite(out), out, values.sum() * 0.0)
+
+
 def _move_probability(target_probs: torch.Tensor, noop_idx: int) -> torch.Tensor:
     return 1.0 - target_probs[..., noop_idx]
 
@@ -154,6 +161,16 @@ class PPOLog:
     approx_kl: float       # importance-ratio diagnostic E[old_lp − new_lp]; PMPO does not use this for the loss
     pmpo_kl: float         # analytical KL(old ‖ new) over the full distributions (the regularizer)
     pos_frac: float        # fraction of owned-planet samples whose advantage was ≥ 0
+    target_entropy: float = 0.0
+    fraction_entropy: float = 0.0
+    move_prob: float = 0.0
+    target_confidence: float = 0.0
+    fraction_alpha_mean: float = 0.0
+    fraction_alpha_max: float = 0.0
+    fraction_beta_mean: float = 0.0
+    fraction_beta_max: float = 0.0
+    pmpo_target_kl: float = 0.0
+    pmpo_fraction_kl: float = 0.0
 
 
 def compute_gae(
@@ -339,14 +356,29 @@ def ppo_update(
             # Fraction is conditional on the categorical selecting a move, so
             # its analytical entropy is weighted by current P(target != no-op),
             # not by the old sampled action.
+            p_move_current = _move_probability(target_dist_probs, p)
             planet_entropy = _conditional_action_entropy(
                 target_log_probs, beta_entropy, p
             )
             denom = owned_w.sum().clamp_min(1.0)
             entropy = (planet_entropy * owned_w).sum() / denom
+            target_entropy_per_planet = -(
+                target_dist_probs
+                * target_log_probs.clamp_min(torch.finfo(target_log_probs.dtype).min)
+            ).sum(dim=-1)
+            target_entropy = (target_entropy_per_planet * owned_w).sum() / denom
+            fraction_entropy = ((p_move_current * beta_entropy) * owned_w).sum() / denom
+            move_prob = (p_move_current * owned_w).sum() / denom
+            target_confidence = (target_dist_probs.amax(dim=-1) * owned_w).sum() / denom
+            fraction_alpha_mean = (fraction_alpha * owned_w).sum() / denom
+            fraction_alpha_max = _weighted_max(fraction_alpha, owned_w)
+            fraction_beta_mean = (fraction_beta * owned_w).sum() / denom
+            fraction_beta_max = _weighted_max(fraction_beta, owned_w)
 
             # ---------------- PMPO analytical KL ----------------------
             pmpo_kl = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
+            pmpo_target_kl = torch.zeros_like(pmpo_kl)
+            pmpo_fraction_kl = torch.zeros_like(pmpo_kl)
             if pmpo_kl_coef != 0.0:
                 old_target_logits = batch["old_target_logits"][mb].float()
                 old_target_log_probs = F.log_softmax(old_target_logits, dim=-1)
@@ -388,6 +420,8 @@ def ppo_update(
                 # when new ≈ old (first PPO minibatch). Clamp to keep the
                 # logged scalar honest and avoid surprising consumers.
                 pmpo_kl = ((planet_kl * owned_w).sum() / denom).clamp_min(0.0)
+                pmpo_target_kl = ((target_kl * owned_w).sum() / denom).clamp_min(0.0)
+                pmpo_fraction_kl = ((frac_kl * owned_w).sum() / denom).clamp_min(0.0)
 
             loss = (
                 policy_loss
@@ -419,6 +453,16 @@ def ppo_update(
                     kl.detach(),
                     pmpo_kl.detach(),
                     pos_frac.detach(),
+                    target_entropy.detach(),
+                    fraction_entropy.detach(),
+                    move_prob.detach(),
+                    target_confidence.detach(),
+                    fraction_alpha_mean.detach(),
+                    fraction_alpha_max.detach(),
+                    fraction_beta_mean.detach(),
+                    fraction_beta_max.detach(),
+                    pmpo_target_kl.detach(),
+                    pmpo_fraction_kl.detach(),
                 ]
             ).float()
             if metric_sum is None:
@@ -428,7 +472,7 @@ def ppo_update(
 
     n_steps = max(1, n_steps)
     if metric_sum is None:
-        logs = [0.0] * 6
+        logs = [0.0] * 16
     else:
         logs = (metric_sum / n_steps).detach().cpu().tolist()
     return PPOLog(
@@ -438,6 +482,16 @@ def ppo_update(
         approx_kl=float(logs[3]),
         pmpo_kl=float(logs[4]),
         pos_frac=float(logs[5]),
+        target_entropy=float(logs[6]),
+        fraction_entropy=float(logs[7]),
+        move_prob=float(logs[8]),
+        target_confidence=float(logs[9]),
+        fraction_alpha_mean=float(logs[10]),
+        fraction_alpha_max=float(logs[11]),
+        fraction_beta_mean=float(logs[12]),
+        fraction_beta_max=float(logs[13]),
+        pmpo_target_kl=float(logs[14]),
+        pmpo_fraction_kl=float(logs[15]),
     )
 
 

@@ -110,7 +110,24 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         epochs=2, minibatch_size=4, grad_clip=0.5,
     )
 
-    for name in ("policy_loss", "value_loss", "entropy", "approx_kl", "pmpo_kl", "pos_frac"):
+    for name in (
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "approx_kl",
+        "pmpo_kl",
+        "pos_frac",
+        "target_entropy",
+        "fraction_entropy",
+        "move_prob",
+        "target_confidence",
+        "fraction_alpha_mean",
+        "fraction_alpha_max",
+        "fraction_beta_mean",
+        "fraction_beta_max",
+        "pmpo_target_kl",
+        "pmpo_fraction_kl",
+    ):
         v = getattr(log, name)
         assert math.isfinite(v), f"{name}={v!r}"
     # Reported number is the running mean across all (epoch, minibatch)
