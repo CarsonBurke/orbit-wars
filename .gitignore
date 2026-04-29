@@ -64,3 +64,6 @@ submission*.zip
 .env.local
 *.local
 configs/local/
+
+
+logs/
