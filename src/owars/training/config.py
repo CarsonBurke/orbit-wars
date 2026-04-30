@@ -69,6 +69,10 @@ class OptimCfg:
     muon_momentum: float = 0.95
     muon_backend_steps: int = 5
     muon_row_normalize: bool = True
+    # Group same-shaped matrices so Muon's row-normalization and
+    # Newton-Schulz backend run as batched/foreach operations instead of a
+    # Python loop of tiny per-parameter matmuls.
+    muon_fused: bool = True
     muon_weight_decay: float = 0.0
     # Linear ramp `momentum_warmup_start` → `muon_momentum` over the first
     # `muon_momentum_warmup_steps` optimizer-step calls. Prevents the

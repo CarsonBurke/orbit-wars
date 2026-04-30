@@ -35,21 +35,25 @@ def zeropower_via_newtonschulz5(
     values into [0.5, 1.5] then collapse them toward 1, which is "good
     enough" for an SGD-like update direction without doing a full SVD.
 
-    Operates in bf16 for speed; transposes if rows < cols so the iteration
-    runs on the smaller dimension. Identical math to parameter-golf's
-    `zeropower_via_newtonschulz5`.
+    Operates in bf16 for speed; transposes tall matrices so the iteration
+    forms the smaller square product. Supports either a single matrix
+    `[rows, cols]` or a batch of same-shaped matrices `[..., rows, cols]`.
     """
     a, b, c = 3.4445, -4.7750, 2.0315
     x = g.bfloat16()
-    x = x / (x.norm() + eps)
-    transposed = g.size(0) > g.size(1)
+    x = x / (x.norm(dim=(-2, -1), keepdim=True) + eps)
+    transposed = g.size(-2) > g.size(-1)
     if transposed:
-        x = x.T
+        x = x.transpose(-2, -1)
     for _ in range(steps):
-        a_mat = x @ x.T
+        a_mat = x @ x.transpose(-2, -1)
         b_mat = b * a_mat + c * (a_mat @ a_mat)
         x = a * x + b_mat @ x
-    return x.T if transposed else x
+    return x.transpose(-2, -1) if transposed else x
+
+
+def _shape_correction(g: torch.Tensor) -> float:
+    return max(1.0, g.size(-2) / g.size(-1)) ** 0.5
 
 
 class Muon(torch.optim.Optimizer):
@@ -74,6 +78,7 @@ class Muon(torch.optim.Optimizer):
         nesterov: bool = True,
         weight_decay: float = 0.0,
         row_normalize: bool = False,
+        fused: bool = True,
         momentum_warmup_steps: int = 0,
         momentum_warmup_start: float = 0.85,
     ):
@@ -84,6 +89,7 @@ class Muon(torch.optim.Optimizer):
             nesterov=nesterov,
             weight_decay=weight_decay,
             row_normalize=row_normalize,
+            fused=fused,
             momentum_warmup_steps=momentum_warmup_steps,
             momentum_warmup_start=momentum_warmup_start,
         )
@@ -117,27 +123,134 @@ class Muon(torch.optim.Optimizer):
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
             row_normalize = group["row_normalize"]
+            fused = group["fused"]
             wd = group["weight_decay"]
+            if fused:
+                self._step_fused_group(
+                    params=params,
+                    lr=lr,
+                    momentum=momentum,
+                    backend_steps=backend_steps,
+                    nesterov=nesterov,
+                    row_normalize=row_normalize,
+                    weight_decay=wd,
+                )
+                continue
             for p in params:
                 if p.grad is None:
                     continue
-                g = p.grad
-                state = self.state[p]
-                buf = state.setdefault("momentum_buffer", torch.zeros_like(g))
-                buf.mul_(momentum).add_(g)
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                if row_normalize:
-                    row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
-                    g = g / row_norms.to(g.dtype)
-                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                # Spectral-norm shape correction.
-                g = g * (max(1.0, g.size(0) / g.size(1)) ** 0.5)
-                if wd > 0.0:
-                    p.data.mul_(1.0 - lr * wd)
-                p.data.add_(g.to(p.dtype), alpha=-lr)
+                self._step_one(
+                    p,
+                    lr=lr,
+                    momentum=momentum,
+                    backend_steps=backend_steps,
+                    nesterov=nesterov,
+                    row_normalize=row_normalize,
+                    weight_decay=wd,
+                )
         self._step_count += 1
         return loss
+
+    def _step_one(
+        self,
+        p: torch.nn.Parameter,
+        *,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        nesterov: bool,
+        row_normalize: bool,
+        weight_decay: float,
+    ) -> None:
+        g = p.grad
+        if g is None:
+            return
+        state = self.state[p]
+        buf = state.setdefault("momentum_buffer", torch.zeros_like(g))
+        buf.mul_(momentum).add_(g)
+        if nesterov:
+            g = g.add(buf, alpha=momentum)
+        if row_normalize:
+            row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
+            g = g / row_norms.to(g.dtype)
+        g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+        g = g * _shape_correction(g)
+        if weight_decay > 0.0:
+            p.data.mul_(1.0 - lr * weight_decay)
+        p.data.add_(g.to(p.dtype), alpha=-lr)
+
+    def _step_fused_group(
+        self,
+        *,
+        params: list[torch.nn.Parameter],
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        nesterov: bool,
+        row_normalize: bool,
+        weight_decay: float,
+    ) -> None:
+        buckets: dict[tuple[torch.device, torch.dtype, torch.Size], list[torch.nn.Parameter]] = {}
+        for p in params:
+            if p.grad is None:
+                continue
+            key = (p.device, p.dtype, p.shape)
+            buckets.setdefault(key, []).append(p)
+
+        for bucket in buckets.values():
+            if len(bucket) == 1:
+                self._step_one(
+                    bucket[0],
+                    lr=lr,
+                    momentum=momentum,
+                    backend_steps=backend_steps,
+                    nesterov=nesterov,
+                    row_normalize=row_normalize,
+                    weight_decay=weight_decay,
+                )
+                continue
+
+            grads = [p.grad for p in bucket]
+            if any(g is None for g in grads):
+                raise RuntimeError("internal Muon bucket included a missing gradient")
+            grad_tensors = [g for g in grads if g is not None]
+            buffers = [
+                self.state[p].setdefault("momentum_buffer", torch.zeros_like(p.grad))
+                for p in bucket
+            ]
+
+            torch._foreach_mul_(buffers, momentum)
+            torch._foreach_add_(buffers, grad_tensors)
+            if nesterov:
+                update_inputs = torch._foreach_add(
+                    grad_tensors,
+                    buffers,
+                    alpha=momentum,
+                )
+            else:
+                update_inputs = grad_tensors
+
+            g = torch.stack(update_inputs)
+            if row_normalize:
+                row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
+                g = g / row_norms.to(g.dtype)
+            g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+            g = g * _shape_correction(g)
+
+            if weight_decay > 0.0:
+                torch._foreach_mul_(bucket, 1.0 - lr * weight_decay)
+            updates = list(g.to(bucket[0].dtype).unbind(0))
+            torch._foreach_add_(bucket, updates, alpha=-lr)
+
+    def state_dict(self) -> dict:
+        state = super().state_dict()
+        state["_step_count"] = self._step_count
+        return state
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._step_count = int(state_dict.get("_step_count", 0))
+        base_state = {k: v for k, v in state_dict.items() if k != "_step_count"}
+        super().load_state_dict(base_state)
 
 
 class MultiOptimizer:

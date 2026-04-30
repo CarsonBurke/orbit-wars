@@ -162,6 +162,7 @@ def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
         momentum=cfg.muon_momentum,
         backend_steps=cfg.muon_backend_steps,
         row_normalize=cfg.muon_row_normalize,
+        fused=cfg.muon_fused,
         weight_decay=cfg.muon_weight_decay,
         momentum_warmup_steps=cfg.muon_momentum_warmup_steps,
         momentum_warmup_start=cfg.muon_momentum_warmup_start,
