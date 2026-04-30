@@ -3,8 +3,10 @@
 
 Default behavior:
   1. Pick the newest TensorBoard run directory under runs/<name>/<timestamp>.
-  2. Pick the newest non-init checkpoint under checkpoints/<name>/.
-  3. Run learned-vs-heuristic in the official Kaggle environment.
+  2. Pick final.pt under checkpoints/<name>/, falling back to the newest
+     non-init checkpoint if the run has not written final weights yet.
+  3. Run final learned weights against themselves in the official Kaggle
+     environment.
   4. Write an HTML replay under the run's eval_replays/ directory.
 """
 
@@ -60,6 +62,9 @@ def _latest_checkpoint(ckpt_root: Path, run_name: str) -> Path:
     run_dir = ckpt_root / run_name
     if not run_dir.exists():
         raise FileNotFoundError(f"checkpoint directory not found: {run_dir}")
+    final = run_dir / "final.pt"
+    if final.is_file():
+        return final
     candidates = [
         p for p in run_dir.glob("*.pt")
         if p.name != "snapshot_init.pt" and p.is_file()
@@ -104,7 +109,7 @@ def _default_out(run: RunChoice, ckpt: Path, opponent: str) -> Path:
     return base / f"{ckpt.stem}_vs_{opponent}_{stamp}.html"
 
 
-def main() -> None:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs-root", type=Path, default=Path("runs"))
     parser.add_argument("--ckpt-root", type=Path, default=Path("checkpoints"))
@@ -113,7 +118,7 @@ def main() -> None:
     parser.add_argument(
         "--opponent",
         choices=("heuristic", "sniper", "bot", "random", "learned"),
-        default="heuristic",
+        default="learned",
         help="Opponent agent. 'bot' is an alias for the competition sniper starter bot.",
     )
     parser.add_argument("--opponent-ckpt", type=Path, default=None)
@@ -124,6 +129,11 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--out", type=Path, default=None)
+    return parser
+
+
+def main() -> None:
+    parser = _parser()
     args = parser.parse_args()
 
     from kaggle_environments import make  # type: ignore[import-not-found]
