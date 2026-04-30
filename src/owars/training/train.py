@@ -553,6 +553,10 @@ def _ppo_loop(
     vec: VecEnv,
 ) -> dict:
     summary: dict = {"updates": []}
+    cumulative_margin = 0.0
+    cumulative_win_margin = 0.0
+    cumulative_loss_margin = 0.0
+    cumulative_games = 0
 
     # Seed the pool with a snapshot of the random-init model. Without this,
     # `_sample_one` returns LEARNER_NAME for every slot until the first
@@ -639,8 +643,18 @@ def _ppo_loop(
             grad_clip=cfg.optim.grad_clip,
         )
 
+        margins = [float(t.final_score) for t in trajs]
         win_rate = float(np.mean([t.won for t in trajs]))
-        margin = float(np.mean([t.final_score for t in trajs]))
+        margin = float(np.mean(margins))
+        update_win_margin = sum(m for t, m in zip(trajs, margins, strict=True) if t.won)
+        update_loss_margin = sum(
+            m for t, m in zip(trajs, margins, strict=True) if not t.won and not t.drawn
+        )
+        cumulative_margin += sum(margins)
+        cumulative_win_margin += update_win_margin
+        cumulative_loss_margin += update_loss_margin
+        cumulative_games += len(margins)
+        cumulative_mean_margin = cumulative_margin / max(1, cumulative_games)
         snapshot_elos = [elo.get(n) for n in pool.snapshot_names()]
         logger.scalars(
             "loss",
@@ -690,6 +704,10 @@ def _ppo_loop(
             {
                 "win_rate": win_rate,
                 "margin": margin,
+                "cumulative_margin": cumulative_margin,
+                "cumulative_win_margin": cumulative_win_margin,
+                "cumulative_loss_margin": cumulative_loss_margin,
+                "cumulative_mean_margin": cumulative_mean_margin,
             },
             update,
         )
@@ -708,6 +726,8 @@ def _ppo_loop(
                 "update": update,
                 "win_rate": win_rate,
                 "margin": margin,
+                "cumulative_margin": cumulative_margin,
+                "cumulative_mean_margin": cumulative_mean_margin,
                 "elo_learner": elo.get(LEARNER_NAME),
             }
         )
@@ -729,6 +749,10 @@ def _ppo_loop(
     summary["final_ckpt"] = str(final_path)
     summary["elo_path"] = str(elo_path)
     summary["elo_learner_final"] = elo.get(LEARNER_NAME)
+    summary["cumulative_margin"] = cumulative_margin
+    summary["cumulative_mean_margin"] = (
+        cumulative_margin / max(1, cumulative_games)
+    )
     return summary
 
 

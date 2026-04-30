@@ -95,7 +95,7 @@ class OptimCfg:
     control_lr: float = 0.02
     weight_decay: float = 1e-4
     grad_clip: float = 0.5
-    minibatch_size: int = 1024
+    minibatch_size: int = 2048
     epochs_per_update: int = 4
 
 
@@ -168,9 +168,8 @@ class RolloutCfg:
     one worker per env.
     """
 
-    num_envs: int = 16
+    num_envs: int = 128
     num_workers: int = 0  # 0 => backend default; for numpy_mp, leave a few cores free
-    max_moves_per_turn: int = 16
     env_backend: str = "numpy"  # "numpy", "numpy_mp", or "kaggle"
 
 

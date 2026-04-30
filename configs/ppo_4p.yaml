@@ -32,7 +32,7 @@ optim:
   lr: 2.0e-4
   weight_decay: 1.0e-4
   grad_clip: 0.5
-  minibatch_size: 1024
+  minibatch_size: 2048
   epochs_per_update: 4
 
 ppo:
@@ -52,8 +52,7 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 16
-  max_moves_per_turn: 24
+  num_envs: 128
 
 opponents:
   snapshot_every: 25

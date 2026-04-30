@@ -54,7 +54,7 @@ optim:
                    # The single most impactful per-step lever for keeping
                    # PPO ratios close to 1: it caps gradient magnitude
                    # *before* Muon/AdamW transform it into a parameter step.
-  minibatch_size: 1024
+  minibatch_size: 2048
   epochs_per_update: 4
 
 ppo:
@@ -79,8 +79,7 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 16              # parallel envs (= episodes per update)
-  max_moves_per_turn: 16
+  num_envs: 128             # parallel envs (= episodes per update)
 
 opponents:
   snapshot_device: train
