@@ -18,4 +18,7 @@ Not yet a Python training backend:
 - No Kaggle-style observation materialization or policy feature buffer API.
 - No PyO3/DLPack integration.
 
-Integrate with `owars.training` only after adding the Python extension boundary and policy batch feature parity tests.
+Python integration lives in `../owars_env_py` and is loaded by
+`owars.training.rust_env.RustVecEnv`. In a repo checkout the wrapper will
+build the extension with `cargo build --release` on first import if a compiled
+module is not already present.

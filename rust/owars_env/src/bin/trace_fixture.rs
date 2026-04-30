@@ -1,7 +1,7 @@
 use std::env;
 
 use owars_env::core::{
-    fixture_game, simple_actions, CometGroup, Game, GameConfig, GameState, Planet, Point,
+    CometGroup, Game, GameConfig, GameState, Planet, Point, fixture_game, simple_actions,
 };
 
 fn main() {

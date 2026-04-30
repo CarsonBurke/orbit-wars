@@ -490,11 +490,7 @@ impl Game {
             let (top_owner, top_ships) = rows[0];
             let (survivor_owner, survivor_ships) = if rows.len() > 1 {
                 let diff = top_ships - rows[1].1;
-                if diff > 0 {
-                    (top_owner, diff)
-                } else {
-                    (-1, 0)
-                }
+                if diff > 0 { (top_owner, diff) } else { (-1, 0) }
             } else {
                 (top_owner, top_ships)
             };

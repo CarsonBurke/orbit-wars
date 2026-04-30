@@ -1,0 +1,13 @@
+[package]
+name = "owars_env_py"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_owars_env"
+crate-type = ["cdylib"]
+
+[dependencies]
+numpy = "0.28"
+owars_env = { path = "../owars_env" }
+pyo3 = { version = "0.28", features = ["extension-module"] }

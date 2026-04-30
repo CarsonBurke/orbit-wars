@@ -200,6 +200,56 @@ def bench_numpy_mp(
     return _summary("numpy_mp", steps, reset_s, step_s, wall_s)
 
 
+def bench_rust_vec(
+    num_envs: int,
+    num_players: int,
+    episode_steps: int,
+    ship_speed: float,
+    workload: str,
+) -> dict[str, float]:
+    from owars.training.rust_env import RustVecEnv
+
+    reset_s = 0.0
+    step_s = 0.0
+    obs_s = 0.0
+    steps = 0
+    start = perf_counter()
+    with RustVecEnv(
+        num_envs=num_envs,
+        num_players=num_players,
+        episode_steps=episode_steps,
+        ship_speed=ship_speed,
+        random_seed=0,
+    ) as vec:
+        t0 = perf_counter()
+        vec.reset()
+        reset_s += perf_counter() - t0
+        done = [False] * num_envs
+        while not all(done):
+            active = [i for i, is_done in enumerate(done) if not is_done]
+            actions = []
+            if workload == "noop":
+                actions = [[[] for _ in range(num_players)] for _ in active]
+            else:
+                t0 = perf_counter()
+                states = [
+                    [{"observation": vec.observation(i, seat)} for seat in range(num_players)]
+                    for i in active
+                ]
+                obs_s += perf_counter() - t0
+                actions = [_actions(state, num_players, workload) for state in states]
+            t0 = perf_counter()
+            results = vec.step_subset_fast(active, actions)
+            step_s += perf_counter() - t0
+            steps += len(active)
+            for idx, (_state, is_done, _final) in results.items():
+                done[idx] = is_done
+    wall_s = perf_counter() - start
+    result = _summary("rust_vec", steps, reset_s, step_s, wall_s)
+    result["obs_s"] = obs_s
+    return result
+
+
 def bench_kaggle_vec(
     num_envs: int,
     num_players: int,
@@ -259,6 +309,7 @@ def main() -> None:
             "numpy_single",
             "numpy_vec",
             "numpy_mp",
+            "rust_vec",
         ),
         default="all",
     )
@@ -276,6 +327,7 @@ def main() -> None:
         "numpy_single": bench_numpy_single,
         "numpy_vec": bench_numpy_vec,
         "numpy_mp": bench_numpy_mp,
+        "rust_vec": bench_rust_vec,
     }
     names = list(benches) if args.backend == "all" else [args.backend]
     for name in names:

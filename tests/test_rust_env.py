@@ -8,12 +8,25 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 
+from owars.policies.features import encode_raw_observations
 from owars.training.numpy_env import NumpyOrbitWarsEnv
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RUST_CRATE = ROOT / "rust" / "owars_env"
+RUST_PY_CRATE = ROOT / "rust" / "owars_env_py"
+
+
+def _build_rust_extension() -> None:
+    subprocess.run(
+        ["cargo", "build", "--release"],
+        cwd=RUST_PY_CRATE,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _fixture_obs(*, comet: bool = False) -> dict[str, Any]:
@@ -248,3 +261,144 @@ def test_rust_generated_comet_spawn_step_matches_numpy():
     assert obs["step"] == 50
     assert rust["step"] == 50
     assert _round_rows(rust["planets"]) == _round_rows(obs["planets"])
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_policy_batch_matches_numpy_vec_env():
+    _build_rust_extension()
+    from owars.training.numpy_env import NumpyVecEnv
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    numpy = NumpyVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    numpy_states = numpy.reset()
+    rust.reset()
+    numpy_states[0] = numpy.step_subset([0], [[[], []]])[0][0]
+    rust.step_subset_fast([0], [[[], []]])
+
+    assert _round_rows(rust.observation(0, 0)["planets"]) == _round_rows(
+        numpy_states[0][0]["observation"]["planets"]
+    )
+
+    fast, contexts = rust.policy_batch([(0, 0), (0, 1)], device="cpu")
+    expected = encode_raw_observations(
+        [numpy_states[0][0]["observation"], numpy_states[0][1]["observation"]],
+        device="cpu",
+    )
+    assert torch.allclose(fast.planet_feats, expected.planet_feats)
+    assert torch.equal(fast.planet_mask, expected.planet_mask)
+    assert torch.equal(fast.planet_owned_mask, expected.planet_owned_mask)
+    assert torch.equal(fast.planet_ids, expected.planet_ids)
+    assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
+    assert torch.equal(fast.fleet_mask, expected.fleet_mask)
+    assert len(contexts) == 2
+
+    obs = numpy_states[0][0]["observation"]
+    src = next(p for p in obs["planets"] if int(p[1]) == 0 and int(p[5]) >= 8)
+    target = next(p for p in obs["planets"] if int(p[1]) != 0)
+    angle = math.atan2(float(target[3]) - float(src[3]), float(target[2]) - float(src[2]))
+    action = [[[int(src[0]), angle, 5, int(target[0]), 3.0, float(target[2]), float(target[3])]], []]
+    numpy_states[0] = numpy.step_subset([0], [action])[0][0]
+    rust.step_subset_fast([0], [action])
+
+    fast, _ = rust.policy_batch([(0, 0), (0, 1)], device="cpu")
+    expected = encode_raw_observations(
+        [numpy_states[0][0]["observation"], numpy_states[0][1]["observation"]],
+        device="cpu",
+    )
+    assert torch.allclose(fast.planet_feats, expected.planet_feats)
+    assert torch.equal(fast.planet_mask, expected.planet_mask)
+    assert torch.equal(fast.planet_owned_mask, expected.planet_owned_mask)
+    assert torch.equal(fast.planet_ids, expected.planet_ids)
+    assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
+    assert torch.equal(fast.fleet_mask, expected.fleet_mask)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_policy_batch_matches_comet_features():
+    _build_rust_extension()
+    from owars.training.numpy_env import NumpyVecEnv
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    numpy = NumpyVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    numpy_states = numpy.reset()
+    rust.reset()
+    for _ in range(50):
+        numpy_states[0] = numpy.step_subset([0], [[[], []]])[0][0]
+        rust.step_subset_fast([0], [[[], []]])
+
+    assert numpy_states[0][0]["observation"]["comet_planet_ids"]
+    fast, _ = rust.policy_batch([(0, 0), (0, 1)], device="cpu")
+    expected = encode_raw_observations(
+        [numpy_states[0][0]["observation"], numpy_states[0][1]["observation"]],
+        device="cpu",
+    )
+    assert torch.allclose(fast.planet_feats, expected.planet_feats)
+    assert torch.equal(fast.planet_mask, expected.planet_mask)
+    assert torch.equal(fast.planet_ids, expected.planet_ids)
+    assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
+    assert torch.equal(fast.fleet_mask, expected.fleet_mask)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_policy_batch_matches_4p_owner_slots():
+    _build_rust_extension()
+    from owars.training.numpy_env import NumpyVecEnv
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=4,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    numpy = NumpyVecEnv(
+        num_envs=1,
+        num_players=4,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    numpy_states = numpy.reset()
+    rust.reset()
+    numpy_states[0] = numpy.step_subset([0], [[[], [], [], []]])[0][0]
+    rust.step_subset_fast([0], [[[], [], [], []]])
+
+    rows = [(0, seat) for seat in range(4)]
+    fast, _ = rust.policy_batch(rows, device="cpu")
+    expected = encode_raw_observations(
+        [numpy_states[0][seat]["observation"] for seat in range(4)],
+        device="cpu",
+    )
+    assert torch.allclose(fast.planet_feats, expected.planet_feats)
+    assert torch.equal(fast.planet_mask, expected.planet_mask)
+    assert torch.equal(fast.planet_owned_mask, expected.planet_owned_mask)
+    assert torch.equal(fast.planet_ids, expected.planet_ids)
+    assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
+    assert torch.equal(fast.fleet_mask, expected.fleet_mask)

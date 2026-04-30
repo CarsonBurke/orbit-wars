@@ -2,7 +2,7 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
-use owars_env::core::{fixture_game, simple_actions, Game, GameConfig};
+use owars_env::core::{Game, GameConfig, fixture_game, simple_actions};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

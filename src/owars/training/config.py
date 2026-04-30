@@ -170,7 +170,7 @@ class RolloutCfg:
 
     num_envs: int = 128
     num_workers: int = 0  # 0 => backend default; set to physical cores for rollout-heavy runs
-    env_backend: str = "numpy_mp"  # "numpy", "numpy_mp", or "kaggle"
+    env_backend: str = "numpy_mp"  # "numpy", "numpy_mp", "rust", or "kaggle"
 
 
 @dataclass

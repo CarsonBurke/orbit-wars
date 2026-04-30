@@ -41,7 +41,7 @@ def evaluate_ckpt(
     model.load_state_dict(state["model"])
     model.eval()
 
-    if env_backend not in {"kaggle", "numpy", "numpy_mp"}:
+    if env_backend not in {"kaggle", "numpy", "numpy_mp", "rust"}:
         raise ValueError(f"unknown env_backend: {env_backend!r}")
     out: dict[str, dict[str, float]] = {}
     for opp_name in baselines:
@@ -86,6 +86,10 @@ def evaluate_ckpt(
             vec = NumpyVecEnv(**vec_kwargs)
         elif env_backend == "numpy_mp":
             vec = ShardedNumpyVecEnv(**vec_kwargs, num_workers=num_workers)
+        elif env_backend == "rust":
+            from .rust_env import RustVecEnv
+
+            vec = RustVecEnv(**vec_kwargs)
         else:
             vec = VecEnv(**vec_kwargs)
         with vec:
@@ -132,7 +136,7 @@ def main() -> None:
     p.add_argument("--device", default="cpu")
     p.add_argument("--num-envs", type=int, default=16)
     p.add_argument(
-        "--env-backend", choices=("kaggle", "numpy", "numpy_mp"), default="kaggle"
+        "--env-backend", choices=("kaggle", "numpy", "numpy_mp", "rust"), default="kaggle"
     )
     p.add_argument("--num-workers", type=int, default=0)
     args = p.parse_args()

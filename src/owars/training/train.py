@@ -510,7 +510,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     # `replay_env_idx=0` keeps env 0's full step history so the PPO loop
     # can dump one rendered game per update; the other workers trim
     # `env.steps` to save memory.
-    if cfg.rollout.env_backend not in {"kaggle", "numpy", "numpy_mp"}:
+    if cfg.rollout.env_backend not in {"kaggle", "numpy", "numpy_mp", "rust"}:
         raise ValueError(f"unknown rollout.env_backend: {cfg.rollout.env_backend!r}")
     vec_kwargs = dict(
         num_envs=cfg.rollout.num_envs,
@@ -529,6 +529,14 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             **vec_kwargs,
             replay_env_idx=None,
             num_workers=cfg.rollout.num_workers,
+            random_seed=cfg.run.seed,
+        )
+    elif cfg.rollout.env_backend == "rust":
+        from .rust_env import RustVecEnv
+
+        vec = RustVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
             random_seed=cfg.run.seed,
         )
     else:
@@ -573,7 +581,11 @@ def _ppo_loop(
     # One rendered game per update lands here (env 0 is the recording
     # worker; see VecEnv(replay_env_idx=0) above). Pretrain disabled
     # recording; turn it back on for the PPO loop.
-    vec.set_recording(True)
+    if getattr(vec, "supports_replay", True):
+        vec.set_recording(True)
+    else:
+        vec.set_recording(False)
+        print("rust env backend does not render HTML replays; skipping per-update replay dumps")
     replays_dir = logger.path / "replays"
     replays_dir.mkdir(parents=True, exist_ok=True)
 
@@ -763,7 +775,7 @@ def main() -> None:
     p.add_argument("--episode-steps", type=int, default=None)
     p.add_argument(
         "--env-backend",
-        choices=("numpy", "numpy_mp", "kaggle"),
+        choices=("numpy", "numpy_mp", "rust", "kaggle"),
         default=None,
     )
     p.add_argument(
