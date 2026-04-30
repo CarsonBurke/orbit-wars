@@ -7,6 +7,7 @@ from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
 from owars.training.league import LEARNER_NAME, OpponentSlot
 from owars.training.numpy_env import NumpyVecEnv
+from owars.training.sharded_numpy_env import ShardedNumpyVecEnv
 from owars.training.vec_env import (
     _annotate_state_with_fleet_targets,
     _record_action_sidecars,
@@ -117,6 +118,37 @@ def test_numpy_fast_rollout_records_configured_learner_seats():
         )
 
     assert [traj.learner_seat for traj in trajs] == [0, 1]
+    assert all(traj.seat_rewards for traj in trajs)
+    assert all(traj.encoded for traj in trajs)
+    for traj in trajs:
+        assert any(mask.any() for mask in traj.owned_mask)
+        for owned, obs in zip(traj.owned_mask, traj.encoded, strict=True):
+            assert owned.equal(obs.planet_owned_mask)
+
+
+def test_sharded_numpy_fast_rollout_records_configured_learner_seats():
+    model = OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
+    opponent = OpponentSlot("noop", agent=lambda _obs: [])
+    vec = ShardedNumpyVecEnv(
+        num_envs=4,
+        num_players=2,
+        episode_steps=12,
+        ship_speed=6.0,
+        random_seed=0,
+        num_workers=2,
+    )
+
+    with vec:
+        trajs = rollout_episodes_batched(
+            model,
+            vec,
+            [[opponent], [opponent], [opponent], [opponent]],
+            num_players=2,
+            learner_seat=[0, 1, 0, 1],
+            device="cpu",
+        )
+
+    assert [traj.learner_seat for traj in trajs] == [0, 1, 0, 1]
     assert all(traj.seat_rewards for traj in trajs)
     assert all(traj.encoded for traj in trajs)
     for traj in trajs:

@@ -142,15 +142,18 @@ def bench_numpy_vec(
         states = vec.reset()
         reset_s += perf_counter() - t0
         done = [False] * num_envs
+        use_fast_step = workload == "noop" and getattr(vec, "fast_rollout", False)
+        step_subset = vec.step_subset_fast if use_fast_step else vec.step_subset
         while not all(done):
             active = [i for i, is_done in enumerate(done) if not is_done]
             actions = [_actions(states[i], num_players, workload) for i in active]
             t0 = perf_counter()
-            results = vec.step_subset(active, actions)
+            results = step_subset(active, actions)
             step_s += perf_counter() - t0
             steps += len(active)
             for idx, (state, is_done, _final) in results.items():
-                states[idx] = state
+                if state is not None:
+                    states[idx] = state
                 done[idx] = is_done
     wall_s = perf_counter() - start
     return _summary("numpy_vec", steps, reset_s, step_s, wall_s)
@@ -180,15 +183,18 @@ def bench_numpy_mp(
         states = vec.reset()
         reset_s += perf_counter() - t0
         done = [False] * num_envs
+        use_fast_step = workload == "noop" and getattr(vec, "fast_rollout", False)
+        step_subset = vec.step_subset_fast if use_fast_step else vec.step_subset
         while not all(done):
             active = [i for i, is_done in enumerate(done) if not is_done]
             actions = [_actions(states[i], num_players, workload) for i in active]
             t0 = perf_counter()
-            results = vec.step_subset(active, actions)
+            results = step_subset(active, actions)
             step_s += perf_counter() - t0
             steps += len(active)
             for idx, (state, is_done, _final) in results.items():
-                states[idx] = state
+                if state is not None:
+                    states[idx] = state
                 done[idx] = is_done
     wall_s = perf_counter() - start
     return _summary("numpy_mp", steps, reset_s, step_s, wall_s)

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import random
 from collections import defaultdict
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
@@ -283,11 +284,11 @@ def _stack_trajectories(
     offset = 0
     for t in trajs:
         rewards = np.asarray(t.reward, dtype=np.float32)
-        T = len(rewards)
-        values = all_values[offset : offset + T]
-        offset += T
+        horizon = len(rewards)
+        values = all_values[offset : offset + horizon]
+        offset += horizon
         if lambda_policy_alpha > 0.0:
-            lam_p = length_adaptive_lambda(T, lambda_policy_alpha)
+            lam_p = length_adaptive_lambda(horizon, lambda_policy_alpha)
         else:
             lam_p = lambda_policy
         adv_p, _ = compute_gae(rewards, values, gamma, lam_p)
@@ -443,10 +444,8 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     set_seed(cfg.run.seed)
     if cfg.run.torch_num_threads > 0:
         torch.set_num_threads(cfg.run.torch_num_threads)
-        try:
+        with suppress(RuntimeError):
             torch.set_num_interop_threads(max(1, cfg.run.torch_num_threads))
-        except RuntimeError:
-            pass
     if cfg.run.device != "cuda":
         raise ValueError("training is CUDA-only; set run.device: cuda")
     if not torch.cuda.is_available():
@@ -759,6 +758,16 @@ def _ppo_loop(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
+    p.add_argument("--name", default=None, help="Override run.name.")
+    p.add_argument("--total-updates", type=int, default=None)
+    p.add_argument("--num-envs", type=int, default=None)
+    p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--episode-steps", type=int, default=None)
+    p.add_argument(
+        "--env-backend",
+        choices=("numpy", "numpy_mp", "kaggle"),
+        default=None,
+    )
     p.add_argument(
         "--load",
         default=None,
@@ -768,6 +777,18 @@ def main() -> None:
     )
     args = p.parse_args()
     cfg = load_config(args.config)
+    if args.name is not None:
+        cfg.run.name = args.name
+    if args.total_updates is not None:
+        cfg.run.total_updates = args.total_updates
+    if args.num_envs is not None:
+        cfg.rollout.num_envs = args.num_envs
+    if args.num_workers is not None:
+        cfg.rollout.num_workers = args.num_workers
+    if args.episode_steps is not None:
+        cfg.game.episode_steps = args.episode_steps
+    if args.env_backend is not None:
+        cfg.rollout.env_backend = args.env_backend
     summary = train_one_run(cfg, load_weights=args.load)
     print({k: v for k, v in summary.items() if k != "updates"})
 

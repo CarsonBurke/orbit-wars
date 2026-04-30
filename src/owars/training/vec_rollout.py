@@ -172,6 +172,7 @@ def rollout_episodes_batched(
     dones = [False] * num_envs
     fast_policy_batch = getattr(vec, "policy_batch", None)
     fast_observation = getattr(vec, "observation", None)
+    fast_observations = getattr(vec, "observations", None)
     fast_step_subset = getattr(vec, "step_subset_fast", None)
     use_fast_numpy_path = (
         bool(getattr(vec, "fast_rollout", False))
@@ -186,6 +187,8 @@ def rollout_episodes_batched(
         opp_buckets: dict[str, list[tuple[int, int, Any, OpponentSlot]]] = (
             defaultdict(list)
         )
+        pending_opp_obs: list[tuple[int, int]] = []
+        pending_opp_slots: list[tuple[int, int, OpponentSlot]] = []
         for env_idx in range(num_envs):
             if dones[env_idx]:
                 continue
@@ -196,12 +199,25 @@ def rollout_episodes_batched(
                     obs = None if use_fast_numpy_path else state[seat]["observation"]
                     learner_bucket.append((env_idx, seat, obs))
                 else:
-                    obs = (
-                        fast_observation(env_idx, seat)
-                        if use_fast_numpy_path
-                        else state[seat]["observation"]
-                    )
-                    opp_buckets[slot.name].append((env_idx, seat, obs, slot))
+                    if use_fast_numpy_path:
+                        pending_opp_obs.append((env_idx, seat))
+                        pending_opp_slots.append((env_idx, seat, slot))
+                    else:
+                        obs = state[seat]["observation"]
+                        opp_buckets[slot.name].append((env_idx, seat, obs, slot))
+
+        if pending_opp_obs:
+            if callable(fast_observations):
+                opponent_obs = fast_observations(pending_opp_obs)
+            else:
+                opponent_obs = [
+                    fast_observation(env_idx, seat)
+                    for env_idx, seat in pending_opp_obs
+                ]
+            for (env_idx, seat, slot), obs in zip(
+                pending_opp_slots, opponent_obs, strict=True
+            ):
+                opp_buckets[slot.name].append((env_idx, seat, obs, slot))
 
         actions_per_env: dict[int, list[Any]] = {
             i: [None] * num_players for i in range(num_envs) if not dones[i]

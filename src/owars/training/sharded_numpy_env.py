@@ -10,12 +10,19 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+from contextlib import suppress
 from typing import Any
 
+from ..policies.features import EncodedObs, select_encoded, stack_encoded
+from ..policies.sampling import ActionContext
 from .numpy_env import NumpyVecEnv
 
 _RESET = "reset"
 _STEP = "step"
+_STEP_FAST = "step_fast"
+_OBSERVATION = "observation"
+_OBSERVATIONS = "observations"
+_POLICY_BATCH = "policy_batch"
 _CLOSE = "close"
 _SET_RECORDING = "set_recording"
 
@@ -73,13 +80,27 @@ def _numpy_shard_worker(
             elif cmd == _STEP:
                 indices, actions = payload
                 remote.send(("ok", vec.step_subset(indices, actions)))
+            elif cmd == _STEP_FAST:
+                indices, actions = payload
+                remote.send(("ok", vec.step_subset_fast(indices, actions)))
+            elif cmd == _OBSERVATION:
+                idx, player = payload
+                remote.send(("ok", vec.observation(int(idx), int(player))))
+            elif cmd == _OBSERVATIONS:
+                rows = [(int(idx), int(player)) for idx, player in payload]
+                remote.send(
+                    ("ok", [vec.observation(idx, player) for idx, player in rows])
+                )
+            elif cmd == _POLICY_BATCH:
+                rows = [(int(idx), int(player)) for idx, player in payload]
+                # Keep tensors on CPU across process boundaries. The parent
+                # process performs the single pinned CPU -> CUDA transfer.
+                remote.send(("ok", vec.policy_batch(rows, device="cpu")))
             else:
                 remote.send(("err", f"unknown cmd: {cmd!r}"))
     except Exception as exc:
-        try:
+        with suppress(Exception):
             remote.send(("err", repr(exc)))
-        except Exception:
-            pass
     finally:
         vec.close()
 
@@ -93,7 +114,7 @@ class ShardedNumpyVecEnv:
     one Kaggle env per worker process.
     """
 
-    fast_rollout = False
+    fast_rollout = True
 
     def __init__(
         self,
@@ -163,6 +184,20 @@ class ShardedNumpyVecEnv:
     def step_subset(
         self, indices: list[int], actions: list[Any]
     ) -> dict[int, tuple[Any, bool, Any]]:
+        return self._step_subset_impl(indices, actions, fast=False)
+
+    def step_subset_fast(
+        self, indices: list[int], actions: list[Any]
+    ) -> dict[int, tuple[Any, bool, Any]]:
+        return self._step_subset_impl(indices, actions, fast=True)
+
+    def _step_subset_impl(
+        self,
+        indices: list[int],
+        actions: list[Any],
+        *,
+        fast: bool,
+    ) -> dict[int, tuple[Any, bool, Any]]:
         assert len(indices) == len(actions), (len(indices), len(actions))
         grouped_indices: list[list[int]] = [[] for _ in self.shards]
         grouped_actions: list[list[Any]] = [[] for _ in self.shards]
@@ -176,7 +211,10 @@ class ShardedNumpyVecEnv:
             if not local_indices:
                 continue
             self._remotes[shard_idx].send(
-                (_STEP, (local_indices, grouped_actions[shard_idx]))
+                (
+                    _STEP_FAST if fast else _STEP,
+                    (local_indices, grouped_actions[shard_idx]),
+                )
             )
             active_shards.append(shard_idx)
 
@@ -189,6 +227,92 @@ class ShardedNumpyVecEnv:
             for local_idx, result in payload.items():
                 results[start + int(local_idx)] = result
         return results
+
+    def observation(self, idx: int, player: int) -> dict[str, Any]:
+        shard_idx, local_idx = self._env_to_shard[idx]
+        remote = self._remotes[shard_idx]
+        remote.send((_OBSERVATION, (local_idx, player)))
+        tag, payload = remote.recv()
+        if tag != "ok":
+            raise RuntimeError(f"numpy shard {shard_idx} observation failed: {payload}")
+        return payload
+
+    def observations(self, rows: list[tuple[int, int]]) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+
+        grouped_rows: list[list[tuple[int, int]]] = [[] for _ in self.shards]
+        grouped_positions: list[list[int]] = [[] for _ in self.shards]
+        for pos, (env_idx, player) in enumerate(rows):
+            shard_idx, local_idx = self._env_to_shard[env_idx]
+            grouped_rows[shard_idx].append((local_idx, player))
+            grouped_positions[shard_idx].append(pos)
+
+        active_shards: list[int] = []
+        for shard_idx, local_rows in enumerate(grouped_rows):
+            if not local_rows:
+                continue
+            self._remotes[shard_idx].send((_OBSERVATIONS, local_rows))
+            active_shards.append(shard_idx)
+
+        out: list[dict[str, Any] | None] = [None] * len(rows)
+        for shard_idx in active_shards:
+            tag, payload = self._remotes[shard_idx].recv()
+            if tag != "ok":
+                raise RuntimeError(
+                    f"numpy shard {shard_idx} observations failed: {payload}"
+                )
+            for obs, pos in zip(payload, grouped_positions[shard_idx], strict=True):
+                out[pos] = obs
+
+        observations = [obs for obs in out if obs is not None]
+        if len(observations) != len(rows):
+            raise RuntimeError("incomplete sharded observations batch")
+        return observations
+
+    def policy_batch(
+        self,
+        rows: list[tuple[int, int]],
+        *,
+        device: str = "cpu",
+        pin_memory: bool = False,
+    ) -> tuple[EncodedObs, list[ActionContext]]:
+        del device, pin_memory
+        if not rows:
+            raise ValueError("policy_batch requires at least one row")
+
+        grouped_rows: list[list[tuple[int, int]]] = [[] for _ in self.shards]
+        grouped_positions: list[list[int]] = [[] for _ in self.shards]
+        for pos, (env_idx, player) in enumerate(rows):
+            shard_idx, local_idx = self._env_to_shard[env_idx]
+            grouped_rows[shard_idx].append((local_idx, player))
+            grouped_positions[shard_idx].append(pos)
+
+        active_shards: list[int] = []
+        for shard_idx, local_rows in enumerate(grouped_rows):
+            if not local_rows:
+                continue
+            self._remotes[shard_idx].send((_POLICY_BATCH, local_rows))
+            active_shards.append(shard_idx)
+
+        encoded_by_pos: list[EncodedObs | None] = [None] * len(rows)
+        contexts_by_pos: list[ActionContext | None] = [None] * len(rows)
+        for shard_idx in active_shards:
+            tag, payload = self._remotes[shard_idx].recv()
+            if tag != "ok":
+                raise RuntimeError(
+                    f"numpy shard {shard_idx} policy_batch failed: {payload}"
+                )
+            encoded, contexts = payload
+            for local_row, pos in enumerate(grouped_positions[shard_idx]):
+                encoded_by_pos[pos] = select_encoded(encoded, local_row)
+                contexts_by_pos[pos] = contexts[local_row]
+
+        encoded_rows = [e for e in encoded_by_pos if e is not None]
+        contexts = [c for c in contexts_by_pos if c is not None]
+        if len(encoded_rows) != len(rows) or len(contexts) != len(rows):
+            raise RuntimeError("incomplete sharded policy batch")
+        return stack_encoded(encoded_rows), contexts
 
     def set_recording(self, enabled: bool) -> None:
         for shard_idx, remote in enumerate(self._remotes):
@@ -206,29 +330,23 @@ class ShardedNumpyVecEnv:
             return
         self._closed = True
         for remote in self._remotes:
-            try:
+            with suppress(Exception):
                 remote.send((_CLOSE, None))
-            except Exception:
-                pass
         for proc in self._workers:
             proc.join(timeout=2.0)
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=1.0)
         for remote in self._remotes:
-            try:
+            with suppress(Exception):
                 remote.close()
-            except Exception:
-                pass
 
-    def __enter__(self) -> "ShardedNumpyVecEnv":
+    def __enter__(self) -> ShardedNumpyVecEnv:
         return self
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
     def __del__(self) -> None:
-        try:
+        with suppress(Exception):
             self.close()
-        except Exception:
-            pass

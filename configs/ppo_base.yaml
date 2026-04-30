@@ -80,6 +80,8 @@ ppo:
 
 rollout:
   num_envs: 128             # parallel envs (= episodes per update)
+  num_workers: 24           # one shard per CPU core; rollout is the bottleneck
+  env_backend: numpy_mp
 
 opponents:
   snapshot_device: train

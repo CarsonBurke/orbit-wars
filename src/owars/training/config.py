@@ -163,14 +163,14 @@ class RolloutCfg:
     `num_envs` is the total rollout parallelism: each PPO update plays
     exactly this many episodes and batches policy forwards across all alive
     envs each step.
-    `numpy` uses the in-process fast rollout path. `num_workers` is only
-    used by the `numpy_mp` backend. The official Kaggle backend already runs
-    one worker per env.
+    `numpy` uses the in-process fast rollout path. `numpy_mp` shards the same
+    fast path across CPU worker processes. `num_workers` is only used by
+    `numpy_mp`; the official Kaggle backend already runs one worker per env.
     """
 
     num_envs: int = 128
-    num_workers: int = 0  # 0 => backend default; for numpy_mp, leave a few cores free
-    env_backend: str = "numpy"  # "numpy", "numpy_mp", or "kaggle"
+    num_workers: int = 0  # 0 => backend default; set to physical cores for rollout-heavy runs
+    env_backend: str = "numpy_mp"  # "numpy", "numpy_mp", or "kaggle"
 
 
 @dataclass
@@ -238,7 +238,7 @@ class RunConfig:
     reward: RewardCfg = field(default_factory=RewardCfg)
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "RunConfig":
+    def from_dict(cls, d: dict[str, Any]) -> RunConfig:
         cfg = cls()
         for section, sub in d.items():
             if not hasattr(cfg, section):

@@ -469,6 +469,62 @@ def test_sharded_numpy_vec_env_matches_scalar_subset_stepping():
             )
 
 
+def test_sharded_numpy_vec_env_supports_fast_rollout_interface():
+    baseline = NumpyVecEnv(
+        num_envs=3,
+        num_players=2,
+        episode_steps=30,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    with ShardedNumpyVecEnv(
+        num_envs=3,
+        num_players=2,
+        episode_steps=30,
+        ship_speed=6.0,
+        random_seed=0,
+        num_workers=2,
+    ) as vec, baseline:
+        baseline_states = baseline.reset()
+        states = vec.reset()
+
+        assert vec.fast_rollout is True
+        obs = vec.observation(0, 1)
+        assert obs["player"] == 1
+        assert obs == states[0][1]["observation"]
+        assert vec.observations([(2, 1), (0, 0)]) == [
+            states[2][1]["observation"],
+            states[0][0]["observation"],
+        ]
+        _assert_obs_close(states[1][0]["observation"], baseline_states[1][0]["observation"])
+
+        rows = [(2, 1), (0, 0), (1, 1)]
+        encoded, contexts = vec.policy_batch(rows, device="cuda")
+        expected, expected_contexts = baseline.policy_batch(rows, device="cpu")
+        assert encoded.planet_feats.device.type == "cpu"
+        assert encoded.planet_feats.shape[0] == len(rows)
+        assert encoded.fleet_feats.shape[0] == len(rows)
+        assert len(contexts) == len(rows)
+        torch.testing.assert_close(encoded.planet_feats, expected.planet_feats)
+        torch.testing.assert_close(encoded.planet_mask, expected.planet_mask)
+        torch.testing.assert_close(encoded.planet_owned_mask, expected.planet_owned_mask)
+        torch.testing.assert_close(encoded.planet_ids, expected.planet_ids)
+        torch.testing.assert_close(encoded.planet_garrison, expected.planet_garrison)
+        torch.testing.assert_close(encoded.fleet_feats, expected.fleet_feats)
+        torch.testing.assert_close(encoded.fleet_mask, expected.fleet_mask)
+        for actual, want in zip(contexts, expected_contexts, strict=True):
+            assert actual.angular_velocity == want.angular_velocity
+            assert list(actual.comet_planet_ids) == list(want.comet_planet_ids)
+            assert np.allclose(actual.planets, want.planets, rtol=0.0, atol=0.0)
+
+        results = vec.step_subset_fast([0, 2], [[[], []], [[], []]])
+        assert set(results) == {0, 2}
+        for state, done, final in results.values():
+            assert done is False
+            assert final is None
+            assert state is None
+
+
 def test_numpy_vec_env_matches_scalar_4p_noops():
     scalar = [
         NumpyOrbitWarsEnv(

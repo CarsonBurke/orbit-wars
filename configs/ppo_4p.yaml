@@ -53,6 +53,8 @@ ppo:
 
 rollout:
   num_envs: 128
+  num_workers: 24
+  env_backend: numpy_mp
 
 opponents:
   snapshot_every: 25
