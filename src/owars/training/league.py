@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import copy
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -80,6 +81,21 @@ class OpponentPool:
 
     # --- snapshot management -------------------------------------------------
 
+    def _copy_model_without_compile_caches(self, model: OrbitPolicy) -> OrbitPolicy:
+        cache_names = (
+            "_owars_minibatch_kernel_cache",
+            "_owars_rollout_kernel_cache",
+        )
+        stashed = {
+            name: model.__dict__.pop(name)
+            for name in cache_names
+            if name in model.__dict__
+        }
+        try:
+            return copy.deepcopy(model)
+        finally:
+            model.__dict__.update(stashed)
+
     def add_snapshot(
         self,
         label: str,
@@ -93,7 +109,7 @@ class OpponentPool:
         Elo). After insertion, the pool is trimmed to top-K by current Elo.
         Returns the snapshot's identity name (e.g. "frozen:0050").
         """
-        snap = copy.deepcopy(model).eval()
+        snap = self._copy_model_without_compile_caches(model).eval()
         for p in snap.parameters():
             p.requires_grad_(False)
         ckpt_path = Path(ckpt_path)

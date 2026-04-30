@@ -29,7 +29,7 @@ from typing import Any
 import torch
 
 from ..policies.features import EncodedObs, encode_raw_observations
-from ..policies.model import OrbitPolicy
+from ..policies.model import OrbitPolicy, PolicyOutput
 from ..policies.sampling import (
     ActionContext,
     sample_batch_actions_context,
@@ -41,6 +41,120 @@ from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
 from .rollout import Trajectory
 from .vec_env import VecEnv
+
+
+def _mark_cuda_graph_step(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+    if callable(mark):
+        mark()
+
+
+def _kernel_cache(model: torch.nn.Module) -> dict:
+    cache = model.__dict__.get("_owars_rollout_kernel_cache")
+    if cache is None:
+        cache = {}
+        model.__dict__["_owars_rollout_kernel_cache"] = cache
+    return cache
+
+
+class _RolloutForwardKernel(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, *, autocast_enabled: bool) -> None:
+        super().__init__()
+        self.model = model
+        self.autocast_enabled = bool(autocast_enabled)
+
+    def forward(
+        self,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+    ) -> PolicyOutput:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            return self.model(feats)
+
+
+def _get_rollout_kernel(
+    model: torch.nn.Module,
+    device: torch.device,
+    compile_mode: str | None,
+) -> torch.nn.Module:
+    mode = compile_mode if device.type == "cuda" else None
+    key = ("rollout", mode)
+    cache = _kernel_cache(model)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    kernel = _RolloutForwardKernel(model, autocast_enabled=device.type == "cuda")
+    if mode is not None:
+        kernel = torch.compile(
+            kernel,
+            dynamic=False,
+            fullgraph=True,
+            mode=mode,
+        )
+    cache[key] = kernel
+    return kernel
+
+
+def _pad_rows(
+    t: torch.Tensor,
+    rows: int,
+    *,
+    fill: int | float | bool = 0,
+) -> torch.Tensor:
+    current = t.shape[0]
+    if current >= rows:
+        return t
+    out = t.new_full((rows, *t.shape[1:]), fill)
+    out[:current] = t
+    return out
+
+
+def _pad_encoded_rows(feats: EncodedObs, rows: int) -> EncodedObs:
+    if feats.planet_feats.shape[0] >= rows:
+        return feats
+    return EncodedObs(
+        planet_feats=_pad_rows(feats.planet_feats, rows),
+        planet_mask=_pad_rows(feats.planet_mask, rows, fill=False),
+        planet_owned_mask=_pad_rows(feats.planet_owned_mask, rows, fill=False),
+        planet_ids=_pad_rows(feats.planet_ids, rows, fill=-1),
+        planet_garrison=_pad_rows(feats.planet_garrison, rows),
+        fleet_feats=_pad_rows(feats.fleet_feats, rows),
+        fleet_mask=_pad_rows(feats.fleet_mask, rows, fill=False),
+    )
+
+
+def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
+    if out.launch_logits.shape[0] == rows:
+        return out
+    return PolicyOutput(
+        launch_logits=out.launch_logits[:rows],
+        target_logits=out.target_logits[:rows],
+        fraction_alpha=out.fraction_alpha[:rows],
+        fraction_beta=out.fraction_beta[:rows],
+        value=out.value[:rows],
+        value_logits=out.value_logits[:rows],
+        planet_owned_mask=out.planet_owned_mask[:rows],
+        planet_mask=out.planet_mask[:rows],
+        planet_ids=out.planet_ids[:rows],
+    )
 
 
 def _empty_traj() -> Trajectory:
@@ -142,6 +256,8 @@ def rollout_episodes_batched(
     deterministic: bool = False,
     reward_cfg: RewardCfg | None = None,
     record_trajectories: bool = True,
+    compile_mode: str | None = None,
+    policy_graph_rows: int | None = None,
 ) -> list[Trajectory]:
     """Play `len(opponents_per_env)` episodes in parallel; one Trajectory per env.
 
@@ -235,6 +351,8 @@ def rollout_episodes_batched(
                 deterministic,
                 record_trajectories,
                 fast_policy_batch if use_fast_numpy_path else None,
+                compile_mode,
+                policy_graph_rows or (num_envs * num_players),
             )
 
         # 3. Per-snapshot inference. Learned snapshots expose `act_batch`;
@@ -284,6 +402,8 @@ def _step_learner_bucket(
     deterministic: bool,
     record_trajectories: bool,
     policy_batch: Any | None = None,
+    compile_mode: str | None = None,
+    graph_rows: int | None = None,
 ) -> None:
     """Encode + batch-forward the learner identity across (env, seat) pairs.
 
@@ -294,6 +414,8 @@ def _step_learner_bucket(
     raw_obs_list = [obs for _, _, obs in bucket]
     target_device = torch.device(device)
     record_on_cpu = record_trajectories and target_device.type == "cuda"
+    graph_enabled = target_device.type == "cuda" and compile_mode is not None
+    graph_rows = max(int(graph_rows or len(bucket)), len(bucket))
     action_contexts: list[ActionContext] | None = None
     if callable(policy_batch):
         rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
@@ -301,7 +423,12 @@ def _step_learner_bucket(
             cpu_stacked, action_contexts = policy_batch(
                 rows, device="cpu", pin_memory=False
             )
-            stacked = _encoded_to_device(cpu_stacked, target_device)
+            device_source = (
+                _pad_encoded_rows(cpu_stacked, graph_rows)
+                if graph_enabled
+                else cpu_stacked
+            )
+            stacked = _encoded_to_device(device_source, target_device)
         else:
             stacked, action_contexts = policy_batch(
                 rows,
@@ -317,26 +444,45 @@ def _step_learner_bucket(
             if record_on_cpu
             else None
         )
-        stacked = (
-            _encoded_to_device(cpu_stacked, target_device)
-            if cpu_stacked is not None
-            else encode_raw_observations(
+        if cpu_stacked is not None:
+            device_source = (
+                _pad_encoded_rows(cpu_stacked, graph_rows)
+                if graph_enabled
+                else cpu_stacked
+            )
+            stacked = _encoded_to_device(device_source, target_device)
+        else:
+            stacked = encode_raw_observations(
                 raw_obs_list,
                 device=device,
                 pin_memory=target_device.type == "cuda",
             )
+    if cpu_stacked is not None:
+        real_rows = cpu_stacked.planet_feats.shape[0]
+    else:
+        real_rows = len(bucket)
+        if stacked.planet_feats.shape[0] < real_rows:
+            raise RuntimeError("encoded rollout batch has fewer rows than bucket")
+    # CUDA rollout uses a fixed padded batch so Inductor can reuse one static
+    # graph even as envs finish and the real learner bucket shrinks.
+    graph_stacked = _pad_encoded_rows(stacked, graph_rows) if graph_enabled else stacked
+    kernel = _get_rollout_kernel(
+        model,
+        target_device,
+        compile_mode if graph_enabled else None,
+    )
+    with torch.no_grad():
+        _mark_cuda_graph_step(target_device)
+        out = kernel(
+            graph_stacked.planet_feats,
+            graph_stacked.planet_mask,
+            graph_stacked.planet_owned_mask,
+            graph_stacked.planet_ids,
+            graph_stacked.planet_garrison,
+            graph_stacked.fleet_feats,
+            graph_stacked.fleet_mask,
         )
-    # bf16 autocast on CUDA is what unlocks FA-2 dispatch in
-    # `SelfAttention.forward` — fp32 inputs make SDPA fall back to the
-    # mem-efficient kernel. Same regime as `ppo_update`.
-    autocast_enabled = torch.device(device).type == "cuda"
-    with (
-        torch.no_grad(),
-        torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
-        ),
-    ):
-        out = model(stacked)
+    out = _slice_policy_output(out, real_rows)
 
     if record_trajectories:
         if action_contexts is not None:

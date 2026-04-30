@@ -97,7 +97,7 @@ class OptimCfg:
     control_lr: float = 0.02
     weight_decay: float = 1e-4
     grad_clip: float = 0.5
-    minibatch_size: int = 2048
+    minibatch_size: int = 4096
     epochs_per_update: int = 4
 
 
@@ -218,6 +218,7 @@ class RunCfg:
     name: str = "default"
     seed: int = 0
     device: str = "cuda"
+    compile_mode: str = "reduce-overhead"
     # Small batched rollout forwards are slower with large CPU thread pools.
     # 0 leaves PyTorch's process default unchanged.
     torch_num_threads: int = 8

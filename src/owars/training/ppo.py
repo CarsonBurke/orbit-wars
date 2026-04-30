@@ -46,8 +46,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.distributions import Beta, kl_divergence
+import torch.nn.functional as F  # noqa: N812
 
 from ..policies.features import EncodedObs
 from ..policies.model import OrbitPolicy
@@ -65,6 +64,21 @@ def _slice_feats(batch: dict[str, torch.Tensor], mb) -> EncodedObs:
         fleet_feats=batch["fleet_feats"][mb],
         fleet_mask=batch["fleet_mask"][mb],
     )
+
+
+def _mark_cuda_graph_step(device: torch.device) -> None:
+    """Tell Inductor's CUDA graph runtime that a new replay step begins.
+
+    This mirrors parameter-golf's training loop: use `torch.compile` with a
+    CUDA-graph-friendly mode, then mark each static-shape minibatch call. It
+    avoids hand-written `torch.cuda.CUDAGraph` buffers around mutable optimizer
+    state while still letting Inductor replay eligible compiled regions.
+    """
+    if device.type != "cuda":
+        return
+    mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+    if callable(mark):
+        mark()
 
 
 def _fixed_minibatches(
@@ -173,6 +187,396 @@ def _conditional_action_entropy(
     )
 
 
+def _beta_log_normalizer(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    return torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
+
+
+def _beta_log_prob(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        (alpha - 1.0) * value.log()
+        + (beta - 1.0) * torch.log1p(-value)
+        - _beta_log_normalizer(alpha, beta)
+    )
+
+
+def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    log_norm = _beta_log_normalizer(alpha, beta)
+    total = alpha + beta
+    return (
+        log_norm
+        - (alpha - 1.0) * torch.digamma(alpha)
+        - (beta - 1.0) * torch.digamma(beta)
+        + (total - 2.0) * torch.digamma(total)
+    )
+
+
+def _beta_kl(
+    source_alpha: torch.Tensor,
+    source_beta: torch.Tensor,
+    target_alpha: torch.Tensor,
+    target_beta: torch.Tensor,
+) -> torch.Tensor:
+    source_total = source_alpha + source_beta
+    return (
+        _beta_log_normalizer(target_alpha, target_beta)
+        - _beta_log_normalizer(source_alpha, source_beta)
+        + (source_alpha - target_alpha) * torch.digamma(source_alpha)
+        + (source_beta - target_beta) * torch.digamma(source_beta)
+        + (target_alpha - source_alpha + target_beta - source_beta)
+        * torch.digamma(source_total)
+    )
+
+
+def _module_device(model: torch.nn.Module) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+class _PPOMinibatchKernel(torch.nn.Module):
+    """Fixed-shape PPO minibatch loss/metric kernel.
+
+    Slicing and optimizer state mutation remain in Python; all hot tensor
+    work between "minibatch tensors in" and "loss/metrics out" lives here so
+    `torch.compile(..., mode="reduce-overhead")` can specialize and CUDA-graph
+    replay the repeated minibatch body.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        value_coef: float,
+        target_entropy_coef: float,
+        fraction_entropy_coef: float,
+        pmpo_kl_coef: float,
+        pmpo_pos_to_neg_weight: float,
+        pmpo_reverse_kl: bool,
+        autocast_enabled: bool,
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.value_coef = float(value_coef)
+        self.target_entropy_coef = float(target_entropy_coef)
+        self.fraction_entropy_coef = float(fraction_entropy_coef)
+        self.pmpo_kl_coef = float(pmpo_kl_coef)
+        self.pmpo_pos_to_neg_weight = float(pmpo_pos_to_neg_weight)
+        self.pmpo_reverse_kl = bool(pmpo_reverse_kl)
+        self.autocast_enabled = bool(autocast_enabled)
+
+    def forward(
+        self,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        row_weight: torch.Tensor,
+        launch: torch.Tensor,
+        target_idx: torch.Tensor,
+        fraction: torch.Tensor,
+        old_log_prob: torch.Tensor,
+        advantage: torch.Tensor,
+        ret: torch.Tensor,
+        owned_mask: torch.Tensor,
+        old_launch_logits: torch.Tensor,
+        old_target_logits: torch.Tensor,
+        old_fraction_alpha: torch.Tensor,
+        old_fraction_beta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            out = self.model(feats)
+
+        launch_logits = out.launch_logits.float()
+        target_logits = _safe_target_logits(out.target_logits.float())
+        fraction_alpha = out.fraction_alpha.float()
+        fraction_beta = out.fraction_beta.float()
+        value_logits = out.value_logits.float()
+
+        owned_f = owned_mask.float()
+        p = target_logits.shape[1]
+        launch_f = launch.float().clamp(0.0, 1.0)
+        target = target_idx.clamp(0, p - 1)
+        launch_lp = -F.binary_cross_entropy_with_logits(
+            launch_logits, launch_f, reduction="none"
+        )
+        target_log_probs = F.log_softmax(target_logits, dim=-1)
+        target_dist_probs = target_log_probs.exp()
+        target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+        frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
+        chosen = launch_lp + launch_f * (target_lp + frac_lp)
+
+        adv_b = advantage.float().unsqueeze(-1).expand_as(chosen)
+        scaled_lp = chosen * adv_b.tanh().abs()
+        row_w = row_weight.to(device=owned_f.device, dtype=owned_f.dtype)
+        row_w_b = row_w.unsqueeze(-1)
+        owned_w = owned_f * row_w_b
+        pos_w = owned_w * (adv_b >= 0.0).to(owned_f.dtype)
+        neg_w = owned_w * (adv_b < 0.0).to(owned_f.dtype)
+
+        pos_loss = _weighted_mean(scaled_lp, pos_w)
+        neg_loss = _weighted_mean(scaled_lp, neg_w)
+        alpha = self.pmpo_pos_to_neg_weight
+        policy_loss = -alpha * pos_loss + (1.0 - alpha) * neg_loss
+
+        value_encoder = self.model.value_encoder
+        target_probs = value_encoder.target_probs(ret.float())
+        log_v_probs = F.log_softmax(value_logits, dim=-1)
+        value_ce = -(target_probs * log_v_probs).sum(dim=-1)
+        value_loss = _weighted_mean(value_ce, row_w)
+
+        beta_entropy = _beta_entropy(fraction_alpha, fraction_beta)
+        p_move_current = launch_logits.sigmoid()
+        planet_entropy = _conditional_action_entropy(
+            launch_logits, target_log_probs, beta_entropy
+        )
+        denom = owned_w.sum().clamp_min(1.0)
+        entropy = (planet_entropy * owned_w).sum() / denom
+        launch_entropy = (_bernoulli_entropy(launch_logits) * owned_w).sum() / denom
+        target_entropy_per_planet = -(
+            target_dist_probs
+            * target_log_probs.clamp_min(torch.finfo(target_log_probs.dtype).min)
+        ).sum(dim=-1)
+        target_entropy = ((p_move_current * target_entropy_per_planet) * owned_w).sum()
+        target_entropy = target_entropy / denom
+        fraction_entropy = ((p_move_current * beta_entropy) * owned_w).sum() / denom
+        move_prob = (p_move_current * owned_w).sum() / denom
+        target_confidence = (target_dist_probs.amax(dim=-1) * owned_w).sum() / denom
+        fraction_alpha_mean = (fraction_alpha * owned_w).sum() / denom
+        fraction_alpha_max = _weighted_max(fraction_alpha, owned_w)
+        fraction_beta_mean = (fraction_beta * owned_w).sum() / denom
+        fraction_beta_max = _weighted_max(fraction_beta, owned_w)
+        fraction_concentration = fraction_alpha + fraction_beta - 2.0
+        fraction_mode = (
+            (fraction_alpha - 1.0)
+            / fraction_concentration.clamp_min(torch.finfo(fraction_alpha.dtype).eps)
+        )
+        fraction_mode_mean = (fraction_mode * owned_w).sum() / denom
+        fraction_concentration_mean = (fraction_concentration * owned_w).sum() / denom
+        fraction_concentration_max = _weighted_max(fraction_concentration, owned_w)
+        entropy_bonus = (
+            self.target_entropy_coef * (launch_entropy + target_entropy)
+            + self.fraction_entropy_coef * fraction_entropy
+        )
+
+        pmpo_kl = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
+        pmpo_target_kl = torch.zeros_like(pmpo_kl)
+        pmpo_fraction_kl = torch.zeros_like(pmpo_kl)
+        if self.pmpo_kl_coef != 0.0:
+            old_target_logits_safe = _safe_target_logits(old_target_logits.float())
+            old_target_log_probs = F.log_softmax(old_target_logits_safe, dim=-1)
+            kl_min = torch.finfo(target_log_probs.dtype).min
+            log_p_new_safe = target_log_probs.clamp_min(kl_min)
+            log_p_old_safe = old_target_log_probs.clamp_min(kl_min)
+            old_launch_logits_f = old_launch_logits.float()
+            old_alpha = old_fraction_alpha.float()
+            old_beta = old_fraction_beta.float()
+
+            if self.pmpo_reverse_kl:
+                launch_kl = _bernoulli_kl(old_launch_logits_f, launch_logits)
+                launch_weight = old_launch_logits_f.sigmoid()
+                target_probs_old = old_target_log_probs.exp()
+                target_kl = (
+                    target_probs_old * (log_p_old_safe - log_p_new_safe)
+                ).sum(dim=-1)
+                frac_kl = _beta_kl(old_alpha, old_beta, fraction_alpha, fraction_beta)
+            else:
+                launch_kl = _bernoulli_kl(launch_logits, old_launch_logits_f)
+                launch_weight = launch_logits.sigmoid()
+                target_kl = (
+                    target_dist_probs * (log_p_new_safe - log_p_old_safe)
+                ).sum(dim=-1)
+                frac_kl = _beta_kl(fraction_alpha, fraction_beta, old_alpha, old_beta)
+            planet_kl = launch_kl + launch_weight * (target_kl + frac_kl)
+            pmpo_kl = ((planet_kl * owned_w).sum() / denom).clamp_min(0.0)
+            pmpo_target_kl = (
+                ((launch_weight * target_kl) * owned_w).sum() / denom
+            ).clamp_min(0.0)
+            pmpo_fraction_kl = (
+                ((launch_weight * frac_kl) * owned_w).sum() / denom
+            ).clamp_min(0.0)
+
+        loss = (
+            policy_loss
+            + self.value_coef * value_loss
+            - entropy_bonus
+            + self.pmpo_kl_coef * pmpo_kl
+        )
+
+        kl = ((old_log_prob.float() - chosen) * owned_w).sum() / denom
+        pos_count = pos_w.sum()
+        total_owned = owned_w.sum().clamp_min(1.0)
+        pos_frac = pos_count / total_owned
+        metrics = torch.stack(
+            [
+                policy_loss.detach(),
+                value_loss.detach(),
+                entropy.detach(),
+                kl.detach(),
+                pmpo_kl.detach(),
+                pos_frac.detach(),
+                target_entropy.detach(),
+                fraction_entropy.detach(),
+                move_prob.detach(),
+                target_confidence.detach(),
+                fraction_alpha_mean.detach(),
+                fraction_alpha_max.detach(),
+                fraction_beta_mean.detach(),
+                fraction_beta_max.detach(),
+                fraction_mode_mean.detach(),
+                fraction_concentration_mean.detach(),
+                fraction_concentration_max.detach(),
+                pmpo_target_kl.detach(),
+                pmpo_fraction_kl.detach(),
+            ]
+        ).float()
+        return loss, metrics
+
+
+class _ValueOnlyMinibatchKernel(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, *, autocast_enabled: bool) -> None:
+        super().__init__()
+        self.model = model
+        self.autocast_enabled = bool(autocast_enabled)
+
+    def forward(
+        self,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        row_weight: torch.Tensor,
+        ret: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            out = self.model(feats)
+        value_logits = out.value_logits.float()
+        target_probs = self.model.value_encoder.target_probs(ret.float())
+        log_probs = F.log_softmax(value_logits, dim=-1)
+        value_ce = -(target_probs * log_probs).sum(dim=-1)
+        value_loss = _weighted_mean(value_ce, row_weight.to(value_ce.device))
+        return value_loss, value_loss.detach().float()
+
+
+def _kernel_cache(model: torch.nn.Module) -> dict:
+    cache = model.__dict__.get("_owars_minibatch_kernel_cache")
+    if cache is None:
+        cache = {}
+        model.__dict__["_owars_minibatch_kernel_cache"] = cache
+    return cache
+
+
+def _compile_kernel(
+    kernel: torch.nn.Module,
+    *,
+    device: torch.device,
+    compile_mode: str | None,
+) -> torch.nn.Module:
+    if device.type != "cuda" or compile_mode is None:
+        return kernel
+    return torch.compile(
+        kernel,
+        dynamic=False,
+        fullgraph=True,
+        mode=compile_mode,
+    )
+
+
+def _get_ppo_kernel(
+    model: torch.nn.Module,
+    *,
+    value_coef: float,
+    target_entropy_coef: float,
+    fraction_entropy_coef: float,
+    pmpo_kl_coef: float,
+    pmpo_pos_to_neg_weight: float,
+    pmpo_reverse_kl: bool,
+    compile_mode: str | None,
+) -> torch.nn.Module:
+    device = _module_device(model)
+    mode = compile_mode if device.type == "cuda" else None
+    key = (
+        "ppo",
+        mode,
+        float(value_coef),
+        float(target_entropy_coef),
+        float(fraction_entropy_coef),
+        float(pmpo_kl_coef),
+        float(pmpo_pos_to_neg_weight),
+        bool(pmpo_reverse_kl),
+    )
+    cache = _kernel_cache(model)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    kernel = _PPOMinibatchKernel(
+        model,
+        value_coef=value_coef,
+        target_entropy_coef=target_entropy_coef,
+        fraction_entropy_coef=fraction_entropy_coef,
+        pmpo_kl_coef=pmpo_kl_coef,
+        pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
+        pmpo_reverse_kl=pmpo_reverse_kl,
+        autocast_enabled=device.type == "cuda",
+    )
+    kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
+    cache[key] = kernel
+    return kernel
+
+
+def _get_value_only_kernel(
+    model: torch.nn.Module,
+    *,
+    compile_mode: str | None,
+) -> torch.nn.Module:
+    device = _module_device(model)
+    mode = compile_mode if device.type == "cuda" else None
+    key = ("value_only", mode)
+    cache = _kernel_cache(model)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    kernel = _ValueOnlyMinibatchKernel(
+        model,
+        autocast_enabled=device.type == "cuda",
+    )
+    kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
+    cache[key] = kernel
+    return kernel
+
+
 @dataclass
 class PPOLog:
     policy_loss: float
@@ -210,11 +614,11 @@ def compute_gae(
     `values` (or use `compute_mc_return` directly) — the critic has
     nothing to bootstrap from yet.
     """
-    T = len(rewards)
-    advs = np.zeros(T, dtype=np.float32)
+    horizon = len(rewards)
+    advs = np.zeros(horizon, dtype=np.float32)
     gae = 0.0
-    for t in reversed(range(T)):
-        next_v = values[t + 1] if t + 1 < T else 0.0
+    for t in reversed(range(horizon)):
+        next_v = values[t + 1] if t + 1 < horizon else 0.0
         delta = rewards[t] + gamma * next_v - values[t]
         gae = delta + gamma * lam * gae
         advs[t] = gae
@@ -229,10 +633,10 @@ def compute_mc_return(rewards: np.ndarray, gamma: float = 1.0) -> np.ndarray:
     in this trajectory has target = the eventual game outcome", which is
     exactly the value-pretraining target.
     """
-    T = len(rewards)
-    out = np.zeros(T, dtype=np.float32)
+    horizon = len(rewards)
+    out = np.zeros(horizon, dtype=np.float32)
     running = 0.0
-    for t in reversed(range(T)):
+    for t in reversed(range(horizon)):
         running = rewards[t] + gamma * running
         out[t] = running
     return out
@@ -265,6 +669,7 @@ def ppo_update(
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
+    compile_mode: str | None = None,
 ) -> PPOLog:
     """Run `epochs × ⌈N/B⌉` minibatch updates on `batch`.
 
@@ -293,189 +698,39 @@ def ppo_update(
     metric_sum: torch.Tensor | None = None
     n_steps = 0
 
-    # `model` may be the torch.compile wrapper around the live OrbitPolicy.
-    # `value_encoder` lives on the underlying module; reach through `_orig_mod`
-    # if compiled, otherwise use the model directly.
-    orig_model = getattr(model, "_orig_mod", model)
-    value_encoder = orig_model.value_encoder
-
-    # bf16 autocast unlocks the SDPA Flash-Attention 2 kernel (head_dim must
-    # also be FA-eligible — see model config). bf16 has fp32-equivalent range
-    # so no GradScaler is needed; AdamW keeps fp32 master weights via
-    # PyTorch's autocast handling. Outside cuda we stay in fp32.
-    #
-    # Autocast wraps ONLY the model forward — log_softmax / log_prob / KL /
-    # value loss all run in fp32 after the cast, mirroring pg's
-    # `F.cross_entropy(logits.float(), …)` pattern (sota_train_gpt.py:163).
-    # bf16's 7 mantissa bits put a noise floor on log-prob differences
-    # (~0.01 nats per update is below bf16 precision); doing distribution
-    # math in bf16 amplifies that noise into the regularizers.
-    autocast_enabled = (
-        next(model.parameters()).is_cuda
-        if any(True for _ in model.parameters())
-        else False
+    kernel = _get_ppo_kernel(
+        model,
+        value_coef=value_coef,
+        target_entropy_coef=target_entropy_coef,
+        fraction_entropy_coef=fraction_entropy_coef,
+        pmpo_kl_coef=pmpo_kl_coef,
+        pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
+        pmpo_reverse_kl=pmpo_reverse_kl,
+        compile_mode=compile_mode,
     )
     for _ in range(epochs):
         for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
-
-            with torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
-            ):
-                out = model(_slice_feats(batch, mb))
-
-            launch_logits = out.launch_logits.float()
-            target_logits = _safe_target_logits(out.target_logits.float())
-            fraction_alpha = out.fraction_alpha.float()
-            fraction_beta = out.fraction_beta.float()
-            value_logits = out.value_logits.float()
-
-            owned_f = batch["owned_mask"][mb].float()
-            p = target_logits.shape[1]
-            launch = batch["launch"][mb].float().clamp(0.0, 1.0)
-            target = batch["target_idx"][mb].clamp(0, p - 1)
-            launch_lp = -F.binary_cross_entropy_with_logits(
-                launch_logits, launch, reduction="none"
-            )
-            target_log_probs = F.log_softmax(target_logits, dim=-1)
-            target_dist_probs = target_log_probs.exp()
-            target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-
-            # Beta log-prob at the recorded sample. Target and fraction are
-            # conditional on launch, mirroring what `sample_with_record`
-            # stored in `old_log_prob`.
-            # `fraction` is already clamped into (eps, 1-eps) at sample time,
-            # so `Beta.log_prob` is finite for all (α, β) ≥ 1.
-            fraction = batch["fraction"][mb].float()
-            new_beta = Beta(fraction_alpha, fraction_beta)
-            frac_lp = new_beta.log_prob(fraction)
-            chosen = launch_lp + launch * (target_lp + frac_lp)
-
-            old_log_prob = batch["old_log_prob"][mb].float()  # [B, P]
-            advantage = batch["advantage"][mb].float()         # [B]
-            adv_b = advantage.unsqueeze(-1).expand_as(chosen)  # [B, P]
-
-            # PMPO policy loss (dreamer4.py:4265-4296). Replaces the clipped
-            # PPO surrogate. Magnitude shaping `tanh(adv).abs()` ∈ [0, 1)
-            # bounds the per-step contribution regardless of advantage scale,
-            # which is why dreamer4 deliberately *does not* z-score advantages
-            # under PMPO.
-            scaled_lp = chosen * adv_b.tanh().abs()
-            row_w = row_weight.to(device=owned_f.device, dtype=owned_f.dtype)
-            row_w_b = row_w.unsqueeze(-1)
-            owned_w = owned_f * row_w_b
-            pos_w = owned_w * (adv_b >= 0.0).to(owned_f.dtype)
-            neg_w = owned_w * (adv_b < 0.0).to(owned_f.dtype)
-
-            pos_loss = _weighted_mean(scaled_lp, pos_w)
-            neg_loss = _weighted_mean(scaled_lp, neg_w)
-            α = pmpo_pos_to_neg_weight
-            policy_loss = -α * pos_loss + (1.0 - α) * neg_loss
-
-            # ---------------- distributional value loss ----------------
-            ret = batch["return"][mb].float()
-            target_probs = value_encoder.target_probs(ret)            # [B, num_bins]
-            log_v_probs = F.log_softmax(value_logits, dim=-1)         # [B, num_bins]
-            value_ce = -(target_probs * log_v_probs).sum(dim=-1)
-            value_loss = _weighted_mean(value_ce, row_w)
-
-            # ---------------- entropy bonus (Bernoulli + categorical + Beta) -------
-            beta_entropy = new_beta.entropy()
-            p_move_current = launch_logits.sigmoid()
-            planet_entropy = _conditional_action_entropy(
-                launch_logits, target_log_probs, beta_entropy
-            )
-            denom = owned_w.sum().clamp_min(1.0)
-            entropy = (planet_entropy * owned_w).sum() / denom
-            launch_entropy = (_bernoulli_entropy(launch_logits) * owned_w).sum() / denom
-            target_entropy_per_planet = -(
-                target_dist_probs
-                * target_log_probs.clamp_min(torch.finfo(target_log_probs.dtype).min)
-            ).sum(dim=-1)
-            target_entropy = (
-                (p_move_current * target_entropy_per_planet) * owned_w
-            ).sum() / denom
-            fraction_entropy = ((p_move_current * beta_entropy) * owned_w).sum() / denom
-            move_prob = (p_move_current * owned_w).sum() / denom
-            target_confidence = (target_dist_probs.amax(dim=-1) * owned_w).sum() / denom
-            fraction_alpha_mean = (fraction_alpha * owned_w).sum() / denom
-            fraction_alpha_max = _weighted_max(fraction_alpha, owned_w)
-            fraction_beta_mean = (fraction_beta * owned_w).sum() / denom
-            fraction_beta_max = _weighted_max(fraction_beta, owned_w)
-            fraction_concentration = fraction_alpha + fraction_beta - 2.0
-            fraction_mode = (
-                (fraction_alpha - 1.0)
-                / fraction_concentration.clamp_min(torch.finfo(fraction_alpha.dtype).eps)
-            )
-            fraction_mode_mean = (fraction_mode * owned_w).sum() / denom
-            fraction_concentration_mean = (
-                fraction_concentration * owned_w
-            ).sum() / denom
-            fraction_concentration_max = _weighted_max(fraction_concentration, owned_w)
-            entropy_bonus = (
-                target_entropy_coef * (launch_entropy + target_entropy)
-                + fraction_entropy_coef * fraction_entropy
-            )
-
-            # ---------------- PMPO analytical KL ----------------------
-            pmpo_kl = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
-            pmpo_target_kl = torch.zeros_like(pmpo_kl)
-            pmpo_fraction_kl = torch.zeros_like(pmpo_kl)
-            if pmpo_kl_coef != 0.0:
-                old_launch_logits = batch["old_launch_logits"][mb].float()
-                old_target_logits = _safe_target_logits(
-                    batch["old_target_logits"][mb].float()
-                )
-                old_target_log_probs = F.log_softmax(old_target_logits, dim=-1)
-                # Self-target slots have `target_logits = -inf` (`model.py`
-                # `_self_target_mask`), so `log_softmax` yields `-inf` there.
-                # `(-inf) − (-inf) = NaN`; clamp log-probs to dtype-min before
-                # the subtraction. At masked slots the corresponding `p_old`
-                # (or `p_new`) is 0 so the contribution is 0 by construction.
-                kl_min = torch.finfo(target_log_probs.dtype).min
-                log_p_new_safe = target_log_probs.clamp_min(kl_min)
-                log_p_old_safe = old_target_log_probs.clamp_min(kl_min)
-
-                old_alpha = batch["old_fraction_alpha"][mb].float()
-                old_beta = batch["old_fraction_beta"][mb].float()
-                old_beta_dist = Beta(old_alpha, old_beta)
-
-                if pmpo_reverse_kl:
-                    # KL(old ‖ new) — dreamer4 default; mass-covering w.r.t.
-                    # the rollout policy.
-                    launch_kl = _bernoulli_kl(old_launch_logits, launch_logits)
-                    launch_weight = old_launch_logits.sigmoid()
-                    target_probs_old = old_target_log_probs.exp()
-                    target_kl = (
-                        target_probs_old * (log_p_old_safe - log_p_new_safe)
-                    ).sum(dim=-1)  # [B, P]
-                    frac_kl = kl_divergence(old_beta_dist, new_beta)
-                else:
-                    # KL(new ‖ old) — forward direction; mode-seeking.
-                    launch_kl = _bernoulli_kl(launch_logits, old_launch_logits)
-                    launch_weight = launch_logits.sigmoid()
-                    target_kl = (
-                        target_dist_probs * (log_p_new_safe - log_p_old_safe)
-                    ).sum(dim=-1)
-                    frac_kl = kl_divergence(new_beta, old_beta_dist)
-                # Target and fraction distributions are conditional on launch.
-                planet_kl = launch_kl + launch_weight * (target_kl + frac_kl)
-                # KL is non-negative analytically; bf16-forward → fp32-cast
-                # leaves last-bit noise that can dip slightly below zero
-                # when new ≈ old (first PPO minibatch). Clamp to keep the
-                # logged scalar honest and avoid surprising consumers.
-                pmpo_kl = ((planet_kl * owned_w).sum() / denom).clamp_min(0.0)
-                pmpo_target_kl = (
-                    ((launch_weight * target_kl) * owned_w).sum() / denom
-                ).clamp_min(0.0)
-                pmpo_fraction_kl = (
-                    ((launch_weight * frac_kl) * owned_w).sum() / denom
-                ).clamp_min(0.0)
-
-            loss = (
-                policy_loss
-                + value_coef * value_loss
-                - entropy_bonus
-                + pmpo_kl_coef * pmpo_kl
+            _mark_cuda_graph_step(device)
+            loss, metrics = kernel(
+                batch["planet_feats"][mb],
+                batch["planet_mask"][mb],
+                batch["planet_owned_mask"][mb],
+                batch["planet_ids"][mb],
+                batch["planet_garrison"][mb],
+                batch["fleet_feats"][mb],
+                batch["fleet_mask"][mb],
+                row_weight,
+                batch["launch"][mb],
+                batch["target_idx"][mb],
+                batch["fraction"][mb],
+                batch["old_log_prob"][mb],
+                batch["advantage"][mb],
+                batch["return"][mb],
+                batch["owned_mask"][mb],
+                batch["old_launch_logits"][mb],
+                batch["old_target_logits"][mb],
+                batch["old_fraction_alpha"][mb],
+                batch["old_fraction_beta"][mb],
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -483,49 +738,17 @@ def ppo_update(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
-            with torch.no_grad():
-                # Importance-ratio diagnostic. Even though PMPO doesn't use it
-                # for the loss, watching `approx_kl` is the cleanest proxy for
-                # per-update policy drift — an order-of-magnitude jump here is
-                # exactly the cold-start signal we want to catch.
-                kl = ((old_log_prob - chosen) * owned_w).sum() / denom
-                pos_count = pos_w.sum()
-                total_owned = owned_w.sum().clamp_min(1.0)
-                pos_frac = pos_count / total_owned
-
-            metrics = torch.stack(
-                [
-                    policy_loss.detach(),
-                    value_loss.detach(),
-                    entropy.detach(),
-                    kl.detach(),
-                    pmpo_kl.detach(),
-                    pos_frac.detach(),
-                    target_entropy.detach(),
-                    fraction_entropy.detach(),
-                    move_prob.detach(),
-                    target_confidence.detach(),
-                    fraction_alpha_mean.detach(),
-                    fraction_alpha_max.detach(),
-                    fraction_beta_mean.detach(),
-                    fraction_beta_max.detach(),
-                    fraction_mode_mean.detach(),
-                    fraction_concentration_mean.detach(),
-                    fraction_concentration_max.detach(),
-                    pmpo_target_kl.detach(),
-                    pmpo_fraction_kl.detach(),
-                ]
-            ).float()
             if metric_sum is None:
                 metric_sum = torch.zeros_like(metrics)
             metric_sum += metrics
             n_steps += 1
 
     n_steps = max(1, n_steps)
-    if metric_sum is None:
-        logs = [0.0] * 19
-    else:
-        logs = (metric_sum / n_steps).detach().cpu().tolist()
+    logs = (
+        [0.0] * 19
+        if metric_sum is None
+        else (metric_sum / n_steps).detach().cpu().tolist()
+    )
     return PPOLog(
         policy_loss=float(logs[0]),
         value_loss=float(logs[1]),
@@ -557,6 +780,7 @@ def value_only_update(
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
+    compile_mode: str | None = None,
 ) -> float:
     """Critic-only distributional CE update for the value-pretraining phase.
 
@@ -572,27 +796,21 @@ def value_only_update(
     device = batch["planet_feats"].device
     total: torch.Tensor | None = None
     n_steps = 0
-
-    orig_model = getattr(model, "_orig_mod", model)
-    value_encoder = orig_model.value_encoder
-
-    autocast_enabled = (
-        next(model.parameters()).is_cuda
-        if any(True for _ in model.parameters())
-        else False
-    )
+    kernel = _get_value_only_kernel(model, compile_mode=compile_mode)
     for _ in range(epochs):
         for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
-            with torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
-            ):
-                out = model(_slice_feats(batch, mb))
-            value_logits = out.value_logits.float()
-            ret = batch["return"][mb].float()
-            target_probs = value_encoder.target_probs(ret)
-            log_probs = F.log_softmax(value_logits, dim=-1)
-            value_ce = -(target_probs * log_probs).sum(dim=-1)
-            value_loss = _weighted_mean(value_ce, row_weight.to(value_ce.device))
+            _mark_cuda_graph_step(device)
+            value_loss, metric = kernel(
+                batch["planet_feats"][mb],
+                batch["planet_mask"][mb],
+                batch["planet_owned_mask"][mb],
+                batch["planet_ids"][mb],
+                batch["planet_garrison"][mb],
+                batch["fleet_feats"][mb],
+                batch["fleet_mask"][mb],
+                row_weight,
+                batch["return"][mb],
+            )
 
             optimizer.zero_grad(set_to_none=True)
             value_loss.backward()
@@ -600,8 +818,8 @@ def value_only_update(
             optimizer.step()
 
             if total is None:
-                total = value_loss.detach().new_zeros(())
-            total += value_loss.detach()
+                total = metric.new_zeros(())
+            total += metric
             n_steps += 1
 
     if total is None:

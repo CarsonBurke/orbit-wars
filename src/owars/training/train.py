@@ -209,6 +209,10 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
     return OrbitPolicy(pcfg)
 
 
+def _compile_mode_for_model(model: OrbitPolicy, cfg: RunConfig) -> str | None:
+    return cfg.run.compile_mode or None
+
+
 def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
     """Walk every (traj, step) once and emit stacked EncodedObs tensors.
 
@@ -367,6 +371,8 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                 device=str(device),
                 deterministic=False,
                 reward_cfg=cfg.reward,
+                compile_mode=_compile_mode_for_model(model, cfg),
+                policy_graph_rows=cfg.rollout.num_envs,
             ))
         batch = {k: v.to(device) for k, v in _pretrain_value_batch(trajs).items()}
         loss = value_only_update(
@@ -374,6 +380,7 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
             epochs=1,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
+            compile_mode=_compile_mode_for_model(model, cfg),
         )
         rets = batch["return"].cpu().numpy()
         # Explained variance: 1 - Var(target - pred)/Var(target). Tracked
@@ -452,21 +459,13 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError("training requires CUDA")
     device = torch.device("cuda")
-    # parameter-golf `sota_train_gpt.py:465` pins SDPA to flash-only. We
-    # *do not* — the nested-jagged SDPA dispatcher (`torch/nested/_internal/
-    # sdpa.py`) only has flash and math jagged kernels; mem_efficient and
-    # cudnn aren't reachable through the jagged path at all, and flash's
-    # eligibility heuristic rejects small-batch rollouts → math is the only
-    # fallback. Disabling math caused "No viable backend" during rollout.
-    # Leaving the default backends in place: jagged forwards consistently
-    # pick flash when it's eligible and math otherwise.
     model = _build_model(cfg).to(device)
     # parameter-golf fp32-master pattern: cast everything to bf16, then
     # restore fp32 for the params that actually need precision (Linear
     # weights, biases, control tensors, summary tokens). This is the
     # explicit equivalent of relying on autocast's implicit weight
-    # casting — but with a deterministic dtype boundary that doesn't
-    # fight `torch.compile` or nested-jagged subclass tracking.
+    # casting — but with a deterministic dtype boundary that doesn't fight
+    # `torch.compile` tracing.
     if device.type == "cuda":
         model.bfloat16()
         restore_fp32_params(model)
@@ -567,12 +566,9 @@ def _ppo_loop(
     init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
     pool.add_snapshot("init", model, init_ckpt)
 
-    # Compile only the PPO-update model forward/backward path. The summary
-    # tokens are stored flat so AOTAutograd's broadcast reductions match the
-    # parameter shapes at larger PPO batch sizes.
-    train_model: OrbitPolicy = model
-    if device.type == "cuda":
-        train_model = torch.compile(model, dynamic=False, fullgraph=True)  # type: ignore[assignment]
+    # `ppo_update` owns minibatch-level compile/capture. Keeping compilation
+    # there lets Inductor see the policy forward, PPO loss, metrics, and
+    # compiled backward as one fixed-shape training kernel.
 
     # One rendered game per update lands here (env 0 is the recording
     # worker; see VecEnv(replay_env_idx=0) above). Pretrain disabled
@@ -603,6 +599,7 @@ def _ppo_loop(
             learner_seat=learner_seats,
             device=str(device),
             reward_cfg=cfg.reward,
+            compile_mode=_compile_mode_for_model(model, cfg),
         )
 
         if vec.last_replay_html is not None:
@@ -628,7 +625,7 @@ def _ppo_loop(
         batch = {k: v.to(device) for k, v in batch.items()}
 
         log = ppo_update(
-            train_model,
+            model,
             optimizer,
             batch,
             value_coef=cfg.ppo.value_coef,
@@ -640,6 +637,7 @@ def _ppo_loop(
             epochs=cfg.optim.epochs_per_update,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
+            compile_mode=_compile_mode_for_model(model, cfg),
         )
 
         margins = [float(t.final_score) for t in trajs]

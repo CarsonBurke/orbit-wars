@@ -14,6 +14,7 @@ run:
   name: ppo_4p
   seed: 0
   device: cuda
+  compile_mode: reduce-overhead
   total_updates: 300
 
 game:
@@ -35,7 +36,7 @@ optim:
   lr: 2.0e-4
   weight_decay: 1.0e-4
   grad_clip: 0.5
-  minibatch_size: 2048
+  minibatch_size: 4096
   epochs_per_update: 4
 
 ppo:
