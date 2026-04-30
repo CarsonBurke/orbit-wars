@@ -39,6 +39,9 @@ wandb/
 mlruns/
 lightning_logs/
 
+# Rust build artifacts
+target/
+
 # Replays + episode logs
 replays/
 episode_logs/

@@ -1,0 +1,16 @@
+[package]
+name = "owars_env"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "owars_env"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench_env"
+path = "src/bin/bench_env.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
