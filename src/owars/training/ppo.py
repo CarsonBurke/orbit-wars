@@ -246,7 +246,7 @@ def length_adaptive_lambda(episode_length: int, alpha: float) -> float:
     knob matters more in regimes with high episode-length variance.
     """
     if alpha <= 0.0:
-        return 0.95
+        raise ValueError("lambda_policy_alpha must be positive for VAPO GAE")
     denom = max(1.0, alpha * float(episode_length))
     return max(0.0, min(0.999, 1.0 - 1.0 / denom))
 

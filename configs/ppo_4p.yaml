@@ -41,8 +41,7 @@ optim:
 ppo:
   gamma: 1.0
   lambda_critic: 1.0
-  lambda_policy: 0.95
-  lambda_policy_alpha: 0.0
+  lambda_policy_alpha: 0.05  # VAPO length-adaptive GAE: λ = 1 - 1/(α * episode_length)
   pmpo_pos_to_neg_weight: 0.5
   pmpo_reverse_kl: true
   pmpo_kl_coef: 0.3

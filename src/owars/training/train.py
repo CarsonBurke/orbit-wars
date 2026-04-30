@@ -243,7 +243,6 @@ def _stack_trajectories(
     trajs: list[Trajectory],
     gamma: float,
     lambda_critic: float,
-    lambda_policy: float,
     lambda_policy_alpha: float,
 ) -> dict[str, torch.Tensor]:
     """Flatten per-step records into one batch with **decoupled GAE**.
@@ -290,10 +289,7 @@ def _stack_trajectories(
         horizon = len(rewards)
         values = all_values[offset : offset + horizon]
         offset += horizon
-        if lambda_policy_alpha > 0.0:
-            lam_p = length_adaptive_lambda(horizon, lambda_policy_alpha)
-        else:
-            lam_p = lambda_policy
+        lam_p = length_adaptive_lambda(horizon, lambda_policy_alpha)
         adv_p, _ = compute_gae(rewards, values, gamma, lam_p)
         _, ret_c = compute_gae(rewards, values, gamma, lambda_critic)
         advs_all.append(adv_p)
@@ -627,7 +623,6 @@ def _ppo_loop(
             trajs,
             gamma=cfg.ppo.gamma,
             lambda_critic=cfg.ppo.lambda_critic,
-            lambda_policy=cfg.ppo.lambda_policy,
             lambda_policy_alpha=cfg.ppo.lambda_policy_alpha,
         )
         batch = {k: v.to(device) for k, v in batch.items()}

@@ -22,6 +22,7 @@ from owars.policies.sampling import sample_batch_with_records
 from owars.training.ppo import (
     _conditional_action_entropy,
     _fixed_minibatches,
+    length_adaptive_lambda,
     ppo_update,
     value_only_update,
 )
@@ -103,6 +104,12 @@ def _toy_batch(
         "old_fraction_alpha": old_fraction_alpha,
         "old_fraction_beta": old_fraction_beta,
     }
+
+
+def test_vapo_length_adaptive_lambda_formula():
+    assert math.isclose(length_adaptive_lambda(100, 0.05), 0.8)
+    assert math.isclose(length_adaptive_lambda(200, 0.05), 0.9)
+    assert math.isclose(length_adaptive_lambda(500, 0.05), 0.96)
 
 
 def test_ppo_update_runs_and_returns_finite_metrics():

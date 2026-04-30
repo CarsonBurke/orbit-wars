@@ -9,8 +9,9 @@
 #     `clip_eps` knob; trust region is the analytical reverse-KL penalty.
 #   - γ = 1.0 (finite-horizon, terminal-only ±1 reward — no discounting)
 #   - λ_critic = 1.0 (Monte-Carlo target, unbiased)
-#   - λ_policy = 0.95 (variance-reduced advantage; raw, not z-scored —
-#     PMPO's tanh|adv| shaping bounds magnitude on its own)
+#   - λ_policy = 1 - 1 / (0.05 * episode_length) for the actor advantage
+#     (VAPO length-adaptive GAE; raw, not z-scored — PMPO's tanh|adv|
+#     shaping bounds magnitude on its own)
 #   - Distributional value head (HL-Gauss CE on [-2, 2] / 51 bins), unclipped.
 
 run:
@@ -63,8 +64,7 @@ optim:
 ppo:
   gamma: 1.0
   lambda_critic: 1.0
-  lambda_policy: 0.95
-  lambda_policy_alpha: 0.0
+  lambda_policy_alpha: 0.05  # VAPO length-adaptive GAE: λ = 1 - 1/(α * episode_length)
   pmpo_pos_to_neg_weight: 0.5   # dreamer4 default — equal weight pos/neg advantage in the PMPO loss
   pmpo_reverse_kl: true         # dreamer4 default — KL(old ‖ new). false ⇒ KL(new ‖ old).
   pmpo_kl_coef: 0.3             # analytical reverse-KL penalty weight (dreamer4 `dreamer4.py:3083`)

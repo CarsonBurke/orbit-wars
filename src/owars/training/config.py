@@ -112,14 +112,12 @@ class PPOCfg:
 
     `lambda_critic = 1.0` makes the value target a Monte-Carlo return
     (unbiased; the cold-start regime where bootstrapping hurts most). The
-    actor advantage uses `lambda_policy` for variance reduction. Setting
-    `lambda_policy_alpha > 0` switches the actor to length-adaptive
+    actor advantage always uses VAPO length-adaptive GAE:
     `λ = 1 − 1/(α·l)` (VAPO §4.2)."""
 
     gamma: float = 1.0
     lambda_critic: float = 1.0
-    lambda_policy: float = 0.95
-    lambda_policy_alpha: float = 0.0   # 0 ⇒ use fixed `lambda_policy`
+    lambda_policy_alpha: float = 0.05
     # PMPO surrogate replaces the clipped PPO surrogate (dreamer4
     # `dreamer4.py:4265-4296`). `tanh(adv).abs()` magnitude shaping plus a
     # pos/neg-advantage split with weight α gives a softer trust region
@@ -250,6 +248,8 @@ class RunConfig:
                 if not hasattr(target, k):
                     raise KeyError(f"unknown {section}.{k}")
                 setattr(target, k, v)
+        if cfg.ppo.lambda_policy_alpha <= 0.0:
+            raise ValueError("ppo.lambda_policy_alpha must be positive")
         return cfg
 
 
