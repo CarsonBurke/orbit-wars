@@ -85,7 +85,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 
 from .config import OrbitPolicyConfig
 from .features import EncodedObs
@@ -106,7 +106,6 @@ class SquaredReLU(nn.Module):
     on bounded-input regimes (RMSNorm + QK-norm + zero-init proj) is small
     and ReLU² has the cleaner "feature on/off" interpretation.
 
-    NJT-safe: `relu` has a nested-jagged kernel, unlike `leaky_relu`.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -120,7 +119,7 @@ class CastedLinear(nn.Linear):
     The store-master / cast-on-forward pattern is the same precision regime
     you'd get from `torch.autocast(bf16)` over a vanilla `nn.Linear`, but
     explicit: the dtype boundary is in this method, no autocast cache,
-    no implicit interaction with `torch.compile` or nested-jagged tracing.
+    no implicit interaction with `torch.compile` tracing.
     Combined with `model.bfloat16()` + `restore_fp32_params(model)` (which
     walks the module tree and `.float()`-s every `CastedLinear` plus all
     `ndim<2` params and named control tensors), this gives:
@@ -151,6 +150,7 @@ _FP32_NAME_SUBSTRINGS: tuple[str, ...] = (
     "target_q_gain",
     "actor_token",
     "critic_token",
+    "fleet_latents",
 )
 
 
@@ -177,8 +177,7 @@ def restore_fp32_params(model: nn.Module) -> None:
             param.data = param.data.float()
 
 class SelfAttention(nn.Module):
-    """Multi-head self-attention with QK-norm + per-head q_gain on a
-    nested-jagged input — strict-flash dispatch.
+    """Multi-head self-attention with QK-norm + per-head q_gain.
 
     parameter-golf pattern (`sota_train_gpt.py:CausalSelfAttention`):
       1. Project x → Q, K, V.
@@ -187,18 +186,8 @@ class SelfAttention(nn.Module):
          drift as the QKV projections move under Muon (or any optimizer).
       3. Multiply Q by per-head learnable `q_gain` (init=5). This is the
          *attention temperature*: high gain → sharp softmax, low → flat.
-      4. SDPA on a `torch.nested` jagged tensor under `sdpa_kernel(
-         [SDPBackend.FLASH_ATTENTION])` — packed valid tokens, no
-         attn_mask, no padding wasted in the kernel. Real FA-2.
+      4. SDPA on dense padded tokens with a key mask.
       5. Output projection (zero-init for cold-start identity).
-
-    Variable-length set masking is handled *outside* the kernel: the
-    encoder packs valid tokens into a jagged tensor (`OrbitPolicy.encode`)
-    and unpacks back to padded `[B, T, D]` after the block stack. SDPA's
-    flash backend rejects any non-causal mask, and PyTorch silently falls
-    back to mem-efficient when `attn_mask` is non-None — using nested-jagged
-    is the only way to *guarantee* FA-2 for bidirectional variable-length
-    attention.
     """
 
     def __init__(self, dim: int, n_heads: int, qk_gain_init: float = 5.0):
@@ -207,10 +196,7 @@ class SelfAttention(nn.Module):
             raise ValueError(f"dim {dim} not divisible by n_heads {n_heads}")
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
-        # Three separate Q/K/V projections (parameter-golf style). NestedTensor
-        # supports `unbind(dim=0)` only, so a fused-QKV → unbind doesn't work.
-        # Splitting at the projection level is also more idiomatic in modern
-        # PyTorch attention impls.
+        # Three separate Q/K/V projections (parameter-golf style).
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, dim, bias=False)
         self.c_v = CastedLinear(dim, dim, bias=False)
@@ -238,9 +224,8 @@ class SelfAttention(nn.Module):
     def forward(
         self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        # `x` is either a nested-jagged tensor of shape [B, j, D] where j
-        # varies per batch, or a dense padded tensor [B, T, D] with
-        # `valid_mask=True` for real tokens.
+        # `x` is a dense padded tensor [B, T, D] with `valid_mask=True` for
+        # real tokens.
         q = self.c_q(x).unflatten(-1, (self.n_heads, self.head_dim))
         k = self.c_k(x).unflatten(-1, (self.n_heads, self.head_dim))
         v = self.c_v(x).unflatten(-1, (self.n_heads, self.head_dim))
@@ -250,9 +235,9 @@ class SelfAttention(nn.Module):
         # SDPA expects [B, H, j, head_dim]. Caller is responsible for
         # bf16 autocast on CUDA — that's what enables FA-2 dispatch.
         # Putting an inner autocast or `sdpa_kernel` here breaks AOT
-        # autograd's nested-jagged subclass accounting under
-        # `torch.compile` (see parameter-golf `sota_train_gpt.py`: outer
-        # autocast around the whole training step, no inner contexts).
+        # autograd under `torch.compile` (see parameter-golf
+        # `sota_train_gpt.py`: outer autocast around the whole training step,
+        # no inner contexts).
         # On CPU SDPA dispatches to the math kernel — used only by tests.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -261,7 +246,57 @@ class SelfAttention(nn.Module):
         if valid_mask is not None:
             attn_mask = valid_mask[:, None, None, :]
         o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
-        o = o.transpose(1, 2).flatten(-2)  # [B, j, H*head_dim] nested
+        o = o.transpose(1, 2).flatten(-2)  # [B, T, H*head_dim]
+        return self.out_proj(o)
+
+
+class CrossAttention(nn.Module):
+    """Cross-attention where a fixed latent set queries a masked source set."""
+
+    def __init__(self, dim: int, n_heads: int, qk_gain_init: float = 1.0):
+        super().__init__()
+        if dim % n_heads != 0:
+            raise ValueError(f"dim {dim} not divisible by n_heads {n_heads}")
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, dim, bias=False)
+        self.c_v = CastedLinear(dim, dim, bias=False)
+        self.out_proj = CastedLinear(dim, dim, bias=False)
+        self.q_gain = nn.Parameter(torch.full((n_heads,), float(qk_gain_init)))
+
+        nn.init.orthogonal_(self.c_q.weight, gain=0.1)
+        nn.init.orthogonal_(self.c_k.weight, gain=0.1)
+        nn.init.orthogonal_(self.c_v.weight, gain=0.1)
+        nn.init.zeros_(self.out_proj.weight)
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        keys_values: torch.Tensor,
+        key_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Rows with no fleets get one synthetic zero key. That keeps SDPA away
+        # from all-masked rows while still contributing no fleet information.
+        empty = ~key_mask.any(dim=-1, keepdim=True)
+        first_key = torch.zeros_like(key_mask)
+        first_key[:, :1] = True
+        safe_mask = key_mask | (empty & first_key)
+        keys_values = keys_values.masked_fill(~key_mask.unsqueeze(-1), 0.0)
+
+        q = self.c_q(queries).unflatten(-1, (self.n_heads, self.head_dim))
+        k = self.c_k(keys_values).unflatten(-1, (self.n_heads, self.head_dim))
+        v = self.c_v(keys_values).unflatten(-1, (self.n_heads, self.head_dim))
+        q = F.rms_norm(q, (self.head_dim,))
+        k = F.rms_norm(k, (self.head_dim,))
+        q = q * self.q_gain.to(q.dtype)[None, None, :, None]
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn_mask = safe_mask[:, None, None, :]
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        o = o.transpose(1, 2).flatten(-2)
         return self.out_proj(o)
 
 
@@ -330,9 +365,9 @@ class TransformerBlock(nn.Module):
         x0: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # `x` and `x0` are nested-jagged [B, j, D] or dense padded
-        # [B, T, D]. Cast scale/mix params to activation dtype to keep the
-        # bf16 residual path bf16 (see parameter-golf `sota_train_gpt.py`).
+        # `x` and `x0` are dense padded [B, T, D]. Cast scale/mix params to
+        # activation dtype to keep the bf16 residual path bf16 (see
+        # parameter-golf `sota_train_gpt.py`).
         dt = x.dtype
         mix = self.resid_mix.to(dt)
         x_in = mix[0] * x + mix[1] * x0
@@ -345,6 +380,97 @@ class TransformerBlock(nn.Module):
             ff = self.drop(ff)
         x = x + self.ff_scale.to(dt) * ff
         return x
+
+
+class FleetLatentBlock(nn.Module):
+    """One Perceiver-style fleet compression block.
+
+    Fleet latents cross-attend to raw fleet tokens, then self-attend among
+    themselves. This costs O(L·F + L²) instead of fleet-fleet O(F²).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ff_dim: int,
+        n_heads: int,
+        dropout: float = 0.0,
+        *,
+        layer_idx: int = 0,
+    ):
+        super().__init__()
+        self.latent_norm = nn.RMSNorm(dim, elementwise_affine=False)
+        self.fleet_norm = nn.RMSNorm(dim, elementwise_affine=False)
+        self.cross_attn = CrossAttention(dim, n_heads)
+        self.cross_scale = nn.Parameter(torch.ones(dim))
+        self.self_block = TransformerBlock(
+            dim,
+            ff_dim,
+            n_heads,
+            dropout,
+            layer_idx=layer_idx,
+        )
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        fleets: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        x0: torch.Tensor,
+    ) -> torch.Tensor:
+        dt = latents.dtype
+        latents = latents + self.cross_scale.to(dt) * self.cross_attn(
+            self.latent_norm(latents),
+            self.fleet_norm(fleets),
+            fleet_mask,
+        )
+        return self.self_block(latents, x0)
+
+
+class FleetLatentTokenizer(nn.Module):
+    """Compress padded fleet tokens into a fixed learned latent set."""
+
+    def __init__(
+        self,
+        dim: int,
+        ff_dim: int,
+        n_heads: int,
+        num_latents: int,
+        depth: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if num_latents < 1:
+            raise ValueError("num_fleet_latents must be >= 1")
+        if depth < 1:
+            raise ValueError("fleet_tokenizer_depth must be >= 1")
+        self.num_latents = num_latents
+        self.fleet_latents = nn.Parameter(torch.zeros(num_latents, dim))
+        nn.init.trunc_normal_(self.fleet_latents, std=0.02)
+        self.input_norm = nn.RMSNorm(dim, elementwise_affine=False)
+        self.layers = nn.ModuleList(
+            [
+                FleetLatentBlock(
+                    dim,
+                    ff_dim,
+                    n_heads,
+                    dropout,
+                    layer_idx=i,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.final_norm = nn.RMSNorm(dim, elementwise_affine=False)
+
+    def forward(self, fleets: torch.Tensor, fleet_mask: torch.Tensor) -> torch.Tensor:
+        b = fleets.shape[0]
+        fleets = self.input_norm(fleets)
+        fleets = fleets.masked_fill(~fleet_mask.unsqueeze(-1), 0.0)
+        latents = self.fleet_latents.view(1, self.num_latents, -1).expand(b, -1, -1)
+        x0 = latents
+        for layer in self.layers:
+            latents = layer(latents, fleets, fleet_mask, x0)
+        return self.final_norm(latents)
 
 
 # Bounds for the mode+concentration Beta fraction head. Extra concentration
@@ -490,11 +616,23 @@ def _match_feature_width(x: torch.Tensor, expected: int) -> torch.Tensor:
 class OrbitPolicy(nn.Module):
     def __init__(self, cfg: OrbitPolicyConfig):
         super().__init__()
-        if cfg.encoder_backend not in {"dense", "nested"}:
+        if cfg.encoder_backend not in {"dense", "fleet_latent"}:
             raise ValueError(f"unknown encoder_backend: {cfg.encoder_backend!r}")
         self.cfg = cfg
         self.planet_embed = CastedLinear(cfg.planet_features, cfg.dim)
         self.fleet_embed = CastedLinear(cfg.fleet_features, cfg.dim)
+        self.fleet_tokenizer = (
+            FleetLatentTokenizer(
+                dim=cfg.dim,
+                ff_dim=cfg.ff_dim,
+                n_heads=cfg.n_heads,
+                num_latents=cfg.num_fleet_latents,
+                depth=cfg.fleet_tokenizer_depth,
+                dropout=cfg.dropout,
+            )
+            if cfg.encoder_backend == "fleet_latent"
+            else None
+        )
         # Two learnable summary tokens (PMA-style). Initialized small so
         # they don't dominate the encoder at step 0 — gradient flow alone
         # will scale them up as the heads start using their output.
@@ -650,6 +788,15 @@ class OrbitPolicy(nn.Module):
 
         h_p = self.planet_embed(planet_feats)
         h_f = self.fleet_embed(fleet_feats)
+        if self.fleet_tokenizer is not None:
+            h_f = self.fleet_tokenizer(h_f, fleet_mask)
+            fleet_mask = torch.ones(
+                b,
+                h_f.shape[1],
+                dtype=torch.bool,
+                device=fleet_mask.device,
+            )
+            f = h_f.shape[1]
         # Prepend the two summary tokens, broadcast to batch dim. Parameters
         # are stored flat so compiled backward's broadcast reduction returns
         # `[d]`, matching the actual parameter shape.
@@ -658,7 +805,7 @@ class OrbitPolicy(nn.Module):
         h = torch.cat([actor_t, critic_t, h_p, h_f], dim=1)
         # Normalize the residual-stream entry point. embed_norm runs on
         # padded `[B, T, D]` since LN is per-token — padded positions are
-        # normalized too but get dropped by the nested-jagged pack below.
+        # normalized too; masks make padded tokens inert in attention.
         h = self.embed_norm(h)
         summary_mask = torch.ones(b, 2, dtype=torch.bool, device=planet_mask.device)
         full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
@@ -700,54 +847,17 @@ class OrbitPolicy(nn.Module):
         h = self.final_norm(h)
         return self._split_encoded(h, planet_mask, fleet_mask, p, f)
 
-    @torch.compiler.disable
-    def _encode_nested(
-        self,
-        h: torch.Tensor,
-        full_mask: torch.Tensor,
-        planet_mask: torch.Tensor,
-        fleet_mask: torch.Tensor,
-        p: int,
-        f: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Nested-jagged encoder retained for A/B benchmarks.
-
-        This can dispatch SDPA to flash on valid packed tokens, but the PyTorch
-        NestedTensor subclass overhead is slower than dense masked attention in
-        our rollout profiles.
-        """
-        lengths = full_mask.sum(dim=-1)  # [B]
-        b = int(lengths.shape[0])
-        offsets = torch.zeros(b + 1, dtype=torch.int64, device=h.device)
-        offsets[1:] = lengths.cumsum(0)
-        # Boolean indexing flattens valid tokens row-major across the batch.
-        values = h[full_mask]
-        h_nt = torch.nested.nested_tensor_from_jagged(values, offsets)
-        # `x0` is the post-embed-norm residual stream; each block's resid_mix
-        # mixes against this fixed reference.
-        x0_nt = h_nt
-        for layer in self.layers:
-            h_nt = layer(h_nt, x0_nt)
-        h_nt = self.final_norm(h_nt)
-        # Unpack: scatter valid tokens back to original padded positions.
-        out_values = h_nt.values()  # [total_valid, D]
-        h = torch.zeros_like(h)
-        h[full_mask] = out_values
-        return self._split_encoded(h, planet_mask, fleet_mask, p, f)
-
     def encode(
         self, feats: EncodedObs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the transformer over [actor, critic, planets..., fleets...].
 
         Returns `(planet_h, fleet_h, h_actor, h_critic, token_mask)` where
-        `token_mask` is the planets+fleets mask. Dense padded CUDA is the
-        default because rollout profiling showed NestedTensor dispatch, not
-        attention compute, dominating model latency.
+        `token_mask` is the planets+fleet-context mask. Dense padded CUDA is
+        the default because rollout profiling showed NestedTensor dispatch,
+        not attention compute, dominating model latency.
         """
         h, full_mask, planet_mask, fleet_mask, p, f = self._embed_tokens(feats)
-        if self.cfg.encoder_backend == "nested":
-            return self._encode_nested(h, full_mask, planet_mask, fleet_mask, p, f)
         return self._encode_dense(h, full_mask, planet_mask, fleet_mask, p, f)
 
     def forward(self, feats: EncodedObs) -> PolicyOutput:

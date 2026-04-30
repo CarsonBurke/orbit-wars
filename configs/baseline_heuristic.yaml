@@ -22,6 +22,9 @@ model:
   depth: 3
   n_heads: 4
   dropout: 0.0
+  encoder_backend: fleet_latent
+  num_fleet_latents: 64
+  fleet_tokenizer_depth: 1
 
 optim:
   lr: 3.0e-4

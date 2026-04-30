@@ -27,7 +27,9 @@ class ModelCfg:
     depth: int = 3
     n_heads: int = 4
     dropout: float = 0.0
-    encoder_backend: Literal["dense", "nested"] = "dense"
+    encoder_backend: Literal["dense", "fleet_latent"] = "fleet_latent"
+    num_fleet_latents: int = 64
+    fleet_tokenizer_depth: int = 1
     value_hidden: int = 64
     value_num_bins: int = 51
     value_min: float = -2.0

@@ -68,6 +68,7 @@ _CONTROL_TENSOR_PATTERNS: tuple[str, ...] = (
     "resid_mix",
     "actor_token",
     "critic_token",
+    "fleet_latents",
 )
 
 # Subset of control tensors that route to the *fast* AdamW group at
@@ -198,6 +199,8 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         n_heads=cfg.model.n_heads,
         dropout=cfg.model.dropout,
         encoder_backend=cfg.model.encoder_backend,
+        num_fleet_latents=cfg.model.num_fleet_latents,
+        fleet_tokenizer_depth=cfg.model.fleet_tokenizer_depth,
         value_hidden=cfg.model.value_hidden,
         value_num_bins=cfg.model.value_num_bins,
         value_min=cfg.model.value_min,
@@ -433,6 +436,8 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     to start from a worse-than-init policy.
     """
     encoder = [model.planet_embed, model.fleet_embed, *model.layers]
+    if model.fleet_tokenizer is not None:
+        encoder.append(model.fleet_tokenizer)
     value = [model.value_head]
     params: list[torch.nn.Parameter] = [model.actor_token, model.critic_token]
     for m in encoder + value:

@@ -18,10 +18,14 @@ class OrbitPolicyConfig:
     depth: int = 3
     n_heads: int = 4
     dropout: float = 0.0
-    # Encoder dispatch. `dense` is the CUDA rollout default because PyTorch's
-    # nested-jagged subclass overhead dominates at our small rollout batch sizes.
-    # `nested` is retained for A/B benchmarks and larger-token experiments.
-    encoder_backend: Literal["dense", "nested"] = "dense"
+    # Encoder dispatch. `fleet_latent` is the default: raw planet tokens are
+    # preserved for the action vocabulary, while raw fleets are compressed.
+    encoder_backend: Literal["dense", "fleet_latent"] = "fleet_latent"
+    # Perceiver-style fleet tokenizer. Raw planet tokens are preserved because
+    # they define the source/target action vocabulary; raw fleet tokens are
+    # compressed into this fixed latent set before the main policy encoder.
+    num_fleet_latents: int = 64
+    fleet_tokenizer_depth: int = 1
 
     # Action factorization. For each owned planet we emit:
     #   - a Bernoulli launch logit

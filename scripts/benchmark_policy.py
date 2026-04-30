@@ -43,16 +43,18 @@ def _bench(
     ff_dim: int,
     depth: int,
     n_heads: int,
+    num_fleet_latents: int,
     warmup: int,
     iters: int,
     compile_model: bool,
-) -> float:
+) -> tuple[float, int]:
     cfg = OrbitPolicyConfig(
         dim=dim,
         ff_dim=ff_dim,
         depth=depth,
         n_heads=n_heads,
         encoder_backend=backend,  # type: ignore[arg-type]
+        num_fleet_latents=num_fleet_latents,
     )
     model = OrbitPolicy(cfg).cuda().eval()
     model.bfloat16()
@@ -67,7 +69,9 @@ def _bench(
         for _ in range(iters):
             model(feats)
         _sync()
-    return (perf_counter() - start) * 1000.0 / iters
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        _h, full_mask, _pm, _fm, _p, _f = model._embed_tokens(feats)
+    return (perf_counter() - start) * 1000.0 / iters, int(full_mask.shape[1])
 
 
 def main() -> None:
@@ -80,11 +84,12 @@ def main() -> None:
     parser.add_argument("--ff-dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--n-heads", type=int, default=4)
+    parser.add_argument("--num-fleet-latents", type=int, default=64)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
         "--backend",
-        choices=("dense", "nested", "both"),
-        default="both",
+        choices=("dense", "fleet_latent", "all"),
+        default="all",
     )
     args = parser.parse_args()
 
@@ -94,7 +99,11 @@ def main() -> None:
     real_tokens = (
         feats.planet_mask.sum(dim=1) + feats.fleet_mask.sum(dim=1) + 2
     ).float()
-    backends = ("dense", "nested") if args.backend == "both" else (args.backend,)
+    backends = (
+        ("dense", "fleet_latent")
+        if args.backend == "all"
+        else (args.backend,)
+    )
     print(
         f"batch={args.batch_size} env_step={args.env_step} "
         f"tokens_mean={real_tokens.mean().item():.1f} "
@@ -102,18 +111,19 @@ def main() -> None:
         f"compiled={args.compile}"
     )
     for backend in backends:
-        ms = _bench(
+        ms, effective_tokens = _bench(
             backend,
             feats,
             dim=args.dim,
             ff_dim=args.ff_dim,
             depth=args.depth,
             n_heads=args.n_heads,
+            num_fleet_latents=args.num_fleet_latents,
             warmup=args.warmup,
             iters=args.iters,
             compile_model=args.compile,
         )
-        print(f"{backend:>6}: {ms:.3f} ms/forward")
+        print(f"{backend:>12}: {ms:.3f} ms/forward effective_tokens={effective_tokens}")
 
 
 if __name__ == "__main__":
