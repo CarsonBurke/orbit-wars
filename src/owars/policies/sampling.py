@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.distributions import Beta
 
 from ..game import angle_to
@@ -442,8 +443,9 @@ def _build_moves_from_lists(
     pmask_l: list[bool],
     ids_l: list[int],
     o: Observation,
-) -> list[Move]:
+) -> tuple[list[Move], list[bool]]:
     moves: list[Move] = []
+    materialized = [False] * len(target_idx_l)
     by_id = {pl.id: pl for pl in o.planets}
     remaining_by_id = {pl.id: int(pl.ships) for pl in o.planets}
     omega = o.angular_velocity
@@ -489,16 +491,25 @@ def _build_moves_from_lists(
         ):
             continue
         moves.append(Move(mine.id, solution.angle, send))
+        materialized[i] = True
         remaining_by_id[mine.id] = remaining - send
 
-    return moves
+    return moves, materialized
 
 
 def _build_moves_from_packed_fields(
     fields_l: list[list[float]],
     o: Observation,
 ) -> list[Move]:
+    return _build_moves_from_packed_fields_with_mask(fields_l, o)[0]
+
+
+def _build_moves_from_packed_fields_with_mask(
+    fields_l: list[list[float]],
+    o: Observation,
+) -> tuple[list[Move], list[bool]]:
     moves: list[Move] = []
+    materialized = [False] * len(fields_l)
     by_id = {pl.id: pl for pl in o.planets}
     remaining_by_id = {pl.id: int(pl.ships) for pl in o.planets}
     omega = o.angular_velocity
@@ -542,15 +553,23 @@ def _build_moves_from_packed_fields(
         ):
             continue
         moves.append(Move(mine.id, solution.angle, send))
+        materialized[i] = True
         remaining_by_id[mine.id] = remaining - send
 
-    return moves
+    return moves, materialized
 
 
 def _build_action_lists_from_packed_fields_raw(
     fields_l: list[list[float]],
     obs: Any,
 ) -> list[list]:
+    return _build_action_lists_from_packed_fields_raw_with_mask(fields_l, obs)[0]
+
+
+def _build_action_lists_from_packed_fields_raw_with_mask(
+    fields_l: list[list[float]],
+    obs: Any,
+) -> tuple[list[list], list[bool]]:
     planets = obs.get("planets", []) if isinstance(obs, dict) else getattr(obs, "planets", [])
     by_id = {int(p[0]): p for p in planets}
     remaining_by_id = {int(p[0]): int(p[5]) for p in planets}
@@ -562,6 +581,7 @@ def _build_action_lists_from_packed_fields_raw(
         or 0.0
     )
     actions: list[list] = []
+    materialized = [False] * len(fields_l)
     p = len(fields_l)
     for i, fields in enumerate(fields_l):
         ti = int(fields[0])
@@ -617,20 +637,29 @@ def _build_action_lists_from_packed_fields_raw(
                 float(solution.y),
             ]
         )
+        materialized[i] = True
         remaining_by_id[int(mine[0])] = mine_ships - send
 
-    return actions
+    return actions, materialized
 
 
 def _build_action_lists_from_packed_fields_context(
     fields_l: list[list[float]],
     context: ActionContext,
 ) -> list[list]:
+    return _build_action_lists_from_packed_fields_context_with_mask(fields_l, context)[0]
+
+
+def _build_action_lists_from_packed_fields_context_with_mask(
+    fields_l: list[list[float]],
+    context: ActionContext,
+) -> tuple[list[list], list[bool]]:
     by_id = {int(p[0]): p for p in context.planets}
     remaining_by_id = {int(p[0]): int(p[5]) for p in context.planets}
     comet_planet_ids = set(context.comet_planet_ids)
     omega = float(context.angular_velocity)
     actions: list[list] = []
+    materialized = [False] * len(fields_l)
     p = len(fields_l)
     for i, fields in enumerate(fields_l):
         ti = int(fields[0])
@@ -686,9 +715,10 @@ def _build_action_lists_from_packed_fields_context(
                 float(solution.y),
             ]
         )
+        materialized[i] = True
         remaining_by_id[int(mine[0])] = mine_ships - send
 
-    return actions
+    return actions, materialized
 
 
 def _packed_action_fields(
@@ -728,6 +758,18 @@ def _build_moves(
     ids: torch.Tensor,
     o: Observation,
 ) -> list[Move]:
+    return _build_moves_with_mask(launch, target_idx, frac, owned, pmask, ids, o)[0]
+
+
+def _build_moves_with_mask(
+    launch: torch.Tensor,
+    target_idx: torch.Tensor,
+    frac: torch.Tensor,
+    owned: torch.Tensor,
+    pmask: torch.Tensor,
+    ids: torch.Tensor,
+    o: Observation,
+) -> tuple[list[Move], list[bool]]:
     """Translate a single env's sampled (launch, target_idx, frac) into legal Moves.
 
     All five tensors come from one batch element: one CPU pull to Python
@@ -801,6 +843,46 @@ def _sample_distributions(
     return launch, target_idx, frac, log_prob
 
 
+def _record_from_materialized_launch(
+    launch: torch.Tensor,
+    target_idx: torch.Tensor,
+    frac: torch.Tensor,
+    launch_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    fraction_alpha: torch.Tensor,
+    fraction_beta: torch.Tensor,
+    materialized: list[bool],
+) -> SampleRecord:
+    actual_launch = torch.as_tensor(
+        materialized,
+        device=launch.device,
+        dtype=launch.dtype,
+    )
+    safe_target_logits = _safe_target_logits(target_logits.float())
+    launch_lp = -F.binary_cross_entropy_with_logits(
+        launch_logits.float(),
+        actual_launch.float(),
+        reduction="none",
+    )
+    target_log_probs = torch.log_softmax(safe_target_logits, dim=-1)
+    target_lp = target_log_probs.gather(
+        -1,
+        target_idx.clamp(0, safe_target_logits.shape[-1] - 1).unsqueeze(-1),
+    ).squeeze(-1)
+    frac_lp = Beta(fraction_alpha.float(), fraction_beta.float()).log_prob(frac.float())
+    log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
+    return SampleRecord(
+        launch=actual_launch,
+        target_idx=target_idx,
+        fraction=frac,
+        log_prob=log_prob,
+        launch_logits=launch_logits,
+        target_logits=target_logits,
+        fraction_alpha=fraction_alpha,
+        fraction_beta=fraction_beta,
+    )
+
+
 def sample_with_record(
     out: PolicyOutput,
     o: Observation,
@@ -822,16 +904,18 @@ def sample_with_record(
         launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
     )
 
-    moves = _build_moves(launch, target_idx, frac, owned, pmask, ids, o)
-    record = SampleRecord(
-        launch=launch,
-        target_idx=target_idx,
-        fraction=frac,
-        log_prob=log_prob,
-        launch_logits=launch_logits,
-        target_logits=target_logits,
-        fraction_alpha=fraction_alpha,
-        fraction_beta=fraction_beta,
+    moves, materialized = _build_moves_with_mask(
+        launch, target_idx, frac, owned, pmask, ids, o
+    )
+    record = _record_from_materialized_launch(
+        launch,
+        target_idx,
+        frac,
+        launch_logits,
+        target_logits,
+        fraction_alpha,
+        fraction_beta,
+        materialized,
     )
     return moves, record
 
@@ -901,18 +985,20 @@ def sample_batch_with_records(
     moves_list: list[list[Move]] = []
     records: list[SampleRecord] = []
     for k in range(b_dim):
-        moves = _build_moves_from_packed_fields(fields_l[k], parsed_list[k])
+        moves, materialized = _build_moves_from_packed_fields_with_mask(
+            fields_l[k], parsed_list[k]
+        )
         moves_list.append(moves)
         records.append(
-            SampleRecord(
-                launch=launch[k],
-                target_idx=target_idx[k],
-                fraction=frac[k],
-                log_prob=log_prob[k],
-                launch_logits=launch_logits[k],
-                target_logits=target_logits[k],
-                fraction_alpha=fraction_alpha[k],
-                fraction_beta=fraction_beta[k],
+            _record_from_materialized_launch(
+                launch[k],
+                target_idx[k],
+                frac[k],
+                launch_logits[k],
+                target_logits[k],
+                fraction_alpha[k],
+                fraction_beta[k],
+                materialized,
             )
         )
     return moves_list, records
@@ -941,21 +1027,20 @@ def sample_batch_with_records_raw(
     actions_list: list[list[list]] = []
     records: list[SampleRecord] = []
     for k in range(b_dim):
-        actions_list.append(
-            _build_action_lists_from_packed_fields_raw(
-                fields_l[k], raw_observations[k]
-            )
+        actions, materialized = _build_action_lists_from_packed_fields_raw_with_mask(
+            fields_l[k], raw_observations[k]
         )
+        actions_list.append(actions)
         records.append(
-            SampleRecord(
-                launch=launch[k],
-                target_idx=target_idx[k],
-                fraction=frac[k],
-                log_prob=log_prob[k],
-                launch_logits=launch_logits[k],
-                target_logits=target_logits[k],
-                fraction_alpha=fraction_alpha[k],
-                fraction_beta=fraction_beta[k],
+            _record_from_materialized_launch(
+                launch[k],
+                target_idx[k],
+                frac[k],
+                launch_logits[k],
+                target_logits[k],
+                fraction_alpha[k],
+                fraction_beta[k],
+                materialized,
             )
         )
     return actions_list, records
@@ -984,21 +1069,20 @@ def sample_batch_with_records_context(
     actions_list: list[list[list]] = []
     records: list[SampleRecord] = []
     for k in range(b_dim):
-        actions_list.append(
-            _build_action_lists_from_packed_fields_context(
-                fields_l[k], contexts[k]
-            )
+        actions, materialized = _build_action_lists_from_packed_fields_context_with_mask(
+            fields_l[k], contexts[k]
         )
+        actions_list.append(actions)
         records.append(
-            SampleRecord(
-                launch=launch[k],
-                target_idx=target_idx[k],
-                fraction=frac[k],
-                log_prob=log_prob[k],
-                launch_logits=launch_logits[k],
-                target_logits=target_logits[k],
-                fraction_alpha=fraction_alpha[k],
-                fraction_beta=fraction_beta[k],
+            _record_from_materialized_launch(
+                launch[k],
+                target_idx[k],
+                frac[k],
+                launch_logits[k],
+                target_logits[k],
+                fraction_alpha[k],
+                fraction_beta[k],
+                materialized,
             )
         )
     return actions_list, records

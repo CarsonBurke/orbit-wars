@@ -15,6 +15,7 @@ from owars.policies.sampling import (
     sample_batch_actions,
     sample_batch_actions_context,
     sample_batch_actions_raw,
+    sample_batch_with_records_raw,
     sample_batch_with_records,
     sample_with_record,
 )
@@ -275,6 +276,33 @@ def test_sampler_skips_sun_crossing_launches():
 
     assert sample_actions(out, o, deterministic=True) == []
     assert sample_batch_actions_raw(out, [obs], deterministic=True) == [[]]
+    moves, record = sample_with_record(out, o, deterministic=True)
+    raw_actions, raw_records = sample_batch_with_records_raw(
+        out, [obs], deterministic=True
+    )
+    assert moves == []
+    assert raw_actions == [[]]
+    assert record.launch[0].item() == 0.0
+    assert raw_records[0].launch[0].item() == 0.0
+
+
+def test_stochastic_rejected_launch_is_recorded_as_noop():
+    obs = _sun_crossing_obs()
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+
+    torch.manual_seed(0)
+    moves, record = sample_with_record(out, o, deterministic=False)
+
+    expected_noop_log_prob = -torch.nn.functional.binary_cross_entropy_with_logits(
+        out.launch_logits[0, 0],
+        torch.zeros_like(out.launch_logits[0, 0]),
+        reduction="none",
+    )
+    assert moves == []
+    assert record.launch[0].item() == 0.0
+    assert torch.allclose(record.log_prob[0], expected_noop_log_prob)
 
 
 def test_sampler_skips_comet_targets_without_path_lead():
