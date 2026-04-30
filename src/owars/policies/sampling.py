@@ -442,7 +442,6 @@ def _build_moves_from_lists(
     pmask_l: list[bool],
     ids_l: list[int],
     o: Observation,
-    max_moves: int,
 ) -> list[Move]:
     moves: list[Move] = []
     by_id = {pl.id: pl for pl in o.planets}
@@ -491,8 +490,6 @@ def _build_moves_from_lists(
             continue
         moves.append(Move(mine.id, solution.angle, send))
         remaining_by_id[mine.id] = remaining - send
-        if len(moves) >= max_moves:
-            break
 
     return moves
 
@@ -500,7 +497,6 @@ def _build_moves_from_lists(
 def _build_moves_from_packed_fields(
     fields_l: list[list[float]],
     o: Observation,
-    max_moves: int,
 ) -> list[Move]:
     moves: list[Move] = []
     by_id = {pl.id: pl for pl in o.planets}
@@ -547,8 +543,6 @@ def _build_moves_from_packed_fields(
             continue
         moves.append(Move(mine.id, solution.angle, send))
         remaining_by_id[mine.id] = remaining - send
-        if len(moves) >= max_moves:
-            break
 
     return moves
 
@@ -556,7 +550,6 @@ def _build_moves_from_packed_fields(
 def _build_action_lists_from_packed_fields_raw(
     fields_l: list[list[float]],
     obs: Any,
-    max_moves: int,
 ) -> list[list]:
     planets = obs.get("planets", []) if isinstance(obs, dict) else getattr(obs, "planets", [])
     by_id = {int(p[0]): p for p in planets}
@@ -625,8 +618,6 @@ def _build_action_lists_from_packed_fields_raw(
             ]
         )
         remaining_by_id[int(mine[0])] = mine_ships - send
-        if len(actions) >= max_moves:
-            break
 
     return actions
 
@@ -634,7 +625,6 @@ def _build_action_lists_from_packed_fields_raw(
 def _build_action_lists_from_packed_fields_context(
     fields_l: list[list[float]],
     context: ActionContext,
-    max_moves: int,
 ) -> list[list]:
     by_id = {int(p[0]): p for p in context.planets}
     remaining_by_id = {int(p[0]): int(p[5]) for p in context.planets}
@@ -697,8 +687,6 @@ def _build_action_lists_from_packed_fields_context(
             ]
         )
         remaining_by_id[int(mine[0])] = mine_ships - send
-        if len(actions) >= max_moves:
-            break
 
     return actions
 
@@ -739,7 +727,6 @@ def _build_moves(
     pmask: torch.Tensor,
     ids: torch.Tensor,
     o: Observation,
-    max_moves: int,
 ) -> list[Move]:
     """Translate a single env's sampled (launch, target_idx, frac) into legal Moves.
 
@@ -756,7 +743,6 @@ def _build_moves(
         pmask.tolist(),
         ids.tolist(),
         o,
-        max_moves,
     )
 
 
@@ -819,7 +805,6 @@ def sample_with_record(
     out: PolicyOutput,
     o: Observation,
     deterministic: bool = False,
-    max_moves: int = 16,
 ) -> tuple[list[Move], SampleRecord]:
     """Sample an action per planet, build the legal `Move` list, AND return
     the per-planet (launch, target_idx, fraction, log_prob) record so PPO can
@@ -837,7 +822,7 @@ def sample_with_record(
         launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
     )
 
-    moves = _build_moves(launch, target_idx, frac, owned, pmask, ids, o, max_moves)
+    moves = _build_moves(launch, target_idx, frac, owned, pmask, ids, o)
     record = SampleRecord(
         launch=launch,
         target_idx=target_idx,
@@ -855,7 +840,6 @@ def sample_actions(
     out: PolicyOutput,
     o: Observation,
     deterministic: bool = True,
-    max_moves: int = 16,
 ) -> list[Move]:
     """Moves-only wrapper for inference paths (eval, agent submission)."""
     launch_logits = out.launch_logits[0]
@@ -881,7 +865,6 @@ def sample_actions(
         out.planet_mask[0],
         out.planet_ids[0],
         o,
-        max_moves,
     )
 
 
@@ -889,7 +872,6 @@ def sample_batch_with_records(
     out: PolicyOutput,
     parsed_list: list[Observation],
     deterministic: bool = False,
-    max_moves: int = 16,
 ) -> tuple[list[list[Move]], list[SampleRecord]]:
     """Batched counterpart to `sample_with_record`.
 
@@ -919,7 +901,7 @@ def sample_batch_with_records(
     moves_list: list[list[Move]] = []
     records: list[SampleRecord] = []
     for k in range(b_dim):
-        moves = _build_moves_from_packed_fields(fields_l[k], parsed_list[k], max_moves)
+        moves = _build_moves_from_packed_fields(fields_l[k], parsed_list[k])
         moves_list.append(moves)
         records.append(
             SampleRecord(
@@ -940,7 +922,6 @@ def sample_batch_with_records_raw(
     out: PolicyOutput,
     raw_observations: list[Any],
     deterministic: bool = False,
-    max_moves: int = 16,
 ) -> tuple[list[list[list]], list[SampleRecord]]:
     """Batched sampler that builds Kaggle action lists from raw obs dicts."""
     launch_logits = out.launch_logits
@@ -962,7 +943,7 @@ def sample_batch_with_records_raw(
     for k in range(b_dim):
         actions_list.append(
             _build_action_lists_from_packed_fields_raw(
-                fields_l[k], raw_observations[k], max_moves
+                fields_l[k], raw_observations[k]
             )
         )
         records.append(
@@ -984,7 +965,6 @@ def sample_batch_with_records_context(
     out: PolicyOutput,
     contexts: list[ActionContext],
     deterministic: bool = False,
-    max_moves: int = 16,
 ) -> tuple[list[list[list]], list[SampleRecord]]:
     """Batched sampler that builds action lists from fast env contexts."""
     launch_logits = out.launch_logits
@@ -1006,7 +986,7 @@ def sample_batch_with_records_context(
     for k in range(b_dim):
         actions_list.append(
             _build_action_lists_from_packed_fields_context(
-                fields_l[k], contexts[k], max_moves
+                fields_l[k], contexts[k]
             )
         )
         records.append(
@@ -1028,7 +1008,6 @@ def sample_batch_actions(
     out: PolicyOutput,
     parsed_list: list[Observation],
     deterministic: bool = True,
-    max_moves: int = 16,
 ) -> list[list[Move]]:
     """Batched moves-only sampler for eval and opponent inference paths."""
     launch_logits = out.launch_logits
@@ -1055,7 +1034,7 @@ def sample_batch_actions(
     )
 
     return [
-        _build_moves_from_packed_fields(fields_l[k], parsed_list[k], max_moves)
+        _build_moves_from_packed_fields(fields_l[k], parsed_list[k])
         for k in range(b_dim)
     ]
 
@@ -1064,7 +1043,6 @@ def sample_batch_actions_raw(
     out: PolicyOutput,
     raw_observations: list[Any],
     deterministic: bool = True,
-    max_moves: int = 16,
 ) -> list[list[list]]:
     """Batched moves-only sampler for raw Kaggle-style observations."""
     launch_logits = out.launch_logits
@@ -1091,7 +1069,7 @@ def sample_batch_actions_raw(
     )
     return [
         _build_action_lists_from_packed_fields_raw(
-            fields_l[k], raw_observations[k], max_moves
+            fields_l[k], raw_observations[k]
         )
         for k in range(b_dim)
     ]
@@ -1101,7 +1079,6 @@ def sample_batch_actions_context(
     out: PolicyOutput,
     contexts: list[ActionContext],
     deterministic: bool = True,
-    max_moves: int = 16,
 ) -> list[list[list]]:
     """Batched moves-only sampler for fast env action contexts."""
     launch_logits = out.launch_logits
@@ -1128,7 +1105,7 @@ def sample_batch_actions_context(
     )
     return [
         _build_action_lists_from_packed_fields_context(
-            fields_l[k], contexts[k], max_moves
+            fields_l[k], contexts[k]
         )
         for k in range(b_dim)
     ]

@@ -31,6 +31,54 @@ _CLOSE = "close"
 _SET_RECORDING = "set_recording"
 
 
+def _strip_action_sidecars(actions: Any) -> Any:
+    """Return official Orbit Wars actions, dropping policy-only sidecar fields."""
+    if not isinstance(actions, list):
+        return actions
+    stripped: list[Any] = []
+    for player_action in actions:
+        if not isinstance(player_action, list):
+            stripped.append(player_action)
+            continue
+        moves: list[Any] = []
+        for move in player_action:
+            if isinstance(move, list) and len(move) > 3:
+                moves.append(move[:3])
+            else:
+                moves.append(move)
+        stripped.append(moves)
+    return stripped
+
+
+def _record_action_sidecars(trackers: list[Any], state: Any, actions: Any) -> None:
+    """Feed full sampled actions into per-player fleet-target trackers."""
+    if not isinstance(state, list) or not isinstance(actions, list):
+        return
+    for player, tracker in enumerate(trackers):
+        if player >= len(state) or player >= len(actions):
+            continue
+        slot = state[player]
+        if not isinstance(slot, dict):
+            continue
+        tracker.record(slot.get("observation"), actions[player])
+
+
+def _annotate_state_with_fleet_targets(trackers: list[Any], state: Any) -> Any:
+    """Attach tracker-derived `fleet_targets` to each player's observation."""
+    if not isinstance(state, list):
+        return state
+    annotated_state = []
+    for player, slot in enumerate(state):
+        if not isinstance(slot, dict) or player >= len(trackers):
+            annotated_state.append(slot)
+            continue
+        obs = slot.get("observation")
+        annotated_slot = dict(slot)
+        annotated_slot["observation"] = trackers[player].annotate(obs)
+        annotated_state.append(annotated_slot)
+    return annotated_state
+
+
 def _env_worker(
     remote: Any,
     num_players: int,
@@ -53,6 +101,8 @@ def _env_worker(
     """
     from kaggle_environments import make  # type: ignore[import-not-found]
 
+    from ..agents.learned import _FleetTargetTracker
+
     env = make(
         "orbit_wars",
         configuration={
@@ -60,6 +110,8 @@ def _env_worker(
             "shipSpeed": ship_speed,
         },
     )
+    trackers = [_FleetTargetTracker() for _ in range(num_players)]
+    last_state: Any = None
     try:
         while True:
             try:
@@ -73,10 +125,17 @@ def _env_worker(
                 remote.send(("ok", None, False, None, None))
                 continue
             if cmd == _RESET:
+                for tracker in trackers:
+                    tracker.reset()
                 state = env.reset(num_agents=num_players)
+                state = _annotate_state_with_fleet_targets(trackers, state)
+                last_state = state
                 remote.send(("ok", state, False, None, None))
             elif cmd == _STEP:
-                state = env.step(payload)
+                _record_action_sidecars(trackers, last_state, payload)
+                state = env.step(_strip_action_sidecars(payload))
+                state = _annotate_state_with_fleet_targets(trackers, state)
+                last_state = state
                 done = bool(env.done)
                 final = env.steps[-1] if done else None
                 replay_html: str | None = None

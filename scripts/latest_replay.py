@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -74,18 +75,16 @@ def _agent_factory(
     *,
     device: str,
     deterministic: bool,
-    max_moves_per_turn: int,
 ) -> Callable[[Any], list[list]]:
     if name == "learned":
         return LearnedAgent(
             ckpt,
             device=device,
             deterministic=deterministic,
-            max_moves_per_turn=max_moves_per_turn,
         )
     if name == "heuristic":
         return HeuristicAgent()
-    if name == "sniper":
+    if name in {"sniper", "bot"}:
         return sniper_agent
     if name == "random":
         return random_agent
@@ -113,8 +112,9 @@ def main() -> None:
     parser.add_argument("--ckpt", type=Path, default=None)
     parser.add_argument(
         "--opponent",
-        choices=("heuristic", "sniper", "random", "learned"),
+        choices=("heuristic", "sniper", "bot", "random", "learned"),
         default="heuristic",
+        help="Opponent agent. 'bot' is an alias for the competition sniper starter bot.",
     )
     parser.add_argument("--opponent-ckpt", type=Path, default=None)
     parser.add_argument("--num-players", type=int, choices=(2, 4), default=2)
@@ -123,7 +123,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--stochastic", action="store_true")
-    parser.add_argument("--max-moves-per-turn", type=int, default=16)
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -144,14 +143,12 @@ def main() -> None:
         ckpt,
         device=args.device,
         deterministic=not args.stochastic,
-        max_moves_per_turn=args.max_moves_per_turn,
     )
     opponent = _agent_factory(
         args.opponent,
         opponent_ckpt,
         device=args.device,
         deterministic=not args.stochastic,
-        max_moves_per_turn=args.max_moves_per_turn,
     )
 
     env = make(

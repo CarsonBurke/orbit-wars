@@ -15,10 +15,16 @@ from typing import Any
 
 import torch
 
+from ..agents.learned import _FleetTargetTracker
 from ..game import parse_observation
-from ..policies.features import EncodedObs, encode_observation
+from ..policies.features import (
+    EncodedObs,
+    encode_observation,
+    encode_raw_observations,
+    select_encoded,
+)
 from ..policies.model import OrbitPolicy
-from ..policies.sampling import sample_with_record
+from ..policies.sampling import sample_batch_with_records_raw, sample_with_record
 from .config import RewardCfg
 
 AgentFn = Callable[[Any], list[list]]
@@ -73,6 +79,28 @@ def make_env(num_players: int, episode_steps: int, ship_speed: float, debug: boo
 def _policy_step(
     model: OrbitPolicy, obs: Any, device: str, deterministic: bool
 ) -> tuple[list[list], dict]:
+    if isinstance(obs, dict):
+        feats = encode_raw_observations([obs], device=device)
+        autocast_enabled = torch.device(device).type == "cuda"
+        with (
+            torch.no_grad(),
+            torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
+            ),
+        ):
+            out = model(feats)
+            actions_list, records = sample_batch_with_records_raw(
+                out, [obs], deterministic=deterministic
+            )
+        actions = actions_list[0]
+        return [move[:3] for move in actions], {
+            "feats": select_encoded(feats, 0),
+            "policy_out": out,
+            "moves": actions,
+            "parsed": None,
+            "record": records[0],
+        }
+
     parsed = parse_observation(obs)
     feats = encode_observation(parsed, device=device)
     autocast_enabled = torch.device(device).type == "cuda"
@@ -137,14 +165,16 @@ def rollout_episode(
         old_launch_logits=[],
         old_target_logits=[], old_fraction_alpha=[], old_fraction_beta=[],
     )
+    learner_tracker = _FleetTargetTracker()
 
     while not env.done:
         actions: list[list] = []
         for seat, slot in enumerate(state):
             if agents[seat] == "__learner__":
-                obs = slot["observation"]
+                obs = learner_tracker.annotate(slot["observation"])
                 acts, info = _policy_step(model, obs, device, deterministic)
                 actions.append(acts)
+                learner_tracker.record(slot["observation"], info["moves"])
                 _record_step(traj, info)
             else:
                 obs = slot["observation"]

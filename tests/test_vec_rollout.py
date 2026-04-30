@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import pytest
 
+from owars.agents.learned import _FleetTargetTracker
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
 from owars.training.league import LEARNER_NAME, OpponentSlot
 from owars.training.numpy_env import NumpyVecEnv
+from owars.training.vec_env import (
+    _annotate_state_with_fleet_targets,
+    _record_action_sidecars,
+    _strip_action_sidecars,
+)
 from owars.training.vec_rollout import (
     _normalize_learner_seats,
     _resolve_seat_agents,
@@ -47,6 +53,48 @@ def test_normalize_learner_seats_validates_length_and_range():
         _normalize_learner_seats([0, 2, 1], num_envs=3, num_players=2)
 
 
+def test_kaggle_vecenv_helpers_preserve_policy_target_sidecars():
+    trackers = [_FleetTargetTracker(), _FleetTargetTracker()]
+    state0 = [
+        {
+            "observation": {
+                "player": 0,
+                "step": 0,
+                "planets": [
+                    [0, 0, 10.0, 10.0, 1.0, 50, 3],
+                    [1, 1, 90.0, 90.0, 1.0, 10, 2],
+                ],
+                "fleets": [],
+            }
+        },
+        {"observation": {"player": 1, "step": 0, "planets": [], "fleets": []}},
+    ]
+    actions = [
+        [[0, 0.5, 10, 1, 2.0, 90.0, 90.0]],
+        [],
+    ]
+
+    annotated0 = _annotate_state_with_fleet_targets(trackers, state0)
+    _record_action_sidecars(trackers, annotated0, actions)
+    state1 = [
+        {
+            "observation": {
+                "player": 0,
+                "step": 1,
+                "planets": state0[0]["observation"]["planets"],
+                "fleets": [[42, 0, 11.0, 11.0, 0.5, 0, 10]],
+            }
+        },
+        {"observation": {"player": 1, "step": 1, "planets": [], "fleets": []}},
+    ]
+
+    assert _strip_action_sidecars(actions) == [[[0, 0.5, 10]], []]
+    annotated1 = _annotate_state_with_fleet_targets(trackers, state1)
+    assert annotated1[0]["observation"]["fleet_targets"] == {
+        "42": [1, 1.0, 90.0, 90.0]
+    }
+
+
 def test_numpy_fast_rollout_records_configured_learner_seats():
     model = OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
     opponent = OpponentSlot("noop", agent=lambda _obs: [])
@@ -66,7 +114,6 @@ def test_numpy_fast_rollout_records_configured_learner_seats():
             num_players=2,
             learner_seat=[0, 1],
             device="cpu",
-            max_moves_per_turn=2,
         )
 
     assert [traj.learner_seat for traj in trajs] == [0, 1]

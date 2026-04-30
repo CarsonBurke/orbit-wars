@@ -142,7 +142,6 @@ def rollout_episodes_batched(
     deterministic: bool = False,
     reward_cfg: RewardCfg | None = None,
     record_trajectories: bool = True,
-    max_moves_per_turn: int = 16,
 ) -> list[Trajectory]:
     """Play `len(opponents_per_env)` episodes in parallel; one Trajectory per env.
 
@@ -219,7 +218,6 @@ def rollout_episodes_batched(
                 device,
                 deterministic,
                 record_trajectories,
-                max_moves_per_turn,
                 fast_policy_batch if use_fast_numpy_path else None,
             )
 
@@ -269,7 +267,6 @@ def _step_learner_bucket(
     device: str,
     deterministic: bool,
     record_trajectories: bool,
-    max_moves_per_turn: int,
     policy_batch: Any | None = None,
 ) -> None:
     """Encode + batch-forward the learner identity across (env, seat) pairs.
@@ -331,14 +328,12 @@ def _step_learner_bucket(
                 out,
                 action_contexts,
                 deterministic=deterministic,
-                max_moves=max_moves_per_turn,
             )
         else:
             actions_list, records = sample_batch_with_records_raw(
                 out,
                 raw_obs_list,
                 deterministic=deterministic,
-                max_moves=max_moves_per_turn,
             )
     else:
         if action_contexts is not None:
@@ -346,14 +341,12 @@ def _step_learner_bucket(
                 out,
                 action_contexts,
                 deterministic=deterministic,
-                max_moves=max_moves_per_turn,
             )
         else:
             actions_list = sample_batch_actions_raw(
                 out,
                 raw_obs_list,
                 deterministic=deterministic,
-                max_moves=max_moves_per_turn,
             )
         records = []
 

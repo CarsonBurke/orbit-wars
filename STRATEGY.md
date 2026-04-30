@@ -142,4 +142,4 @@ Read the matrix; then expand: pick the best 1–2 settings per row and run a 2-D
 Still to characterize in `notebooks/`:
 - Distribution of orbital vs static planet counts across maps (the spec says ≥3 static, ≥1 orbiting — what's the typical split?).
 - Comet-spawn timing impact on win probability (do comet groups disproportionately advantage the leader?).
-- Empirical max move count per turn the policy emits at convergence (informs `max_moves_per_turn`).
+- Empirical move count per turn the policy emits at convergence.

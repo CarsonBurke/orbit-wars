@@ -149,7 +149,6 @@ class LearnedAgent:
         ckpt_path: str | Path,
         device: str = "cpu",
         deterministic: bool = True,
-        max_moves_per_turn: int = 16,
     ):
         state = torch.load(ckpt_path, map_location=device)
         cfg = OrbitPolicyConfig(**state["config"])
@@ -164,7 +163,6 @@ class LearnedAgent:
         self.model.eval()
         self.device = device
         self.deterministic = deterministic
-        self.max_moves_per_turn = max_moves_per_turn
         self._tracker = _FleetTargetTracker()
         self._batch_trackers: dict[tuple[Any, ...], _FleetTargetTracker] = {}
 
@@ -181,7 +179,6 @@ class LearnedAgent:
             out,
             [annotated],
             deterministic=self.deterministic,
-            max_moves=self.max_moves_per_turn,
         )[0]
         self._tracker.record(obs, actions)
         return [move[:3] for move in actions]
@@ -211,7 +208,6 @@ class LearnedAgent:
             out,
             annotated,
             deterministic=self.deterministic,
-            max_moves=self.max_moves_per_turn,
         )
         live_keys = set(keys)
         self._batch_trackers = {

@@ -367,7 +367,6 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                 device=str(device),
                 deterministic=False,
                 reward_cfg=cfg.reward,
-                max_moves_per_turn=cfg.rollout.max_moves_per_turn,
             ))
         batch = {k: v.to(device) for k, v in _pretrain_value_batch(trajs).items()}
         loss = value_only_update(
@@ -600,7 +599,6 @@ def _ppo_loop(
             learner_seat=learner_seats,
             device=str(device),
             reward_cfg=cfg.reward,
-            max_moves_per_turn=cfg.rollout.max_moves_per_turn,
         )
 
         if vec.last_replay_html is not None:
