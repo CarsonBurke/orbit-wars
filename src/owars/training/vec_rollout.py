@@ -463,6 +463,15 @@ def _step_learner_bucket(
         real_rows = len(bucket)
         if stacked.planet_feats.shape[0] < real_rows:
             raise RuntimeError("encoded rollout batch has fewer rows than bucket")
+    learner_rows: list[int] = []
+    learner_envs: list[int] = []
+    if record_trajectories:
+        learner_rows = [
+            k
+            for k, (env_idx, seat, _obs) in enumerate(bucket)
+            if seat == learner_seats[env_idx]
+        ]
+        learner_envs = [bucket[k][0] for k in learner_rows]
     # CUDA rollout uses a fixed padded batch so Inductor can reuse one static
     # graph even as envs finish and the real learner bucket shrinks.
     graph_stacked = _pad_encoded_rows(stacked, graph_rows) if graph_enabled else stacked
@@ -490,12 +499,14 @@ def _step_learner_bucket(
                 out,
                 action_contexts,
                 deterministic=deterministic,
+                record_rows=learner_rows,
             )
         else:
             actions_list, records = sample_batch_with_records_raw(
                 out,
                 raw_obs_list,
                 deterministic=deterministic,
+                record_rows=learner_rows,
             )
     else:
         if action_contexts is not None:
@@ -512,49 +523,42 @@ def _step_learner_bucket(
             )
         records = []
 
-    if record_trajectories:
-        learner_rows = [
-            k
-            for k, (env_idx, seat, _obs) in enumerate(bucket)
-            if seat == learner_seats[env_idx]
-        ]
-        learner_envs = [bucket[k][0] for k in learner_rows]
-        if learner_rows:
-            row_idx = torch.as_tensor(
-                learner_rows, device=out.value.device, dtype=torch.long
-            )
-            rec = _materialize_records_cpu(
-                stacked,
-                cpu_stacked,
-                out,
-                records,
-                row_idx,
-                learner_rows,
-            )
-            for j, env_idx in enumerate(learner_envs):
-                traj = trajectories[env_idx]
-                traj.encoded.append(
-                    EncodedObs(
-                        planet_feats=rec["planet_feats"][j],
-                        planet_mask=rec["planet_mask"][j],
-                        planet_owned_mask=rec["planet_owned_mask"][j],
-                        planet_ids=rec["planet_ids"][j],
-                        planet_garrison=rec["planet_garrison"][j],
-                        fleet_feats=rec["fleet_feats"][j],
-                        fleet_mask=rec["fleet_mask"][j],
-                    )
+    if record_trajectories and learner_rows:
+        row_idx = torch.as_tensor(
+            learner_rows, device=out.value.device, dtype=torch.long
+        )
+        rec = _materialize_records_cpu(
+            stacked,
+            cpu_stacked,
+            out,
+            records,
+            row_idx,
+            learner_rows,
+        )
+        for j, env_idx in enumerate(learner_envs):
+            traj = trajectories[env_idx]
+            traj.encoded.append(
+                EncodedObs(
+                    planet_feats=rec["planet_feats"][j],
+                    planet_mask=rec["planet_mask"][j],
+                    planet_owned_mask=rec["planet_owned_mask"][j],
+                    planet_ids=rec["planet_ids"][j],
+                    planet_garrison=rec["planet_garrison"][j],
+                    fleet_feats=rec["fleet_feats"][j],
+                    fleet_mask=rec["fleet_mask"][j],
                 )
-                traj.launch.append(rec["launch"][j])
-                traj.target_idx.append(rec["target_idx"][j])
-                traj.fraction.append(rec["fraction"][j])
-                traj.log_prob.append(rec["log_prob"][j])
-                traj.value.append(rec["value"][j])
-                traj.owned_mask.append(rec["owned_mask"][j])
-                traj.old_launch_logits.append(rec["old_launch_logits"][j])
-                traj.old_target_logits.append(rec["old_target_logits"][j])
-                traj.old_fraction_alpha.append(rec["old_fraction_alpha"][j])
-                traj.old_fraction_beta.append(rec["old_fraction_beta"][j])
-                traj.reward.append(0.0)
+            )
+            traj.launch.append(rec["launch"][j])
+            traj.target_idx.append(rec["target_idx"][j])
+            traj.fraction.append(rec["fraction"][j])
+            traj.log_prob.append(rec["log_prob"][j])
+            traj.value.append(rec["value"][j])
+            traj.owned_mask.append(rec["owned_mask"][j])
+            traj.old_launch_logits.append(rec["old_launch_logits"][j])
+            traj.old_target_logits.append(rec["old_target_logits"][j])
+            traj.old_fraction_alpha.append(rec["old_fraction_alpha"][j])
+            traj.old_fraction_beta.append(rec["old_fraction_beta"][j])
+            traj.reward.append(0.0)
 
     for k, (env_idx, seat, _obs) in enumerate(bucket):
         actions_per_env[env_idx][seat] = actions_list[k]
@@ -581,14 +585,24 @@ def _materialize_records_cpu(
         if feature_source.planet_feats.device.type == "cpu"
         else row_idx
     )
-    launch = torch.stack([records[k].launch for k in rows])
-    target_idx = torch.stack([records[k].target_idx for k in rows])
-    fraction = torch.stack([records[k].fraction for k in rows])
-    log_prob = torch.stack([records[k].log_prob for k in rows])
-    old_launch_logits = torch.stack([records[k].launch_logits for k in rows])
-    old_target_logits = torch.stack([records[k].target_logits for k in rows])
-    old_fraction_alpha = torch.stack([records[k].fraction_alpha for k in rows])
-    old_fraction_beta = torch.stack([records[k].fraction_beta for k in rows])
+    if isinstance(records, list):
+        launch = torch.stack([records[k].launch for k in rows])
+        target_idx = torch.stack([records[k].target_idx for k in rows])
+        fraction = torch.stack([records[k].fraction for k in rows])
+        log_prob = torch.stack([records[k].log_prob for k in rows])
+        old_launch_logits = torch.stack([records[k].launch_logits for k in rows])
+        old_target_logits = torch.stack([records[k].target_logits for k in rows])
+        old_fraction_alpha = torch.stack([records[k].fraction_alpha for k in rows])
+        old_fraction_beta = torch.stack([records[k].fraction_beta for k in rows])
+    else:
+        launch = records.launch
+        target_idx = records.target_idx
+        fraction = records.fraction
+        log_prob = records.log_prob
+        old_launch_logits = records.launch_logits
+        old_target_logits = records.target_logits
+        old_fraction_alpha = records.fraction_alpha
+        old_fraction_beta = records.fraction_beta
     owned_mask = out.planet_owned_mask.index_select(0, row_idx)
     value = out.value.index_select(0, row_idx)
     b, p = target_idx.shape

@@ -25,11 +25,12 @@ tanh-Gaussian, which had pre-squash `z` and post-squash fraction);
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as nn_functional
 from torch.distributions import Beta
 
 from ..game import angle_to
@@ -109,6 +110,25 @@ class SampleRecord:
     target_logits: torch.Tensor       # [P, P] — old-policy categorical logits (PMPO KL input)
     fraction_alpha: torch.Tensor      # [P] — old-policy Beta α
     fraction_beta: torch.Tensor       # [P] — old-policy Beta β
+
+
+@dataclass
+class SampleBatchRecord:
+    """Batched PPO record for vector rollouts.
+
+    Same fields as `SampleRecord`, with a leading row dimension. This avoids
+    constructing one Python object and one small torch graph per bucket row in
+    the rollout hot path.
+    """
+
+    launch: torch.Tensor
+    target_idx: torch.Tensor
+    fraction: torch.Tensor
+    log_prob: torch.Tensor
+    launch_logits: torch.Tensor
+    target_logits: torch.Tensor
+    fraction_alpha: torch.Tensor
+    fraction_beta: torch.Tensor
 
 
 @dataclass(slots=True)
@@ -504,6 +524,24 @@ def _build_moves_from_packed_fields(
     return _build_moves_from_packed_fields_with_mask(fields_l, o)[0]
 
 
+def _candidate_action_indices(fields_l: Any) -> Any:
+    if hasattr(fields_l, "ndim"):
+        mask = (
+            (fields_l[:, 2] >= 0.5)
+            & (fields_l[:, 3] >= 0.5)
+            & (fields_l[:, 4] >= 0.5)
+        )
+        indices = mask.nonzero()
+        if isinstance(indices, tuple):
+            return indices[0]
+        return indices.flatten()
+    return (
+        i
+        for i, fields in enumerate(fields_l)
+        if fields[2] >= 0.5 and fields[3] >= 0.5 and fields[4] >= 0.5
+    )
+
+
 def _build_moves_from_packed_fields_with_mask(
     fields_l: list[list[float]],
     o: Observation,
@@ -514,10 +552,10 @@ def _build_moves_from_packed_fields_with_mask(
     remaining_by_id = {pl.id: int(pl.ships) for pl in o.planets}
     omega = o.angular_velocity
     p = len(fields_l)
-    for i, fields in enumerate(fields_l):
+    for i in _candidate_action_indices(fields_l):
+        i = int(i)
+        fields = fields_l[i]
         ti = int(fields[0])
-        if fields[2] < 0.5 or fields[3] < 0.5 or fields[4] < 0.5:
-            continue
         if ti == i:
             continue
         target_id = int(fields_l[ti][5]) if 0 <= ti < p else -1
@@ -583,10 +621,10 @@ def _build_action_lists_from_packed_fields_raw_with_mask(
     actions: list[list] = []
     materialized = [False] * len(fields_l)
     p = len(fields_l)
-    for i, fields in enumerate(fields_l):
+    for i in _candidate_action_indices(fields_l):
+        i = int(i)
+        fields = fields_l[i]
         ti = int(fields[0])
-        if fields[2] < 0.5 or fields[3] < 0.5 or fields[4] < 0.5:
-            continue
         if ti == i:
             continue
         target_id = int(fields_l[ti][5]) if 0 <= ti < p else -1
@@ -661,10 +699,10 @@ def _build_action_lists_from_packed_fields_context_with_mask(
     actions: list[list] = []
     materialized = [False] * len(fields_l)
     p = len(fields_l)
-    for i, fields in enumerate(fields_l):
+    for i in _candidate_action_indices(fields_l):
+        i = int(i)
+        fields = fields_l[i]
         ti = int(fields[0])
-        if fields[2] < 0.5 or fields[3] < 0.5 or fields[4] < 0.5:
-            continue
         if ti == i:
             continue
         target_id = int(fields_l[ti][5]) if 0 <= ti < p else -1
@@ -728,12 +766,14 @@ def _packed_action_fields(
     owned: torch.Tensor,
     pmask: torch.Tensor,
     ids: torch.Tensor,
-) -> list[list[list[float]]]:
+) -> Any:
     """Copy all Python action fields to host in one transfer.
 
     Separate `.cpu().tolist()` calls on CUDA each synchronize the stream.
-    Packing the small [B, P] fields together keeps PPO records on-device
-    while making env-action materialization pay one synchronization.
+    Packing the small [B, P] fields together keeps PPO records on-device while
+    making env-action materialization pay one synchronization. Keep the host
+    result as a NumPy view instead of nested Python lists; the builders only
+    need indexed scalar reads, and `.tolist()` becomes costly at rollout scale.
     """
     packed = torch.stack(
         (
@@ -746,7 +786,7 @@ def _packed_action_fields(
         ),
         dim=-1,
     )
-    return packed.detach().cpu().tolist()
+    return packed.detach().cpu().numpy()
 
 
 def _build_moves(
@@ -859,7 +899,7 @@ def _record_from_materialized_launch(
         dtype=launch.dtype,
     )
     safe_target_logits = _safe_target_logits(target_logits.float())
-    launch_lp = -F.binary_cross_entropy_with_logits(
+    launch_lp = -nn_functional.binary_cross_entropy_with_logits(
         launch_logits.float(),
         actual_launch.float(),
         reduction="none",
@@ -880,6 +920,77 @@ def _record_from_materialized_launch(
         target_logits=target_logits,
         fraction_alpha=fraction_alpha,
         fraction_beta=fraction_beta,
+    )
+
+
+def _beta_log_prob(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    log_norm = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
+    return (
+        (alpha - 1.0) * value.log()
+        + (beta - 1.0) * torch.log1p(-value)
+        - log_norm
+    )
+
+
+def _batch_record_from_materialized_launch(
+    launch: torch.Tensor,
+    target_idx: torch.Tensor,
+    frac: torch.Tensor,
+    launch_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    fraction_alpha: torch.Tensor,
+    fraction_beta: torch.Tensor,
+    materialized: list[list[bool]],
+    rows: Sequence[int],
+) -> SampleBatchRecord:
+    row_idx = torch.as_tensor(rows, device=launch.device, dtype=torch.long)
+    if len(rows) == 0:
+        actual_launch = launch.new_zeros((0, launch.shape[1]))
+    else:
+        if len(materialized) != len(rows):
+            raise RuntimeError("materialized action rows do not match record rows")
+        actual_launch = torch.as_tensor(
+            materialized,
+            device=launch.device,
+            dtype=launch.dtype,
+        )
+    target_idx_r = target_idx.index_select(0, row_idx)
+    frac_r = frac.index_select(0, row_idx)
+    launch_logits_r = launch_logits.index_select(0, row_idx)
+    target_logits_r = target_logits.index_select(0, row_idx)
+    fraction_alpha_r = fraction_alpha.index_select(0, row_idx)
+    fraction_beta_r = fraction_beta.index_select(0, row_idx)
+
+    safe_target_logits = _safe_target_logits(target_logits_r.float())
+    launch_lp = -nn_functional.binary_cross_entropy_with_logits(
+        launch_logits_r.float(),
+        actual_launch.float(),
+        reduction="none",
+    )
+    target_log_probs = torch.log_softmax(safe_target_logits, dim=-1)
+    target_lp = target_log_probs.gather(
+        -1,
+        target_idx_r.clamp(0, safe_target_logits.shape[-1] - 1).unsqueeze(-1),
+    ).squeeze(-1)
+    frac_lp = _beta_log_prob(
+        fraction_alpha_r.float(),
+        fraction_beta_r.float(),
+        frac_r.float(),
+    )
+    log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
+    return SampleBatchRecord(
+        launch=actual_launch,
+        target_idx=target_idx_r,
+        fraction=frac_r,
+        log_prob=log_prob,
+        launch_logits=launch_logits_r,
+        target_logits=target_logits_r,
+        fraction_alpha=fraction_alpha_r,
+        fraction_beta=fraction_beta_r,
     )
 
 
@@ -956,12 +1067,15 @@ def sample_batch_with_records(
     out: PolicyOutput,
     parsed_list: list[Observation],
     deterministic: bool = False,
-) -> tuple[list[list[Move]], list[SampleRecord]]:
+    record_rows: Sequence[int] | None = None,
+) -> tuple[list[list[Move]], list[SampleRecord] | SampleBatchRecord]:
     """Batched counterpart to `sample_with_record`.
 
     `out` is a B>1 PolicyOutput (its tensors have a leading batch dim);
     `parsed_list` has length B with the parsed observation per element.
-    Returns one move list and one `SampleRecord` per element.
+    Returns one move list per element. By default it also returns one
+    `SampleRecord` per element for legacy callers. When `record_rows` is
+    provided, it returns a single `SampleBatchRecord` for those rows only.
 
     The Bernoulli/Categorical/Beta samples are drawn once over the full [B, P]
     tensor — that's where the GPU win comes from. The per-element
@@ -984,22 +1098,45 @@ def sample_batch_with_records(
 
     moves_list: list[list[Move]] = []
     records: list[SampleRecord] = []
+    record_pos = (
+        {int(row): pos for pos, row in enumerate(record_rows)}
+        if record_rows is not None
+        else None
+    )
+    materialized_rows: list[list[bool] | None] = (
+        [None] * len(record_rows) if record_rows is not None else []
+    )
     for k in range(b_dim):
         moves, materialized = _build_moves_from_packed_fields_with_mask(
             fields_l[k], parsed_list[k]
         )
         moves_list.append(moves)
-        records.append(
-            _record_from_materialized_launch(
-                launch[k],
-                target_idx[k],
-                frac[k],
-                launch_logits[k],
-                target_logits[k],
-                fraction_alpha[k],
-                fraction_beta[k],
-                materialized,
+        if record_pos is None:
+            records.append(
+                _record_from_materialized_launch(
+                    launch[k],
+                    target_idx[k],
+                    frac[k],
+                    launch_logits[k],
+                    target_logits[k],
+                    fraction_alpha[k],
+                    fraction_beta[k],
+                    materialized,
+                )
             )
+        elif k in record_pos:
+            materialized_rows[record_pos[k]] = materialized
+    if record_rows is not None:
+        return moves_list, _batch_record_from_materialized_launch(
+            launch,
+            target_idx,
+            frac,
+            launch_logits,
+            target_logits,
+            fraction_alpha,
+            fraction_beta,
+            [row for row in materialized_rows if row is not None],
+            record_rows,
         )
     return moves_list, records
 
@@ -1008,7 +1145,8 @@ def sample_batch_with_records_raw(
     out: PolicyOutput,
     raw_observations: list[Any],
     deterministic: bool = False,
-) -> tuple[list[list[list]], list[SampleRecord]]:
+    record_rows: Sequence[int] | None = None,
+) -> tuple[list[list[list]], list[SampleRecord] | SampleBatchRecord]:
     """Batched sampler that builds Kaggle action lists from raw obs dicts."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
@@ -1026,22 +1164,45 @@ def sample_batch_with_records_raw(
 
     actions_list: list[list[list]] = []
     records: list[SampleRecord] = []
+    record_pos = (
+        {int(row): pos for pos, row in enumerate(record_rows)}
+        if record_rows is not None
+        else None
+    )
+    materialized_rows: list[list[bool] | None] = (
+        [None] * len(record_rows) if record_rows is not None else []
+    )
     for k in range(b_dim):
         actions, materialized = _build_action_lists_from_packed_fields_raw_with_mask(
             fields_l[k], raw_observations[k]
         )
         actions_list.append(actions)
-        records.append(
-            _record_from_materialized_launch(
-                launch[k],
-                target_idx[k],
-                frac[k],
-                launch_logits[k],
-                target_logits[k],
-                fraction_alpha[k],
-                fraction_beta[k],
-                materialized,
+        if record_pos is None:
+            records.append(
+                _record_from_materialized_launch(
+                    launch[k],
+                    target_idx[k],
+                    frac[k],
+                    launch_logits[k],
+                    target_logits[k],
+                    fraction_alpha[k],
+                    fraction_beta[k],
+                    materialized,
+                )
             )
+        elif k in record_pos:
+            materialized_rows[record_pos[k]] = materialized
+    if record_rows is not None:
+        return actions_list, _batch_record_from_materialized_launch(
+            launch,
+            target_idx,
+            frac,
+            launch_logits,
+            target_logits,
+            fraction_alpha,
+            fraction_beta,
+            [row for row in materialized_rows if row is not None],
+            record_rows,
         )
     return actions_list, records
 
@@ -1050,7 +1211,8 @@ def sample_batch_with_records_context(
     out: PolicyOutput,
     contexts: list[ActionContext],
     deterministic: bool = False,
-) -> tuple[list[list[list]], list[SampleRecord]]:
+    record_rows: Sequence[int] | None = None,
+) -> tuple[list[list[list]], list[SampleRecord] | SampleBatchRecord]:
     """Batched sampler that builds action lists from fast env contexts."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
@@ -1068,22 +1230,45 @@ def sample_batch_with_records_context(
 
     actions_list: list[list[list]] = []
     records: list[SampleRecord] = []
+    record_pos = (
+        {int(row): pos for pos, row in enumerate(record_rows)}
+        if record_rows is not None
+        else None
+    )
+    materialized_rows: list[list[bool] | None] = (
+        [None] * len(record_rows) if record_rows is not None else []
+    )
     for k in range(b_dim):
         actions, materialized = _build_action_lists_from_packed_fields_context_with_mask(
             fields_l[k], contexts[k]
         )
         actions_list.append(actions)
-        records.append(
-            _record_from_materialized_launch(
-                launch[k],
-                target_idx[k],
-                frac[k],
-                launch_logits[k],
-                target_logits[k],
-                fraction_alpha[k],
-                fraction_beta[k],
-                materialized,
+        if record_pos is None:
+            records.append(
+                _record_from_materialized_launch(
+                    launch[k],
+                    target_idx[k],
+                    frac[k],
+                    launch_logits[k],
+                    target_logits[k],
+                    fraction_alpha[k],
+                    fraction_beta[k],
+                    materialized,
+                )
             )
+        elif k in record_pos:
+            materialized_rows[record_pos[k]] = materialized
+    if record_rows is not None:
+        return actions_list, _batch_record_from_materialized_launch(
+            launch,
+            target_idx,
+            frac,
+            launch_logits,
+            target_logits,
+            fraction_alpha,
+            fraction_beta,
+            [row for row in materialized_rows if row is not None],
+            record_rows,
         )
     return actions_list, records
 

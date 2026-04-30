@@ -10,13 +10,15 @@ from owars.policies.features import stack_encoded
 from owars.policies.model import PolicyOutput
 from owars.policies.sampling import (
     ActionContext,
+    SampleBatchRecord,
     SampleRecord,
     sample_actions,
     sample_batch_actions,
     sample_batch_actions_context,
     sample_batch_actions_raw,
-    sample_batch_with_records_raw,
     sample_batch_with_records,
+    sample_batch_with_records_context,
+    sample_batch_with_records_raw,
     sample_with_record,
 )
 
@@ -166,6 +168,46 @@ def test_batched_log_probs_finite_under_stochastic_sampling():
         assert torch.isfinite(rec.log_prob).all(), rec.log_prob
 
 
+def test_batched_sampler_can_return_subset_record_batch():
+    o = parse_observation(_obs())
+    feats = encode_observation(o)
+    stacked = stack_encoded([feats, feats, feats, feats])
+    model = _model()
+
+    torch.manual_seed(123)
+    out = model(stacked)
+    _, records = sample_batch_with_records(out, [o] * 4, deterministic=False)
+
+    torch.manual_seed(123)
+    out_subset = model(stacked)
+    moves, batch_record = sample_batch_with_records(
+        out_subset, [o] * 4, deterministic=False, record_rows=[1, 3]
+    )
+
+    assert len(moves) == 4
+    assert isinstance(batch_record, SampleBatchRecord)
+    assert torch.equal(batch_record.launch, torch.stack([records[1].launch, records[3].launch]))
+    assert torch.equal(batch_record.target_idx, torch.stack([records[1].target_idx, records[3].target_idx]))
+    assert torch.allclose(batch_record.fraction, torch.stack([records[1].fraction, records[3].fraction]))
+    assert torch.allclose(batch_record.log_prob, torch.stack([records[1].log_prob, records[3].log_prob]), atol=1e-6)
+    assert torch.allclose(
+        batch_record.launch_logits,
+        torch.stack([records[1].launch_logits, records[3].launch_logits]),
+    )
+    assert torch.allclose(
+        batch_record.target_logits,
+        torch.stack([records[1].target_logits, records[3].target_logits]),
+    )
+    assert torch.allclose(
+        batch_record.fraction_alpha,
+        torch.stack([records[1].fraction_alpha, records[3].fraction_alpha]),
+    )
+    assert torch.allclose(
+        batch_record.fraction_beta,
+        torch.stack([records[1].fraction_beta, records[3].fraction_beta]),
+    )
+
+
 def test_batched_matches_single_under_fixed_seed():
     """Equivalence: a B=1 batched call produces the same record as the
     single-element sampler when the RNG is reset between."""
@@ -284,6 +326,37 @@ def test_sampler_skips_sun_crossing_launches():
     assert raw_actions == [[]]
     assert record.launch[0].item() == 0.0
     assert raw_records[0].launch[0].item() == 0.0
+
+
+def test_subset_records_match_raw_and_context_rejected_launch():
+    obs = _sun_crossing_obs()
+    feats = encode_observation(parse_observation(obs))
+    out = _forced_move_output(feats)
+    context = ActionContext(
+        planets=obs["planets"],
+        angular_velocity=obs["angular_velocity"],
+        comet_planet_ids=obs.get("comet_planet_ids", ()),
+    )
+
+    _, raw_records = sample_batch_with_records_raw(out, [obs], deterministic=True)
+    _, raw_batch = sample_batch_with_records_raw(
+        out, [obs], deterministic=True, record_rows=[0]
+    )
+    _, context_batch = sample_batch_with_records_context(
+        out, [context], deterministic=True, record_rows=[0]
+    )
+
+    expected = raw_records[0]
+    assert raw_batch.launch[0, 0].item() == 0.0
+    assert context_batch.launch[0, 0].item() == 0.0
+    assert torch.allclose(raw_batch.launch[0], expected.launch)
+    assert torch.equal(raw_batch.target_idx[0], expected.target_idx)
+    assert torch.allclose(raw_batch.fraction[0], expected.fraction)
+    assert torch.allclose(raw_batch.log_prob[0], expected.log_prob, atol=1e-6)
+    assert torch.allclose(context_batch.launch[0], expected.launch)
+    assert torch.equal(context_batch.target_idx[0], expected.target_idx)
+    assert torch.allclose(context_batch.fraction[0], expected.fraction)
+    assert torch.allclose(context_batch.log_prob[0], expected.log_prob, atol=1e-6)
 
 
 def test_stochastic_rejected_launch_is_recorded_as_noop():
