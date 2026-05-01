@@ -861,8 +861,7 @@ class OrbitPolicy(nn.Module):
         # (mode_logit, concentration_logit) for the Beta fraction distribution.
         self.fraction_head = CastedLinear(2 * cfg.dim, 2)
         # gain=0.01 — cleanrl PPO's canonical actor-readout init
-        # (`ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:182`,
-        # `ppo_continuous_action.py:127`). Bias the concentration head so
+        # (`ppo_continuous_action.py:127`). Bias the concentration head so
         # init is Beta(1.7, 1.7), matching the old near-uniform cold start.
         nn.init.orthogonal_(self.fraction_head.weight, gain=0.01)
         nn.init.zeros_(self.fraction_head.bias)

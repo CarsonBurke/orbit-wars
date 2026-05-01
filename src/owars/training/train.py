@@ -246,27 +246,20 @@ def _stack_trajectories(
     """Flatten per-step records into one PPO batch with conventional GAE."""
     batch = _stack_encoded(trajs)
 
-    launch, tidx, frac, lp, owned = [], [], [], [], []
-    olaunch, otl, oalpha, obeta = [], [], [], []
+    launch, tidx, frac, lp, owned, target_legal = [], [], [], [], [], []
     for t in trajs:
         launch.extend(t.launch)
         tidx.extend(t.target_idx)
         frac.extend(t.fraction)
         lp.extend(t.log_prob)
         owned.extend(t.owned_mask)
-        olaunch.extend(t.old_launch_logits)
-        otl.extend(t.old_target_logits)
-        oalpha.extend(t.old_fraction_alpha)
-        obeta.extend(t.old_fraction_beta)
+        target_legal.extend(t.target_legal_mask)
     batch["launch"] = torch.stack(launch).float()
     batch["target_idx"] = torch.stack(tidx).long()
     batch["fraction"] = torch.stack(frac).float()
     batch["old_log_prob"] = torch.stack(lp).float()
     batch["owned_mask"] = torch.stack(owned).bool()
-    batch["old_launch_logits"] = torch.stack(olaunch).float()
-    batch["old_target_logits"] = torch.stack(otl).float()
-    batch["old_fraction_alpha"] = torch.stack(oalpha).float()
-    batch["old_fraction_beta"] = torch.stack(obeta).float()
+    batch["target_legal_mask"] = torch.stack(target_legal).bool()
 
     # Single global CPU pull of every per-step value across the batch —
     # one sync instead of one per trajectory.
@@ -289,8 +282,6 @@ def _stack_trajectories(
 
     advs = torch.from_numpy(np.concatenate(advs_all)).float()
     rets = torch.from_numpy(np.concatenate(rets_all)).float()
-    # PMPO uses only the sign of the advantage; critic targets remain raw
-    # projected-margin returns.
     batch["advantage"] = advs
     batch["return"] = rets
     batch["raw_advantage_abs_mean"] = torch.tensor(
@@ -637,9 +628,9 @@ def _ppo_loop(
             value_coef=cfg.ppo.value_coef,
             target_entropy_coef=cfg.ppo.target_entropy_coef,
             fraction_entropy_coef=cfg.ppo.fraction_entropy_coef,
-            pmpo_kl_coef=cfg.ppo.pmpo_kl_coef,
-            pmpo_pos_to_neg_weight=cfg.ppo.pmpo_pos_to_neg_weight,
-            pmpo_reverse_kl=cfg.ppo.pmpo_reverse_kl,
+            norm_advantage=cfg.ppo.norm_advantage,
+            spo_eps_low=cfg.ppo.spo_eps_low,
+            spo_eps_high=cfg.ppo.spo_eps_high,
             epochs=cfg.optim.epochs_per_update,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
@@ -671,9 +662,7 @@ def _ppo_loop(
             "kl",
             {
                 "approx": log.approx_kl,
-                "pmpo": log.pmpo_kl,
-                "pmpo_target": log.pmpo_target_kl,
-                "pmpo_fraction": log.pmpo_fraction_kl,
+                "spo_penalty": log.spo_penalty,
             },
             update,
         )

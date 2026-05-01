@@ -36,6 +36,19 @@ def test_invalid_gamma_raises():
     raise AssertionError("expected ValueError for invalid gamma")
 
 
+def test_invalid_spo_eps_raises():
+    for ppo_cfg in (
+        {"spo_eps_low": 0.0},
+        {"spo_eps_high": 0.0},
+        {"spo_eps_low": 0.3, "spo_eps_high": 0.2},
+    ):
+        try:
+            RunConfig.from_dict({"ppo": ppo_cfg})
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {ppo_cfg}")
+
+
 def test_invalid_planet_rope_config_raises():
     for model_cfg in (
         {"planet_rope_fraction": -0.1},

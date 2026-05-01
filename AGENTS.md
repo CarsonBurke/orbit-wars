@@ -34,7 +34,7 @@ Code for the **Orbit Wars** Kaggle simulation competition. We submit an agent (a
 
 - **Configs are the source of truth.** A run is `python scripts/train.py --config configs/<name>.yaml`. Don't bury hyperparameters in code.
 - **Ablations are configs that override a base config.** See `ablations/`. Run them via `scripts/ablate.py`; one tensorboard subdir per cell.
-- **Tensorboard, always.** Every training run writes to `runs/<config_name>/<timestamp>/`. Scalars: PPO loss, value loss, entropy, KL, clip-frac, win-rate per opponent, mean margin. Histograms: predicted-target distributions, fraction-of-garrison.
+- **Tensorboard, always.** Every training run writes to `runs/<config_name>/<timestamp>/`. Scalars: policy loss, value loss, entropy, KL, SPO penalty, win-rate per opponent, mean margin. Histograms: predicted-target distributions, fraction-of-garrison.
 - **Don't commit data, checkpoints, runs, or `submission*.tar.gz`** — `.gitignore` covers them.
 - **The default model is in `src/owars/policies/model.py`** — a small set-transformer over planet/fleet tokens with target-attention and a Beta-distributed fraction head. See `STRATEGY.md` for the why.
 - **The runtime entry point is `submission/main.py`.** It vendors `src/owars/` and lazy-loads weights — the bundle runs offline by design.

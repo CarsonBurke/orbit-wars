@@ -14,10 +14,10 @@ cells:
   - { run.name: lr_3em4, optim.lr: 3.0e-4 }
   - { run.name: lr_1em3, optim.lr: 1.0e-3 }
 
-  # analytical PMPO KL penalty
-  - { run.name: pmpo_kl_010, ppo.pmpo_kl_coef: 0.10 }
-  - { run.name: pmpo_kl_030, ppo.pmpo_kl_coef: 0.30 }
-  - { run.name: pmpo_kl_100, ppo.pmpo_kl_coef: 1.00 }
+  # CleanRL SPO-asym penalty bound in the helpful drift direction
+  - { run.name: spo_high_020, ppo.spo_eps_high: 0.20 }
+  - { run.name: spo_high_028, ppo.spo_eps_high: 0.28 }
+  - { run.name: spo_high_040, ppo.spo_eps_high: 0.40 }
 
   # target entropy coef; fraction entropy stays disabled in the base config
   - { run.name: ent_001,  ppo.target_entropy_coef: 0.001 }

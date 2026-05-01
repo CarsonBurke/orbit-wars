@@ -564,7 +564,7 @@ def test_rust_vec_env_native_sampler_matches_context_sampler():
     assert torch.equal(got_records.launch, expected_records.launch)
     assert torch.equal(got_records.target_idx, expected_records.target_idx)
     assert torch.allclose(got_records.log_prob, expected_records.log_prob)
-    assert torch.equal(torch.isfinite(got_records.target_logits), torch.isfinite(expected_records.target_logits))
+    assert torch.equal(got_records.target_legal_mask, expected_records.target_legal_mask)
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")

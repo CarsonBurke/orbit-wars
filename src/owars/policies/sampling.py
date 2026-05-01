@@ -44,7 +44,6 @@ from .model import PolicyOutput
 # (post-parameterization) `log_prob` is finite on the closed [0, 1] but the Beta-
 # Jacobian `(α-1) log z + (β-1) log(1-z)` blows up if a sampled z hits
 # exactly 0 or 1 with α=1 or β=1 (where the corresponding term is 0·log 0).
-# Mirrors `cleanrl ppo_continuous_action_pmpo_d4_beta_relusq_v3.py:47`.
 SAMPLE_EPS: float = 1e-7
 
 
@@ -92,12 +91,8 @@ LEAD_MAX_SCAN_DISTANCE: float = math.hypot(BOARD_SIZE, BOARD_SIZE) + 8.0
 class SampleRecord:
     """Per-planet record of the sampled action — used by PPO rollouts.
 
-    The full distribution parameters (`launch_logits`, `target_logits`,
-    `fraction_alpha`, `fraction_beta`) are recorded alongside the sample so
-    PPO can compute the analytical KL divergence between the rollout-time
-    policy and the current policy (PMPO penalty, dreamer4
-    §`pmpo_kl_div_loss_weight`). Importance-ratio PPO uses only `log_prob`,
-    but the KL term needs the full distributions — hence both.
+    The target legality mask is recorded so PPO can recompute the current
+    policy log-prob under the same action support used during rollout.
 
     The Beta sample IS the action (no separate latent), so we only carry
     `fraction` ∈ (eps, 1-eps); recomputing `log_prob` at that value uses
@@ -108,10 +103,7 @@ class SampleRecord:
     target_idx: torch.Tensor   # [P] long, in [0, P)
     fraction: torch.Tensor     # [P] float in (eps, 1-eps) — Beta sample, used both for the move and for PPO's log_prob recompute
     log_prob: torch.Tensor     # [P] float — Bernoulli + launch*(Categorical + Beta)
-    launch_logits: torch.Tensor       # [P] — old-policy Bernoulli logits (PMPO KL input)
-    target_logits: torch.Tensor       # [P, P] — old-policy categorical logits, masked to the sampled legality context
-    fraction_alpha: torch.Tensor      # [P] — old-policy Beta α
-    fraction_beta: torch.Tensor       # [P] — old-policy Beta β
+    target_legal_mask: torch.Tensor   # [P, P] bool
 
 
 @dataclass
@@ -127,10 +119,7 @@ class SampleBatchRecord:
     target_idx: torch.Tensor
     fraction: torch.Tensor
     log_prob: torch.Tensor
-    launch_logits: torch.Tensor
-    target_logits: torch.Tensor
-    fraction_alpha: torch.Tensor
-    fraction_beta: torch.Tensor
+    target_legal_mask: torch.Tensor
 
 
 @dataclass(slots=True)
@@ -1226,10 +1215,7 @@ def _record_from_materialized_launch(
         target_idx=target_idx,
         fraction=frac,
         log_prob=log_prob,
-        launch_logits=launch_logits,
-        target_logits=target_logits,
-        fraction_alpha=fraction_alpha,
-        fraction_beta=fraction_beta,
+        target_legal_mask=torch.isfinite(target_logits),
     )
 
 
@@ -1257,14 +1243,13 @@ def _batch_record_from_materialized_launch(
         )
     target_idx_r = target_idx.index_select(0, row_idx)
     frac_r = frac.index_select(0, row_idx)
-    launch_logits_r = launch_logits.index_select(0, row_idx)
     target_logits_r = target_logits.index_select(0, row_idx)
     fraction_alpha_r = fraction_alpha.index_select(0, row_idx)
     fraction_beta_r = fraction_beta.index_select(0, row_idx)
 
     safe_target_logits = _safe_target_logits(target_logits_r.float())
     launch_lp = -nn_functional.binary_cross_entropy_with_logits(
-        launch_logits_r.float(),
+        launch_logits.index_select(0, row_idx).float(),
         actual_launch.float(),
         reduction="none",
     )
@@ -1284,10 +1269,7 @@ def _batch_record_from_materialized_launch(
         target_idx=target_idx_r,
         fraction=frac_r,
         log_prob=log_prob,
-        launch_logits=launch_logits_r,
-        target_logits=target_logits_r,
-        fraction_alpha=fraction_alpha_r,
-        fraction_beta=fraction_beta_r,
+        target_legal_mask=torch.isfinite(target_logits_r),
     )
 
 

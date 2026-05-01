@@ -49,9 +49,9 @@ optim:
 ppo:
   gamma: 0.997
   gae_lambda: 0.95
-  pmpo_pos_to_neg_weight: 0.5
-  pmpo_reverse_kl: true
-  pmpo_kl_coef: 0.3
+  norm_advantage: true
+  spo_eps_low: 0.2
+  spo_eps_high: 0.28
   value_coef: 1.0
   target_entropy_coef: 0.015   # a touch higher to keep diverse strategies alive in FFA
   fraction_entropy_coef: 0.0

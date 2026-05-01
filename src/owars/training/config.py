@@ -103,7 +103,7 @@ class OptimCfg:
 
 @dataclass
 class PPOCfg:
-    """PMPO + dreamer4-aligned distributional critic.
+    """SPO-asym policy objective + distributional critic.
 
     Dense potential rewards make the per-step signal informative, so use the
     conventional PPO GAE setup: discounted returns with one fixed lambda for
@@ -112,15 +112,11 @@ class PPOCfg:
 
     gamma: float = 0.997
     gae_lambda: float = 0.95
-    # PMPO surrogate replaces the clipped PPO surrogate. It uses only the sign
-    # of the advantage, matching Dreamer4 paper Eq. 11. There is no `clip_eps`
-    # knob — the analytical KL term below is the only trust-region signal.
-    pmpo_pos_to_neg_weight: float = 0.5    # equal weight on pos and neg advantage (dreamer4 default)
-    pmpo_reverse_kl: bool = True            # dreamer4 default direction. False is an ablation, not full joint forward KL.
-    # PMPO KL penalty. Launch uses full Bernoulli KL; target/fraction KL is
-    # weighted by the source launch probability, matching the analytical KL of
-    # the latent factored policy distribution.
-    pmpo_kl_coef: float = 0.3
+    norm_advantage: bool = True
+    # CleanRL SPO asym: quadratic ratio penalty with a looser bound when
+    # ratio drift agrees with the advantage sign.
+    spo_eps_low: float = 0.2
+    spo_eps_high: float = 0.28
     # Distributional CE gradients are naturally bounded (per-bin
     # `softmax − target_probs` has ‖∇‖ ~ O(1)), unlike MSE which blew
     # up under bad predictions. dreamer4 effectively runs the equivalent
@@ -248,6 +244,10 @@ class RunConfig:
             raise ValueError("ppo.gae_lambda must be in [0, 1]")
         if not 0.0 < cfg.ppo.gamma <= 1.0:
             raise ValueError("ppo.gamma must be in (0, 1]")
+        if cfg.ppo.spo_eps_low <= 0.0 or cfg.ppo.spo_eps_high <= 0.0:
+            raise ValueError("ppo.spo_eps_low/high must be positive")
+        if cfg.ppo.spo_eps_high < cfg.ppo.spo_eps_low:
+            raise ValueError("ppo.spo_eps_high must be >= ppo.spo_eps_low")
         if not 0.0 <= cfg.model.planet_rope_fraction <= 1.0:
             raise ValueError("model.planet_rope_fraction must be in [0, 1]")
         if cfg.model.planet_rope_base <= 0.0:

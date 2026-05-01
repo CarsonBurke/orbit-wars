@@ -1,43 +1,14 @@
-"""PPO update — dreamer4-aligned PMPO surrogate + distributional critic.
+"""SPO-asym policy update with a distributional critic.
 
-This file is **not** vanilla clipped PPO. It mirrors dreamer4's
-`learn_from_experience` pipeline (`dreamer4.py:4258–4548`) with the small
-adaptations the Orbit Wars action structure imposes:
+The policy loss follows CleanRL's SPO asymmetric variant:
 
-  1. **PMPO policy loss** (no PPO clip). On a per-action-factor log-prob `lp`:
-        scaled_lp = lp
-     split by sign of `adv`:
-        policy_loss = −α · mean(scaled_lp[adv ≥ 0])
-                      + (1−α) · mean(scaled_lp[adv < 0])
-     with `α = pmpo_pos_to_neg_weight = 0.5` (dreamer4 default).
-     This is the principled replacement for the clipped surrogate when
-     PMPO is on — running both at once double-counts the trust region.
+    J = E[r*A - |A|*(r-1)^2/(2*eps)]
 
-  2. **PMPO KL penalty**. `pmpo_reverse_kl=True` uses dreamer4's reverse-KL
-     direction for each modeled factor (`dreamer4.py:4323-4324`):
-        Bernoulli launch: Σ p_old · (log p_old − log p_new)
-        Categorical target | launch: same, weighted by source P(launch)
-        Beta fraction | launch: kl_divergence(old, new), weighted by source P(launch)
-     This is the analytical KL for the policy's latent factored action
-     distribution. The actor log-prob still uses the materialized action after
-     the legality layer, but the trust-region penalty follows dreamer4 and
-     regularizes the full distribution, not only sampled/executed branches.
-
-  3. **Conventional GAE** supplies both critic returns and actor advantages.
-     PMPO uses only the sign of the advantage; critic returns stay in raw
-     reward units.
-
-  4. **Distributional value loss** (HL-Gauss CE, `dreamer4.py:4509-4515`).
-     The critic emits `value_logits` over a fixed bin support; the loss
-     is cross-entropy against `target_probs(returns)`. No value clipping —
-     distributional CE has bounded per-element gradients
-     (`softmax_i − target_i ∈ [-1, 1]`), and dreamer4's
-     `max(ce, ce_of_clipped_v)` clip degenerates with our narrow HL-Gauss
-     σ (the re-encoded clipped scalar doesn't overlap with the return target,
-     so clipped CE saturates at `−log(eps) ≈ 46` and dominates the loss).
-
-Unlike dreamer4's world-model setup, this is a pure policy/value agent: policy
-gradients are allowed through the shared encoder.
+where `eps` is larger when ratio drift agrees with the advantage sign and
+smaller otherwise. The critic emits `value_logits` over a fixed bin support
+and trains with cross-entropy against HL-Gauss-encoded returns. No scalar value
+clipping is used because the distributional CE gradients are already bounded
+per bin.
 """
 
 from __future__ import annotations
@@ -157,18 +128,6 @@ def _bernoulli_log_probs(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return log_p0, log_p1
 
 
-def _bernoulli_kl(
-    source_logits: torch.Tensor,
-    target_logits: torch.Tensor,
-) -> torch.Tensor:
-    source_p = source_logits.sigmoid()
-    source_log_p0, source_log_p1 = _bernoulli_log_probs(source_logits)
-    target_log_p0, target_log_p1 = _bernoulli_log_probs(target_logits)
-    return source_p * (source_log_p1 - target_log_p1) + (1.0 - source_p) * (
-        source_log_p0 - target_log_p0
-    )
-
-
 def _bernoulli_entropy(logits: torch.Tensor) -> torch.Tensor:
     p = logits.sigmoid()
     log_p0, log_p1 = _bernoulli_log_probs(logits)
@@ -219,23 +178,6 @@ def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _beta_kl(
-    source_alpha: torch.Tensor,
-    source_beta: torch.Tensor,
-    target_alpha: torch.Tensor,
-    target_beta: torch.Tensor,
-) -> torch.Tensor:
-    source_total = source_alpha + source_beta
-    return (
-        _beta_log_normalizer(target_alpha, target_beta)
-        - _beta_log_normalizer(source_alpha, source_beta)
-        + (source_alpha - target_alpha) * torch.digamma(source_alpha)
-        + (source_beta - target_beta) * torch.digamma(source_beta)
-        + (target_alpha - source_alpha + target_beta - source_beta)
-        * torch.digamma(source_total)
-    )
-
-
 def _module_device(model: torch.nn.Module) -> torch.device:
     try:
         return next(model.parameters()).device
@@ -259,9 +201,9 @@ class _PPOMinibatchKernel(torch.nn.Module):
         value_coef: float,
         target_entropy_coef: float,
         fraction_entropy_coef: float,
-        pmpo_kl_coef: float,
-        pmpo_pos_to_neg_weight: float,
-        pmpo_reverse_kl: bool,
+        norm_advantage: bool,
+        spo_eps_low: float,
+        spo_eps_high: float,
         autocast_enabled: bool,
     ) -> None:
         super().__init__()
@@ -269,9 +211,9 @@ class _PPOMinibatchKernel(torch.nn.Module):
         self.value_coef = float(value_coef)
         self.target_entropy_coef = float(target_entropy_coef)
         self.fraction_entropy_coef = float(fraction_entropy_coef)
-        self.pmpo_kl_coef = float(pmpo_kl_coef)
-        self.pmpo_pos_to_neg_weight = float(pmpo_pos_to_neg_weight)
-        self.pmpo_reverse_kl = bool(pmpo_reverse_kl)
+        self.norm_advantage = bool(norm_advantage)
+        self.spo_eps_low = float(spo_eps_low)
+        self.spo_eps_high = float(spo_eps_high)
         self.autocast_enabled = bool(autocast_enabled)
 
     def forward(
@@ -291,10 +233,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         advantage: torch.Tensor,
         ret: torch.Tensor,
         owned_mask: torch.Tensor,
-        old_launch_logits: torch.Tensor,
-        old_target_logits: torch.Tensor,
-        old_fraction_alpha: torch.Tensor,
-        old_fraction_beta: torch.Tensor,
+        target_legal_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -310,10 +249,10 @@ class _PPOMinibatchKernel(torch.nn.Module):
         ):
             out = self.model(feats)
 
-        old_target_mask = torch.isfinite(old_target_logits)
-        has_legal_target = old_target_mask.any(dim=-1)
+        target_legal_mask = target_legal_mask.bool()
+        has_legal_target = target_legal_mask.any(dim=-1)
         launch_logits = out.launch_logits.float().masked_fill(~has_legal_target, -20.0)
-        target_logits = out.target_logits.float().masked_fill(~old_target_mask, float("-inf"))
+        target_logits = out.target_logits.float().masked_fill(~target_legal_mask, float("-inf"))
         target_logits = _safe_target_logits(target_logits)
         fraction_alpha = out.fraction_alpha.float()
         fraction_beta = out.fraction_beta.float()
@@ -332,25 +271,28 @@ class _PPOMinibatchKernel(torch.nn.Module):
         frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
         chosen = launch_lp + launch_f * (target_lp + frac_lp)
 
-        factor_log_probs = torch.stack((launch_lp, target_lp, frac_lp), dim=-1)
-        factor_mask = torch.stack(
-            (torch.ones_like(launch_f), launch_f, launch_f),
-            dim=-1,
-        )
         adv_b = advantage.float().unsqueeze(-1).expand_as(chosen)
-        adv_f = advantage.float().unsqueeze(-1).unsqueeze(-1).expand_as(factor_log_probs)
-        scaled_lp = factor_log_probs
         row_w = row_weight.to(device=owned_f.device, dtype=owned_f.dtype)
         row_w_b = row_w.unsqueeze(-1)
         owned_w = owned_f * row_w_b
-        factor_w = owned_w.unsqueeze(-1) * factor_mask
-        pos_w = factor_w * (adv_f >= 0.0).to(owned_f.dtype)
-        neg_w = factor_w * (adv_f < 0.0).to(owned_f.dtype)
+        denom = owned_w.sum().clamp_min(1.0)
 
-        pos_loss = _weighted_mean(scaled_lp, pos_w)
-        neg_loss = _weighted_mean(scaled_lp, neg_w)
-        alpha = self.pmpo_pos_to_neg_weight
-        policy_loss = -alpha * pos_loss + (1.0 - alpha) * neg_loss
+        log_ratio = chosen - old_log_prob.float()
+        ratio = log_ratio.exp()
+        adv_actor = adv_b
+        if self.norm_advantage:
+            adv_mean = (adv_actor * owned_w).sum() / denom
+            adv_var = (((adv_actor - adv_mean).square()) * owned_w).sum() / denom
+            adv_actor = (adv_actor - adv_mean) * torch.rsqrt(adv_var + 1e-8)
+        ratio_diff = ratio - 1.0
+        eps = torch.where(
+            adv_actor * ratio_diff > 0.0,
+            torch.full_like(ratio, self.spo_eps_high),
+            torch.full_like(ratio, self.spo_eps_low),
+        )
+        spo_penalty = adv_actor.abs() * ratio_diff.square() / (2.0 * eps)
+        policy_loss = -_weighted_mean(adv_actor * ratio - spo_penalty, owned_w)
+        spo_penalty_mean = _weighted_mean(spo_penalty, owned_w)
 
         value_encoder = self.model.value_encoder
         target_probs = value_encoder.target_probs(ret.float())
@@ -363,7 +305,6 @@ class _PPOMinibatchKernel(torch.nn.Module):
         planet_entropy = _conditional_action_entropy(
             launch_logits, target_log_probs, beta_entropy
         )
-        denom = owned_w.sum().clamp_min(1.0)
         entropy = (planet_entropy * owned_w).sum() / denom
         launch_entropy = (_bernoulli_entropy(launch_logits) * owned_w).sum() / denom
         target_entropy_per_planet = -(
@@ -392,50 +333,13 @@ class _PPOMinibatchKernel(torch.nn.Module):
             + self.fraction_entropy_coef * fraction_entropy
         )
 
-        pmpo_kl = torch.zeros((), dtype=policy_loss.dtype, device=policy_loss.device)
-        pmpo_target_kl = torch.zeros_like(pmpo_kl)
-        pmpo_fraction_kl = torch.zeros_like(pmpo_kl)
-        if self.pmpo_kl_coef != 0.0:
-            old_target_logits_safe = _safe_target_logits(old_target_logits.float())
-            old_target_log_probs = F.log_softmax(old_target_logits_safe, dim=-1)
-            kl_min = torch.finfo(target_log_probs.dtype).min
-            log_p_new_safe = target_log_probs.clamp_min(kl_min)
-            log_p_old_safe = old_target_log_probs.clamp_min(kl_min)
-            old_launch_logits_f = old_launch_logits.float()
-            old_alpha = old_fraction_alpha.float()
-            old_beta = old_fraction_beta.float()
-            if self.pmpo_reverse_kl:
-                launch_kl = _bernoulli_kl(old_launch_logits_f, launch_logits)
-                conditional_kl_weight = old_launch_logits_f.sigmoid()
-                target_probs_old = old_target_log_probs.exp()
-                target_kl = (
-                    target_probs_old * (log_p_old_safe - log_p_new_safe)
-                ).sum(dim=-1)
-                frac_kl = _beta_kl(old_alpha, old_beta, fraction_alpha, fraction_beta)
-            else:
-                launch_kl = _bernoulli_kl(launch_logits, old_launch_logits_f)
-                conditional_kl_weight = launch_logits.sigmoid()
-                target_kl = (
-                    target_dist_probs * (log_p_new_safe - log_p_old_safe)
-                ).sum(dim=-1)
-                frac_kl = _beta_kl(fraction_alpha, fraction_beta, old_alpha, old_beta)
-            planet_kl = launch_kl + conditional_kl_weight * (target_kl + frac_kl)
-            pmpo_kl = ((planet_kl * owned_w).sum() / denom).clamp_min(0.0)
-            pmpo_target_kl = (
-                ((conditional_kl_weight * target_kl) * owned_w).sum() / denom
-            ).clamp_min(0.0)
-            pmpo_fraction_kl = (
-                ((conditional_kl_weight * frac_kl) * owned_w).sum() / denom
-            ).clamp_min(0.0)
-
         loss = (
             policy_loss
             + self.value_coef * value_loss
             - entropy_bonus
-            + self.pmpo_kl_coef * pmpo_kl
         )
 
-        kl = ((old_log_prob.float() - chosen) * owned_w).sum() / denom
+        kl = (((ratio - 1.0) - log_ratio) * owned_w).sum() / denom
         pos_count = (owned_w * (adv_b >= 0.0).to(owned_f.dtype)).sum()
         total_owned = owned_w.sum().clamp_min(1.0)
         pos_frac = pos_count / total_owned
@@ -445,7 +349,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 value_loss.detach(),
                 entropy.detach(),
                 kl.detach(),
-                pmpo_kl.detach(),
+                spo_penalty_mean.detach(),
                 pos_frac.detach(),
                 target_entropy.detach(),
                 fraction_entropy.detach(),
@@ -458,8 +362,6 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 fraction_mode_mean.detach(),
                 fraction_concentration_mean.detach(),
                 fraction_concentration_max.detach(),
-                pmpo_target_kl.detach(),
-                pmpo_fraction_kl.detach(),
             ]
         ).float()
         return loss, metrics
@@ -534,9 +436,9 @@ def _get_ppo_kernel(
     value_coef: float,
     target_entropy_coef: float,
     fraction_entropy_coef: float,
-    pmpo_kl_coef: float,
-    pmpo_pos_to_neg_weight: float,
-    pmpo_reverse_kl: bool,
+    norm_advantage: bool,
+    spo_eps_low: float,
+    spo_eps_high: float,
     compile_mode: str | None,
 ) -> torch.nn.Module:
     device = _module_device(model)
@@ -547,9 +449,9 @@ def _get_ppo_kernel(
         float(value_coef),
         float(target_entropy_coef),
         float(fraction_entropy_coef),
-        float(pmpo_kl_coef),
-        float(pmpo_pos_to_neg_weight),
-        bool(pmpo_reverse_kl),
+        bool(norm_advantage),
+        float(spo_eps_low),
+        float(spo_eps_high),
     )
     cache = _kernel_cache(model)
     cached = cache.get(key)
@@ -560,9 +462,9 @@ def _get_ppo_kernel(
         value_coef=value_coef,
         target_entropy_coef=target_entropy_coef,
         fraction_entropy_coef=fraction_entropy_coef,
-        pmpo_kl_coef=pmpo_kl_coef,
-        pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
-        pmpo_reverse_kl=pmpo_reverse_kl,
+        norm_advantage=norm_advantage,
+        spo_eps_low=spo_eps_low,
+        spo_eps_high=spo_eps_high,
         autocast_enabled=device.type == "cuda",
     )
     kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
@@ -596,9 +498,9 @@ class PPOLog:
     policy_loss: float
     value_loss: float
     entropy: float
-    approx_kl: float       # importance-ratio diagnostic E[old_lp − new_lp]; PMPO does not use this for the loss
-    pmpo_kl: float         # launch KL plus probability-weighted conditional target/fraction KL
-    pos_frac: float        # fraction of owned-planet samples whose advantage was ≥ 0
+    approx_kl: float
+    spo_penalty: float
+    pos_frac: float
     target_entropy: float = 0.0
     fraction_entropy: float = 0.0
     move_prob: float = 0.0
@@ -610,8 +512,6 @@ class PPOLog:
     fraction_mode_mean: float = 0.0
     fraction_concentration_mean: float = 0.0
     fraction_concentration_max: float = 0.0
-    pmpo_target_kl: float = 0.0
-    pmpo_fraction_kl: float = 0.0
 
 
 def compute_gae(
@@ -660,9 +560,9 @@ def ppo_update(
     value_coef: float,
     target_entropy_coef: float,
     fraction_entropy_coef: float,
-    pmpo_kl_coef: float,
-    pmpo_pos_to_neg_weight: float,
-    pmpo_reverse_kl: bool,
+    norm_advantage: bool,
+    spo_eps_low: float,
+    spo_eps_high: float,
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
@@ -675,18 +575,10 @@ def ppo_update(
       `planet_garrison`, `fleet_feats`, `fleet_mask`,
       `launch` [B,P], `target_idx` [B,P], `fraction` [B,P],
       `old_log_prob` [B,P], `advantage` [B], `return` [B],
-      `owned_mask` [B,P],
-      `old_launch_logits` [B,P],
-      `old_target_logits` [B,P,P],
-      `old_fraction_alpha` [B,P], `old_fraction_beta` [B,P].
+      `owned_mask` [B,P], `target_legal_mask` [B,P,P].
 
-    PMPO surrogate: `policy_loss = −α·mean(log_prob[pos]) + (1−α)·mean(log_prob[neg])`.
-    Launch is always a factor; target/fraction are factors only for materialized
-    launches. No PPO clip.
-    Trust region is the PMPO KL term: full Bernoulli launch KL plus
-    probability-weighted conditional target/fraction KL. `pmpo_reverse_kl=True`
-    matches dreamer4's direction for each factor; setting `False` flips the
-    factor direction.
+    The actor objective is SPO asym:
+      `-mean(ratio * advantage - |advantage| * (ratio - 1)^2 / (2 * eps))`.
 
     Distributional value loss: cross-entropy against HL-Gauss-encoded
     returns (`value_encoder.target_probs(returns)`). No value clipping.
@@ -702,9 +594,9 @@ def ppo_update(
         value_coef=value_coef,
         target_entropy_coef=target_entropy_coef,
         fraction_entropy_coef=fraction_entropy_coef,
-        pmpo_kl_coef=pmpo_kl_coef,
-        pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
-        pmpo_reverse_kl=pmpo_reverse_kl,
+        norm_advantage=norm_advantage,
+        spo_eps_low=spo_eps_low,
+        spo_eps_high=spo_eps_high,
         compile_mode=compile_mode,
     )
     for _ in range(epochs):
@@ -726,10 +618,7 @@ def ppo_update(
                 batch["advantage"][mb],
                 batch["return"][mb],
                 batch["owned_mask"][mb],
-                batch["old_launch_logits"][mb],
-                batch["old_target_logits"][mb],
-                batch["old_fraction_alpha"][mb],
-                batch["old_fraction_beta"][mb],
+                batch["target_legal_mask"][mb],
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -744,7 +633,7 @@ def ppo_update(
 
     n_steps = max(1, n_steps)
     logs = (
-        [0.0] * 19
+        [0.0] * 17
         if metric_sum is None
         else (metric_sum / n_steps).detach().cpu().tolist()
     )
@@ -753,7 +642,7 @@ def ppo_update(
         value_loss=float(logs[1]),
         entropy=float(logs[2]),
         approx_kl=float(logs[3]),
-        pmpo_kl=float(logs[4]),
+        spo_penalty=float(logs[4]),
         pos_frac=float(logs[5]),
         target_entropy=float(logs[6]),
         fraction_entropy=float(logs[7]),
@@ -766,8 +655,6 @@ def ppo_update(
         fraction_mode_mean=float(logs[14]),
         fraction_concentration_mean=float(logs[15]),
         fraction_concentration_max=float(logs[16]),
-        pmpo_target_kl=float(logs[17]),
-        pmpo_fraction_kl=float(logs[18]),
     )
 
 

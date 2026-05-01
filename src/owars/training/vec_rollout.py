@@ -161,10 +161,7 @@ def _empty_traj() -> Trajectory:
     return Trajectory(
         encoded=[], launch=[], target_idx=[], fraction=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
-        old_launch_logits=[],
-        old_target_logits=[],
-        old_fraction_alpha=[],
-        old_fraction_beta=[],
+        target_legal_mask=[],
     )
 
 
@@ -682,10 +679,7 @@ def _step_learner_bucket(
             traj.log_prob.append(rec["log_prob"][j])
             traj.value.append(rec["value"][j])
             traj.owned_mask.append(rec["owned_mask"][j])
-            traj.old_launch_logits.append(rec["old_launch_logits"][j])
-            traj.old_target_logits.append(rec["old_target_logits"][j])
-            traj.old_fraction_alpha.append(rec["old_fraction_alpha"][j])
-            traj.old_fraction_beta.append(rec["old_fraction_beta"][j])
+            traj.target_legal_mask.append(rec["target_legal_mask"][j])
             traj.reward.append(0.0)
 
     for k, (env_idx, seat, _obs) in enumerate(bucket):
@@ -718,19 +712,13 @@ def _materialize_records_cpu(
         target_idx = torch.stack([records[k].target_idx for k in rows])
         fraction = torch.stack([records[k].fraction for k in rows])
         log_prob = torch.stack([records[k].log_prob for k in rows])
-        old_launch_logits = torch.stack([records[k].launch_logits for k in rows])
-        old_target_logits = torch.stack([records[k].target_logits for k in rows])
-        old_fraction_alpha = torch.stack([records[k].fraction_alpha for k in rows])
-        old_fraction_beta = torch.stack([records[k].fraction_beta for k in rows])
+        target_legal_mask = torch.stack([records[k].target_legal_mask for k in rows])
     else:
         launch = records.launch
         target_idx = records.target_idx
         fraction = records.fraction
         log_prob = records.log_prob
-        old_launch_logits = records.launch_logits
-        old_target_logits = records.target_logits
-        old_fraction_alpha = records.fraction_alpha
-        old_fraction_beta = records.fraction_beta
+        target_legal_mask = records.target_legal_mask
     owned_mask = out.planet_owned_mask.index_select(0, row_idx)
     value = out.value.index_select(0, row_idx)
     b, p = target_idx.shape
@@ -742,10 +730,7 @@ def _materialize_records_cpu(
             log_prob.float(),
             value.float().unsqueeze(1),
             owned_mask.float(),
-            old_launch_logits.float(),
-            old_target_logits.float().reshape(b, -1),
-            old_fraction_alpha.float(),
-            old_fraction_beta.float(),
+            target_legal_mask.float().reshape(b, -1),
         ),
         dim=1,
     ).detach().cpu()
@@ -762,14 +747,8 @@ def _materialize_records_cpu(
     pos += 1
     owned_mask_cpu = flat[:, pos : pos + p].bool()
     pos += p
-    old_launch_logits_cpu = flat[:, pos : pos + p]
-    pos += p
-    old_logits_width = p * p
-    old_target_logits_cpu = flat[:, pos : pos + old_logits_width].reshape(b, p, p)
-    pos += old_logits_width
-    old_fraction_alpha_cpu = flat[:, pos : pos + p]
-    pos += p
-    old_fraction_beta_cpu = flat[:, pos : pos + p]
+    target_legal_width = p * p
+    target_legal_mask_cpu = flat[:, pos : pos + target_legal_width].reshape(b, p, p).bool()
 
     return {
         "planet_feats": feature_source.planet_feats.index_select(0, feature_rows)
@@ -799,10 +778,7 @@ def _materialize_records_cpu(
         "log_prob": log_prob_cpu,
         "value": value_cpu,
         "owned_mask": owned_mask_cpu,
-        "old_launch_logits": old_launch_logits_cpu,
-        "old_target_logits": old_target_logits_cpu,
-        "old_fraction_alpha": old_fraction_alpha_cpu,
-        "old_fraction_beta": old_fraction_beta_cpu,
+        "target_legal_mask": target_legal_mask_cpu,
     }
 
 

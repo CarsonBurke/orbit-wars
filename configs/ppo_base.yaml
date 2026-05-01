@@ -5,9 +5,8 @@
 # and reward shaping should be tuned per-mode.
 #
 # Defaults baked in:
-#   - PMPO surrogate (dreamer4-aligned) instead of clipped PPO. No
-#     `clip_eps` knob; trust region is launch KL plus probability-weighted
-#     conditional target/fraction KL.
+#   - CleanRL SPO-asym surrogate with `spo_eps_low = 0.2`,
+#     `spo_eps_high = 0.28`, and minibatch advantage normalization.
 #   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
 #   - Distributional value head (symlog HL-Gauss CE on ±100k raw margin / 153 bins), unclipped.
@@ -71,9 +70,9 @@ optim:
 ppo:
   gamma: 0.997
   gae_lambda: 0.95
-  pmpo_pos_to_neg_weight: 0.5   # dreamer4 default — equal weight pos/neg advantage in the PMPO loss
-  pmpo_reverse_kl: true         # dreamer4 default direction; false is only an ablation
-  pmpo_kl_coef: 0.3             # launch KL + probability-weighted conditional target/fraction KL
+  norm_advantage: true
+  spo_eps_low: 0.2
+  spo_eps_high: 0.28
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
 
   target_entropy_coef: 0.01     # categorical target distribution has no structural floor, so keep it from collapsing

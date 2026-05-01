@@ -197,21 +197,9 @@ def test_batched_sampler_can_return_subset_record_batch():
     assert torch.equal(batch_record.target_idx, torch.stack([records[1].target_idx, records[3].target_idx]))
     assert torch.allclose(batch_record.fraction, torch.stack([records[1].fraction, records[3].fraction]))
     assert torch.allclose(batch_record.log_prob, torch.stack([records[1].log_prob, records[3].log_prob]), atol=1e-6)
-    assert torch.allclose(
-        batch_record.launch_logits,
-        torch.stack([records[1].launch_logits, records[3].launch_logits]),
-    )
-    assert torch.allclose(
-        batch_record.target_logits,
-        torch.stack([records[1].target_logits, records[3].target_logits]),
-    )
-    assert torch.allclose(
-        batch_record.fraction_alpha,
-        torch.stack([records[1].fraction_alpha, records[3].fraction_alpha]),
-    )
-    assert torch.allclose(
-        batch_record.fraction_beta,
-        torch.stack([records[1].fraction_beta, records[3].fraction_beta]),
+    assert torch.equal(
+        batch_record.target_legal_mask,
+        torch.stack([records[1].target_legal_mask, records[3].target_legal_mask]),
     )
 
 
@@ -352,7 +340,7 @@ def test_sampler_records_noop_when_no_legal_target_exists():
     assert raw_actions == [[]]
     assert record.launch[0].item() == 0.0
     assert raw_records[0].launch[0].item() == 0.0
-    assert not torch.isfinite(record.target_logits[0]).any()
+    assert not record.target_legal_mask[0].any()
 
 
 def test_subset_records_match_legality_masked_target_sampling():
@@ -423,10 +411,15 @@ def test_no_launch_record_still_masks_missing_legal_target_support():
     assert raw_actions == [[]]
     assert record.launch[0].item() == 0.0
     assert raw_records[0].launch[0].item() == 0.0
-    assert record.launch_logits[0].item() == -20.0
-    assert raw_records[0].launch_logits[0].item() == -20.0
-    assert not torch.isfinite(record.target_logits[0]).any()
-    assert not torch.isfinite(raw_records[0].target_logits[0]).any()
+    expected_noop_log_prob = -torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.tensor(-20.0),
+        torch.zeros_like(out.launch_logits[0, 0]),
+        reduction="none",
+    )
+    assert torch.allclose(record.log_prob[0], expected_noop_log_prob, atol=1e-6)
+    assert torch.allclose(raw_records[0].log_prob[0], expected_noop_log_prob, atol=1e-6)
+    assert not record.target_legal_mask[0].any()
+    assert not raw_records[0].target_legal_mask[0].any()
 
 
 def test_sampler_masks_comet_target_to_legal_alternative():

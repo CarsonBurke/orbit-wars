@@ -120,7 +120,7 @@ Each row is one knob; everything else stays at the base config.
 | `opponents.pool` | self-only / balanced / baselines / heuristic-only / + frozen | `opponents_v0.yaml` |
 | `reward.*` | terminal-only / cap+loss / heavy / light / margin-only | `reward_v0.yaml` |
 | `optim.lr` | 1e-4, 3e-4, 1e-3 | `ppo_v0.yaml` |
-| `ppo.clip_eps` | 0.10, 0.20, 0.30 | `ppo_v0.yaml` |
+| `ppo.spo_eps_high` | 0.20, 0.28, 0.40 | `ppo_v0.yaml` |
 | `ppo.gamma` | 0.99, 0.995, 0.999 | `ppo_v0.yaml` |
 
 Read the matrix; then expand: pick the best 1–2 settings per row and run a 2-D combo of the top knobs.

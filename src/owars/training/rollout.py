@@ -79,12 +79,7 @@ class Trajectory:
     value: list[torch.Tensor]                 # scalar tensors (no .item() in the hot loop)
     reward: list[float]
     owned_mask: list[torch.Tensor]            # [P] bool
-    # Old-policy distribution parameters captured at rollout time. Used by
-    # PMPO's analytical KL(new ‖ old) penalty (`ppo.py::ppo_update`).
-    old_launch_logits: list[torch.Tensor]     # [P] float
-    old_target_logits: list[torch.Tensor]     # [P, P] float
-    old_fraction_alpha: list[torch.Tensor]    # [P] float — rollout-policy Beta α
-    old_fraction_beta: list[torch.Tensor]     # [P] float — rollout-policy Beta β
+    target_legal_mask: list[torch.Tensor]     # [P, P] bool
     final_score: float = 0.0
     won: bool = False
     drawn: bool = False
@@ -201,8 +196,7 @@ def rollout_episode(
     traj = Trajectory(
         encoded=[], launch=[], target_idx=[], fraction=[],
         log_prob=[], value=[], reward=[], owned_mask=[],
-        old_launch_logits=[],
-        old_target_logits=[], old_fraction_alpha=[], old_fraction_beta=[],
+        target_legal_mask=[],
     )
     learner_tracker = _FleetTargetTracker()
 
@@ -273,10 +267,7 @@ def record_step(
     traj.log_prob.append(record.log_prob.detach().clone())
     traj.value.append(value_t.detach().clone())
     traj.owned_mask.append(owned_mask_t.detach().clone())
-    traj.old_launch_logits.append(record.launch_logits.detach().clone())
-    traj.old_target_logits.append(record.target_logits.detach().clone())
-    traj.old_fraction_alpha.append(record.fraction_alpha.detach().clone())
-    traj.old_fraction_beta.append(record.fraction_beta.detach().clone())
+    traj.target_legal_mask.append(record.target_legal_mask.detach().clone())
     traj.reward.append(0.0)
 
 
