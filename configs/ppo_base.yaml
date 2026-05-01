@@ -6,12 +6,10 @@
 #
 # Defaults baked in:
 #   - PMPO surrogate (dreamer4-aligned) instead of clipped PPO. No
-#     `clip_eps` knob; trust region is the analytical reverse-KL penalty.
-#   - γ = 1.0 (finite-horizon, terminal-only ±1 reward — no discounting)
-#   - λ_critic = 1.0 (Monte-Carlo target, unbiased)
-#   - λ_policy = 1 - 1 / (0.05 * episode_length) for the actor advantage
-#     (VAPO length-adaptive GAE; raw, not z-scored — PMPO's tanh|adv|
-#     shaping bounds magnitude on its own)
+#     `clip_eps` knob; trust region is launch KL plus probability-weighted
+#     conditional target/fraction KL.
+#   - Dense reward = delta of normalized projected population margin.
+#   - Conventional GAE: γ = 0.997, λ = 0.95.
 #   - Distributional value head (HL-Gauss CE on [-2, 2] / 51 bins), unclipped.
 
 run:
@@ -21,7 +19,7 @@ run:
   compile_mode: reduce-overhead
   log_root: runs
   ckpt_root: checkpoints
-  total_updates: 200
+  total_updates: 1000
 
 game:
   num_players: 2
@@ -41,6 +39,8 @@ model:
   depth: 3
   n_heads: 4
   dropout: 0.0
+  planet_rope_fraction: 0.25   # partial 2D RoPE over 8/32 dims per head, planets only
+  planet_rope_base: 10000.0
   encoder_backend: fleet_latent
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
@@ -63,12 +63,11 @@ optim:
   epochs_per_update: 4
 
 ppo:
-  gamma: 1.0
-  lambda_critic: 1.0
-  lambda_policy_alpha: 0.05  # VAPO length-adaptive GAE: λ = 1 - 1/(α * episode_length)
+  gamma: 0.997
+  gae_lambda: 0.95
   pmpo_pos_to_neg_weight: 0.5   # dreamer4 default — equal weight pos/neg advantage in the PMPO loss
-  pmpo_reverse_kl: true         # dreamer4 default — KL(old ‖ new). false ⇒ KL(new ‖ old).
-  pmpo_kl_coef: 0.3             # analytical reverse-KL penalty weight (dreamer4 `dreamer4.py:3083`)
+  pmpo_reverse_kl: true         # dreamer4 default direction; false is only an ablation
+  pmpo_kl_coef: 0.3             # launch KL + probability-weighted conditional target/fraction KL
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
 
   target_entropy_coef: 0.01     # categorical target distribution has no structural floor, so keep it from collapsing
@@ -84,8 +83,8 @@ ppo:
 
 rollout:
   num_envs: 128             # parallel envs (= episodes per update)
-  num_workers: 24           # one shard per CPU core; rollout is the bottleneck
-  env_backend: numpy_mp
+  num_workers: 0            # only used by numpy_mp
+  env_backend: rust
 
 opponents:
   snapshot_device: train
@@ -101,10 +100,9 @@ opponents:
   k_factor: 32.0
 
 reward:
-  win_value: 1.0
-  loss_value: -1.0
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
   draw_value: 0.0
-  capture_bonus: 0.0
-  loss_penalty: 0.0
-  sun_loss_penalty: 0.0
   margin_scale: 0.0

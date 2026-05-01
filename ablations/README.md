@@ -15,7 +15,7 @@ Each cell becomes its own run under `runs/<matrix_name>/<cell.run.name>/<timesta
 | [`headline.yaml`](headline.yaml) | Did the modeling work pay off? Heuristic vs sniper vs trained transformer (small) vs trained transformer (medium). **Run this first.** |
 | [`policy_v0.yaml`](policy_v0.yaml) | Architecture sweep (one knob per cell): depth, width, heads, dropout. |
 | [`opponents_v0.yaml`](opponents_v0.yaml) | Opponent-pool composition: pure self-play vs mixed vs heavy-heuristic — the dial that most controls strategy diversity. |
-| [`reward_v0.yaml`](reward_v0.yaml) | Reward-shaping sweep: capture/loss bonuses, margin scale, terminal-only rewards. |
+| [`reward_v0.yaml`](reward_v0.yaml) | Dense projected-population reward sweep. |
 | [`ppo_v0.yaml`](ppo_v0.yaml) | PPO knobs: clip, gamma, lr, entropy coef, value coef. |
 
 ## Conventions

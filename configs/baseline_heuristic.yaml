@@ -23,6 +23,8 @@ model:
   depth: 3
   n_heads: 4
   dropout: 0.0
+  planet_rope_fraction: 0.25
+  planet_rope_base: 10000.0
   encoder_backend: fleet_latent
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
@@ -35,9 +37,8 @@ optim:
   epochs_per_update: 4
 
 ppo:
-  gamma: 1.0
-  lambda_critic: 1.0
-  lambda_policy_alpha: 0.05
+  gamma: 0.997
+  gae_lambda: 0.95
   pmpo_pos_to_neg_weight: 0.5
   pmpo_reverse_kl: true
   pmpo_kl_coef: 0.3
@@ -48,8 +49,8 @@ ppo:
 
 rollout:
   num_envs: 128
-  num_workers: 24
-  env_backend: numpy_mp
+  num_workers: 0
+  env_backend: rust
 
 opponents:
   snapshot_every: 50
@@ -59,6 +60,8 @@ opponents:
   k_factor: 32.0
 
 reward:
-  win_value: 1.0
-  loss_value: -1.0
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
   draw_value: 0.0

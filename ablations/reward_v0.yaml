@@ -1,9 +1,9 @@
-# Reward-shaping sweep.
+# Dense reward sweep.
 #
-# The terminal margin is the load-bearing signal — but pure terminal
-# rewards are very sparse over a 500-step game. Small intermediate shaping
-# helps credit-assignment, but too much shaping pushes the policy toward
-# the proxy and away from the actual win-rate.
+# The base reward is the delta of normalized projected population margin
+# against the strongest enemy. This sweep tests how strongly to weight that
+# potential, how much future production to project into population, and
+# whether mixing terminal outcome back in helps or hurts.
 #
 # Run with: python scripts/ablate.py --matrix ablations/reward_v0.yaml
 
@@ -11,11 +11,10 @@ base: configs/ppo_base.yaml
 name: reward_v0
 
 cells:
-  - { run.name: terminal_only, reward.capture_bonus: 0.0, reward.loss_penalty: 0.0, reward.sun_loss_penalty: 0.0 }
-  - { run.name: cap_only,      reward.capture_bonus: 0.05, reward.loss_penalty: 0.0 }
-  - { run.name: cap_and_loss,  reward.capture_bonus: 0.05, reward.loss_penalty: -0.05 }
-  - { run.name: heavy_capture, reward.capture_bonus: 0.1,  reward.loss_penalty: -0.1 }
-  - { run.name: light_shaping, reward.capture_bonus: 0.02, reward.loss_penalty: -0.02 }
-  - { run.name: margin_high,   reward.margin_scale: 0.005 }
-  - { run.name: margin_low,    reward.margin_scale: 0.0001 }
-  - { run.name: sun_strong,    reward.sun_loss_penalty: -0.001 }
+  - { run.name: dense_base, reward.potential_weight: 1.0, reward.production_weight: 1.0 }
+  - { run.name: pop_only, reward.potential_weight: 1.0, reward.production_weight: 0.0 }
+  - { run.name: prod_half, reward.potential_weight: 1.0, reward.production_weight: 0.5 }
+  - { run.name: prod_two, reward.potential_weight: 1.0, reward.production_weight: 2.0 }
+  - { run.name: dense_half, reward.potential_weight: 0.5, reward.production_weight: 1.0 }
+  - { run.name: dense_double, reward.potential_weight: 2.0, reward.production_weight: 1.0 }
+  - { run.name: outcome_mix, reward.win_value: 0.25, reward.loss_value: -0.25, reward.draw_value: 0.0 }

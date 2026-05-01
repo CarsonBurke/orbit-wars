@@ -70,7 +70,9 @@ def _bench(
             model(feats)
         _sync()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        _h, full_mask, _pm, _fm, _p, _f = model._embed_tokens(feats)
+        _h, full_mask, _pm, _fm, _rope, _planet_slice, _p, _f = (
+            model._embed_tokens(feats)
+        )
     return (perf_counter() - start) * 1000.0 / iters, int(full_mask.shape[1])
 
 

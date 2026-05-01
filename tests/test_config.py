@@ -20,12 +20,33 @@ def test_unknown_key_raises():
     raise AssertionError("expected KeyError for unknown model field")
 
 
-def test_non_positive_lambda_policy_alpha_raises():
+def test_invalid_gae_lambda_raises():
     try:
-        RunConfig.from_dict({"ppo": {"lambda_policy_alpha": 0.0}})
+        RunConfig.from_dict({"ppo": {"gae_lambda": 1.5}})
     except ValueError:
         return
-    raise AssertionError("expected ValueError for non-positive lambda_policy_alpha")
+    raise AssertionError("expected ValueError for invalid gae_lambda")
+
+
+def test_invalid_gamma_raises():
+    try:
+        RunConfig.from_dict({"ppo": {"gamma": 1.01}})
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for invalid gamma")
+
+
+def test_invalid_planet_rope_config_raises():
+    for model_cfg in (
+        {"planet_rope_fraction": -0.1},
+        {"planet_rope_fraction": 1.1},
+        {"planet_rope_base": 0.0},
+    ):
+        try:
+            RunConfig.from_dict({"model": model_cfg})
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {model_cfg}")
 
 
 def test_deep_override_merges():
@@ -37,18 +58,22 @@ def test_deep_override_merges():
 
 
 def test_real_yaml_loads():
-    cfg = RunConfig.from_dict(yaml.safe_load(open("configs/ppo_base.yaml")))
+    with open("configs/ppo_base.yaml") as f:
+        cfg = RunConfig.from_dict(yaml.safe_load(f))
     assert cfg.run.name == "ppo_base"
     assert cfg.game.episode_steps == 500
     assert 0.0 <= cfg.opponents.self_play_prob <= 1.0
     assert cfg.opponents.top_k > 0
-    assert cfg.ppo.lambda_policy_alpha == 0.05
+    assert cfg.ppo.gamma == 0.997
+    assert cfg.ppo.gae_lambda == 0.95
 
 
-def test_learned_configs_use_vapo_length_adaptive_gae():
+def test_learned_configs_use_conventional_gae():
     for path in ("configs/ppo_base.yaml", "configs/ppo_4p.yaml"):
-        cfg = RunConfig.from_dict(yaml.safe_load(open(path)))
-        assert cfg.ppo.lambda_policy_alpha == 0.05
+        with open(path) as f:
+            cfg = RunConfig.from_dict(yaml.safe_load(f))
+        assert cfg.ppo.gamma == 0.997
+        assert cfg.ppo.gae_lambda == 0.95
 
 
 def test_ablation_yaml_keys_load():

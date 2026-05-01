@@ -55,14 +55,13 @@ is bounded by 1 (CE) instead of unbounded (MSE on a possibly-misscaled
 scalar), which makes the critic dramatically more robust to early
 mis-prediction.
 
-We deliberately drop dreamer4's symlog transform — our reward is
-terminal-only ±1 with γ=1, so unshaped returns live in [-1, 1]. We
-default the bin support to [-2, 2] (51 bins) so margin shaping
-(`RewardCfg.margin_scale > 0` adds up to ±2·margin_scale) has 1.0 of
-headroom on each side; configs that go past that should widen via
-`OrbitPolicyConfig.value_min/max`. σ = 0.5 × bin_size (dreamer4
-default), and `target_probs` clips out-of-range targets to the
-boundary bin so the head degrades gracefully rather than producing NaN.
+We deliberately drop dreamer4's symlog transform. The default reward is a
+bounded dense potential delta based on projected population margin, so returns
+usually stay near the default [-2, 2] support. Configs that mix in large
+terminal or margin rewards should widen via `OrbitPolicyConfig.value_min/max`.
+σ = 0.5 × bin_size (dreamer4 default), and `target_probs` clips out-of-range
+targets to the boundary bin so the head degrades gracefully rather than
+producing NaN.
 
 **Critic still shares the encoder backbone.** Value-loss gradients flow
 through the same transformer the actor uses. This is tamed by
@@ -89,6 +88,10 @@ import torch.nn.functional as F  # noqa: N812
 
 from .config import OrbitPolicyConfig
 from .features import EncodedObs
+
+
+_PLANET_XY_SCALE: float = 100.0
+_PLANET_XY_OFFSET: float = 50.0
 
 
 class SquaredReLU(nn.Module):
@@ -176,6 +179,132 @@ def restore_fp32_params(model: nn.Module) -> None:
         if wants_fp32 and param.dtype != torch.float32:
             param.data = param.data.float()
 
+
+class Rotary2D(nn.Module):
+    """Shared partial 2D RoPE for physical board tokens.
+
+    Positions are continuous board coordinates, not sequence indices. The
+    rotated subspace is split evenly between x and y axes; remaining head
+    channels stay unrotated. Callers apply it only to the contiguous planet
+    token slice; summary/fleet tokens never enter this module.
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        fraction: float = 0.25,
+        base: float = 10000.0,
+    ):
+        super().__init__()
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError("planet_rope_fraction must be in [0, 1]")
+        if base <= 0.0:
+            raise ValueError("planet_rope_base must be positive")
+        self.base = float(base)
+        target = int(round(head_dim * fraction))
+        # 2D RoPE needs one even-width pair group for x and one for y, so the
+        # total rotated width must be a multiple of 4.
+        rotate_dim = 4 * int(round(target / 4))
+        if fraction > 0.0:
+            rotate_dim = max(4, rotate_dim)
+        rotate_dim = min(head_dim - (head_dim % 4), rotate_dim)
+        self.rotate_dim = rotate_dim
+        self.axis_dim = rotate_dim // 2
+        self.register_buffer(
+            "inv_freq",
+            self._make_inv_freq(torch.device("cpu")),
+            persistent=False,
+        )
+
+    def _make_inv_freq(self, device: torch.device) -> torch.Tensor:
+        if self.axis_dim == 0:
+            return torch.empty(0, dtype=torch.float32, device=device)
+        return 1.0 / (
+            self.base
+            ** (
+                torch.arange(
+                    0,
+                    self.axis_dim,
+                    2,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                / max(1, self.axis_dim)
+            )
+        )
+
+    def _apply(self, fn):  # type: ignore[no-untyped-def]
+        out = super()._apply(fn)
+        # `model.bfloat16()` casts buffers. RoPE frequencies are tiny control
+        # data; recompute them in fp32 on the transformed device.
+        self.inv_freq = self._make_inv_freq(self.inv_freq.device)
+        return out
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+    def cache(
+        self,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> Rotary2DCache | None:
+        """Precompute per-forward sin/cos for reuse by every encoder block."""
+        if self.rotate_dim == 0:
+            return None
+        pos_x = positions[..., 0].float().unsqueeze(-1)
+        pos_y = positions[..., 1].float().unsqueeze(-1)
+        inv = self.inv_freq
+        cos_x = torch.repeat_interleave((pos_x * inv).cos(), 2, dim=-1).to(dtype)
+        sin_x = torch.repeat_interleave((pos_x * inv).sin(), 2, dim=-1).to(dtype)
+        cos_y = torch.repeat_interleave((pos_y * inv).cos(), 2, dim=-1).to(dtype)
+        sin_y = torch.repeat_interleave((pos_y * inv).sin(), 2, dim=-1).to(dtype)
+        return Rotary2DCache(cos_x, sin_x, cos_y, sin_y)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cache: Rotary2DCache | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.rotate_dim == 0 or cache is None:
+            return q, k
+        axis = self.axis_dim
+        q_rot = q[..., : self.rotate_dim]
+        k_rot = k[..., : self.rotate_dim]
+        q_x, q_y = q_rot[..., :axis], q_rot[..., axis:]
+        k_x, k_y = k_rot[..., :axis], k_rot[..., axis:]
+        cos_x = cache.cos_x.unsqueeze(2)
+        sin_x = cache.sin_x.unsqueeze(2)
+        cos_y = cache.cos_y.unsqueeze(2)
+        sin_y = cache.sin_y.unsqueeze(2)
+        q_new = torch.cat(
+            (
+                q_x * cos_x + self._rotate_half(q_x) * sin_x,
+                q_y * cos_y + self._rotate_half(q_y) * sin_y,
+            ),
+            dim=-1,
+        )
+        k_new = torch.cat(
+            (
+                k_x * cos_x + self._rotate_half(k_x) * sin_x,
+                k_y * cos_y + self._rotate_half(k_y) * sin_y,
+            ),
+            dim=-1,
+        )
+        return q_new, k_new
+
+
+@dataclass(frozen=True)
+class Rotary2DCache:
+    cos_x: torch.Tensor
+    sin_x: torch.Tensor
+    cos_y: torch.Tensor
+    sin_y: torch.Tensor
+
+
 class SelfAttention(nn.Module):
     """Multi-head self-attention with QK-norm + per-head q_gain.
 
@@ -222,7 +351,13 @@ class SelfAttention(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
 
     def forward(
-        self, x: torch.Tensor, valid_mask: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        *,
+        rope: Rotary2D | None = None,
+        rope_cache: Rotary2DCache | None = None,
+        rope_slice: slice | None = None,
     ) -> torch.Tensor:
         # `x` is a dense padded tensor [B, T, D] with `valid_mask=True` for
         # real tokens.
@@ -231,6 +366,10 @@ class SelfAttention(nn.Module):
         v = self.c_v(x).unflatten(-1, (self.n_heads, self.head_dim))
         q = F.rms_norm(q, (self.head_dim,))
         k = F.rms_norm(k, (self.head_dim,))
+        if rope is not None and rope_cache is not None and rope_slice is not None:
+            q_planet, k_planet = rope(q[:, rope_slice], k[:, rope_slice], rope_cache)
+            q[:, rope_slice, :, : rope.rotate_dim] = q_planet
+            k[:, rope_slice, :, : rope.rotate_dim] = k_planet
         q = q * self.q_gain.to(q.dtype)[None, None, :, None]
         # SDPA expects [B, H, j, head_dim]. Caller is responsible for
         # bf16 autocast on CUDA — that's what enables FA-2 dispatch.
@@ -364,6 +503,10 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         x0: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
+        *,
+        rope: Rotary2D | None = None,
+        rope_cache: Rotary2DCache | None = None,
+        rope_slice: slice | None = None,
     ) -> torch.Tensor:
         # `x` and `x0` are dense padded [B, T, D]. Cast scale/mix params to
         # activation dtype to keep the bf16 residual path bf16 (see
@@ -371,7 +514,13 @@ class TransformerBlock(nn.Module):
         dt = x.dtype
         mix = self.resid_mix.to(dt)
         x_in = mix[0] * x + mix[1] * x0
-        a = self.attn(self.ln1(x_in) * self.ln_scale_factor, valid_mask)
+        a = self.attn(
+            self.ln1(x_in) * self.ln_scale_factor,
+            valid_mask,
+            rope=rope,
+            rope_cache=rope_cache,
+            rope_slice=rope_slice,
+        )
         if self.drop.p:
             a = self.drop(a)
         x = x_in + self.attn_scale.to(dt) * a
@@ -649,6 +798,12 @@ class OrbitPolicy(nn.Module):
         # have heterogeneous scales, so a single LN here gives every block
         # the same input regime and stabilizes resid_mix's `x0` reference.
         self.embed_norm = nn.RMSNorm(cfg.dim, elementwise_affine=False)
+        head_dim = cfg.dim // cfg.n_heads
+        self.planet_rope = Rotary2D(
+            head_dim,
+            fraction=cfg.planet_rope_fraction,
+            base=cfg.planet_rope_base,
+        )
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
@@ -723,10 +878,9 @@ class OrbitPolicy(nn.Module):
         )
         nn.init.constant_(self.fraction_head.bias[1], _logit(conc_p))
         # Distributional value head — emits logits over `value_num_bins`
-        # bins on the [-1, 1] support. Scalar V is recovered from these
-        # via `HLGaussLoss.bins_to_scalar`. dreamer4 uses 255 bins on a
-        # symlog'd support; with our terminal-only ±1 reward (returns ∈
-        # [-1, 1]) we use a coarser linear bin set.
+        # bins. Scalar V is recovered from these via `HLGaussLoss.bins_to_scalar`.
+        # dreamer4 uses 255 bins on a symlog'd support; our bounded dense
+        # reward uses a coarser linear bin set.
         self.value_encoder = HLGaussLoss(
             min_value=cfg.value_min,
             max_value=cfg.value_max,
@@ -764,7 +918,16 @@ class OrbitPolicy(nn.Module):
 
     def _embed_tokens(
         self, feats: EncodedObs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Rotary2DCache | None,
+        slice,
+        int,
+        int,
+    ]:
         # Promote to batch dim if not already.
         if feats.planet_feats.dim() == 2:
             planet_feats = feats.planet_feats.unsqueeze(0)
@@ -809,7 +972,13 @@ class OrbitPolicy(nn.Module):
         h = self.embed_norm(h)
         summary_mask = torch.ones(b, 2, dtype=torch.bool, device=planet_mask.device)
         full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
-        return h, full_mask, planet_mask, fleet_mask, p, f
+        # Planet features store centered normalized coordinates:
+        # ((x - 50) / 100, (y - 50) / 100). RoPE uses physical board
+        # coordinates so the phase scale is meaningful on the 100x100 map.
+        planet_xy = planet_feats[..., :2] * _PLANET_XY_SCALE + _PLANET_XY_OFFSET
+        rope_cache = self.planet_rope.cache(planet_xy, h.dtype)
+        planet_slice = slice(2, 2 + p)
+        return h, full_mask, planet_mask, fleet_mask, rope_cache, planet_slice, p, f
 
     def _split_encoded(
         self,
@@ -832,6 +1001,8 @@ class OrbitPolicy(nn.Module):
         full_mask: torch.Tensor,
         planet_mask: torch.Tensor,
         fleet_mask: torch.Tensor,
+        rope_cache: Rotary2DCache | None,
+        planet_slice: slice,
         p: int,
         f: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -843,7 +1014,14 @@ class OrbitPolicy(nn.Module):
         """
         x0 = h
         for layer in self.layers:
-            h = layer(h, x0, full_mask)
+            h = layer(
+                h,
+                x0,
+                full_mask,
+                rope=self.planet_rope,
+                rope_cache=rope_cache,
+                rope_slice=planet_slice,
+            )
         h = self.final_norm(h)
         return self._split_encoded(h, planet_mask, fleet_mask, p, f)
 
@@ -857,8 +1035,19 @@ class OrbitPolicy(nn.Module):
         the default because rollout profiling showed NestedTensor dispatch,
         not attention compute, dominating model latency.
         """
-        h, full_mask, planet_mask, fleet_mask, p, f = self._embed_tokens(feats)
-        return self._encode_dense(h, full_mask, planet_mask, fleet_mask, p, f)
+        h, full_mask, planet_mask, fleet_mask, rope_cache, planet_slice, p, f = (
+            self._embed_tokens(feats)
+        )
+        return self._encode_dense(
+            h,
+            full_mask,
+            planet_mask,
+            fleet_mask,
+            rope_cache,
+            planet_slice,
+            p,
+            f,
+        )
 
     def forward(self, feats: EncodedObs) -> PolicyOutput:
         planet_h, _fleet_h, h_actor, h_critic, _token_mask = self.encode(feats)

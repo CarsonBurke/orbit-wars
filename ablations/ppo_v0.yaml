@@ -34,10 +34,10 @@ cells:
   - { run.name: gamma_995,  ppo.gamma: 0.995 }
   - { run.name: gamma_999,  ppo.gamma: 0.999 }
 
-  # VAPO length-adaptive actor GAE alpha: λ = 1 - 1 / (alpha * episode_length)
-  - { run.name: lam_alpha_003, ppo.lambda_policy_alpha: 0.03 }
-  - { run.name: lam_alpha_005, ppo.lambda_policy_alpha: 0.05 }
-  - { run.name: lam_alpha_008, ppo.lambda_policy_alpha: 0.08 }
+  # conventional fixed GAE lambda
+  - { run.name: gae_090, ppo.gae_lambda: 0.90 }
+  - { run.name: gae_095, ppo.gae_lambda: 0.95 }
+  - { run.name: gae_098, ppo.gae_lambda: 0.98 }
 
   # epochs / minibatches
   - { run.name: epochs_2,  optim.epochs_per_update: 2 }

@@ -52,6 +52,30 @@ def test_policy_forward_shapes():
     assert cfg.value_min <= float(out.value.item()) <= cfg.value_max
 
 
+def test_planet_rope_frequency_buffer_stays_fp32_after_bfloat16():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
+    model = OrbitPolicy(cfg)
+
+    model.bfloat16()
+
+    assert model.planet_rope.inv_freq.dtype == torch.float32
+
+
+def test_planet_rope_can_be_disabled():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        planet_rope_fraction=0.0,
+    )
+    model = OrbitPolicy(cfg)
+    out = model(encode_observation(parse_observation(_obs())))
+
+    assert model.planet_rope.rotate_dim == 0
+    assert out.launch_logits.shape == (1, 64)
+
+
 def test_fleet_latent_encoder_compresses_fleet_tokens():
     cfg = OrbitPolicyConfig(
         dim=32,
@@ -64,12 +88,16 @@ def test_fleet_latent_encoder_compresses_fleet_tokens():
     model = OrbitPolicy(cfg)
     feats = encode_observation(parse_observation(_obs()))
 
-    h, full_mask, planet_mask, fleet_mask, p, f = model._embed_tokens(feats)
+    h, full_mask, planet_mask, fleet_mask, rope_cache, planet_slice, p, f = (
+        model._embed_tokens(feats)
+    )
 
     assert h.shape[1] == 2 + 64 + cfg.num_fleet_latents
     assert full_mask.shape[1] == h.shape[1]
     assert planet_mask.shape[-1] == 64
     assert fleet_mask.shape[-1] == cfg.num_fleet_latents
+    assert rope_cache is not None
+    assert planet_slice == slice(2, 66)
     assert p == 64
     assert f == cfg.num_fleet_latents
 

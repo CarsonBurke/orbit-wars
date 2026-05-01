@@ -18,6 +18,11 @@ class OrbitPolicyConfig:
     depth: int = 3
     n_heads: int = 4
     dropout: float = 0.0
+    # Apply 2D RoPE to this fraction of each self-attention head for physical
+    # planet tokens. Summary/fleet tokens keep the ordinary content attention.
+    # The actual rotated width is rounded to a valid 2D pair count.
+    planet_rope_fraction: float = 0.25
+    planet_rope_base: float = 10000.0
     # Encoder dispatch. `fleet_latent` is the default: raw planet tokens are
     # preserved for the action vocabulary, while raw fleets are compressed.
     encoder_backend: Literal["dense", "fleet_latent"] = "fleet_latent"
@@ -36,13 +41,9 @@ class OrbitPolicyConfig:
 
     # Distributional value head — predicts a categorical over `value_num_bins`
     # bins on `[value_min, value_max]`, trained with HL-Gauss CE (dreamer4
-    # `dreamer4.py:722–805`). With γ=1 the *unshaped* return is exactly the
-    # terminal outcome ∈ [-1, 1], but `RewardCfg.margin_scale > 0` adds
-    # `margin_scale · margin` to the terminal reward (margin ≤ 2 in 2P). We
-    # default to [-2, 2] to give 1.0 headroom on each side — covers
-    # `margin_scale ≤ 0.5` exactly. Configs with more aggressive margin
-    # shaping (or non-terminal shaping bonuses, currently dead) should
-    # widen further. 51 bins → ~0.08 resolution. The scalar value used for
+    # `dreamer4.py:722–805`). Default dense-potential returns are bounded and
+    # usually fit inside [-2, 2]. Configs that mix in larger terminal/margin
+    # rewards should widen further. 51 bins → ~0.08 resolution. The scalar value used for
     # advantage is the expectation E[V] = Σ p_i · c_i recovered via
     # `HLGaussLoss.bins_to_scalar`. Targets outside the support are clipped
     # to the boundary bin in `target_probs`, so the head degrades gracefully
