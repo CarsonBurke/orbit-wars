@@ -48,6 +48,13 @@ def _sun_crossing_obs():
     return obs
 
 
+def _sun_crossing_only_obs():
+    obs = _sun_crossing_obs()
+    obs["planets"] = obs["planets"][:2]
+    obs["initial_planets"] = obs["initial_planets"][:2]
+    return obs
+
+
 def _model() -> OrbitPolicy:
     return OrbitPolicy(OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2))
 
@@ -310,14 +317,33 @@ def test_raw_and_context_samplers_cap_duplicate_source_actions():
     _assert_duplicate_source_actions_do_not_overlaunch(context_actions)
 
 
-def test_sampler_skips_sun_crossing_launches():
+def test_sampler_masks_sun_crossing_target_to_legal_alternative():
     obs = _sun_crossing_obs()
     o = parse_observation(obs)
     feats = encode_observation(o)
     out = _forced_move_output(feats)
 
-    assert sample_actions(out, o, deterministic=True) == []
-    assert sample_batch_actions_raw(out, [obs], deterministic=True) == [[]]
+    moves, record = sample_with_record(out, o, deterministic=True)
+    raw_actions, raw_records = sample_batch_with_records_raw(
+        out, [obs], deterministic=True
+    )
+
+    assert sample_actions(out, o, deterministic=True)
+    assert sample_batch_actions_raw(out, [obs], deterministic=True)
+    assert moves
+    assert raw_actions[0]
+    assert record.launch[0].item() == 1.0
+    assert raw_records[0].launch[0].item() == 1.0
+    assert record.target_idx[0].item() == 2
+    assert raw_records[0].target_idx[0].item() == 2
+
+
+def test_sampler_records_noop_when_no_legal_target_exists():
+    obs = _sun_crossing_only_obs()
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+
     moves, record = sample_with_record(out, o, deterministic=True)
     raw_actions, raw_records = sample_batch_with_records_raw(
         out, [obs], deterministic=True
@@ -326,9 +352,10 @@ def test_sampler_skips_sun_crossing_launches():
     assert raw_actions == [[]]
     assert record.launch[0].item() == 0.0
     assert raw_records[0].launch[0].item() == 0.0
+    assert not torch.isfinite(record.target_logits[0]).any()
 
 
-def test_subset_records_match_raw_and_context_rejected_launch():
+def test_subset_records_match_legality_masked_target_sampling():
     obs = _sun_crossing_obs()
     feats = encode_observation(parse_observation(obs))
     out = _forced_move_output(feats)
@@ -347,8 +374,10 @@ def test_subset_records_match_raw_and_context_rejected_launch():
     )
 
     expected = raw_records[0]
-    assert raw_batch.launch[0, 0].item() == 0.0
-    assert context_batch.launch[0, 0].item() == 0.0
+    assert raw_batch.launch[0, 0].item() == 1.0
+    assert context_batch.launch[0, 0].item() == 1.0
+    assert raw_batch.target_idx[0, 0].item() == 2
+    assert context_batch.target_idx[0, 0].item() == 2
     assert torch.allclose(raw_batch.launch[0], expected.launch)
     assert torch.equal(raw_batch.target_idx[0], expected.target_idx)
     assert torch.allclose(raw_batch.fraction[0], expected.fraction)
@@ -359,33 +388,59 @@ def test_subset_records_match_raw_and_context_rejected_launch():
     assert torch.allclose(context_batch.log_prob[0], expected.log_prob, atol=1e-6)
 
 
-def test_stochastic_rejected_launch_is_recorded_as_noop():
-    obs = _sun_crossing_obs()
+def test_stochastic_launch_without_legal_target_is_recorded_as_noop():
+    obs = _sun_crossing_only_obs()
     o = parse_observation(obs)
     feats = encode_observation(o)
     out = _forced_move_output(feats)
 
     torch.manual_seed(0)
     moves, record = sample_with_record(out, o, deterministic=False)
-
     expected_noop_log_prob = -torch.nn.functional.binary_cross_entropy_with_logits(
-        out.launch_logits[0, 0],
+        torch.tensor(-20.0),
         torch.zeros_like(out.launch_logits[0, 0]),
         reduction="none",
     )
+
     assert moves == []
     assert record.launch[0].item() == 0.0
-    assert torch.allclose(record.log_prob[0], expected_noop_log_prob)
+    assert torch.allclose(record.log_prob[0], expected_noop_log_prob, atol=1e-6)
 
 
-def test_sampler_skips_comet_targets_without_path_lead():
+def test_no_launch_record_still_masks_missing_legal_target_support():
+    obs = _sun_crossing_only_obs()
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+    out.launch_logits[:, 0] = -100.0
+
+    moves, record = sample_with_record(out, o, deterministic=True)
+    raw_actions, raw_records = sample_batch_with_records_raw(
+        out, [obs], deterministic=True
+    )
+
+    assert moves == []
+    assert raw_actions == [[]]
+    assert record.launch[0].item() == 0.0
+    assert raw_records[0].launch[0].item() == 0.0
+    assert record.launch_logits[0].item() == -20.0
+    assert raw_records[0].launch_logits[0].item() == -20.0
+    assert not torch.isfinite(record.target_logits[0]).any()
+    assert not torch.isfinite(raw_records[0].target_logits[0]).any()
+
+
+def test_sampler_masks_comet_target_to_legal_alternative():
     obs = _obs()
     obs["comet_planet_ids"] = [1]
     o = parse_observation(obs)
     feats = encode_observation(o)
     out = _forced_move_output(feats)
 
-    assert sample_actions(out, o, deterministic=True) == []
+    moves, record = sample_with_record(out, o, deterministic=True)
+    assert moves
+    assert record.launch[0].item() == 1.0
+    assert record.target_idx[0].item() == 2
+    assert sample_actions(out, o, deterministic=True)
     assert sample_batch_actions_context(
         out,
         [
@@ -396,4 +451,4 @@ def test_sampler_skips_comet_targets_without_path_lead():
             )
         ],
         deterministic=True,
-    ) == [[]]
+    )[0]

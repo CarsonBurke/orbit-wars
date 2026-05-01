@@ -13,8 +13,7 @@ def test_fleet_speed_monotonic_with_size():
 def test_fleet_speed_caps_near_max():
     # ~1000 ships should hit the cap (default 6.0).
     assert abs(fleet_speed(1000) - 6.0) < 1e-6
-    # Larger fleets exceed the modeled cap (formula doesn't clamp), but
-    # the simulator does — that's the runtime concern, not ours here.
+    assert fleet_speed(5000) == 6.0
 
 
 def test_travel_steps_small_distance():

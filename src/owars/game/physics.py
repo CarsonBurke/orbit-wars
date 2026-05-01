@@ -21,7 +21,7 @@ def fleet_speed(ships: int, max_speed: float = MAX_SHIP_SPEED) -> float:
     if ships <= 1:
         return 1.0
     frac = math.log(ships) / math.log(1000.0)
-    return 1.0 + (max_speed - 1.0) * (frac**1.5)
+    return min(max_speed, 1.0 + (max_speed - 1.0) * (frac**1.5))
 
 
 def travel_steps(distance: float, ships: int, max_speed: float = MAX_SHIP_SPEED) -> int:

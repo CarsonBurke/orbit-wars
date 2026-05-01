@@ -29,6 +29,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as nn_functional
 from torch.distributions import Beta
@@ -107,7 +108,7 @@ class SampleRecord:
     fraction: torch.Tensor     # [P] float in (eps, 1-eps) — Beta sample, used both for the move and for PPO's log_prob recompute
     log_prob: torch.Tensor     # [P] float — Bernoulli + launch*(Categorical + Beta)
     launch_logits: torch.Tensor       # [P] — old-policy Bernoulli logits (PMPO KL input)
-    target_logits: torch.Tensor       # [P, P] — old-policy categorical logits (PMPO KL input)
+    target_logits: torch.Tensor       # [P, P] — old-policy categorical logits, masked to the sampled legality context
     fraction_alpha: torch.Tensor      # [P] — old-policy Beta α
     fraction_beta: torch.Tensor       # [P] — old-policy Beta β
 
@@ -542,6 +543,375 @@ def _candidate_action_indices(fields_l: Any) -> Any:
     )
 
 
+def _planet_id(planet: Any) -> int:
+    return int(planet[0])
+
+
+def _planet_x(planet: Any) -> float:
+    return float(planet[2])
+
+
+def _planet_y(planet: Any) -> float:
+    return float(planet[3])
+
+
+def _planet_radius(planet: Any) -> float:
+    return float(planet[4])
+
+
+def _planet_ships(planet: Any) -> int:
+    return int(planet[5])
+
+
+def _planet_field_map(planets: Any) -> dict[int, tuple[float, float, float, int]]:
+    return {
+        _planet_id(pl): (
+            _planet_x(pl),
+            _planet_y(pl),
+            _planet_radius(pl),
+            _planet_ships(pl),
+        )
+        for pl in planets
+    }
+
+
+def _target_legal_mask_from_planets(
+    frac_l: Sequence[float],
+    active_source_l: Sequence[bool],
+    pmask_l: Sequence[bool],
+    ids_l: Sequence[int],
+    planets: Any,
+    angular_velocity: float,
+    comet_planet_ids: Any,
+) -> list[list[bool]]:
+    p = len(ids_l)
+    mask = [[False] * p for _ in range(p)]
+    planet_fields = _planet_field_map(planets)
+    comet_ids = {int(pid) for pid in comet_planet_ids}
+    omega = float(angular_velocity)
+    target_fields = [
+        (j, planet_fields[target_id])
+        for j, target_id in enumerate(int(v) for v in ids_l)
+        if bool(pmask_l[j])
+        and target_id >= 0
+        and target_id not in comet_ids
+        and target_id in planet_fields
+    ]
+    for i in range(p):
+        if not (bool(active_source_l[i]) and bool(pmask_l[i])):
+            continue
+        source = planet_fields.get(int(ids_l[i]))
+        if source is None:
+            continue
+        source_x, source_y, source_radius, remaining = source
+        if remaining < 2:
+            continue
+        frac = max(0.0, min(1.0, float(frac_l[i])))
+        send = max(1, min(remaining - 1, int(round(remaining * frac))))
+        if send <= 0:
+            continue
+        for j, target in target_fields:
+            if j == i:
+                continue
+            target_x, target_y, target_radius, _target_ships = target
+            solution = _lead_solution(
+                source_x,
+                source_y,
+                source_radius,
+                target_x,
+                target_y,
+                target_radius,
+                omega,
+                send,
+            )
+            if solution is None:
+                continue
+            if not _safe_flight_segment(
+                source_x,
+                source_y,
+                source_radius,
+                solution.angle,
+                solution.x,
+                solution.y,
+            ):
+                continue
+            mask[i][j] = True
+    return mask
+
+
+def _target_legal_mask_from_packed_legality_fields(
+    fields_l: Any,
+    planets: Any,
+    angular_velocity: float,
+    comet_planet_ids: Any,
+) -> Any:
+    p = len(fields_l)
+    mask = np.zeros((p, p), dtype=bool)
+    planet_fields = _planet_field_map(planets)
+    comet_ids = {int(pid) for pid in comet_planet_ids}
+    omega = float(angular_velocity)
+    ids = [int(fields_l[j][4]) for j in range(p)]
+    present = [float(fields_l[j][3]) >= 0.5 for j in range(p)]
+    target_fields = [
+        (j, planet_fields[target_id])
+        for j, target_id in enumerate(ids)
+        if present[j]
+        and target_id >= 0
+        and target_id not in comet_ids
+        and target_id in planet_fields
+    ]
+
+    if target_fields:
+        x = np.full(p, np.nan, dtype=np.float64)
+        y = np.full(p, np.nan, dtype=np.float64)
+        radius = np.zeros(p, dtype=np.float64)
+        ships = np.zeros(p, dtype=np.int32)
+        known = np.zeros(p, dtype=bool)
+        for idx, planet_id in enumerate(ids):
+            fields = planet_fields.get(planet_id)
+            if fields is None:
+                continue
+            x[idx], y[idx], radius[idx], ships[idx] = fields
+            known[idx] = True
+
+        source = (
+            (np.asarray(fields_l[:, 2], dtype=np.float64) >= 0.5)
+            & np.asarray(present, dtype=bool)
+            & known
+            & (ships >= 2)
+        )
+        static_target = np.asarray(present, dtype=bool) & known
+        if comet_ids:
+            static_target &= np.asarray([planet_id not in comet_ids for planet_id in ids], dtype=bool)
+        static_target &= np.asarray(ids, dtype=np.int64) >= 0
+        orbit_radius = np.hypot(x - CENTER[0], y - CENTER[1])
+        is_orbiting = (
+            (orbit_radius + radius < ROTATION_RADIUS_LIMIT)
+            & (abs(omega) > 1e-12)
+            & (orbit_radius > 1e-9)
+        )
+        static_target &= ~is_orbiting
+        source_idx = np.flatnonzero(source)
+        target_idx = np.flatnonzero(static_target)
+        if source_idx.size and target_idx.size:
+            frac = np.clip(np.asarray(fields_l[source_idx, 1], dtype=np.float64), 0.0, 1.0)
+            remaining = ships[source_idx].astype(np.float64)
+            send = np.rint(remaining * frac).astype(np.int32)
+            send = np.maximum(1, np.minimum(ships[source_idx] - 1, send))
+            speed = np.ones(send.shape, dtype=np.float64)
+            fast = send > 1
+            speed[fast] = 1.0 + 5.0 * (
+                np.log(send[fast].astype(np.float64)) / math.log(1000.0)
+            ) ** 1.5
+
+            dx = x[target_idx][None, :] - x[source_idx][:, None]
+            dy = y[target_idx][None, :] - y[source_idx][:, None]
+            distance = np.hypot(dx, dy)
+            pair_ok = distance / speed[:, None] <= LEAD_T_HORIZON_STEPS
+            pair_ok &= source_idx[:, None] != target_idx[None, :]
+
+            angle = np.arctan2(dy, dx)
+            offset = np.maximum(0.0, radius[source_idx] + 0.1)
+            start_x = x[source_idx][:, None] + np.cos(angle) * offset[:, None]
+            start_y = y[source_idx][:, None] + np.sin(angle) * offset[:, None]
+            end_x = x[target_idx][None, :]
+            end_y = y[target_idx][None, :]
+            pair_ok &= (
+                (start_x >= 0.0)
+                & (start_x <= BOARD_SIZE)
+                & (start_y >= 0.0)
+                & (start_y <= BOARD_SIZE)
+                & (end_x >= 0.0)
+                & (end_x <= BOARD_SIZE)
+                & (end_y >= 0.0)
+                & (end_y <= BOARD_SIZE)
+            )
+
+            seg_x = end_x - start_x
+            seg_y = end_y - start_y
+            denom = seg_x * seg_x + seg_y * seg_y
+            projection = ((CENTER[0] - start_x) * seg_x + (CENTER[1] - start_y) * seg_y)
+            t = np.divide(projection, denom, out=np.zeros_like(projection), where=denom > 0.0)
+            t = np.clip(t, 0.0, 1.0)
+            qx = start_x + t * seg_x
+            qy = start_y + t * seg_y
+            sun_distance = np.hypot(CENTER[0] - qx, CENTER[1] - qy)
+            pair_ok &= sun_distance >= SUN_RADIUS
+            mask[np.ix_(source_idx, target_idx)] = pair_ok
+
+    for i in range(p):
+        fields = fields_l[i]
+        if not (float(fields[2]) >= 0.5 and present[i]):
+            continue
+        source = planet_fields.get(ids[i])
+        if source is None:
+            continue
+        source_x, source_y, source_radius, remaining = source
+        if remaining < 2:
+            continue
+        frac = max(0.0, min(1.0, float(fields[1])))
+        send = max(1, min(remaining - 1, int(round(remaining * frac))))
+        if send <= 0:
+            continue
+        for j, target in target_fields:
+            if j == i:
+                continue
+            target_orbit_radius = math.hypot(target[0] - CENTER[0], target[1] - CENTER[1])
+            if not (
+                target_orbit_radius + target[2] < ROTATION_RADIUS_LIMIT
+                and abs(omega) > 1e-12
+                and target_orbit_radius > 1e-9
+            ):
+                continue
+            target_x, target_y, target_radius, _target_ships = target
+            solution = _lead_solution(
+                source_x,
+                source_y,
+                source_radius,
+                target_x,
+                target_y,
+                target_radius,
+                omega,
+                send,
+            )
+            if solution is None:
+                continue
+            if not _safe_flight_segment(
+                source_x,
+                source_y,
+                source_radius,
+                solution.angle,
+                solution.x,
+                solution.y,
+            ):
+                continue
+            mask[i, j] = True
+    return mask
+
+
+def _packed_legality_fields(
+    launch: torch.Tensor,
+    frac: torch.Tensor,
+    owned: torch.Tensor,
+    pmask: torch.Tensor,
+    ids: torch.Tensor,
+) -> Any:
+    return torch.stack(
+        (
+            launch.float(),
+            frac.float(),
+            owned.float(),
+            pmask.float(),
+            ids.float(),
+        ),
+        dim=-1,
+    ).detach().cpu().numpy()
+
+
+def _target_legal_mask_tensor(mask_l: Any, device: torch.device | str) -> torch.Tensor:
+    return torch.as_tensor(np.asarray(mask_l, dtype=bool), device=device, dtype=torch.bool)
+
+
+def _packed_action_fields_from_legality_fields(
+    target_idx: torch.Tensor,
+    legality_fields_l: Any,
+    target_legal_mask_l: Any,
+) -> Any:
+    target_idx_l = target_idx.detach().cpu().numpy()
+    fields_l = np.empty(target_idx_l.shape + (6,), dtype=legality_fields_l.dtype)
+    fields_l[..., 0] = target_idx_l
+    fields_l[..., 1] = legality_fields_l[..., 1]
+    fields_l[..., 2] = legality_fields_l[..., 0]
+    fields_l[..., 3] = legality_fields_l[..., 2]
+    fields_l[..., 4] = legality_fields_l[..., 3]
+    fields_l[..., 5] = legality_fields_l[..., 4]
+    fields_l[..., 2] *= np.asarray(target_legal_mask_l, dtype=bool).any(axis=-1)
+    return fields_l
+
+
+def _target_legal_mask_from_observation(
+    frac: torch.Tensor,
+    launch: torch.Tensor,
+    owned: torch.Tensor,
+    pmask: torch.Tensor,
+    ids: torch.Tensor,
+    obs: Observation,
+) -> torch.Tensor:
+    del launch
+    source = owned.to(dtype=torch.bool) & pmask.to(dtype=torch.bool)
+    return torch.as_tensor(
+        _target_legal_mask_from_planets(
+            frac.detach().cpu().tolist(),
+            source.detach().cpu().tolist(),
+            pmask.detach().cpu().tolist(),
+            [int(v) for v in ids.detach().cpu().tolist()],
+            obs.planets,
+            obs.angular_velocity,
+            obs.comet_planet_ids,
+        ),
+        device=frac.device,
+        dtype=torch.bool,
+    )
+
+
+def _apply_target_legal_mask(
+    target_logits: torch.Tensor,
+    target_legal_mask: torch.Tensor,
+    launch: torch.Tensor,
+    owned: torch.Tensor,
+    pmask: torch.Tensor,
+) -> torch.Tensor:
+    del launch
+    source = owned.to(dtype=torch.bool) & pmask.to(dtype=torch.bool)
+    source = source.to(device=target_logits.device).unsqueeze(-1)
+    target_legal_mask = target_legal_mask.to(device=target_logits.device, dtype=torch.bool)
+    masked = target_logits.float().masked_fill(~target_legal_mask, float("-inf"))
+    return torch.where(source, masked, target_logits.float())
+
+
+def _mask_impossible_launches(
+    launch_logits: torch.Tensor,
+    launch: torch.Tensor,
+    target_legal_mask: torch.Tensor,
+    owned: torch.Tensor,
+    pmask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    source = owned.to(dtype=torch.bool) & pmask.to(dtype=torch.bool)
+    has_legal_target = target_legal_mask.to(device=launch.device, dtype=torch.bool).any(dim=-1)
+    impossible = source & ~has_legal_target
+    launch_logits = launch_logits.float().masked_fill(impossible, -20.0)
+    launch = launch.masked_fill(impossible, 0.0)
+    return launch_logits, launch
+
+
+def _sample_launch_fraction(
+    launch_logits: torch.Tensor,
+    fraction_alpha: torch.Tensor,
+    fraction_beta: torch.Tensor,
+    deterministic: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    launch_logits = launch_logits.float()
+    fraction_alpha = fraction_alpha.float()
+    fraction_beta = fraction_beta.float()
+    if deterministic:
+        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
+        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
+        return launch, frac
+    launch = torch.distributions.Bernoulli(logits=launch_logits).sample()
+    frac = Beta(fraction_alpha, fraction_beta).sample().clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+    return launch, frac
+
+
+def _sample_target(
+    target_logits: torch.Tensor,
+    deterministic: bool,
+) -> torch.Tensor:
+    safe_target_logits = _safe_target_logits(target_logits.float())
+    if deterministic:
+        return safe_target_logits.argmax(dim=-1)
+    return torch.distributions.Categorical(logits=safe_target_logits).sample()
+
+
 def _build_moves_from_packed_fields_with_mask(
     fields_l: list[list[float]],
     o: Observation,
@@ -759,36 +1129,6 @@ def _build_action_lists_from_packed_fields_context_with_mask(
     return actions, materialized
 
 
-def _packed_action_fields(
-    launch: torch.Tensor,
-    target_idx: torch.Tensor,
-    frac: torch.Tensor,
-    owned: torch.Tensor,
-    pmask: torch.Tensor,
-    ids: torch.Tensor,
-) -> Any:
-    """Copy all Python action fields to host in one transfer.
-
-    Separate `.cpu().tolist()` calls on CUDA each synchronize the stream.
-    Packing the small [B, P] fields together keeps PPO records on-device while
-    making env-action materialization pay one synchronization. Keep the host
-    result as a NumPy view instead of nested Python lists; the builders only
-    need indexed scalar reads, and `.tolist()` becomes costly at rollout scale.
-    """
-    packed = torch.stack(
-        (
-            target_idx.float(),
-            frac.float(),
-            launch.float(),
-            owned.float(),
-            pmask.float(),
-            ids.float(),
-        ),
-        dim=-1,
-    )
-    return packed.detach().cpu().numpy()
-
-
 def _build_moves(
     launch: torch.Tensor,
     target_idx: torch.Tensor,
@@ -834,53 +1174,17 @@ def _safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
     return torch.where(finite, target_logits, torch.zeros_like(target_logits))
 
 
-def _sample_distributions(
-    launch_logits: torch.Tensor,
-    target_logits: torch.Tensor,
-    fraction_alpha: torch.Tensor,
-    fraction_beta: torch.Tensor,
-    deterministic: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample (launch, target_idx, fraction, log_prob) from the heads.
-
-    Works for both unbatched [P, ...] and batched [B, P, ...] shapes.
-
-    The target and Beta log-probs only count when `launch=1`: on a no-launch
-    step those samples are drawn but ignored downstream, so they should not
-    contribute to the importance ratio.
-
-    All distribution math runs in fp32 (parameter-golf `sota_train_gpt.py:163`
-    `F.cross_entropy(logits.float(), …)`). bf16 has only 7 mantissa bits, and
-    `log_prob` differences across PPO updates are tiny (~0.01 nats). Computing
-    them in bf16 puts a precision-noise floor on `approx_kl` ≈ 0.5·(ratio−1)²
-    that swamps real signal. Casting here keeps the model forward in bf16
-    (FA-2, autocast) while sampling and `old_log_prob` get fp32 precision.
-    """
-    launch_logits = launch_logits.float()
-    target_logits = target_logits.float()
-    target_logits = _safe_target_logits(target_logits)
-    fraction_alpha = fraction_alpha.float()
-    fraction_beta = fraction_beta.float()
-    frac_dist = Beta(fraction_alpha, fraction_beta)
-    if deterministic:
-        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
-        target_idx = target_logits.argmax(dim=-1)
-        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
-        log_prob = torch.zeros_like(target_idx, dtype=fraction_alpha.dtype)
-        return launch, target_idx, frac, log_prob
-
-    launch_dist = torch.distributions.Bernoulli(logits=launch_logits)
-    launch = launch_dist.sample()
-    launch_lp = launch_dist.log_prob(launch)
-    target_dist = torch.distributions.Categorical(logits=target_logits)
-    target_idx = target_dist.sample()
-    target_lp = target_dist.log_prob(target_idx)
-
-    frac = frac_dist.sample().clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
-    frac_lp = frac_dist.log_prob(frac)
-
-    log_prob = launch_lp + launch.to(frac_lp.dtype) * (target_lp + frac_lp)
-    return launch, target_idx, frac, log_prob
+def _beta_log_prob(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    log_norm = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
+    return (
+        (alpha - 1.0) * value.log()
+        + (beta - 1.0) * torch.log1p(-value)
+        - log_norm
+    )
 
 
 def _record_from_materialized_launch(
@@ -893,10 +1197,11 @@ def _record_from_materialized_launch(
     fraction_beta: torch.Tensor,
     materialized: list[bool],
 ) -> SampleRecord:
+    del launch
     actual_launch = torch.as_tensor(
         materialized,
-        device=launch.device,
-        dtype=launch.dtype,
+        device=target_idx.device,
+        dtype=fraction_alpha.dtype,
     )
     safe_target_logits = _safe_target_logits(target_logits.float())
     launch_lp = -nn_functional.binary_cross_entropy_with_logits(
@@ -909,7 +1214,7 @@ def _record_from_materialized_launch(
         -1,
         target_idx.clamp(0, safe_target_logits.shape[-1] - 1).unsqueeze(-1),
     ).squeeze(-1)
-    frac_lp = Beta(fraction_alpha.float(), fraction_beta.float()).log_prob(frac.float())
+    frac_lp = _beta_log_prob(fraction_alpha.float(), fraction_beta.float(), frac.float())
     log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
     return SampleRecord(
         launch=actual_launch,
@@ -920,19 +1225,6 @@ def _record_from_materialized_launch(
         target_logits=target_logits,
         fraction_alpha=fraction_alpha,
         fraction_beta=fraction_beta,
-    )
-
-
-def _beta_log_prob(
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-    value: torch.Tensor,
-) -> torch.Tensor:
-    log_norm = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
-    return (
-        (alpha - 1.0) * value.log()
-        + (beta - 1.0) * torch.log1p(-value)
-        - log_norm
     )
 
 
@@ -1011,9 +1303,19 @@ def sample_with_record(
     pmask = out.planet_mask[0]
     ids = out.planet_ids[0]
 
-    launch, target_idx, frac, log_prob = _sample_distributions(
-        launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
+    launch, frac = _sample_launch_fraction(
+        launch_logits, fraction_alpha, fraction_beta, deterministic
     )
+    target_legal_mask = _target_legal_mask_from_observation(
+        frac, launch, owned, pmask, ids, o
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits, target_legal_mask, launch, owned, pmask
+    )
+    launch_logits, launch = _mask_impossible_launches(
+        launch_logits, launch, target_legal_mask, owned, pmask
+    )
+    target_idx = _sample_target(target_logits, deterministic)
 
     moves, materialized = _build_moves_with_mask(
         launch, target_idx, frac, owned, pmask, ids, o
@@ -1041,24 +1343,29 @@ def sample_actions(
     target_logits = out.target_logits[0]
     fraction_alpha = out.fraction_alpha[0]
     fraction_beta = out.fraction_beta[0]
-    target_logits = _safe_target_logits(target_logits)
-    if deterministic:
-        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
-        target_idx = target_logits.argmax(dim=-1)
-        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
-    else:
-        launch = torch.distributions.Bernoulli(logits=launch_logits.float()).sample()
-        target_dist = torch.distributions.Categorical(logits=target_logits)
-        target_idx = target_dist.sample()
-        frac = Beta(fraction_alpha, fraction_beta).sample()
-    frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+    owned = out.planet_owned_mask[0]
+    pmask = out.planet_mask[0]
+    ids = out.planet_ids[0]
+    launch, frac = _sample_launch_fraction(
+        launch_logits, fraction_alpha, fraction_beta, deterministic
+    )
+    target_legal_mask = _target_legal_mask_from_observation(
+        frac, launch, owned, pmask, ids, o
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits, target_legal_mask, launch, owned, pmask
+    )
+    _launch_logits, launch = _mask_impossible_launches(
+        launch_logits, launch, target_legal_mask, owned, pmask
+    )
+    target_idx = _sample_target(target_logits, deterministic)
     return _build_moves(
         launch,
         target_idx,
         frac,
-        out.planet_owned_mask[0],
-        out.planet_mask[0],
-        out.planet_ids[0],
+        owned,
+        pmask,
+        ids,
         o,
     )
 
@@ -1088,12 +1395,38 @@ def sample_batch_with_records(
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
-    launch, target_idx, frac, log_prob = _sample_distributions(
-        launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
+    launch, frac = _sample_launch_fraction(
+        launch_logits, fraction_alpha, fraction_beta, deterministic
     )
+    legality_fields_l = _packed_legality_fields(
+        launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+    target_legal_mask_l = [
+        _target_legal_mask_from_packed_legality_fields(
+            legality_fields_l[k],
+            parsed_list[k].planets,
+            parsed_list[k].angular_velocity,
+            parsed_list[k].comet_planet_ids,
+        )
+        for k in range(b_dim)
+    ]
+    target_legal_mask = _target_legal_mask_tensor(
+        target_legal_mask_l, target_logits.device
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits, target_legal_mask, launch, out.planet_owned_mask, out.planet_mask
+    )
+    launch_logits, launch = _mask_impossible_launches(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+    )
+    target_idx = _sample_target(target_logits, deterministic)
 
-    fields_l = _packed_action_fields(
-        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    fields_l = _packed_action_fields_from_legality_fields(
+        target_idx, legality_fields_l, target_legal_mask_l
     )
 
     moves_list: list[list[Move]] = []
@@ -1155,11 +1488,46 @@ def sample_batch_with_records_raw(
     b_dim, p, _ = target_logits.shape
     assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
 
-    launch, target_idx, frac, log_prob = _sample_distributions(
-        launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
+    launch, frac = _sample_launch_fraction(
+        launch_logits, fraction_alpha, fraction_beta, deterministic
     )
-    fields_l = _packed_action_fields(
-        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    legality_fields_l = _packed_legality_fields(
+        launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+    target_legal_mask_l = [
+        _target_legal_mask_from_packed_legality_fields(
+            legality_fields_l[k],
+            raw_observations[k].get("planets", [])
+            if isinstance(raw_observations[k], dict)
+            else getattr(raw_observations[k], "planets", []),
+            (
+                raw_observations[k].get("angular_velocity", 0.0)
+                if isinstance(raw_observations[k], dict)
+                else getattr(raw_observations[k], "angular_velocity", 0.0)
+            )
+            or 0.0,
+            raw_observations[k].get("comet_planet_ids", [])
+            if isinstance(raw_observations[k], dict)
+            else getattr(raw_observations[k], "comet_planet_ids", []),
+        )
+        for k in range(b_dim)
+    ]
+    target_legal_mask = _target_legal_mask_tensor(
+        target_legal_mask_l, target_logits.device
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits, target_legal_mask, launch, out.planet_owned_mask, out.planet_mask
+    )
+    launch_logits, launch = _mask_impossible_launches(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+    )
+    target_idx = _sample_target(target_logits, deterministic)
+    fields_l = _packed_action_fields_from_legality_fields(
+        target_idx, legality_fields_l, target_legal_mask_l
     )
 
     actions_list: list[list[list]] = []
@@ -1221,11 +1589,37 @@ def sample_batch_with_records_context(
     b_dim, p, _ = target_logits.shape
     assert len(contexts) == b_dim, (len(contexts), b_dim)
 
-    launch, target_idx, frac, log_prob = _sample_distributions(
-        launch_logits, target_logits, fraction_alpha, fraction_beta, deterministic
+    launch, frac = _sample_launch_fraction(
+        launch_logits, fraction_alpha, fraction_beta, deterministic
     )
-    fields_l = _packed_action_fields(
-        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    legality_fields_l = _packed_legality_fields(
+        launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+    target_legal_mask_l = [
+        _target_legal_mask_from_packed_legality_fields(
+            legality_fields_l[k],
+            contexts[k].planets,
+            contexts[k].angular_velocity,
+            contexts[k].comet_planet_ids,
+        )
+        for k in range(b_dim)
+    ]
+    target_legal_mask = _target_legal_mask_tensor(
+        target_legal_mask_l, target_logits.device
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits, target_legal_mask, launch, out.planet_owned_mask, out.planet_mask
+    )
+    launch_logits, launch = _mask_impossible_launches(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+    )
+    target_idx = _sample_target(target_logits, deterministic)
+    fields_l = _packed_action_fields_from_legality_fields(
+        target_idx, legality_fields_l, target_legal_mask_l
     )
 
     actions_list: list[list[list]] = []
@@ -1286,20 +1680,38 @@ def sample_batch_actions(
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
-    target_logits = _safe_target_logits(target_logits)
-    if deterministic:
-        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
-        target_idx = target_logits.argmax(dim=-1)
-        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
-    else:
-        launch = torch.distributions.Bernoulli(logits=launch_logits.float()).sample()
-        target_dist = torch.distributions.Categorical(logits=target_logits)
-        target_idx = target_dist.sample()
-        frac = Beta(fraction_alpha, fraction_beta).sample()
-    frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+    launch, frac = _sample_launch_fraction(
+        launch_logits, fraction_alpha, fraction_beta, deterministic
+    )
+    legality_fields_l = _packed_legality_fields(
+        launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+    target_legal_mask_l = [
+        _target_legal_mask_from_packed_legality_fields(
+            legality_fields_l[k],
+            parsed_list[k].planets,
+            parsed_list[k].angular_velocity,
+            parsed_list[k].comet_planet_ids,
+        )
+        for k in range(b_dim)
+    ]
+    target_legal_mask = _target_legal_mask_tensor(
+        target_legal_mask_l, target_logits.device
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits, target_legal_mask, launch, out.planet_owned_mask, out.planet_mask
+    )
+    _launch_logits, launch = _mask_impossible_launches(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+    )
+    target_idx = _sample_target(target_logits, deterministic)
 
-    fields_l = _packed_action_fields(
-        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    fields_l = _packed_action_fields_from_legality_fields(
+        target_idx, legality_fields_l, target_legal_mask_l
     )
 
     return [
@@ -1321,20 +1733,47 @@ def sample_batch_actions_raw(
     b_dim, p, _ = target_logits.shape
     assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
 
-    target_logits = _safe_target_logits(target_logits)
-    if deterministic:
-        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
-        target_idx = target_logits.argmax(dim=-1)
-        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
-    else:
-        launch = torch.distributions.Bernoulli(logits=launch_logits.float()).sample()
-        target_dist = torch.distributions.Categorical(logits=target_logits)
-        target_idx = target_dist.sample()
-        frac = Beta(fraction_alpha, fraction_beta).sample()
-    frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+    launch, frac = _sample_launch_fraction(
+        launch_logits, fraction_alpha, fraction_beta, deterministic
+    )
+    legality_fields_l = _packed_legality_fields(
+        launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+    target_legal_mask_l = [
+        _target_legal_mask_from_packed_legality_fields(
+            legality_fields_l[k],
+            raw_observations[k].get("planets", [])
+            if isinstance(raw_observations[k], dict)
+            else getattr(raw_observations[k], "planets", []),
+            (
+                raw_observations[k].get("angular_velocity", 0.0)
+                if isinstance(raw_observations[k], dict)
+                else getattr(raw_observations[k], "angular_velocity", 0.0)
+            )
+            or 0.0,
+            raw_observations[k].get("comet_planet_ids", [])
+            if isinstance(raw_observations[k], dict)
+            else getattr(raw_observations[k], "comet_planet_ids", []),
+        )
+        for k in range(b_dim)
+    ]
+    target_legal_mask = _target_legal_mask_tensor(
+        target_legal_mask_l, target_logits.device
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits, target_legal_mask, launch, out.planet_owned_mask, out.planet_mask
+    )
+    _launch_logits, launch = _mask_impossible_launches(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+    )
+    target_idx = _sample_target(target_logits, deterministic)
 
-    fields_l = _packed_action_fields(
-        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    fields_l = _packed_action_fields_from_legality_fields(
+        target_idx, legality_fields_l, target_legal_mask_l
     )
     return [
         _build_action_lists_from_packed_fields_raw(
@@ -1357,20 +1796,38 @@ def sample_batch_actions_context(
     b_dim, p, _ = target_logits.shape
     assert len(contexts) == b_dim, (len(contexts), b_dim)
 
-    target_logits = _safe_target_logits(target_logits)
-    if deterministic:
-        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
-        target_idx = target_logits.argmax(dim=-1)
-        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
-    else:
-        launch = torch.distributions.Bernoulli(logits=launch_logits.float()).sample()
-        target_dist = torch.distributions.Categorical(logits=target_logits)
-        target_idx = target_dist.sample()
-        frac = Beta(fraction_alpha, fraction_beta).sample()
-    frac = frac.clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+    launch, frac = _sample_launch_fraction(
+        launch_logits, fraction_alpha, fraction_beta, deterministic
+    )
+    legality_fields_l = _packed_legality_fields(
+        launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    )
+    target_legal_mask_l = [
+        _target_legal_mask_from_packed_legality_fields(
+            legality_fields_l[k],
+            contexts[k].planets,
+            contexts[k].angular_velocity,
+            contexts[k].comet_planet_ids,
+        )
+        for k in range(b_dim)
+    ]
+    target_legal_mask = _target_legal_mask_tensor(
+        target_legal_mask_l, target_logits.device
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits, target_legal_mask, launch, out.planet_owned_mask, out.planet_mask
+    )
+    _launch_logits, launch = _mask_impossible_launches(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+    )
+    target_idx = _sample_target(target_logits, deterministic)
 
-    fields_l = _packed_action_fields(
-        launch, target_idx, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
+    fields_l = _packed_action_fields_from_legality_fields(
+        target_idx, legality_fields_l, target_legal_mask_l
     )
     return [
         _build_action_lists_from_packed_fields_context(
