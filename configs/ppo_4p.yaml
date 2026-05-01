@@ -40,6 +40,7 @@ model:
 
 optim:
   lr: 2.0e-4
+  head_lr: 2.0e-4
   weight_decay: 1.0e-4
   grad_clip: 0.5
   minibatch_size: 4096

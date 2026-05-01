@@ -44,10 +44,10 @@ class OptimCfg:
     """Optimizer hyperparameters.
 
     We use a parameter-golf-style dual-optimizer setup: **Muon (with row
-    normalization, "normuon")** for 2D matrix weights in the transformer
-    blocks and projection heads, and **AdamW** for everything else
-    (LayerNorm gains/biases, summary tokens, control tensors like
-    `attn_scale`/`ff_scale`/`resid_mix`, and Linear biases).
+    normalization, "normuon")** for 2D matrix weights inside transformer
+    blocks, and fused **AdamW** for everything else (input projections,
+    action/value readouts, biases, summary tokens, and control tensors like
+    `attn_scale`/`ff_scale`/`resid_mix`).
 
     Muon orthogonalizes the gradient via Newton-Schulz iteration, producing
     updates with bounded spectral norm regardless of the gradient's input
@@ -57,20 +57,11 @@ class OptimCfg:
     pre-normalized to unit-spectral-norm before the lr multiply.
     """
 
-    # Muon (matrix-2D weights in blocks + projection heads).
+    # Muon (matrix-2D weights inside transformer blocks).
     # `muon_lr` is naturally ~50–100× larger than an AdamW lr because Muon
     # updates are bounded after orthogonalization; parameter-golf uses 0.022
     # for matrix params on a 512-dim transformer.
     muon_lr: float = 0.022
-    # Slower Muon LR for the action-head readout matrices (target_query,
-    # target_key, fraction_head, launch_head). parameter-golf gives the LM
-    # head ~3× slower LR than the trunk (`head_lr=0.008` vs `matrix_lr=0.022`,
-    # `sota_train_gpt.py:10,211`). The readout is the only path between
-    # encoder shifts and policy logits/μ — slowing it dampens ratio drift
-    # per step without slowing the trunk's ability to learn the value
-    # function. value_head matrices stay at `muon_lr` (value loss isn't
-    # on the KL critical path).
-    muon_head_lr: float = 0.008
     muon_momentum: float = 0.95
     muon_backend_steps: int = 5
     muon_row_normalize: bool = True
@@ -88,8 +79,14 @@ class OptimCfg:
     # PPO's first updates land before that long.)
     muon_momentum_warmup_steps: int = 100
     muon_momentum_warmup_start: float = 0.85
-    # AdamW (default group: biases, summary tokens). PPO-canonical 3e-4.
+    # AdamW (default group: input projections, biases, summary tokens).
+    # PPO-canonical 3e-4.
     lr: float = 3e-4
+    # AdamW for task readouts (`target_query/key`, launch/fraction heads,
+    # and value head). parameter-golf keeps output heads out of Muon; using
+    # fused AdamW here is both cheaper than Newton-Schulz on tiny matrices
+    # and avoids turning a large readout gradient into a full spectral step.
+    head_lr: float = 3e-4
     # AdamW (control-tensor group: per-channel residual scales `attn_scale`,
     # `ff_scale`, `resid_mix`, and per-head attention temperature `q_gain`).
     # parameter-golf runs `scalar_lr ≈ matrix_lr` (0.02 vs 0.022) — equal

@@ -56,20 +56,6 @@ from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
 from .vec_rollout import alternating_learner_seats, rollout_episodes_batched
 
-# Parameter-name patterns that should *never* go to Muon even when shape
-# is 2D. These are control tensors (per-channel scales, residual mixes)
-# that conceptually act as scalars-per-channel; orthogonalizing their
-# 2D shape would destroy the per-channel meaning. Mirrors parameter-golf
-# `CONTROL_TENSOR_NAME_PATTERNS`.
-_CONTROL_TENSOR_PATTERNS: tuple[str, ...] = (
-    "attn_scale",
-    "ff_scale",
-    "resid_mix",
-    "actor_token",
-    "critic_token",
-    "fleet_latents",
-)
-
 # Subset of control tensors that route to the *fast* AdamW group at
 # `control_lr` (≈ `muon_lr`) — per-channel residual scales and the
 # attention-temperature gains (trunk `q_gain` + `target_q_gain`). The
@@ -83,17 +69,23 @@ _CONTROL_LR_PATTERNS: tuple[str, ...] = (
     "q_gain",  # also matches `target_q_gain` via substring
 )
 
-# Parameter-name patterns for the *slow* Muon group: action-head readouts
-# that produce policy logits / fraction params. These get a lower Muon LR
-# than the trunk (parameter-golf `head_lr=0.008` vs `matrix_lr=0.022`),
-# because every spectral-norm step here translates ~directly into Δlogit
-# / Δμ / Δlog σ → ratio drift → approx_kl. `value_head` is excluded — its
-# updates don't reach the policy.
+# Parameter-name prefixes for transformer block stacks. This mirrors
+# parameter-golf's optimizer ownership: Muon sees block matrices only, while
+# embeddings/readouts are handled by AdamW.
+_MUON_BLOCK_PREFIXES: tuple[str, ...] = (
+    "layers.",
+    "fleet_tokenizer.layers.",
+)
+
+# Task-specific readouts stay out of Muon. They are small enough that fused
+# AdamW is faster than Newton-Schulz, and they map directly to policy/value
+# logits where a full spectral step is too aggressive at cold start.
 _HEAD_LR_PATTERNS: tuple[str, ...] = (
     "target_query",
     "target_key",
     "fraction_head",
     "launch_head",
+    "value_head",
 )
 
 
@@ -106,40 +98,42 @@ def _split_params(
     list[torch.nn.Parameter],
 ]:
     """Partition `model.parameters()` into
-    (muon_trunk, muon_head, adamw_default, adamw_control).
+    (muon_blocks, adamw_default, adamw_control, adamw_head).
 
-    Muon (trunk): 2D weight matrices that aren't control tensors and
-    aren't action-head readouts — encoder block weights, projection
-    embeds, value-head matrices.
+    Muon (blocks): 2D matrices inside the transformer block stacks, matching
+    parameter-golf's optimizee split.
 
-    Muon (head): action-head readout matrices — `target_query`,
-    `target_key`, `fraction_head`, `launch_head`. Same Muon optimizer
-    state, slower LR.
+    AdamW (head-lr): task readout matrices — `target_query`, `target_key`,
+    `fraction_head`, `launch_head`, and `value_head`.
 
     AdamW (control-lr): per-channel residual scales and `q_gain`s — need
     update magnitudes comparable to Muon's matrix updates, see
     `OptimCfg.control_lr`.
 
-    AdamW (default-lr): everything else — biases, summary tokens.
+    AdamW (default-lr): everything else — input projections, biases,
+    summary tokens, and latent tokens.
     """
-    muon_trunk: list[torch.nn.Parameter] = []
-    muon_head: list[torch.nn.Parameter] = []
+    muon_blocks: list[torch.nn.Parameter] = []
     adamw_default: list[torch.nn.Parameter] = []
     adamw_control: list[torch.nn.Parameter] = []
+    adamw_head: list[torch.nn.Parameter] = []
     for name, p in model.named_parameters():
-        is_control = any(pat in name for pat in _CONTROL_TENSOR_PATTERNS)
+        is_muon_block = (
+            p.ndim == 2
+            and any(name.startswith(prefix) for prefix in _MUON_BLOCK_PREFIXES)
+            and not any(pat in name for pat in _CONTROL_LR_PATTERNS)
+        )
         is_control_lr = any(pat in name for pat in _CONTROL_LR_PATTERNS)
         is_head_lr = any(pat in name for pat in _HEAD_LR_PATTERNS)
-        if p.ndim == 2 and not is_control:
-            if is_head_lr:
-                muon_head.append(p)
-            else:
-                muon_trunk.append(p)
+        if is_muon_block:
+            muon_blocks.append(p)
+        elif is_head_lr:
+            adamw_head.append(p)
         elif is_control_lr:
             adamw_control.append(p)
         else:
             adamw_default.append(p)
-    return muon_trunk, muon_head, adamw_default, adamw_control
+    return muon_blocks, adamw_default, adamw_control, adamw_head
 
 
 def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
@@ -149,16 +143,13 @@ def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
     `step` / `zero_grad` / `param_groups` so the PPO loop's clip-grad and
     step calls work transparently across both children.
     """
-    muon_trunk, muon_head, adamw_default, adamw_control = _split_params(model)
-    # Two Muon param-groups: trunk at `muon_lr`, action-head readouts at
-    # the slower `muon_head_lr`. One Muon optimizer instance keeps the
-    # NS5 step counter (and momentum-warmup schedule) shared across both
-    # groups — same opt-step pacing, different per-group LR.
+    muon_blocks, adamw_default, adamw_control, adamw_head = _split_params(model)
+    # One Muon param-group for transformer block matrices, matching
+    # parameter-golf's optimizee split. Task heads and input projections are
+    # AdamW below; running Newton-Schulz on those tiny readouts is slower and
+    # was the source of oversized cold-start policy-head moves.
     muon_opt = Muon(
-        [
-            {"params": muon_trunk, "lr": cfg.muon_lr},
-            {"params": muon_head, "lr": cfg.muon_head_lr},
-        ],
+        [{"params": muon_blocks, "lr": cfg.muon_lr}],
         lr=cfg.muon_lr,
         momentum=cfg.muon_momentum,
         backend_steps=cfg.muon_backend_steps,
@@ -175,12 +166,14 @@ def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
     # statistics and a stale running variance underestimates the current
     # step size, which translates into oversized parameter updates.
     #
-    # Two AdamW param-groups: control tensors at `control_lr` (≈ muon_lr,
-    # parity with matrix updates) and everything else at `lr`.
+    # Three AdamW param-groups: default tensors at `lr`, control tensors at
+    # `control_lr` (≈ muon_lr, parity with matrix updates), and task readouts
+    # at `head_lr`.
     adamw_opt = torch.optim.AdamW(
         [
             {"params": adamw_default, "lr": cfg.lr},
             {"params": adamw_control, "lr": cfg.control_lr},
+            {"params": adamw_head, "lr": cfg.head_lr},
         ],
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,

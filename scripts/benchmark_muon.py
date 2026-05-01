@@ -2,8 +2,8 @@
 """Benchmark scalar vs grouped Muon optimizer steps.
 
 This isolates the optimizer backend from PPO/env work by cloning the real
-OrbitPolicy matrix-parameter shapes, assigning fixed synthetic gradients, and
-timing `Muon.step()`.
+OrbitPolicy Muon-owned block-matrix shapes, assigning fixed synthetic
+gradients, and timing `Muon.step()`.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def _sync(device: torch.device) -> None:
 def _make_param_groups(config_path: str, device: torch.device) -> list[dict]:
     cfg = load_config(config_path)
     model = _build_model(cfg).to(device)
-    trunk, head, _adamw_default, _adamw_control = _split_params(model)
+    muon_blocks, _adamw_default, _adamw_control, _adamw_head = _split_params(model)
 
     def clone_params(params: list[torch.nn.Parameter]) -> list[torch.nn.Parameter]:
         return [
@@ -41,10 +41,7 @@ def _make_param_groups(config_path: str, device: torch.device) -> list[dict]:
             for p in params
         ]
 
-    return [
-        {"params": clone_params(trunk), "lr": cfg.optim.muon_lr},
-        {"params": clone_params(head), "lr": cfg.optim.muon_head_lr},
-    ]
+    return [{"params": clone_params(muon_blocks), "lr": cfg.optim.muon_lr}]
 
 
 def _clone_groups(groups: list[dict]) -> list[dict]:

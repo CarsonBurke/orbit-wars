@@ -4,8 +4,9 @@ Lifted from parameter-golf's `sota_train_gpt.py:Muon`, expanded for
 readability. Designed for 2D matrix weights — the orthogonalization step
 operates on the gradient as a matrix and produces an update with unit
 spectral norm (modulo a `sqrt(rows / cols)` shape correction). Combine
-with AdamW on the *non-matrix* parameters (LayerNorm gains, biases, scale
-parameters, summary tokens) — see `_split_params` in `train.py`.
+with AdamW on parameters outside transformer block matrices (input
+projections, task readouts, biases, scale parameters, summary tokens) — see
+`_split_params` in `train.py`.
 
 Why Muon for cold-start PPO: AdamW's first step takes a full-lr step in
 the raw gradient direction (no running second moment to scale against),
