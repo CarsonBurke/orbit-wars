@@ -901,8 +901,7 @@ impl Game {
             .filter(|&idx| idx != player)
             .map(projected)
             .fold(0.0, f64::max);
-        let denom = own + enemy + 1.0;
-        ((own - enemy) / denom.max(1.0)) as f32
+        (own - enemy) as f32
     }
 }
 
@@ -1274,7 +1273,7 @@ mod tests {
 
         let own = 10.0 + 90.0 * 2.0;
         let enemy = 20.0 + 90.0;
-        let expected = (own - enemy) / (own + enemy + 1.0);
+        let expected = own - enemy;
         assert!((f64::from(game.projected_margin_potential(0, 1.0)) - expected).abs() < 1e-6);
     }
 

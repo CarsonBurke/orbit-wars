@@ -8,9 +8,9 @@
 #   - PMPO surrogate (dreamer4-aligned) instead of clipped PPO. No
 #     `clip_eps` knob; trust region is launch KL plus probability-weighted
 #     conditional target/fraction KL.
-#   - Dense reward = delta of normalized projected population margin.
+#   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
-#   - Distributional value head (HL-Gauss CE on [-2, 2] / 51 bins), unclipped.
+#   - Distributional value head (symlog HL-Gauss CE on ±100k raw margin / 153 bins), unclipped.
 
 run:
   name: ppo_base
@@ -44,6 +44,10 @@ model:
   encoder_backend: fleet_latent
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
+  value_min: -100000.0
+  value_max: 100000.0
+  value_num_bins: 153
+  value_symlog: true
 
 optim:
   # Muon (matrix params). Matches parameter-golf `matrix_lr=0.022`.

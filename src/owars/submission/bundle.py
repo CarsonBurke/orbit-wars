@@ -16,6 +16,7 @@ owars.*` resolve from the bundle.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import shutil
 import tarfile
 from pathlib import Path
@@ -27,6 +28,15 @@ def build_submission(
     *,
     package_root: str | Path = "src/owars",
     main_py: str | Path = "submission/main.py",
+    runtime_packages: tuple[str, ...] = (
+        "hl_gauss_pytorch",
+        "einops",
+        "einx",
+        "frozendict",
+        "mpmath",
+        "sympy",
+        "torch_einops_utils",
+    ),
 ) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -39,6 +49,8 @@ def build_submission(
     (staging / "weights").mkdir()
     shutil.copy(ckpt_path, staging / "weights" / "policy.pt")
     shutil.copytree(package_root, staging / "owars")
+    for package in runtime_packages:
+        _copy_runtime_package(package, staging)
 
     with tarfile.open(out_path, "w:gz") as tar:
         for p in staging.rglob("*"):
@@ -46,6 +58,16 @@ def build_submission(
             tar.add(p, arcname=arcname)
     shutil.rmtree(staging)
     return out_path
+
+
+def _copy_runtime_package(package: str, staging: Path) -> None:
+    spec = importlib.util.find_spec(package)
+    if spec is None or spec.origin is None:
+        raise RuntimeError(f"runtime package {package!r} is not importable")
+    source = Path(spec.origin).parent
+    destination = staging / package
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+    shutil.copytree(source, destination, ignore=ignore)
 
 
 def main() -> None:

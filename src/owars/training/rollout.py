@@ -57,7 +57,7 @@ def _obs_reward_potential(
     ]
     own = projected[player]
     enemy = max((projected[p] for p in range(num_players) if p != player), default=0.0)
-    return (own - enemy) / max(1.0, own + enemy + 1.0)
+    return own - enemy
 
 
 @dataclass

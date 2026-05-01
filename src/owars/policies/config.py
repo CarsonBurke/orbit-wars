@@ -40,18 +40,17 @@ class OrbitPolicyConfig:
     # lead-intercept solver in `sampling.py` — no learned angle component.
 
     # Distributional value head — predicts a categorical over `value_num_bins`
-    # bins on `[value_min, value_max]`, trained with HL-Gauss CE (dreamer4
-    # `dreamer4.py:722–805`). Default dense-potential returns are bounded and
-    # usually fit inside [-2, 2]. Configs that mix in larger terminal/margin
-    # rewards should widen further. 51 bins → ~0.08 resolution. The scalar value used for
-    # advantage is the expectation E[V] = Σ p_i · c_i recovered via
-    # `HLGaussLoss.bins_to_scalar`. Targets outside the support are clipped
-    # to the boundary bin in `target_probs`, so the head degrades gracefully
-    # instead of going NaN if returns exceed the range.
+    # bins, trained with Dreamer4-style symlog HL-Gauss CE. `value_min/max`
+    # are raw return bounds; with `value_symlog=True`, the library transforms
+    # them to symlog support endpoints for bucket placement and decodes scalar
+    # predictions with symexp. For example, raw ±100k becomes symlog support
+    # ±log(100001) ≈ ±11.51. Targets outside the raw support are clipped to
+    # the boundary bin in `target_probs`.
     value_hidden: int = 64
-    value_num_bins: int = 51
-    value_min: float = -2.0
-    value_max: float = 2.0
+    value_num_bins: int = 153
+    value_min: float = -100_000.0
+    value_max: float = 100_000.0
+    value_symlog: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)

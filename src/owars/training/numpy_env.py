@@ -1424,7 +1424,7 @@ class NumpyVecEnv:
             (float(projected[p]) for p in range(self.num_players) if p != player),
             default=0.0,
         )
-        return (own - enemy) / max(1.0, own + enemy + 1.0)
+        return own - enemy
 
     def policy_batch(
         self,

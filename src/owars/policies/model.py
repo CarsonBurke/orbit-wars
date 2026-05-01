@@ -55,13 +55,12 @@ is bounded by 1 (CE) instead of unbounded (MSE on a possibly-misscaled
 scalar), which makes the critic dramatically more robust to early
 mis-prediction.
 
-We deliberately drop dreamer4's symlog transform. The default reward is a
-bounded dense potential delta based on projected population margin, so returns
-usually stay near the default [-2, 2] support. Configs that mix in large
-terminal or margin rewards should widen via `OrbitPolicyConfig.value_min/max`.
-σ = 0.5 × bin_size (dreamer4 default), and `target_probs` clips out-of-range
-targets to the boundary bin so the head degrades gracefully rather than
-producing NaN.
+We use Dreamer4's symlog HL-Gauss value encoding over a wide raw support by
+default. Raw projected-margin rewards can move by tens of thousands over an
+episode, but symlog bucket placement preserves resolution near zero while
+still representing decisive endgame margins. σ = 0.5 × bin_size (Dreamer4
+default), and `target_probs` clips out-of-range targets to the boundary bin so
+the head degrades gracefully rather than producing NaN.
 
 **Critic still shares the encoder backbone.** Value-loss gradients flow
 through the same transformer the actor uses. This is tamed by
@@ -85,10 +84,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
+from hl_gauss_pytorch import HLGaussLoss as _LibraryHLGaussLoss
 
 from .config import OrbitPolicyConfig
 from .features import EncodedObs
-
 
 _PLANET_XY_SCALE: float = 100.0
 _PLANET_XY_OFFSET: float = 50.0
@@ -633,9 +632,10 @@ FRACTION_CONCENTRATION_MAX: float = 20.0
 class HLGaussLoss(nn.Module):
     """Histogram-loss-Gaussian distributional regression head.
 
-    Lifted in spirit from dreamer4 (`dreamer4.py:722–805` `SymExpHLGauss`)
-    and the underlying Imani et al. 2018 / Farebrother et al. 2024 design.
-    For our [-1, 1] return range we drop the symlog transform.
+    Thin adapter around `hl_gauss_pytorch.HLGaussLoss`, the same package used
+    by Dreamer4's `SymExpHLGauss` wrapper. The adapter preserves the small API
+    the rest of this repo expects: scalar target encoding via `target_probs`
+    and scalar value recovery via `bins_to_scalar`.
 
     Forward semantics:
       - `target_probs(value)` encodes a scalar to a per-bin probability
@@ -645,9 +645,9 @@ class HLGaussLoss(nn.Module):
       - `loss(logits, target_probs)` is just F.cross_entropy on a per-element
         basis (caller is responsible for masking/reduction).
 
-    All math casts to fp32 internally — the support buffer is bf16 after
-    `model.bfloat16()` but bin edges in [-1, 1] need more than 7 mantissa
-    bits to be useful as targets.
+    With `symlog=True`, `min_value` / `max_value` are raw values. The library
+    transforms those endpoints to symlog space for the histogram support and
+    applies symexp when decoding scalar predictions.
     """
 
     def __init__(
@@ -656,65 +656,59 @@ class HLGaussLoss(nn.Module):
         max_value: float = 1.0,
         num_bins: int = 41,
         sigma_to_bin_ratio: float = 0.5,
+        symlog: bool = False,
     ):
         super().__init__()
         if num_bins < 2:
             raise ValueError(f"num_bins must be ≥ 2, got {num_bins}")
+        if min_value >= max_value:
+            raise ValueError("min_value must be less than max_value")
         self.num_bins = num_bins
         self.min_value = min_value
         self.max_value = max_value
-        self.bin_size = (max_value - min_value) / num_bins
-        self.sigma = sigma_to_bin_ratio * self.bin_size
-        self.sigma_times_sqrt_two = (2.0 ** 0.5) * self.sigma
-
-    def _support(self, ref: torch.Tensor) -> torch.Tensor:
-        """Bin-edge tensor `[num_bins+1]` in fp32 on `ref`'s device.
-
-        We deliberately do *not* `register_buffer` the support — `model.bfloat16()`
-        casts buffers to bf16, but bin edges in [-2, 2] need fp32 (bf16 step
-        ≈ 0.016 vs 0.08 bin spacing → ~20% bin shift). Recomputing per call
-        on the input device is trivial (tens of floats).
-        """
-        return torch.linspace(
-            self.min_value,
-            self.max_value,
-            self.num_bins + 1,
-            dtype=torch.float32,
-            device=ref.device,
+        self.symlog = bool(symlog)
+        transform = _symlog if self.symlog else None
+        inverse_transform = _symexp if self.symlog else None
+        self.encoder = _LibraryHLGaussLoss(
+            min_value=min_value,
+            max_value=max_value,
+            num_bins=num_bins,
+            sigma_to_bin_ratio=sigma_to_bin_ratio,
+            clamp_to_range=True,
+            transform=transform,
+            inverse_transform=inverse_transform,
         )
 
-    def _centers(self, support: torch.Tensor) -> torch.Tensor:
-        return (support[:-1] + support[1:]) / 2
+    def _apply(self, fn):  # type: ignore[no-untyped-def]
+        out = super()._apply(fn)
+        # `model.bfloat16()` casts buffers too. The histogram support defines
+        # target placement and scalar decoding, so keep it in fp32 like the
+        # previous local implementation did.
+        for name, buffer in self.encoder.named_buffers(recurse=False):
+            if buffer.is_floating_point() and buffer.dtype != torch.float32:
+                self.encoder._buffers[name] = buffer.float()
+        return out
 
     def target_probs(self, values: torch.Tensor) -> torch.Tensor:
         """Encode scalar `values` (any leading shape) into [..., num_bins]
         probabilities under a Gaussian centered at each value.
 
-        We deliberately diverge from dreamer4's library default
-        (`hl_gauss_pytorch/hl_gauss.py:131-146`, `clamp_to_range=False`)
-        and clamp the target to `[min_value, max_value]` upfront. Their
-        255-bin symlog [-20, 20] support corresponds to ±5e8 in raw units
-        — effectively never out-of-range. Our compact [-2, 2] support
-        could be exceeded if a config dials margin shaping past 0.5;
-        without the clamp the truncated-Gaussian collapses (cdf saturates
-        on both ends, z ≈ 0, divide by `clamp_min(1e-10)` yields an
-        all-zero target distribution → zero CE gradient). The clamp
-        concentrates mass at the boundary bin instead, degrading
-        gracefully rather than silently no-op'ing the value loss.
+        We set `clamp_to_range=True` on the library encoder, so out-of-support
+        targets concentrate mass at the boundary instead of producing a
+        near-zero target distribution and a silent value-loss no-op.
         """
-        v = values.float().clamp(self.min_value, self.max_value)
-        support = self._support(v)  # [num_bins+1]
-        # cdf[..., i] = erf((support_i − v) / (σ√2))
-        cdf = torch.erf((support - v.unsqueeze(-1)) / self.sigma_times_sqrt_two)
-        bin_probs = cdf[..., 1:] - cdf[..., :-1]
-        z = (cdf[..., -1] - cdf[..., 0]).clamp_min(1e-10)
-        return bin_probs / z.unsqueeze(-1)
+        return self.encoder.transform_to_probs(values.float())
 
     def bins_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
-        probs = F.softmax(logits.float(), dim=-1)
-        support = self._support(probs)
-        centers = self._centers(support)
-        return (probs * centers).sum(dim=-1)
+        return self.encoder(logits.float()).clamp(self.min_value, self.max_value)
+
+
+def _symlog(x: torch.Tensor) -> torch.Tensor:
+    return x.sign() * torch.log1p(x.abs())
+
+
+def _symexp(x: torch.Tensor) -> torch.Tensor:
+    return x.sign() * torch.expm1(x.abs())
 
 def _logit(p: float) -> float:
     return math.log(p / (1.0 - p))
@@ -879,12 +873,13 @@ class OrbitPolicy(nn.Module):
         nn.init.constant_(self.fraction_head.bias[1], _logit(conc_p))
         # Distributional value head — emits logits over `value_num_bins`
         # bins. Scalar V is recovered from these via `HLGaussLoss.bins_to_scalar`.
-        # dreamer4 uses 255 bins on a symlog'd support; our bounded dense
-        # reward uses a coarser linear bin set.
+        # The default uses Dreamer4-style symlog buckets over a wide raw
+        # projected-margin support.
         self.value_encoder = HLGaussLoss(
             min_value=cfg.value_min,
             max_value=cfg.value_max,
             num_bins=cfg.value_num_bins,
+            symlog=cfg.value_symlog,
         )
         self.value_head = nn.Sequential(
             CastedLinear(cfg.dim, cfg.value_hidden, bias=False),

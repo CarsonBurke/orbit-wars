@@ -72,7 +72,7 @@ def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():
     )
     own = 15 + 90 * 2
     best_enemy = max(20 + 90 * 1, 5 + 90 * 4)
-    assert phi == pytest.approx((own - best_enemy) / (own + best_enemy + 1))
+    assert phi == pytest.approx(own - best_enemy)
 
     terminal = {**obs, "step": 100}
     terminal_phi = _obs_reward_potential(
@@ -82,7 +82,7 @@ def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():
         episode_steps=100,
         production_weight=1.0,
     )
-    assert terminal_phi == pytest.approx((15 - 20) / (15 + 20 + 1))
+    assert terminal_phi == pytest.approx(15 - 20)
 
     done_state = [
         {"status": "DONE", "observation": obs},

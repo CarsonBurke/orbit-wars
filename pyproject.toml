@@ -15,6 +15,7 @@ dependencies = [
   "pyyaml>=6.0",
   "rich>=13.7",
   "kaggle-environments>=1.16",
+  "hl-gauss-pytorch>=0.2.3",
 ]
 
 [project.optional-dependencies]

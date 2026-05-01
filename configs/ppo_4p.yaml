@@ -33,6 +33,10 @@ model:
   encoder_backend: fleet_latent
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
+  value_min: -100000.0
+  value_max: 100000.0
+  value_num_bins: 153
+  value_symlog: true
 
 optim:
   lr: 2.0e-4

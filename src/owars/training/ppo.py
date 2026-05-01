@@ -5,7 +5,7 @@ This file is **not** vanilla clipped PPO. It mirrors dreamer4's
 adaptations the Orbit Wars action structure imposes:
 
   1. **PMPO policy loss** (no PPO clip). On a per-action-factor log-prob `lp`:
-        scaled_lp = lp · |tanh(adv)|
+        scaled_lp = lp
      split by sign of `adv`:
         policy_loss = −α · mean(scaled_lp[adv ≥ 0])
                       + (1−α) · mean(scaled_lp[adv < 0])
@@ -24,9 +24,8 @@ adaptations the Orbit Wars action structure imposes:
      regularizes the full distribution, not only sampled/executed branches.
 
   3. **Conventional GAE** supplies both critic returns and actor advantages.
-     Advantages are *not* z-score normalized — PMPO's `tanh(adv).abs()` already
-     bounds advantage magnitude (dreamer4 deliberately disables advantage
-     normalization when `use_pmpo`).
+     PMPO uses only the sign of the advantage; critic returns stay in raw
+     reward units.
 
   4. **Distributional value loss** (HL-Gauss CE, `dreamer4.py:4509-4515`).
      The critic emits `value_logits` over a fixed bin support; the loss
@@ -340,7 +339,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         )
         adv_b = advantage.float().unsqueeze(-1).expand_as(chosen)
         adv_f = advantage.float().unsqueeze(-1).unsqueeze(-1).expand_as(factor_log_probs)
-        scaled_lp = factor_log_probs * adv_f.tanh().abs()
+        scaled_lp = factor_log_probs
         row_w = row_weight.to(device=owned_f.device, dtype=owned_f.dtype)
         row_w_b = row_w.unsqueeze(-1)
         owned_w = owned_f * row_w_b
@@ -681,10 +680,9 @@ def ppo_update(
       `old_target_logits` [B,P,P],
       `old_fraction_alpha` [B,P], `old_fraction_beta` [B,P].
 
-    PMPO surrogate: `policy_loss = −α·mean(scaled[pos]) + (1−α)·mean(scaled[neg])`
-    where `scaled = action_factor_log_prob · |tanh(advantage)|`. Launch is
-    always a factor; target/fraction are factors only for materialized launches.
-    No PPO clip.
+    PMPO surrogate: `policy_loss = −α·mean(log_prob[pos]) + (1−α)·mean(log_prob[neg])`.
+    Launch is always a factor; target/fraction are factors only for materialized
+    launches. No PPO clip.
     Trust region is the PMPO KL term: full Bernoulli launch KL plus
     probability-weighted conditional target/fraction KL. `pmpo_reverse_kl=True`
     matches dreamer4's direction for each factor; setting `False` flips the

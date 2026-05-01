@@ -348,9 +348,7 @@ def test_pmpo_policy_loss_averages_valid_action_factors_like_dreamer4():
     frac_lp = Beta(model.new_alpha[0, 0], model.new_beta[0, 0]).log_prob(
         torch.tensor(0.5)
     )
-    expected = -0.5 * torch.stack((launch_lp, target_lp, frac_lp)).mean() * torch.tanh(
-        torch.tensor(1.0)
-    )
+    expected = -0.5 * torch.stack((launch_lp, target_lp, frac_lp)).mean()
     assert math.isclose(log.policy_loss, float(expected), rel_tol=1e-6)
 
 

@@ -206,6 +206,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         value_num_bins=cfg.model.value_num_bins,
         value_min=cfg.model.value_min,
         value_max=cfg.model.value_max,
+        value_symlog=cfg.model.value_symlog,
     )
     return OrbitPolicy(pcfg)
 
@@ -295,13 +296,14 @@ def _stack_trajectories(
 
     advs = torch.from_numpy(np.concatenate(advs_all)).float()
     rets = torch.from_numpy(np.concatenate(rets_all)).float()
-    # PMPO uses `tanh(adv).abs()` magnitude shaping, which is bounded in
-    # [0, 1) regardless of advantage scale — so we deliberately do *not*
-    # z-score advantages here (dreamer4 `dreamer4.py:4130` makes the same
-    # choice: `normalize_advantages = default(None, not use_pmpo)`). The
-    # raw advantage signal carries through to PMPO's pos/neg split.
+    # PMPO uses only the sign of the advantage; critic targets remain raw
+    # projected-margin returns.
     batch["advantage"] = advs
     batch["return"] = rets
+    batch["raw_advantage_abs_mean"] = torch.tensor(
+        float(advs.abs().mean()) if advs.numel() else 0.0,
+        dtype=torch.float32,
+    )
     return batch
 
 
@@ -691,6 +693,7 @@ def _ppo_loop(
                 "target_confidence": log.target_confidence,
                 "move_prob": log.move_prob,
                 "pos_advantage_frac": log.pos_frac,
+                "raw_advantage_abs_mean": float(batch["raw_advantage_abs_mean"]),
             },
             update,
         )

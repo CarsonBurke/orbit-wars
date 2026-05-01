@@ -2,7 +2,7 @@ import torch
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
-from owars.policies.model import _fraction_beta_params
+from owars.policies.model import HLGaussLoss, _fraction_beta_params
 from owars.policies.sampling import _deterministic_fraction
 
 
@@ -59,6 +59,39 @@ def test_planet_rope_frequency_buffer_stays_fp32_after_bfloat16():
     model.bfloat16()
 
     assert model.planet_rope.inv_freq.dtype == torch.float32
+
+
+def test_value_histogram_buffers_stay_fp32_after_bfloat16():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
+    model = OrbitPolicy(cfg)
+
+    model.bfloat16()
+
+    buffers = dict(model.value_encoder.encoder.named_buffers())
+    assert buffers["support"].dtype == torch.float32
+    assert buffers["centers"].dtype == torch.float32
+
+
+def test_symlog_hl_gauss_encodes_wide_raw_margin_targets():
+    encoder = HLGaussLoss(
+        min_value=-100_000.0,
+        max_value=100_000.0,
+        num_bins=153,
+        symlog=True,
+    )
+    assert encoder.encoder.min_value == torch.log1p(torch.tensor(100_000.0)).neg().item()
+    assert encoder.encoder.max_value == torch.log1p(torch.tensor(100_000.0)).item()
+
+    targets = torch.tensor([-200_000.0, -1000.0, 0.0, 1000.0, 200_000.0])
+    probs = encoder.target_probs(targets)
+
+    assert probs.shape == (5, 153)
+    assert torch.isfinite(probs).all()
+    assert torch.allclose(probs.sum(dim=-1), torch.ones(5), atol=1e-5)
+
+    zero_logits = torch.zeros(3, 153)
+    values = encoder.bins_to_scalar(zero_logits)
+    assert torch.allclose(values, torch.zeros(3), atol=1e-4)
 
 
 def test_planet_rope_can_be_disabled():

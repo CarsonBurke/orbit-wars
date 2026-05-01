@@ -49,6 +49,14 @@ def test_invalid_planet_rope_config_raises():
         raise AssertionError(f"expected ValueError for {model_cfg}")
 
 
+def test_invalid_value_support_raises():
+    try:
+        RunConfig.from_dict({"model": {"value_min": 1.0, "value_max": 1.0}})
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for invalid value support")
+
+
 def test_deep_override_merges():
     base = {"a": {"x": 1, "y": 2}, "b": 3}
     over = {"a": {"y": 20}, "c": 5}

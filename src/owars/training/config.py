@@ -33,9 +33,10 @@ class ModelCfg:
     num_fleet_latents: int = 64
     fleet_tokenizer_depth: int = 1
     value_hidden: int = 64
-    value_num_bins: int = 51
-    value_min: float = -2.0
-    value_max: float = 2.0
+    value_num_bins: int = 153
+    value_min: float = -100_000.0
+    value_max: float = 100_000.0
+    value_symlog: bool = True
 
 
 @dataclass
@@ -114,11 +115,9 @@ class PPOCfg:
 
     gamma: float = 0.997
     gae_lambda: float = 0.95
-    # PMPO surrogate replaces the clipped PPO surrogate (dreamer4
-    # `dreamer4.py:4265-4296`). `tanh(adv).abs()` magnitude shaping plus a
-    # pos/neg-advantage split with weight α gives a softer trust region
-    # than ratio clipping. There is no `clip_eps` knob — the analytical
-    # KL term below is the only trust-region signal.
+    # PMPO surrogate replaces the clipped PPO surrogate. It uses only the sign
+    # of the advantage, matching Dreamer4 paper Eq. 11. There is no `clip_eps`
+    # knob — the analytical KL term below is the only trust-region signal.
     pmpo_pos_to_neg_weight: float = 0.5    # equal weight on pos and neg advantage (dreamer4 default)
     pmpo_reverse_kl: bool = True            # dreamer4 default direction. False is an ablation, not full joint forward KL.
     # PMPO KL penalty. Launch uses full Bernoulli KL; target/fraction KL is
@@ -194,9 +193,9 @@ class RewardCfg:
 
         potential_weight * (Phi(s_next) - Phi(s))
 
-    where Phi is normalized projected population margin against the strongest
-    enemy. Population is current ships on owned planets plus ships in owned
-    fleets. Production is converted into projected future population by
+    where Phi is raw projected population margin against the strongest enemy.
+    Population is current ships on owned planets plus ships in owned fleets.
+    Production is converted into projected future population by
     `production_weight * turns_left`.
 
     Terminal outcome fields default to zero because the dense potential
@@ -256,6 +255,8 @@ class RunConfig:
             raise ValueError("model.planet_rope_fraction must be in [0, 1]")
         if cfg.model.planet_rope_base <= 0.0:
             raise ValueError("model.planet_rope_base must be positive")
+        if cfg.model.value_min >= cfg.model.value_max:
+            raise ValueError("model.value_min must be less than model.value_max")
         if cfg.reward.production_weight < 0.0:
             raise ValueError("reward.production_weight must be non-negative")
         return cfg

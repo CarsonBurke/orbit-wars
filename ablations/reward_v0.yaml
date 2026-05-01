@@ -1,8 +1,8 @@
 # Dense reward sweep.
 #
-# The base reward is the delta of normalized projected population margin
-# against the strongest enemy. This sweep tests how strongly to weight that
-# potential, how much future production to project into population, and
+# The base reward is the delta of raw projected population margin against the
+# strongest enemy. This sweep tests how strongly to weight that potential, how
+# much future production to project into population, and
 # whether mixing terminal outcome back in helps or hurts.
 #
 # Run with: python scripts/ablate.py --matrix ablations/reward_v0.yaml
