@@ -85,6 +85,7 @@ def _deterministic_fraction(
 LEAD_BISECT_ITERS: int = 24
 LEAD_T_HORIZON_STEPS: float = 600.0  # episode is 500 steps; a bit of slack
 LEAD_MAX_TURNS: int = int(LEAD_T_HORIZON_STEPS)
+LEAD_MAX_SCAN_DISTANCE: float = math.hypot(BOARD_SIZE, BOARD_SIZE) + 8.0
 
 
 @dataclass
@@ -253,7 +254,11 @@ def _lead_solution_from_point(
     # one of those exact checked positions, not a continuous-time interpolation.
     theta0 = math.atan2(target_y - cy, target_x - cx)
     previous_error: float | None = None
-    for k in range(1, LEAD_MAX_TURNS + 1):
+    max_turns = min(
+        LEAD_MAX_TURNS,
+        max(1, int(math.ceil((LEAD_MAX_SCAN_DISTANCE + target_radius) / sp)) + 1),
+    )
+    for k in range(1, max_turns + 1):
         theta = theta0 + angular_velocity * (k - 1)
         tx = cx + orbit_radius * math.cos(theta)
         ty = cy + orbit_radius * math.sin(theta)

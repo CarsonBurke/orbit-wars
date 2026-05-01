@@ -326,6 +326,23 @@ def test_rust_vec_env_policy_batch_matches_numpy_vec_env():
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_step_subset_fast_rejects_duplicate_indices():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust.reset()
+    with pytest.raises(ValueError, match="indices must be unique"):
+        rust.step_subset_fast([0, 0], [[[], []], [[], []]])
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
 def test_rust_vec_env_native_sampler_matches_context_sampler():
     _build_rust_extension()
     from owars.policies.model import PolicyOutput
