@@ -22,7 +22,6 @@ env/
 
 # Tensorboard / training runs (top-level only — keep src/owars/runs etc. tracked)
 /runs/*
-!/runs/.gitkeep
 
 # Model checkpoints (top-level only)
 /checkpoints/*
