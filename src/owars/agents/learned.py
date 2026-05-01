@@ -14,9 +14,20 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn as nn
 
-from ..policies.features import encode_raw_observations
-from ..policies.model import OrbitPolicy, OrbitPolicyConfig, restore_fp32_params
+from ..policies.features import (
+    MAX_FLEETS,
+    MAX_PLANETS,
+    EncodedObs,
+    encode_raw_observations,
+)
+from ..policies.model import (
+    OrbitPolicy,
+    OrbitPolicyConfig,
+    PolicyOutput,
+    restore_fp32_params,
+)
 from ..policies.sampling import sample_batch_actions_raw
 
 
@@ -143,12 +154,93 @@ class _FleetTargetTracker:
             )
 
 
+class _InferenceForwardKernel(nn.Module):
+    def __init__(self, model: OrbitPolicy, *, autocast_enabled: bool) -> None:
+        super().__init__()
+        self.model = model
+        self.autocast_enabled = bool(autocast_enabled)
+
+    def forward(
+        self,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+    ) -> PolicyOutput:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+        )
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=self.autocast_enabled,
+        ):
+            return self.model(feats)
+
+
+def _mark_cuda_graph_step(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+    if callable(mark):
+        mark()
+
+
+def _next_power_of_two(n: int) -> int:
+    return 1 << max(0, int(n - 1).bit_length())
+
+
+def _pad_rows(t: torch.Tensor, rows: int, fill: int | float | bool = 0) -> torch.Tensor:
+    if t.shape[0] >= rows:
+        return t
+    pad_shape = (rows - t.shape[0], *t.shape[1:])
+    pad = t.new_full(pad_shape, fill)
+    return torch.cat((t, pad), dim=0)
+
+
+def _pad_encoded(feats: EncodedObs, rows: int) -> EncodedObs:
+    return EncodedObs(
+        planet_feats=_pad_rows(feats.planet_feats, rows),
+        planet_mask=_pad_rows(feats.planet_mask, rows, fill=False),
+        planet_owned_mask=_pad_rows(feats.planet_owned_mask, rows, fill=False),
+        planet_ids=_pad_rows(feats.planet_ids, rows, fill=-1),
+        planet_garrison=_pad_rows(feats.planet_garrison, rows),
+        fleet_feats=_pad_rows(feats.fleet_feats, rows),
+        fleet_mask=_pad_rows(feats.fleet_mask, rows, fill=False),
+    )
+
+
+def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
+    return PolicyOutput(
+        launch_logits=out.launch_logits[:rows],
+        target_logits=out.target_logits[:rows],
+        fraction_alpha=out.fraction_alpha[:rows],
+        fraction_beta=out.fraction_beta[:rows],
+        value=out.value[:rows],
+        value_logits=out.value_logits[:rows],
+        planet_owned_mask=out.planet_owned_mask[:rows],
+        planet_mask=out.planet_mask[:rows],
+        planet_ids=out.planet_ids[:rows],
+    )
+
+
 class LearnedAgent:
     def __init__(
         self,
         ckpt_path: str | Path,
         device: str = "cpu",
         deterministic: bool = True,
+        compile_mode: str | None = None,
+        compile_graph_rows: int | None = None,
     ):
         state = torch.load(ckpt_path, map_location=device)
         cfg = OrbitPolicyConfig(**state["config"])
@@ -163,18 +255,97 @@ class LearnedAgent:
         self.model.eval()
         self.device = device
         self.deterministic = deterministic
+        self.compile_mode = compile_mode if torch.device(device).type == "cuda" else None
+        self.compile_graph_rows = (
+            int(compile_graph_rows)
+            if self.compile_mode is not None and compile_graph_rows is not None
+            else None
+        )
+        self._forward_kernels: dict[int, nn.Module] = {}
         self._tracker = _FleetTargetTracker()
         self._batch_trackers: dict[tuple[Any, ...], _FleetTargetTracker] = {}
+        if self.compile_graph_rows is not None:
+            self._warmup_forward_kernel(self.compile_graph_rows)
+
+    def _warmup_forward_kernel(self, rows: int) -> None:
+        rows = max(1, int(rows))
+        device = torch.device(self.device)
+        feats = EncodedObs(
+            planet_feats=torch.zeros(
+                rows,
+                MAX_PLANETS,
+                self.model.cfg.planet_features,
+                device=device,
+            ),
+            planet_mask=torch.zeros(rows, MAX_PLANETS, dtype=torch.bool, device=device),
+            planet_owned_mask=torch.zeros(
+                rows,
+                MAX_PLANETS,
+                dtype=torch.bool,
+                device=device,
+            ),
+            planet_ids=torch.full(
+                (rows, MAX_PLANETS),
+                -1,
+                dtype=torch.long,
+                device=device,
+            ),
+            planet_garrison=torch.zeros(rows, MAX_PLANETS, device=device),
+            fleet_feats=torch.zeros(
+                rows,
+                MAX_FLEETS,
+                self.model.cfg.fleet_features,
+                device=device,
+            ),
+            fleet_mask=torch.zeros(rows, MAX_FLEETS, dtype=torch.bool, device=device),
+        )
+        with torch.inference_mode():
+            self._forward(feats, rows)
+
+    def _forward(self, feats: EncodedObs, rows: int) -> PolicyOutput:
+        device = torch.device(self.device)
+        if self.compile_graph_rows is not None:
+            graph_rows = (
+                self.compile_graph_rows
+                if rows <= self.compile_graph_rows
+                else _next_power_of_two(rows)
+            )
+        elif self.compile_mode is not None:
+            graph_rows = _next_power_of_two(rows)
+        else:
+            graph_rows = rows
+        graph_feats = _pad_encoded(feats, graph_rows) if graph_rows != rows else feats
+        kernel = self._forward_kernels.get(graph_rows)
+        if kernel is None:
+            kernel = _InferenceForwardKernel(
+                self.model,
+                autocast_enabled=device.type == "cuda",
+            )
+            if self.compile_mode is not None:
+                kernel = torch.compile(
+                    kernel,
+                    dynamic=False,
+                    fullgraph=True,
+                    mode=self.compile_mode,
+                )
+            self._forward_kernels[graph_rows] = kernel
+        _mark_cuda_graph_step(device)
+        out = kernel(
+            graph_feats.planet_feats,
+            graph_feats.planet_mask,
+            graph_feats.planet_owned_mask,
+            graph_feats.planet_ids,
+            graph_feats.planet_garrison,
+            graph_feats.fleet_feats,
+            graph_feats.fleet_mask,
+        )
+        return _slice_policy_output(out, rows) if graph_rows != rows else out
 
     @torch.inference_mode()
     def __call__(self, obs: Any) -> list[list]:
         annotated = self._tracker.annotate(obs)
         feats = encode_raw_observations([annotated], device=self.device)
-        autocast_enabled = torch.device(self.device).type == "cuda"
-        with torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
-        ):
-            out = self.model(feats)
+        out = self._forward(feats, 1)
         actions = sample_batch_actions_raw(
             out,
             [annotated],
@@ -199,11 +370,7 @@ class LearnedAgent:
             device=self.device,
             pin_memory=torch.device(self.device).type == "cuda",
         )
-        autocast_enabled = torch.device(self.device).type == "cuda"
-        with torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
-        ):
-            out = self.model(feats)
+        out = self._forward(feats, len(annotated))
         actions_list = sample_batch_actions_raw(
             out,
             annotated,

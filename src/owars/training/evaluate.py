@@ -8,12 +8,13 @@ this after training to confirm the policy actually improved against
 from __future__ import annotations
 
 import argparse
+import warnings
 
 import numpy as np
 import torch
 
 from ..policies.config import OrbitPolicyConfig
-from ..policies.model import OrbitPolicy
+from ..policies.model import OrbitPolicy, restore_fp32_params
 from .league import BUILTIN, OpponentSlot
 from .numpy_env import NumpyVecEnv
 from .rollout import rollout_episode
@@ -34,12 +35,17 @@ def evaluate_ckpt(
     num_envs: int = 16,
     env_backend: str = "kaggle",
     num_workers: int = 0,
+    compile_mode: str | None = "reduce-overhead",
 ) -> dict:
     state = torch.load(ckpt_path, map_location=device)
     cfg = OrbitPolicyConfig(**state["config"])
     model = OrbitPolicy(cfg).to(device)
+    if torch.device(device).type == "cuda":
+        model.bfloat16()
+        restore_fp32_params(model)
     model.load_state_dict(state["model"])
     model.eval()
+    compile_mode = compile_mode if torch.device(device).type == "cuda" else None
 
     if env_backend not in {"kaggle", "numpy", "numpy_mp", "rust"}:
         raise ValueError(f"unknown env_backend: {env_backend!r}")
@@ -51,6 +57,13 @@ def evaluate_ckpt(
         wins = draws = 0
         margins: list[float] = []
         if envs == 1 and env_backend == "kaggle":
+            if compile_mode is not None:
+                warnings.warn(
+                    "compile_mode is only used by vectorized evaluation; "
+                    "use --num-envs > 1 or a fast env backend to benchmark compiled CUDA inference.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             opps = [opp] * (num_players - 1)
             for game_idx in range(n_games):
                 traj = rollout_episode(
@@ -107,6 +120,8 @@ def evaluate_ckpt(
                     device=device,
                     deterministic=False,
                     record_trajectories=False,
+                    compile_mode=compile_mode,
+                    policy_graph_rows=envs,
                 )
                 for traj in trajs[: n_games - len(margins)]:
                     wins += int(traj.won)
@@ -139,7 +154,13 @@ def main() -> None:
         "--env-backend", choices=("kaggle", "numpy", "numpy_mp", "rust"), default="kaggle"
     )
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument(
+        "--compile-mode",
+        default="reduce-overhead",
+        help="CUDA torch.compile mode for batched policy forwards; use 'none' to disable.",
+    )
     args = p.parse_args()
+    compile_mode = None if args.compile_mode.lower() == "none" else args.compile_mode
 
     results = evaluate_ckpt(
         args.ckpt, n_games=args.games, num_players=args.num_players,
@@ -148,6 +169,7 @@ def main() -> None:
         num_envs=args.num_envs,
         env_backend=args.env_backend,
         num_workers=args.num_workers,
+        compile_mode=compile_mode,
     )
     for k, v in results.items():
         print(f"{k}: {v}")
