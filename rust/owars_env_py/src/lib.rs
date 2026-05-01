@@ -38,6 +38,13 @@ struct TargetMotion {
     positions: Vec<(f64, f64)>,
 }
 
+struct LegalMaskState {
+    planet_limit: usize,
+    target_motions: Vec<TargetMotion>,
+    static_legal: Vec<bool>,
+    orbiting_targets: Vec<usize>,
+}
+
 #[derive(Clone)]
 struct RowActionResult {
     actions: Vec<Action>,
@@ -230,6 +237,68 @@ impl RustCoreVecEnv {
         Ok(out.into_pyarray(py))
     }
 
+    fn legal_target_mask_from_state<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        frac: PyReadonlyArray2<'_, f32>,
+    ) -> PyResult<Bound<'py, numpy::PyArray3<bool>>> {
+        let shape = frac.shape();
+        let (batch, planets) = (shape[0], shape[1]);
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        let frac_v = frac.as_array().to_owned();
+        let games = &self.games;
+        let mut groups = Vec::new();
+        let mut start = 0;
+        while start < batch {
+            let env_idx = rows[start].0;
+            let mut end = start + 1;
+            while end < batch && rows[end].0 == env_idx {
+                end += 1;
+            }
+            groups.push((start, end, env_idx));
+            start = end;
+        }
+        let stride = planets * planets;
+        let flat = py.detach(|| {
+            let group_results = groups
+                .into_par_iter()
+                .map(|(start, end, env_idx)| {
+                    let game = &games[env_idx];
+                    let legal_state = legal_mask_state(game, planets);
+                    let mut out = vec![false; (end - start) * stride];
+                    for row in start..end {
+                        let player = rows[row].1;
+                        let offset = (row - start) * stride;
+                        fill_legal_mask_row_from_state(
+                            game,
+                            &legal_state,
+                            player,
+                            planets,
+                            |col| frac_v[[row, col]] as f64,
+                            &mut out[offset..offset + stride],
+                        );
+                    }
+                    (start, out)
+                })
+                .collect::<Vec<_>>();
+            let mut flat = vec![false; batch * stride];
+            for (start, group) in group_results {
+                let offset = start * stride;
+                flat[offset..offset + group.len()].copy_from_slice(&group);
+            }
+            flat
+        });
+        let out = Array3::from_shape_vec((batch, planets, planets), flat).map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build legal mask: {err}"))
+        })?;
+        Ok(out.into_pyarray(py))
+    }
+
     fn materialize_actions<'py>(
         &self,
         py: Python<'py>,
@@ -274,39 +343,47 @@ impl RustCoreVecEnv {
                 .collect::<Vec<_>>()
         });
 
-        let actions = PyList::empty(py);
-        let mut materialized = Array2::<bool>::from_elem((batch, planets), false);
-        for (row, result) in results.iter().enumerate() {
-            if native {
-                actions.append(Py::new(
-                    py,
-                    NativeActionList {
-                        actions: result.actions.clone(),
-                    },
-                )?)?;
-            } else {
-                let row_actions = PyList::empty(py);
-                for action in &result.actions {
-                    let item = PyList::empty(py);
-                    item.append(action.from_planet_id)?;
-                    item.append(action.angle)?;
-                    item.append(action.ships)?;
-                    item.append(action.target_id)?;
-                    item.append(action.eta)?;
-                    item.append(action.target_x)?;
-                    item.append(action.target_y)?;
-                    row_actions.append(item)?;
-                }
-                actions.append(row_actions)?;
-            }
-            for col in 0..planets {
-                materialized[[row, col]] = result.materialized[col];
-            }
+        build_materialized_actions_dict(py, batch, planets, native, &results)
+    }
+
+    fn materialize_actions_from_state<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        launch: PyReadonlyArray2<'_, f32>,
+        target_idx: PyReadonlyArray2<'_, i64>,
+        frac: PyReadonlyArray2<'_, f32>,
+        native: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let shape = launch.shape();
+        let (batch, planets) = (shape[0], shape[1]);
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
         }
-        let out = PyDict::new(py);
-        out.set_item("actions", actions)?;
-        out.set_item("materialized", materialized.into_pyarray(py))?;
-        Ok(out)
+        let launch_v = launch.as_array().to_owned();
+        let target_v = target_idx.as_array().to_owned();
+        let frac_v = frac.as_array().to_owned();
+        let games = &self.games;
+        let results = py.detach(|| {
+            (0..batch)
+                .into_par_iter()
+                .map(|row| {
+                    let (env_idx, player) = rows[row];
+                    materialize_action_row_from_state(
+                        &games[env_idx],
+                        player,
+                        planets,
+                        |col| launch_v[[row, col]] as f64,
+                        |col| target_v[[row, col]] as usize,
+                        |col| frac_v[[row, col]] as f64,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        build_materialized_actions_dict(py, batch, planets, native, &results)
     }
 
     fn policy_batch<'py>(
@@ -314,55 +391,15 @@ impl RustCoreVecEnv {
         py: Python<'py>,
         rows: Vec<(usize, usize)>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let batch = rows.len();
-        let mut planet_feats = Array3::<f32>::zeros((batch, MAX_PLANETS, PLANET_FEAT_DIM));
-        let mut planet_mask = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
-        let mut planet_owned = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
-        let mut planet_ids = Array2::<i64>::from_elem((batch, MAX_PLANETS), -1);
-        let mut planet_garrison = Array2::<f32>::zeros((batch, MAX_PLANETS));
-        let mut fleet_feats = Array3::<f32>::zeros((batch, MAX_FLEETS, FLEET_FEAT_DIM));
-        let mut fleet_mask = Array2::<bool>::from_elem((batch, MAX_FLEETS), false);
-        let contexts = PyList::empty(py);
+        policy_batch_dict(py, &self.games, rows, true)
+    }
 
-        for (row, (env_idx, player)) in rows.into_iter().enumerate() {
-            let game = &self.games[env_idx];
-            fill_planet_features(
-                game,
-                player,
-                row,
-                &mut PlanetBatchMut {
-                    feats: &mut planet_feats,
-                    mask: &mut planet_mask,
-                    owned_mask: &mut planet_owned,
-                    ids: &mut planet_ids,
-                    garrison: &mut planet_garrison,
-                },
-            );
-            fill_fleet_features(game, player, row, &mut fleet_feats, &mut fleet_mask);
-            let planet_rows = planet_rows_array(game);
-            let comet_ids = game
-                .comets
-                .iter()
-                .flat_map(|group| group.planet_ids.iter().copied())
-                .map(i64::from)
-                .collect::<Vec<_>>();
-            contexts.append((
-                planet_rows.into_pyarray(py),
-                game.angular_velocity,
-                Array1::from_vec(comet_ids).into_pyarray(py),
-            ))?;
-        }
-
-        let out = PyDict::new(py);
-        out.set_item("planet_feats", planet_feats.into_pyarray(py))?;
-        out.set_item("planet_mask", planet_mask.into_pyarray(py))?;
-        out.set_item("planet_owned_mask", planet_owned.into_pyarray(py))?;
-        out.set_item("planet_ids", planet_ids.into_pyarray(py))?;
-        out.set_item("planet_garrison", planet_garrison.into_pyarray(py))?;
-        out.set_item("fleet_feats", fleet_feats.into_pyarray(py))?;
-        out.set_item("fleet_mask", fleet_mask.into_pyarray(py))?;
-        out.set_item("contexts", contexts)?;
-        Ok(out)
+    fn policy_batch_no_context<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        policy_batch_dict(py, &self.games, rows, false)
     }
 }
 
@@ -377,6 +414,65 @@ impl RustCoreVecEnv {
             })
             .collect();
     }
+}
+
+fn policy_batch_dict<'py>(
+    py: Python<'py>,
+    games: &[Game],
+    rows: Vec<(usize, usize)>,
+    include_contexts: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let batch = rows.len();
+    let mut planet_feats = Array3::<f32>::zeros((batch, MAX_PLANETS, PLANET_FEAT_DIM));
+    let mut planet_mask = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
+    let mut planet_owned = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
+    let mut planet_ids = Array2::<i64>::from_elem((batch, MAX_PLANETS), -1);
+    let mut planet_garrison = Array2::<f32>::zeros((batch, MAX_PLANETS));
+    let mut fleet_feats = Array3::<f32>::zeros((batch, MAX_FLEETS, FLEET_FEAT_DIM));
+    let mut fleet_mask = Array2::<bool>::from_elem((batch, MAX_FLEETS), false);
+    let contexts = PyList::empty(py);
+
+    for (row, (env_idx, player)) in rows.into_iter().enumerate() {
+        let game = &games[env_idx];
+        fill_planet_features(
+            game,
+            player,
+            row,
+            &mut PlanetBatchMut {
+                feats: &mut planet_feats,
+                mask: &mut planet_mask,
+                owned_mask: &mut planet_owned,
+                ids: &mut planet_ids,
+                garrison: &mut planet_garrison,
+            },
+        );
+        fill_fleet_features(game, player, row, &mut fleet_feats, &mut fleet_mask);
+        if include_contexts {
+            let planet_rows = planet_rows_array(game);
+            let comet_ids = game
+                .comets
+                .iter()
+                .flat_map(|group| group.planet_ids.iter().copied())
+                .map(i64::from)
+                .collect::<Vec<_>>();
+            contexts.append((
+                planet_rows.into_pyarray(py),
+                game.angular_velocity,
+                Array1::from_vec(comet_ids).into_pyarray(py),
+            ))?;
+        }
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("planet_feats", planet_feats.into_pyarray(py))?;
+    out.set_item("planet_mask", planet_mask.into_pyarray(py))?;
+    out.set_item("planet_owned_mask", planet_owned.into_pyarray(py))?;
+    out.set_item("planet_ids", planet_ids.into_pyarray(py))?;
+    out.set_item("planet_garrison", planet_garrison.into_pyarray(py))?;
+    out.set_item("fleet_feats", fleet_feats.into_pyarray(py))?;
+    out.set_item("fleet_mask", fleet_mask.into_pyarray(py))?;
+    out.set_item("contexts", contexts)?;
+    Ok(out)
 }
 
 fn parse_env_actions(obj: &Bound<'_, PyAny>, num_players: usize) -> PyResult<Vec<PlayerAction>> {
@@ -746,6 +842,142 @@ fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
     }
 }
 
+fn fill_legal_mask_row_from_state<FFrac>(
+    game: &Game,
+    state: &LegalMaskState,
+    player: usize,
+    planets_len: usize,
+    frac_at: FFrac,
+    out: &mut [bool],
+) where
+    FFrac: Fn(usize) -> f64,
+{
+    let planet_limit = state.planet_limit.min(planets_len);
+
+    for i in 0..planet_limit {
+        let source = game.planets[i];
+        if source.owner != player as i32 || source.ships < 2 {
+            continue;
+        }
+        let send = ships_to_send(source.ships, frac_at(i));
+        if send <= 0 {
+            continue;
+        }
+        let speed = fleet_speed_local(send, game.ship_speed);
+        if speed <= 0.0 {
+            continue;
+        }
+        let src_offset = i * planets_len;
+        for j in 0..planet_limit {
+            out[src_offset + j] = state.static_legal[src_offset + j];
+        }
+        for &j in &state.orbiting_targets {
+            if i == j {
+                continue;
+            }
+            let Some(solution) =
+                lead_solution_cached_with_speed(&source, &state.target_motions[j], speed)
+            else {
+                continue;
+            };
+            if !safe_flight_segment(
+                source.x,
+                source.y,
+                source.radius,
+                solution.angle,
+                solution.x,
+                solution.y,
+            ) {
+                continue;
+            }
+            out[src_offset + j] = true;
+        }
+    }
+}
+
+fn legal_mask_state(game: &Game, planets_len: usize) -> LegalMaskState {
+    let planet_limit = planets_len.min(game.planets.len());
+    let target_motions = game
+        .planets
+        .iter()
+        .take(planet_limit)
+        .map(|target| target_motion(target, game.angular_velocity, game.ship_speed))
+        .collect::<Vec<_>>();
+    let is_comet_col = game
+        .planets
+        .iter()
+        .take(planet_limit)
+        .map(|target| is_comet_planet(game, target.id))
+        .collect::<Vec<_>>();
+    let orbiting_targets = target_motions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, target)| (target.is_orbiting && !is_comet_col[idx]).then_some(idx))
+        .collect::<Vec<_>>();
+    let mut static_legal = vec![false; planets_len * planets_len];
+    for (i, source) in game.planets.iter().take(planet_limit).copied().enumerate() {
+        let src_offset = i * planets_len;
+        for j in 0..planet_limit {
+            if i == j || is_comet_col[j] || target_motions[j].is_orbiting {
+                continue;
+            }
+            let target = &target_motions[j];
+            let angle = (target.y - source.y).atan2(target.x - source.x);
+            if safe_flight_segment(source.x, source.y, source.radius, angle, target.x, target.y) {
+                static_legal[src_offset + j] = true;
+            }
+        }
+    }
+    LegalMaskState {
+        planet_limit,
+        target_motions,
+        static_legal,
+        orbiting_targets,
+    }
+}
+
+fn build_materialized_actions_dict<'py>(
+    py: Python<'py>,
+    batch: usize,
+    planets: usize,
+    native: bool,
+    results: &[RowActionResult],
+) -> PyResult<Bound<'py, PyDict>> {
+    let actions = PyList::empty(py);
+    let mut materialized = Array2::<bool>::from_elem((batch, planets), false);
+    for (row, result) in results.iter().enumerate() {
+        if native {
+            actions.append(Py::new(
+                py,
+                NativeActionList {
+                    actions: result.actions.clone(),
+                },
+            )?)?;
+        } else {
+            let row_actions = PyList::empty(py);
+            for action in &result.actions {
+                let item = PyList::empty(py);
+                item.append(action.from_planet_id)?;
+                item.append(action.angle)?;
+                item.append(action.ships)?;
+                item.append(action.target_id)?;
+                item.append(action.eta)?;
+                item.append(action.target_x)?;
+                item.append(action.target_y)?;
+                row_actions.append(item)?;
+            }
+            actions.append(row_actions)?;
+        }
+        for col in 0..planets {
+            materialized[[row, col]] = result.materialized[col];
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("actions", actions)?;
+    out.set_item("materialized", materialized.into_pyarray(py))?;
+    Ok(out)
+}
+
 fn planets_by_col<FIds, FMask>(
     game: &Game,
     planets_len: usize,
@@ -877,6 +1109,91 @@ where
     result
 }
 
+fn materialize_action_row_from_state<FLaunch, FTarget, FFrac>(
+    game: &Game,
+    player: usize,
+    planets_len: usize,
+    launch_at: FLaunch,
+    target_at: FTarget,
+    frac_at: FFrac,
+) -> RowActionResult
+where
+    FLaunch: Fn(usize) -> f64,
+    FTarget: Fn(usize) -> usize,
+    FFrac: Fn(usize) -> f64,
+{
+    let planet_limit = planets_len.min(game.planets.len());
+    let comet_ids = game
+        .comets
+        .iter()
+        .flat_map(|group| group.planet_ids.iter().copied())
+        .collect::<std::collections::HashSet<_>>();
+    let mut result = RowActionResult {
+        actions: Vec::new(),
+        materialized: vec![false; planets_len],
+    };
+    let mut remaining = game
+        .planets
+        .iter()
+        .take(planet_limit)
+        .map(|planet| planet.ships)
+        .collect::<Vec<_>>();
+    for i in 0..planet_limit {
+        if launch_at(i) < 0.5 {
+            continue;
+        }
+        let source = game.planets[i];
+        let source_ships = remaining[i];
+        if source.owner != player as i32 || source_ships < 2 {
+            continue;
+        }
+        let ti = target_at(i);
+        if ti == i || ti >= planet_limit {
+            continue;
+        }
+        let target = game.planets[ti];
+        let target_id = target.id;
+        if comet_ids.contains(&target_id) {
+            continue;
+        }
+        let send = ships_to_send(source_ships, frac_at(i));
+        if send <= 0 {
+            continue;
+        }
+        let Some(solution) = lead_solution(
+            &source,
+            &target,
+            game.angular_velocity,
+            send,
+            game.ship_speed,
+        ) else {
+            continue;
+        };
+        if !safe_flight_segment(
+            source.x,
+            source.y,
+            source.radius,
+            solution.angle,
+            solution.x,
+            solution.y,
+        ) {
+            continue;
+        }
+        result.actions.push(Action {
+            from_planet_id: source.id,
+            angle: solution.angle,
+            ships: send,
+            target_id,
+            eta: solution.time,
+            target_x: solution.x,
+            target_y: solution.y,
+        });
+        result.materialized[i] = true;
+        remaining[i] = source_ships - send;
+    }
+    result
+}
+
 fn ships_to_send(remaining: i32, frac: f64) -> i32 {
     if remaining < 2 {
         return 0;
@@ -934,8 +1251,16 @@ fn lead_solution_cached(
     send: i32,
     max_speed: f64,
 ) -> Option<LeadSolution> {
+    lead_solution_cached_with_speed(source, target, fleet_speed_local(send, max_speed))
+}
+
+fn lead_solution_cached_with_speed(
+    source: &Planet,
+    target: &TargetMotion,
+    speed: f64,
+) -> Option<LeadSolution> {
     let mut solution =
-        lead_solution_from_point_cached(source.x, source.y, target, send, max_speed)?;
+        lead_solution_from_point_cached_with_speed(source.x, source.y, target, speed)?;
     let mut angle = solution.angle;
     let offset = (source.radius + 0.1).max(0.0);
     if offset <= 0.0 {
@@ -944,7 +1269,7 @@ fn lead_solution_cached(
     for _ in 0..4 {
         let start_x = source.x + angle.cos() * offset;
         let start_y = source.y + angle.sin() * offset;
-        let refined = lead_solution_from_point_cached(start_x, start_y, target, send, max_speed)?;
+        let refined = lead_solution_from_point_cached_with_speed(start_x, start_y, target, speed)?;
         if angle_delta(refined.angle, angle).abs() < 1e-6 {
             return Some(refined);
         }
@@ -954,14 +1279,12 @@ fn lead_solution_cached(
     Some(solution)
 }
 
-fn lead_solution_from_point_cached(
+fn lead_solution_from_point_cached_with_speed(
     source_x: f64,
     source_y: f64,
     target: &TargetMotion,
-    send: i32,
-    max_speed: f64,
+    speed: f64,
 ) -> Option<LeadSolution> {
-    let speed = fleet_speed_local(send, max_speed);
     if speed <= 0.0 {
         return None;
     }

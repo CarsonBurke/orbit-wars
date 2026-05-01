@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -343,10 +344,180 @@ def test_rust_vec_env_step_subset_fast_rejects_duplicate_indices():
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_policy_batch_no_context_matches_features():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust.reset()
+    rows = [(0, 0), (0, 1)]
+    with_context, contexts = rust.policy_batch(rows, device="cpu")
+    without_context, no_contexts = rust.policy_batch_no_context(rows, device="cpu")
+
+    assert len(contexts) == 2
+    assert no_contexts == []
+    assert torch.equal(without_context.planet_feats, with_context.planet_feats)
+    assert torch.equal(without_context.planet_mask, with_context.planet_mask)
+    assert torch.equal(without_context.planet_owned_mask, with_context.planet_owned_mask)
+    assert torch.equal(without_context.planet_ids, with_context.planet_ids)
+    assert torch.equal(without_context.planet_garrison, with_context.planet_garrison)
+    assert torch.equal(without_context.fleet_feats, with_context.fleet_feats)
+    assert torch.equal(without_context.fleet_mask, with_context.fleet_mask)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_state_legal_mask_matches_feature_legal_mask():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust.reset()
+    rust.step_subset_fast([0, 1], [[[], []], [[], []]])
+    rows = [(0, 0), (1, 0), (0, 1), (1, 1)]
+    fast, _contexts = rust.policy_batch(rows, device="cpu")
+    frac = torch.full(fast.planet_mask.shape, 0.75, dtype=torch.float32).numpy()
+
+    state_mask = rust._core.legal_target_mask_from_state(rows, frac)
+    feature_mask = rust._core.legal_target_mask(
+        rows,
+        frac,
+        fast.planet_owned_mask.numpy(),
+        fast.planet_mask.numpy(),
+        fast.planet_ids.numpy(),
+    )
+
+    assert state_mask.any()
+    assert np.array_equal(state_mask, feature_mask)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_state_sampler_matches_feature_sampler_after_comets_4p():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=4,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=1,
+    )
+    rust.reset()
+    noop = [[[], [], [], []], [[], [], [], []]]
+    for _ in range(65):
+        rust.step_subset_fast([0, 1], noop)
+
+    rows = [(1, 2), (0, 0), (1, 0), (0, 3), (1, 1), (0, 2)]
+    fast, _contexts = rust.policy_batch(rows, device="cpu")
+    frac = torch.linspace(
+        0.25,
+        0.85,
+        steps=fast.planet_mask.numel(),
+        dtype=torch.float32,
+    ).reshape(fast.planet_mask.shape)
+    frac_np = frac.numpy()
+
+    state_mask = rust._core.legal_target_mask_from_state(rows, frac_np)
+    feature_mask = rust._core.legal_target_mask(
+        rows,
+        frac_np,
+        fast.planet_owned_mask.numpy(),
+        fast.planet_mask.numpy(),
+        fast.planet_ids.numpy(),
+    )
+    assert state_mask.any()
+    assert np.array_equal(state_mask, feature_mask)
+
+    has_target = state_mask.any(axis=-1)
+    launch = (fast.planet_owned_mask.numpy() & has_target).astype(np.float32)
+    target_idx = np.zeros(fast.planet_mask.shape, dtype=np.int64)
+    for row in range(state_mask.shape[0]):
+        for source in range(state_mask.shape[1]):
+            legal_targets = np.flatnonzero(state_mask[row, source])
+            if len(legal_targets):
+                target_idx[row, source] = int(legal_targets[0])
+
+    state_materialized = rust._core.materialize_actions_from_state(
+        rows,
+        launch,
+        target_idx,
+        frac_np,
+        False,
+    )
+    feature_materialized = rust._core.materialize_actions(
+        rows,
+        launch,
+        target_idx,
+        frac_np,
+        fast.planet_owned_mask.numpy(),
+        fast.planet_mask.numpy(),
+        fast.planet_ids.numpy(),
+        False,
+    )
+
+    assert state_materialized["actions"] == feature_materialized["actions"]
+    assert np.array_equal(
+        state_materialized["materialized"],
+        feature_materialized["materialized"],
+    )
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fast_rollout_uses_policy_batch_no_context(monkeypatch):
+    _build_rust_extension()
+    from owars.policies.config import OrbitPolicyConfig
+    from owars.policies.model import OrbitPolicy
+    from owars.training.league import LEARNER_NAME, OpponentSlot
+    from owars.training.rust_env import RustVecEnv
+    from owars.training.vec_rollout import rollout_episodes_batched
+
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=8,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+
+    def fail_policy_batch(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("fast rollout should use policy_batch_no_context")
+
+    monkeypatch.setattr(rust, "policy_batch", fail_policy_batch)
+    model = OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
+    opponent = OpponentSlot(LEARNER_NAME, agent=None)
+    trajs = rollout_episodes_batched(
+        model,
+        rust,
+        [[opponent], [opponent]],
+        num_players=2,
+        device="cpu",
+    )
+
+    assert len(trajs) == 2
+    assert all(traj.encoded for traj in trajs)
+    assert all(traj.reward for traj in trajs)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
 def test_rust_vec_env_native_sampler_matches_context_sampler():
     _build_rust_extension()
     from owars.policies.model import PolicyOutput
-    from owars.policies.sampling import sample_batch_with_records_context
+    from owars.policies.sampling import (
+        sample_batch_actions_context,
+        sample_batch_with_records_context,
+    )
     from owars.training.rust_env import RustVecEnv
 
     rust = RustVecEnv(
@@ -387,6 +558,9 @@ def test_rust_vec_env_native_sampler_matches_context_sampler():
     )
 
     assert got_actions == expected_actions
+    assert rust.sample_batch_actions(
+        out, rows, deterministic=True
+    ) == sample_batch_actions_context(out, contexts, deterministic=True)
     assert torch.equal(got_records.launch, expected_records.launch)
     assert torch.equal(got_records.target_idx, expected_records.target_idx)
     assert torch.allclose(got_records.log_prob, expected_records.log_prob)

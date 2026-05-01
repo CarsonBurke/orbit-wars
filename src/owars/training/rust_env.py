@@ -173,9 +173,9 @@ class RustVecEnv:
         *,
         deterministic: bool = False,
         record_rows: list[int] | None = None,
-        feature_source: EncodedObs | None = None,
         native_actions: bool = False,
     ) -> tuple[list[list[list]], Any]:
+        row_pairs = [(int(idx), int(player)) for idx, player in rows]
         launch_logits = out.launch_logits
         target_logits = out.target_logits
         fraction_alpha = out.fraction_alpha
@@ -183,17 +183,10 @@ class RustVecEnv:
         launch, frac = _sample_launch_fraction(
             launch_logits, fraction_alpha, fraction_beta, deterministic
         )
-        source = feature_source if feature_source is not None else out
         frac_np = _numpy_from_tensor(frac.float())
-        owned_np = _numpy_from_tensor(source.planet_owned_mask)
-        mask_np = _numpy_from_tensor(source.planet_mask)
-        ids_np = _numpy_from_tensor(source.planet_ids)
-        target_legal_mask_np = self._core.legal_target_mask(
-            [(int(idx), int(player)) for idx, player in rows],
+        target_legal_mask_np = self._core.legal_target_mask_from_state(
+            row_pairs,
             frac_np,
-            owned_np,
-            mask_np,
-            ids_np,
         )
         target_legal_mask = torch.as_tensor(
             target_legal_mask_np, device=target_logits.device, dtype=torch.bool
@@ -213,20 +206,17 @@ class RustVecEnv:
             out.planet_mask,
         )
         target_idx = _sample_target(target_logits, deterministic)
-        materialized = self._core.materialize_actions(
-            [(int(idx), int(player)) for idx, player in rows],
+        materialized = self._core.materialize_actions_from_state(
+            row_pairs,
             _numpy_from_tensor(launch.float()),
             _numpy_from_tensor(target_idx.to(torch.int64)),
             frac_np,
-            owned_np,
-            mask_np,
-            ids_np,
             bool(native_actions),
         )
         actions_list = materialized["actions"]
         if record_rows is None:
             record_rows = list(range(len(rows)))
-        materialized_rows = materialized["materialized"][record_rows].tolist()
+        materialized_rows = materialized["materialized"][record_rows]
         records = _batch_record_from_materialized_launch(
             launch,
             target_idx,
@@ -246,7 +236,6 @@ class RustVecEnv:
         rows: list[tuple[int, int]],
         *,
         deterministic: bool = True,
-        feature_source: EncodedObs | None = None,
         native_actions: bool = False,
     ) -> list[list[list]]:
         actions, _records = self.sample_batch_with_records(
@@ -254,7 +243,6 @@ class RustVecEnv:
             rows,
             deterministic=deterministic,
             record_rows=[],
-            feature_source=feature_source,
             native_actions=native_actions,
         )
         return actions
@@ -266,15 +254,49 @@ class RustVecEnv:
         device: str = "cpu",
         pin_memory: bool = False,
     ) -> tuple[EncodedObs, list[ActionContext]]:
-        data = self._core.policy_batch([(int(idx), int(player)) for idx, player in rows])
-        contexts = [
-            ActionContext(
-                planets=ctx[0],
-                angular_velocity=float(ctx[1]),
-                comet_planet_ids=tuple(int(pid) for pid in ctx[2].tolist()),
-            )
-            for ctx in data["contexts"]
-        ]
+        return self._policy_batch_from_core(
+            self._core.policy_batch([(int(idx), int(player)) for idx, player in rows]),
+            device=device,
+            pin_memory=pin_memory,
+            include_contexts=True,
+        )
+
+    def policy_batch_no_context(
+        self,
+        rows: list[tuple[int, int]],
+        *,
+        device: str = "cpu",
+        pin_memory: bool = False,
+    ) -> tuple[EncodedObs, list[ActionContext]]:
+        return self._policy_batch_from_core(
+            self._core.policy_batch_no_context(
+                [(int(idx), int(player)) for idx, player in rows]
+            ),
+            device=device,
+            pin_memory=pin_memory,
+            include_contexts=False,
+        )
+
+    def _policy_batch_from_core(
+        self,
+        data: Any,
+        *,
+        device: str,
+        pin_memory: bool,
+        include_contexts: bool,
+    ) -> tuple[EncodedObs, list[ActionContext]]:
+        contexts = (
+            [
+                ActionContext(
+                    planets=ctx[0],
+                    angular_velocity=float(ctx[1]),
+                    comet_planet_ids=tuple(int(pid) for pid in ctx[2].tolist()),
+                )
+                for ctx in data["contexts"]
+            ]
+            if include_contexts
+            else []
+        )
         return (
             EncodedObs(
                 planet_feats=_tensor_from_numpy(

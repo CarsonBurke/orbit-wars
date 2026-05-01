@@ -373,6 +373,7 @@ def rollout_episodes_batched(
             reward_cfg,
         )
     fast_policy_batch = getattr(vec, "policy_batch", None)
+    fast_policy_batch_no_context = getattr(vec, "policy_batch_no_context", None)
     fast_observation = getattr(vec, "observation", None)
     fast_observations = getattr(vec, "observations", None)
     fast_step_subset = getattr(vec, "step_subset_fast", None)
@@ -436,7 +437,11 @@ def rollout_episodes_batched(
                 device,
                 deterministic,
                 record_trajectories,
-                fast_policy_batch if use_fast_numpy_path else None,
+                (
+                    fast_policy_batch_no_context
+                    if use_fast_numpy_path and callable(fast_policy_batch_no_context)
+                    else fast_policy_batch if use_fast_numpy_path else None
+                ),
                 compile_mode,
                 policy_graph_rows or (num_envs * num_players),
             )
@@ -608,7 +613,6 @@ def _step_learner_bucket(
                 policy_rows,
                 deterministic=deterministic,
                 record_rows=learner_rows,
-                feature_source=cpu_stacked if cpu_stacked is not None else stacked,
                 native_actions=True,
             )
         elif action_contexts is not None:
@@ -631,7 +635,6 @@ def _step_learner_bucket(
                 out,
                 policy_rows,
                 deterministic=deterministic,
-                feature_source=cpu_stacked if cpu_stacked is not None else stacked,
                 native_actions=True,
             )
         elif action_contexts is not None:

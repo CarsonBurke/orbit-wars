@@ -1241,7 +1241,7 @@ def _batch_record_from_materialized_launch(
     target_logits: torch.Tensor,
     fraction_alpha: torch.Tensor,
     fraction_beta: torch.Tensor,
-    materialized: list[list[bool]],
+    materialized: Any,
     rows: Sequence[int],
 ) -> SampleBatchRecord:
     row_idx = torch.as_tensor(rows, device=launch.device, dtype=torch.long)
