@@ -18,7 +18,14 @@ import numpy as np
 import torch
 
 from ..policies.features import EncodedObs
-from ..policies.sampling import ActionContext
+from ..policies.sampling import (
+    ActionContext,
+    _apply_target_legal_mask,
+    _batch_record_from_materialized_launch,
+    _mask_impossible_launches,
+    _sample_launch_fraction,
+    _sample_target,
+)
 
 
 def _load_native() -> Any:
@@ -73,6 +80,10 @@ def _tensor_from_numpy(
     return tensor.to(target)
 
 
+def _numpy_from_tensor(tensor: torch.Tensor) -> np.ndarray:
+    return tensor.detach().cpu().numpy()
+
+
 class RustVecEnv:
     fast_rollout = True
     supports_replay = False
@@ -89,6 +100,7 @@ class RustVecEnv:
     ) -> None:
         del comet_speed, replay_env_idx
         self.num_envs = int(num_envs)
+        self.episode_steps = int(episode_steps)
         self.replay_env_idx: int | None = None
         self.last_replay_html: str | None = None
         self._num_players = int(num_players)
@@ -110,17 +122,19 @@ class RustVecEnv:
     ) -> dict[int, tuple[Any, bool, Any]]:
         raw = self._core.step_subset_fast(indices, actions)
         out: dict[int, tuple[Any, bool, Any]] = {}
-        for idx, (_state, done, rewards) in raw.items():
+        for idx, (_state, done, final_result) in raw.items():
             final = None
-            if rewards is not None:
+            if final_result is not None:
+                rewards, scores = final_result
                 final = [
                     SimpleNamespace(
                         reward=float(reward),
+                        score=float(score),
                         status="DONE",
                         action=None,
                         observation=None,
                     )
-                    for reward in rewards
+                    for reward, score in zip(rewards, scores, strict=True)
                 ]
             out[int(idx)] = (None, bool(done), final)
         return out
@@ -140,6 +154,110 @@ class RustVecEnv:
 
     def observations(self, rows: list[tuple[int, int]]) -> list[dict[str, Any]]:
         return self._core.observations([(int(idx), int(player)) for idx, player in rows])
+
+    def reward_potentials(
+        self,
+        rows: list[tuple[int, int]],
+        *,
+        production_weight: float,
+    ) -> np.ndarray:
+        return self._core.reward_potentials(
+            [(int(idx), int(player)) for idx, player in rows],
+            float(production_weight),
+        )
+
+    def sample_batch_with_records(
+        self,
+        out: Any,
+        rows: list[tuple[int, int]],
+        *,
+        deterministic: bool = False,
+        record_rows: list[int] | None = None,
+        feature_source: EncodedObs | None = None,
+        native_actions: bool = False,
+    ) -> tuple[list[list[list]], Any]:
+        launch_logits = out.launch_logits
+        target_logits = out.target_logits
+        fraction_alpha = out.fraction_alpha
+        fraction_beta = out.fraction_beta
+        launch, frac = _sample_launch_fraction(
+            launch_logits, fraction_alpha, fraction_beta, deterministic
+        )
+        source = feature_source if feature_source is not None else out
+        frac_np = _numpy_from_tensor(frac.float())
+        owned_np = _numpy_from_tensor(source.planet_owned_mask)
+        mask_np = _numpy_from_tensor(source.planet_mask)
+        ids_np = _numpy_from_tensor(source.planet_ids)
+        target_legal_mask_np = self._core.legal_target_mask(
+            [(int(idx), int(player)) for idx, player in rows],
+            frac_np,
+            owned_np,
+            mask_np,
+            ids_np,
+        )
+        target_legal_mask = torch.as_tensor(
+            target_legal_mask_np, device=target_logits.device, dtype=torch.bool
+        )
+        target_logits = _apply_target_legal_mask(
+            target_logits,
+            target_legal_mask,
+            launch,
+            out.planet_owned_mask,
+            out.planet_mask,
+        )
+        launch_logits, launch = _mask_impossible_launches(
+            launch_logits,
+            launch,
+            target_legal_mask,
+            out.planet_owned_mask,
+            out.planet_mask,
+        )
+        target_idx = _sample_target(target_logits, deterministic)
+        materialized = self._core.materialize_actions(
+            [(int(idx), int(player)) for idx, player in rows],
+            _numpy_from_tensor(launch.float()),
+            _numpy_from_tensor(target_idx.to(torch.int64)),
+            frac_np,
+            owned_np,
+            mask_np,
+            ids_np,
+            bool(native_actions),
+        )
+        actions_list = materialized["actions"]
+        if record_rows is None:
+            record_rows = list(range(len(rows)))
+        materialized_rows = materialized["materialized"][record_rows].tolist()
+        records = _batch_record_from_materialized_launch(
+            launch,
+            target_idx,
+            frac,
+            launch_logits,
+            target_logits,
+            fraction_alpha,
+            fraction_beta,
+            materialized_rows,
+            record_rows,
+        )
+        return actions_list, records
+
+    def sample_batch_actions(
+        self,
+        out: Any,
+        rows: list[tuple[int, int]],
+        *,
+        deterministic: bool = True,
+        feature_source: EncodedObs | None = None,
+        native_actions: bool = False,
+    ) -> list[list[list]]:
+        actions, _records = self.sample_batch_with_records(
+            out,
+            rows,
+            deterministic=deterministic,
+            record_rows=[],
+            feature_source=feature_source,
+            native_actions=native_actions,
+        )
+        return actions
 
     def policy_batch(
         self,

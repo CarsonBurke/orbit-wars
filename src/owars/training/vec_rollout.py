@@ -225,14 +225,14 @@ def _finalize_trajectory(
     """Write seat_rewards / outcome onto a finished trajectory."""
     if final is None:
         return
-    seat_rewards = [float(s.reward or 0.0) for s in final]
-    learner_reward = seat_rewards[learner_seat]
-    others = [r for i, r in enumerate(seat_rewards) if i != learner_seat]
-    margin = learner_reward - max(others) if others else learner_reward
+    seat_scores = [float(getattr(s, "score", s.reward or 0.0)) for s in final]
+    learner_score = seat_scores[learner_seat]
+    others = [r for i, r in enumerate(seat_scores) if i != learner_seat]
+    margin = learner_score - max(others) if others else learner_score
     traj.final_score = margin
-    traj.won = learner_reward > max(others) if others else True
-    traj.drawn = bool(others) and learner_reward == max(others)
-    traj.seat_rewards = seat_rewards
+    traj.won = learner_score > max(others) if others else True
+    traj.drawn = bool(others) and learner_score == max(others)
+    traj.seat_rewards = seat_scores
     traj.learner_seat = learner_seat
 
     if traj.won:
@@ -243,6 +243,80 @@ def _finalize_trajectory(
         outcome = reward_cfg.loss_value
     if traj.reward:
         traj.reward[-1] += outcome + reward_cfg.margin_scale * margin
+
+
+def _obs_reward_potential(
+    obs: Any,
+    player: int,
+    num_players: int,
+    episode_steps: int,
+    production_weight: float,
+) -> float:
+    get = obs.get if isinstance(obs, dict) else lambda key, default=None: getattr(obs, key, default)
+    ships = [0.0] * num_players
+    production = [0.0] * num_players
+    for planet in get("planets", []) or []:
+        owner = int(planet[1])
+        if owner != -1:
+            ships[owner] += float(planet[5])
+            production[owner] += float(planet[6])
+    for fleet in get("fleets", []) or []:
+        owner = int(fleet[1])
+        if owner != -1:
+            ships[owner] += float(fleet[6])
+    step = int(get("step", 0) or 0)
+    turns_left = max(0.0, float(episode_steps - step))
+    projected = [
+        ships[p] + production_weight * turns_left * production[p]
+        for p in range(num_players)
+    ]
+    own = projected[player]
+    enemy = max((projected[p] for p in range(num_players) if p != player), default=0.0)
+    return (own - enemy) / max(1.0, own + enemy + 1.0)
+
+
+def _state_reward_potential(
+    state: Any,
+    player: int,
+    num_players: int,
+    episode_steps: int,
+    production_weight: float,
+) -> float:
+    slot = state[player]
+    obs = slot["observation"] if isinstance(slot, dict) else slot.observation
+    return _obs_reward_potential(
+        obs,
+        player,
+        num_players,
+        episode_steps,
+        production_weight,
+    )
+
+
+def _reward_potentials(
+    vec: Any,
+    states: Sequence[Any],
+    rows: list[tuple[int, int]],
+    num_players: int,
+    episode_steps: int,
+    reward_cfg: RewardCfg,
+) -> list[float]:
+    if not rows:
+        return []
+    native = getattr(vec, "reward_potentials", None)
+    if callable(native):
+        values = native(rows, production_weight=reward_cfg.production_weight)
+        return [float(v) for v in values]
+    return [
+        _state_reward_potential(
+            states[env_idx],
+            player,
+            num_players,
+            episode_steps,
+            reward_cfg.production_weight,
+        )
+        for env_idx, player in rows
+    ]
 
 
 def rollout_episodes_batched(
@@ -286,6 +360,18 @@ def rollout_episodes_batched(
 
     states = vec.reset()
     dones = [False] * num_envs
+    episode_steps = int(getattr(vec, "episode_steps", 500))
+    dense_potential = record_trajectories and reward_cfg.potential_weight != 0.0
+    previous_potential = [0.0] * num_envs
+    if dense_potential:
+        previous_potential = _reward_potentials(
+            vec,
+            states,
+            [(idx, learner_seats[idx]) for idx in range(num_envs)],
+            num_players,
+            episode_steps,
+            reward_cfg,
+        )
     fast_policy_batch = getattr(vec, "policy_batch", None)
     fast_observation = getattr(vec, "observation", None)
     fast_observations = getattr(vec, "observations", None)
@@ -382,6 +468,25 @@ def rollout_episodes_batched(
             if done:
                 dones[i] = True
                 finals[i] = final
+        if dense_potential:
+            rows = [
+                (idx, learner_seats[idx])
+                for idx in active
+                if trajectories[idx].reward
+            ]
+            current_potential = _reward_potentials(
+                vec,
+                states,
+                rows,
+                num_players,
+                episode_steps,
+                reward_cfg,
+            )
+            for (env_idx, _seat), phi in zip(rows, current_potential, strict=True):
+                trajectories[env_idx].reward[-1] += reward_cfg.potential_weight * (
+                    phi - previous_potential[env_idx]
+                )
+                previous_potential[env_idx] = phi
 
     # 5. Apply terminal reward + record seat_rewards on each trajectory.
     for env_idx in range(num_envs):
@@ -417,11 +522,14 @@ def _step_learner_bucket(
     graph_enabled = target_device.type == "cuda" and compile_mode is not None
     graph_rows = max(int(graph_rows or len(bucket)), len(bucket))
     action_contexts: list[ActionContext] | None = None
+    policy_rows: list[tuple[int, int]] | None = None
+    fast_sampler = getattr(getattr(policy_batch, "__self__", None), "sample_batch_with_records", None)
+    fast_actions_sampler = getattr(getattr(policy_batch, "__self__", None), "sample_batch_actions", None)
     if callable(policy_batch):
-        rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
+        policy_rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
         if record_on_cpu:
             cpu_stacked, action_contexts = policy_batch(
-                rows, device="cpu", pin_memory=False
+                policy_rows, device="cpu", pin_memory=False
             )
             device_source = (
                 _pad_encoded_rows(cpu_stacked, graph_rows)
@@ -431,7 +539,7 @@ def _step_learner_bucket(
             stacked = _encoded_to_device(device_source, target_device)
         else:
             stacked, action_contexts = policy_batch(
-                rows,
+                policy_rows,
                 device=device,
                 pin_memory=target_device.type == "cuda",
             )
@@ -494,7 +602,16 @@ def _step_learner_bucket(
     out = _slice_policy_output(out, real_rows)
 
     if record_trajectories:
-        if action_contexts is not None:
+        if callable(fast_sampler) and policy_rows is not None:
+            actions_list, records = fast_sampler(
+                out,
+                policy_rows,
+                deterministic=deterministic,
+                record_rows=learner_rows,
+                feature_source=cpu_stacked if cpu_stacked is not None else stacked,
+                native_actions=True,
+            )
+        elif action_contexts is not None:
             actions_list, records = sample_batch_with_records_context(
                 out,
                 action_contexts,
@@ -509,7 +626,15 @@ def _step_learner_bucket(
                 record_rows=learner_rows,
             )
     else:
-        if action_contexts is not None:
+        if callable(fast_actions_sampler) and policy_rows is not None:
+            actions_list = fast_actions_sampler(
+                out,
+                policy_rows,
+                deterministic=deterministic,
+                feature_source=cpu_stacked if cpu_stacked is not None else stacked,
+                native_actions=True,
+            )
+        elif action_contexts is not None:
             actions_list = sample_batch_actions_context(
                 out,
                 action_contexts,

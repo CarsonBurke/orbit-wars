@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 numpy = "0.28"
 owars_env = { path = "../owars_env" }
 pyo3 = { version = "0.28", features = ["extension-module"] }
+rayon = "1.10"

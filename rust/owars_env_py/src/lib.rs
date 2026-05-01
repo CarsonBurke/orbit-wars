@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 
-use numpy::IntoPyArray;
+use numpy::{IntoPyArray, PyReadonlyArray2, PyUntypedArrayMethods};
 use numpy::ndarray::{Array1, Array2, Array3};
-use owars_env::{Action, Game, GameConfig, PlayerAction};
+use owars_env::{Action, Game, GameConfig, Planet, PlayerAction};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use rayon::prelude::*;
 
 const BOARD_SIZE: f64 = 100.0;
 const CENTER: f64 = 50.0;
+const SUN_RADIUS: f64 = 10.0;
 const ROTATION_RADIUS_LIMIT: f64 = 50.0;
 const MAX_SHIP_SPEED: f64 = 6.0;
 const MAX_OMEGA: f64 = 0.05;
@@ -16,6 +18,28 @@ const MAX_FLEETS: usize = 384;
 const PLANET_FEAT_DIM: usize = 19;
 const FLEET_FEAT_DIM: usize = 20;
 const LOG_1000: f64 = 6.907_755_278_982_137;
+const LEAD_T_HORIZON_STEPS: f64 = 600.0;
+const LEAD_MAX_TURNS: i32 = LEAD_T_HORIZON_STEPS as i32;
+
+#[derive(Clone, Copy)]
+struct LeadSolution {
+    angle: f64,
+    time: f64,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone)]
+struct RowActionResult {
+    actions: Vec<Action>,
+    materialized: Vec<bool>,
+}
+
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+struct NativeActionList {
+    actions: PlayerAction,
+}
 
 #[pyclass]
 struct RustCoreVecEnv {
@@ -70,12 +94,12 @@ impl RustCoreVecEnv {
             let parsed = parse_env_actions(&action_obj, self.num_players)?;
             let game = &mut self.games[env_idx];
             let result = game.step(&parsed);
-            let final_rewards = if result.done {
-                Some(result.rewards)
+            let final_result = if result.done {
+                Some((result.rewards, game.scores()))
             } else {
                 None
             };
-            out.set_item(env_idx, (py.None(), result.done, final_rewards))?;
+            out.set_item(env_idx, (py.None(), result.done, final_result))?;
         }
         Ok(out)
     }
@@ -98,6 +122,151 @@ impl RustCoreVecEnv {
         for (idx, player) in rows {
             out.append(observation_dict(py, &self.games[idx], player)?)?;
         }
+        Ok(out)
+    }
+
+    fn reward_potentials<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        production_weight: f64,
+    ) -> Bound<'py, numpy::PyArray1<f32>> {
+        let values = rows
+            .into_iter()
+            .map(|(idx, player)| {
+                self.games[idx].projected_margin_potential(player, production_weight)
+            })
+            .collect::<Vec<_>>();
+        Array1::from_vec(values).into_pyarray(py)
+    }
+
+    fn legal_target_mask<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        frac: PyReadonlyArray2<'_, f32>,
+        owned: PyReadonlyArray2<'_, bool>,
+        pmask: PyReadonlyArray2<'_, bool>,
+        ids: PyReadonlyArray2<'_, i64>,
+    ) -> PyResult<Bound<'py, numpy::PyArray3<bool>>> {
+        let shape = frac.shape();
+        let (batch, planets) = (shape[0], shape[1]);
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        let frac_v = frac.as_array().to_owned();
+        let owned_v = owned.as_array().to_owned();
+        let pmask_v = pmask.as_array().to_owned();
+        let ids_v = ids.as_array().to_owned();
+        let games = &self.games;
+        let masks = py.detach(|| {
+            (0..batch)
+                .into_par_iter()
+                .map(|row| {
+                    let game = &games[rows[row].0];
+                    let mut out = vec![false; planets * planets];
+                    fill_legal_mask_row(
+                        game,
+                        planets,
+                        |col| frac_v[[row, col]] as f64,
+                        |col| owned_v[[row, col]],
+                        |col| pmask_v[[row, col]],
+                        |col| ids_v[[row, col]] as i32,
+                        &mut out,
+                    );
+                    out
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut out = Array3::<bool>::from_elem((batch, planets, planets), false);
+        for row in 0..batch {
+            for i in 0..planets {
+                for j in 0..planets {
+                    out[[row, i, j]] = masks[row][i * planets + j];
+                }
+            }
+        }
+        Ok(out.into_pyarray(py))
+    }
+
+    fn materialize_actions<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        launch: PyReadonlyArray2<'_, f32>,
+        target_idx: PyReadonlyArray2<'_, i64>,
+        frac: PyReadonlyArray2<'_, f32>,
+        owned: PyReadonlyArray2<'_, bool>,
+        pmask: PyReadonlyArray2<'_, bool>,
+        ids: PyReadonlyArray2<'_, i64>,
+        native: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let shape = launch.shape();
+        let (batch, planets) = (shape[0], shape[1]);
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        let launch_v = launch.as_array().to_owned();
+        let target_v = target_idx.as_array().to_owned();
+        let frac_v = frac.as_array().to_owned();
+        let owned_v = owned.as_array().to_owned();
+        let pmask_v = pmask.as_array().to_owned();
+        let ids_v = ids.as_array().to_owned();
+        let games = &self.games;
+        let results = py.detach(|| {
+            (0..batch)
+                .into_par_iter()
+                .map(|row| {
+                    materialize_action_row(
+                        &games[rows[row].0],
+                        planets,
+                        |col| launch_v[[row, col]] as f64,
+                        |col| target_v[[row, col]] as usize,
+                        |col| frac_v[[row, col]] as f64,
+                        |col| owned_v[[row, col]],
+                        |col| pmask_v[[row, col]],
+                        |col| ids_v[[row, col]] as i32,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let actions = PyList::empty(py);
+        let mut materialized = Array2::<bool>::from_elem((batch, planets), false);
+        for (row, result) in results.iter().enumerate() {
+            if native {
+                actions.append(Py::new(
+                    py,
+                    NativeActionList {
+                        actions: result.actions.clone(),
+                    },
+                )?)?;
+            } else {
+                let row_actions = PyList::empty(py);
+                for action in &result.actions {
+                    let item = PyList::empty(py);
+                    item.append(action.from_planet_id)?;
+                    item.append(action.angle)?;
+                    item.append(action.ships)?;
+                    item.append(action.target_id)?;
+                    item.append(action.eta)?;
+                    item.append(action.target_x)?;
+                    item.append(action.target_y)?;
+                    row_actions.append(item)?;
+                }
+                actions.append(row_actions)?;
+            }
+            for col in 0..planets {
+                materialized[[row, col]] = result.materialized[col];
+            }
+        }
+        let out = PyDict::new(py);
+        out.set_item("actions", actions)?;
+        out.set_item("materialized", materialized.into_pyarray(py))?;
         Ok(out)
     }
 
@@ -180,6 +349,10 @@ fn parse_env_actions(obj: &Bound<'_, PyAny>, num_players: usize) -> PyResult<Vec
         let Ok(player_obj) = players.get_item(player) else {
             continue;
         };
+        if let Ok(native) = player_obj.extract::<PyRef<'_, NativeActionList>>() {
+            *player_out = native.actions.clone();
+            continue;
+        }
         let Ok(moves) = player_obj.cast::<PyList>() else {
             continue;
         };
@@ -464,8 +637,287 @@ fn comet_motion_by_id(game: &Game) -> HashMap<i32, Option<(f64, f64)>> {
     out
 }
 
+fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
+    game: &Game,
+    planets_len: usize,
+    frac_at: FFrac,
+    owned_at: FOwned,
+    mask_at: FMask,
+    id_at: FIds,
+    out: &mut [bool],
+) where
+    FFrac: Fn(usize) -> f64,
+    FOwned: Fn(usize) -> bool,
+    FMask: Fn(usize) -> bool,
+    FIds: Fn(usize) -> i32,
+{
+    let by_id = game.planets.iter().map(|p| (p.id, *p)).collect::<HashMap<_, _>>();
+    let comet_ids = game
+        .comets
+        .iter()
+        .flat_map(|group| group.planet_ids.iter().copied())
+        .collect::<std::collections::HashSet<_>>();
+    for i in 0..planets_len {
+        if !(owned_at(i) && mask_at(i)) {
+            continue;
+        }
+        let Some(source) = by_id.get(&id_at(i)).copied() else {
+            continue;
+        };
+        if source.ships < 2 {
+            continue;
+        }
+        let send = ships_to_send(source.ships, frac_at(i));
+        if send <= 0 {
+            continue;
+        }
+        for j in 0..planets_len {
+            if i == j || !mask_at(j) {
+                continue;
+            }
+            let target_id = id_at(j);
+            if target_id < 0 || comet_ids.contains(&target_id) {
+                continue;
+            }
+            let Some(target) = by_id.get(&target_id).copied() else {
+                continue;
+            };
+            let Some(solution) = lead_solution(&source, &target, game.angular_velocity, send, game.ship_speed) else {
+                continue;
+            };
+            if !safe_flight_segment(source.x, source.y, source.radius, solution.angle, solution.x, solution.y) {
+                continue;
+            }
+            out[i * planets_len + j] = true;
+        }
+    }
+}
+
+fn materialize_action_row<FLaunch, FTarget, FFrac, FOwned, FMask, FIds>(
+    game: &Game,
+    planets_len: usize,
+    launch_at: FLaunch,
+    target_at: FTarget,
+    frac_at: FFrac,
+    owned_at: FOwned,
+    mask_at: FMask,
+    id_at: FIds,
+) -> RowActionResult
+where
+    FLaunch: Fn(usize) -> f64,
+    FTarget: Fn(usize) -> usize,
+    FFrac: Fn(usize) -> f64,
+    FOwned: Fn(usize) -> bool,
+    FMask: Fn(usize) -> bool,
+    FIds: Fn(usize) -> i32,
+{
+    let by_id = game.planets.iter().map(|p| (p.id, *p)).collect::<HashMap<_, _>>();
+    let comet_ids = game
+        .comets
+        .iter()
+        .flat_map(|group| group.planet_ids.iter().copied())
+        .collect::<std::collections::HashSet<_>>();
+    let mut remaining = game
+        .planets
+        .iter()
+        .map(|p| (p.id, p.ships))
+        .collect::<HashMap<_, _>>();
+    let mut result = RowActionResult {
+        actions: Vec::new(),
+        materialized: vec![false; planets_len],
+    };
+    for i in 0..planets_len {
+        if !(launch_at(i) >= 0.5 && owned_at(i) && mask_at(i)) {
+            continue;
+        }
+        let ti = target_at(i);
+        if ti == i || ti >= planets_len {
+            continue;
+        }
+        let target_id = id_at(ti);
+        if target_id < 0 || comet_ids.contains(&target_id) {
+            continue;
+        }
+        let source_id = id_at(i);
+        let (Some(source), Some(target)) = (by_id.get(&source_id).copied(), by_id.get(&target_id).copied()) else {
+            continue;
+        };
+        let source_ships = *remaining.get(&source_id).unwrap_or(&source.ships);
+        if source_ships < 2 {
+            continue;
+        }
+        let send = ships_to_send(source_ships, frac_at(i));
+        if send <= 0 {
+            continue;
+        }
+        let Some(solution) = lead_solution(&source, &target, game.angular_velocity, send, game.ship_speed) else {
+            continue;
+        };
+        if !safe_flight_segment(source.x, source.y, source.radius, solution.angle, solution.x, solution.y) {
+            continue;
+        }
+        result.actions.push(Action {
+            from_planet_id: source.id,
+            angle: solution.angle,
+            ships: send,
+            target_id,
+            eta: solution.time,
+            target_x: solution.x,
+            target_y: solution.y,
+        });
+        result.materialized[i] = true;
+        remaining.insert(source_id, source_ships - send);
+    }
+    result
+}
+
+fn ships_to_send(remaining: i32, frac: f64) -> i32 {
+    if remaining < 2 {
+        return 0;
+    }
+    let raw = (remaining as f64 * frac.clamp(0.0, 1.0)).round() as i32;
+    raw.clamp(1, remaining - 1)
+}
+
+fn fleet_speed_local(ships: i32, max_speed: f64) -> f64 {
+    if ships <= 1 {
+        return 1.0;
+    }
+    let frac = (ships as f64).ln() / LOG_1000;
+    (1.0 + (max_speed - 1.0) * frac.powf(1.5)).min(max_speed)
+}
+
+fn lead_solution(source: &Planet, target: &Planet, angular_velocity: f64, send: i32, max_speed: f64) -> Option<LeadSolution> {
+    let mut solution = lead_solution_from_point(
+        source.x,
+        source.y,
+        target.x,
+        target.y,
+        target.radius,
+        angular_velocity,
+        send,
+        max_speed,
+    )?;
+    let mut angle = solution.angle;
+    let offset = (source.radius + 0.1).max(0.0);
+    if offset <= 0.0 {
+        return Some(solution);
+    }
+    for _ in 0..4 {
+        let start_x = source.x + angle.cos() * offset;
+        let start_y = source.y + angle.sin() * offset;
+        let refined = lead_solution_from_point(
+            start_x,
+            start_y,
+            target.x,
+            target.y,
+            target.radius,
+            angular_velocity,
+            send,
+            max_speed,
+        )?;
+        if angle_delta(refined.angle, angle).abs() < 1e-6 {
+            return Some(refined);
+        }
+        angle = refined.angle;
+        solution = refined;
+    }
+    Some(solution)
+}
+
+fn lead_solution_from_point(
+    source_x: f64,
+    source_y: f64,
+    target_x: f64,
+    target_y: f64,
+    target_radius: f64,
+    angular_velocity: f64,
+    send: i32,
+    max_speed: f64,
+) -> Option<LeadSolution> {
+    let speed = fleet_speed_local(send, max_speed);
+    if speed <= 0.0 {
+        return None;
+    }
+    let orbit_radius = ((target_x - CENTER).powi(2) + (target_y - CENTER).powi(2)).sqrt();
+    let is_orbiting = orbit_radius + target_radius < ROTATION_RADIUS_LIMIT
+        && angular_velocity.abs() > 1e-12
+        && orbit_radius > 1e-9;
+    if !is_orbiting {
+        let distance = ((target_x - source_x).powi(2) + (target_y - source_y).powi(2)).sqrt();
+        if distance / speed > LEAD_T_HORIZON_STEPS {
+            return None;
+        }
+        return Some(LeadSolution {
+            angle: (target_y - source_y).atan2(target_x - source_x),
+            time: ((distance - target_radius).max(0.0) / speed).ceil().max(1.0),
+            x: target_x,
+            y: target_y,
+        });
+    }
+    let theta0 = (target_y - CENTER).atan2(target_x - CENTER);
+    let mut previous_error: Option<f64> = None;
+    for k in 1..=LEAD_MAX_TURNS {
+        let theta = theta0 + angular_velocity * (k - 1) as f64;
+        let tx = CENTER + orbit_radius * theta.cos();
+        let ty = CENTER + orbit_radius * theta.sin();
+        let distance = ((tx - source_x).powi(2) + (ty - source_y).powi(2)).sqrt();
+        let error = distance - k as f64 * speed;
+        if error <= target_radius {
+            let prev_dist = ((k - 1) as f64 * speed).max(0.0);
+            if distance >= prev_dist - target_radius {
+                return Some(LeadSolution {
+                    angle: (ty - source_y).atan2(tx - source_x),
+                    time: k as f64,
+                    x: tx,
+                    y: ty,
+                });
+            }
+        }
+        if let Some(prev) = previous_error {
+            if prev < -target_radius && error > target_radius {
+                break;
+            }
+        }
+        previous_error = Some(error);
+    }
+    None
+}
+
+fn safe_flight_segment(source_x: f64, source_y: f64, source_radius: f64, angle: f64, end_x: f64, end_y: f64) -> bool {
+    let offset = (source_radius + 0.1).max(0.0);
+    let start_x = source_x + angle.cos() * offset;
+    let start_y = source_y + angle.sin() * offset;
+    if !inside_board(start_x, start_y) || !inside_board(end_x, end_y) {
+        return false;
+    }
+    point_to_segment_distance_local((CENTER, CENTER), (start_x, start_y), (end_x, end_y)) >= SUN_RADIUS
+}
+
+fn inside_board(x: f64, y: f64) -> bool {
+    (0.0..=BOARD_SIZE).contains(&x) && (0.0..=BOARD_SIZE).contains(&y)
+}
+
+fn point_to_segment_distance_local(point: (f64, f64), start: (f64, f64), end: (f64, f64)) -> f64 {
+    let seg_x = end.0 - start.0;
+    let seg_y = end.1 - start.1;
+    let l2 = seg_x * seg_x + seg_y * seg_y;
+    if l2 == 0.0 {
+        return ((point.0 - start.0).powi(2) + (point.1 - start.1).powi(2)).sqrt();
+    }
+    let raw_t = ((point.0 - start.0) * seg_x + (point.1 - start.1) * seg_y) / l2;
+    let t = raw_t.clamp(0.0, 1.0);
+    let proj = (start.0 + t * seg_x, start.1 + t * seg_y);
+    ((point.0 - proj.0).powi(2) + (point.1 - proj.1).powi(2)).sqrt()
+}
+
+fn angle_delta(a: f64, b: f64) -> f64 {
+    (a - b).sin().atan2((a - b).cos())
+}
+
 #[pymodule]
 fn _owars_env(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustCoreVecEnv>()?;
+    m.add_class::<NativeActionList>()?;
     Ok(())
 }
