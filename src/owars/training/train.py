@@ -48,7 +48,6 @@ from .ppo import (
     _slice_feats,
     compute_gae,
     compute_mc_return,
-    length_adaptive_lambda,
     ppo_update,
     value_only_update,
 )
@@ -198,6 +197,8 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         depth=cfg.model.depth,
         n_heads=cfg.model.n_heads,
         dropout=cfg.model.dropout,
+        planet_rope_fraction=cfg.model.planet_rope_fraction,
+        planet_rope_base=cfg.model.planet_rope_base,
         encoder_backend=cfg.model.encoder_backend,
         num_fleet_latents=cfg.model.num_fleet_latents,
         fleet_tokenizer_depth=cfg.model.fleet_tokenizer_depth,
@@ -246,14 +247,9 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
 def _stack_trajectories(
     trajs: list[Trajectory],
     gamma: float,
-    lambda_critic: float,
-    lambda_policy_alpha: float,
+    gae_lambda: float,
 ) -> dict[str, torch.Tensor]:
-    """Flatten per-step records into one batch with **decoupled GAE**.
-
-    Critic target = GAE-λ_critic returns (typically λ=1 → MC return).
-    Actor advantage = GAE-λ_policy advantages (optionally length-adaptive).
-    """
+    """Flatten per-step records into one PPO batch with conventional GAE."""
     batch = _stack_encoded(trajs)
 
     launch, tidx, frac, lp, owned = [], [], [], [], []
@@ -293,11 +289,9 @@ def _stack_trajectories(
         horizon = len(rewards)
         values = all_values[offset : offset + horizon]
         offset += horizon
-        lam_p = length_adaptive_lambda(horizon, lambda_policy_alpha)
-        adv_p, _ = compute_gae(rewards, values, gamma, lam_p)
-        _, ret_c = compute_gae(rewards, values, gamma, lambda_critic)
-        advs_all.append(adv_p)
-        rets_all.append(ret_c)
+        adv, ret = compute_gae(rewards, values, gamma, gae_lambda)
+        advs_all.append(adv)
+        rets_all.append(ret)
 
     advs = torch.from_numpy(np.concatenate(advs_all)).float()
     rets = torch.from_numpy(np.concatenate(rets_all)).float()
@@ -311,18 +305,21 @@ def _stack_trajectories(
     return batch
 
 
-def _pretrain_value_batch(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
+def _pretrain_value_batch(trajs: list[Trajectory], gamma: float) -> dict[str, torch.Tensor]:
     """Critic-target = pure Monte-Carlo trajectory return (γ=1, λ=1).
 
-    With terminal-only ±1 reward this is a constant per trajectory =
-    the eventual game outcome — i.e. supervised regression of V(s) onto
-    the win indicator. Exactly the cold-start signal we want.
+    For dense potential rewards this is the undiscounted accumulated change in
+    projected population margin. Pretraining is still behavior-policy value
+    regression, but it is no longer a constant win/loss label per trajectory.
 
     Encoder fields only — `value_only_update` doesn't read the actor-side
     records, so we skip stacking and host→device-copying them.
     """
     batch = _stack_encoded(trajs)
-    rets_all = [compute_mc_return(np.asarray(t.reward, dtype=np.float32), gamma=1.0) for t in trajs]
+    rets_all = [
+        compute_mc_return(np.asarray(t.reward, dtype=np.float32), gamma=gamma)
+        for t in trajs
+    ]
     batch["return"] = torch.from_numpy(np.concatenate(rets_all)).float()
     return batch
 
@@ -374,7 +371,10 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                 compile_mode=_compile_mode_for_model(model, cfg),
                 policy_graph_rows=cfg.rollout.num_envs,
             ))
-        batch = {k: v.to(device) for k, v in _pretrain_value_batch(trajs).items()}
+        batch = {
+            k: v.to(device)
+            for k, v in _pretrain_value_batch(trajs, gamma=cfg.ppo.gamma).items()
+        }
         loss = value_only_update(
             model, optimizer, batch,
             epochs=1,
@@ -631,8 +631,7 @@ def _ppo_loop(
         batch = _stack_trajectories(
             trajs,
             gamma=cfg.ppo.gamma,
-            lambda_critic=cfg.ppo.lambda_critic,
-            lambda_policy_alpha=cfg.ppo.lambda_policy_alpha,
+            gae_lambda=cfg.ppo.gae_lambda,
         )
         batch = {k: v.to(device) for k, v in batch.items()}
 

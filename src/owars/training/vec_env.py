@@ -23,6 +23,7 @@ separately in STRATEGY.md. Subprocess parallelism is the cheap win.
 from __future__ import annotations
 
 import multiprocessing as mp
+from contextlib import suppress
 from typing import Any
 
 _RESET = "reset"
@@ -151,10 +152,8 @@ def _env_worker(
             else:
                 remote.send(("err", f"unknown cmd: {cmd!r}", True, None, None))
     except Exception as e:  # bubble worker errors back to main
-        try:
+        with suppress(Exception):
             remote.send(("err", repr(e), True, None, None))
-        except Exception:
-            pass
 
 
 class VecEnv:
@@ -176,6 +175,7 @@ class VecEnv:
         replay_env_idx: int | None = None,
     ):
         self.num_envs = num_envs
+        self.episode_steps = episode_steps
         self.replay_env_idx = replay_env_idx
         # Latest finished game's rendered HTML from the recording worker.
         # Caller reads after a rollout, then resets to None on the next reset().
@@ -229,7 +229,7 @@ class VecEnv:
         call, the rendered HTML is stashed on `self.last_replay_html`.
         """
         assert len(indices) == len(actions), (len(indices), len(actions))
-        for i, a in zip(indices, actions):
+        for i, a in zip(indices, actions, strict=True):
             self._remotes[i].send((_STEP, a))
         results: dict[int, tuple[Any, bool, Any]] = {}
         for i in indices:
@@ -263,29 +263,23 @@ class VecEnv:
             return
         self._closed = True
         for r in self._remotes:
-            try:
+            with suppress(Exception):
                 r.send((_CLOSE, None))
-            except Exception:
-                pass
         for p in self._workers:
             p.join(timeout=2.0)
             if p.is_alive():
                 p.terminate()
                 p.join(timeout=1.0)
         for r in self._remotes:
-            try:
+            with suppress(Exception):
                 r.close()
-            except Exception:
-                pass
 
-    def __enter__(self) -> "VecEnv":
+    def __enter__(self) -> VecEnv:
         return self
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
     def __del__(self) -> None:  # best-effort cleanup
-        try:
+        with suppress(Exception):
             self.close()
-        except Exception:
-            pass

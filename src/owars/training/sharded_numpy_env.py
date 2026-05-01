@@ -23,6 +23,7 @@ _STEP_FAST = "step_fast"
 _OBSERVATION = "observation"
 _OBSERVATIONS = "observations"
 _POLICY_BATCH = "policy_batch"
+_REWARD_POTENTIALS = "reward_potentials"
 _CLOSE = "close"
 _SET_RECORDING = "set_recording"
 
@@ -96,6 +97,17 @@ def _numpy_shard_worker(
                 # Keep tensors on CPU across process boundaries. The parent
                 # process performs the single pinned CPU -> CUDA transfer.
                 remote.send(("ok", vec.policy_batch(rows, device="cpu")))
+            elif cmd == _REWARD_POTENTIALS:
+                rows, production_weight = payload
+                rows = [(int(idx), int(player)) for idx, player in rows]
+                remote.send(
+                    (
+                        "ok",
+                        vec.reward_potentials(
+                            rows, production_weight=float(production_weight)
+                        ),
+                    )
+                )
             else:
                 remote.send(("err", f"unknown cmd: {cmd!r}"))
     except Exception as exc:
@@ -313,6 +325,46 @@ class ShardedNumpyVecEnv:
         if len(encoded_rows) != len(rows) or len(contexts) != len(rows):
             raise RuntimeError("incomplete sharded policy batch")
         return stack_encoded(encoded_rows), contexts
+
+    def reward_potentials(
+        self,
+        rows: list[tuple[int, int]],
+        *,
+        production_weight: float,
+    ) -> Any:
+        if not rows:
+            return []
+
+        grouped_rows: list[list[tuple[int, int]]] = [[] for _ in self.shards]
+        grouped_positions: list[list[int]] = [[] for _ in self.shards]
+        for pos, (env_idx, player) in enumerate(rows):
+            shard_idx, local_idx = self._env_to_shard[env_idx]
+            grouped_rows[shard_idx].append((local_idx, player))
+            grouped_positions[shard_idx].append(pos)
+
+        active_shards: list[int] = []
+        for shard_idx, local_rows in enumerate(grouped_rows):
+            if not local_rows:
+                continue
+            self._remotes[shard_idx].send(
+                (_REWARD_POTENTIALS, (local_rows, production_weight))
+            )
+            active_shards.append(shard_idx)
+
+        out: list[float | None] = [None] * len(rows)
+        for shard_idx in active_shards:
+            tag, payload = self._remotes[shard_idx].recv()
+            if tag != "ok":
+                raise RuntimeError(
+                    f"numpy shard {shard_idx} reward_potentials failed: {payload}"
+                )
+            for value, pos in zip(payload, grouped_positions[shard_idx], strict=True):
+                out[pos] = float(value)
+
+        values = [value for value in out if value is not None]
+        if len(values) != len(rows):
+            raise RuntimeError("incomplete sharded reward potentials")
+        return values
 
     def set_recording(self, enabled: bool) -> None:
         for shard_idx, remote in enumerate(self._remotes):

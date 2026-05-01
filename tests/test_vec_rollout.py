@@ -15,7 +15,9 @@ from owars.training.vec_env import (
 )
 from owars.training.vec_rollout import (
     _normalize_learner_seats,
+    _obs_reward_potential,
     _resolve_seat_agents,
+    _state_reward_potential,
     alternating_learner_seats,
     rollout_episodes_batched,
 )
@@ -52,6 +54,45 @@ def test_normalize_learner_seats_validates_length_and_range():
         _normalize_learner_seats([0, 1], num_envs=3, num_players=2)
     with pytest.raises(ValueError):
         _normalize_learner_seats([0, 2, 1], num_envs=3, num_players=2)
+
+
+def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():
+    obs = {
+        "player": 0,
+        "step": 10,
+        "planets": [
+            [0, 0, 0.0, 0.0, 1.0, 10, 2],
+            [1, 1, 0.0, 0.0, 1.0, 20, 1],
+            [2, 2, 0.0, 0.0, 1.0, 5, 4],
+        ],
+        "fleets": [[10, 0, 0.0, 0.0, 0.0, 0, 5]],
+    }
+    phi = _obs_reward_potential(
+        obs, player=0, num_players=3, episode_steps=100, production_weight=1.0
+    )
+    own = 15 + 90 * 2
+    best_enemy = max(20 + 90 * 1, 5 + 90 * 4)
+    assert phi == pytest.approx((own - best_enemy) / (own + best_enemy + 1))
+
+    terminal = {**obs, "step": 100}
+    terminal_phi = _obs_reward_potential(
+        terminal,
+        player=0,
+        num_players=3,
+        episode_steps=100,
+        production_weight=1.0,
+    )
+    assert terminal_phi == pytest.approx((15 - 20) / (15 + 20 + 1))
+
+    done_state = [
+        {"status": "DONE", "observation": obs},
+        {"status": "DONE", "observation": {**obs, "player": 1}},
+        {"status": "DONE", "observation": {**obs, "player": 2}},
+    ]
+    early_finish_phi = _state_reward_potential(
+        done_state, player=0, num_players=3, episode_steps=100, production_weight=1.0
+    )
+    assert early_finish_phi == pytest.approx(phi)
 
 
 def test_kaggle_vecenv_helpers_preserve_policy_target_sidecars():
@@ -124,6 +165,32 @@ def test_numpy_fast_rollout_records_configured_learner_seats():
         assert any(mask.any() for mask in traj.owned_mask)
         for owned, obs in zip(traj.owned_mask, traj.encoded, strict=True):
             assert owned.equal(obs.planet_owned_mask)
+
+
+def test_numpy_reward_potentials_match_materialized_observations():
+    vec = NumpyVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=12,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    with vec:
+        states = vec.reset()
+        rows = [(0, 0), (1, 1)]
+        potentials = vec.reward_potentials(rows, production_weight=1.0)
+        expected = [
+            _obs_reward_potential(
+                states[env_idx][player]["observation"],
+                player=player,
+                num_players=2,
+                episode_steps=12,
+                production_weight=1.0,
+            )
+            for env_idx, player in rows
+        ]
+
+    assert potentials.tolist() == pytest.approx(expected)
 
 
 def test_sharded_numpy_fast_rollout_records_configured_learner_seats():

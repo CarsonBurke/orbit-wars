@@ -30,6 +30,36 @@ from .config import RewardCfg
 AgentFn = Callable[[Any], list[list]]
 
 
+def _obs_reward_potential(
+    obs: Any,
+    player: int,
+    num_players: int,
+    episode_steps: int,
+    production_weight: float,
+) -> float:
+    get = obs.get if isinstance(obs, dict) else lambda key, default=None: getattr(obs, key, default)
+    ships = [0.0] * num_players
+    production = [0.0] * num_players
+    for planet in get("planets", []) or []:
+        owner = int(planet[1])
+        if owner != -1:
+            ships[owner] += float(planet[5])
+            production[owner] += float(planet[6])
+    for fleet in get("fleets", []) or []:
+        owner = int(fleet[1])
+        if owner != -1:
+            ships[owner] += float(fleet[6])
+    step = int(get("step", 0) or 0)
+    turns_left = max(0.0, float(episode_steps - step))
+    projected = [
+        ships[p] + production_weight * turns_left * production[p]
+        for p in range(num_players)
+    ]
+    own = projected[player]
+    enemy = max((projected[p] for p in range(num_players) if p != player), default=0.0)
+    return (own - enemy) / max(1.0, own + enemy + 1.0)
+
+
 @dataclass
 class Trajectory:
     """Per-step records for the *learning* agent only.
@@ -158,6 +188,15 @@ def rollout_episode(
             op_ix += 1
 
     state = env.reset(num_agents=num_players)
+    previous_potential = 0.0
+    if reward_cfg.potential_weight != 0.0:
+        previous_potential = _obs_reward_potential(
+            state[learner_ix]["observation"],
+            learner_ix,
+            num_players,
+            episode_steps,
+            reward_cfg.production_weight,
+        )
 
     traj = Trajectory(
         encoded=[], launch=[], target_idx=[], fraction=[],
@@ -180,16 +219,28 @@ def rollout_episode(
                 obs = slot["observation"]
                 actions.append(agents[seat](obs))
         state = env.step(actions)
+        if reward_cfg.potential_weight != 0.0 and traj.reward:
+            current_potential = _obs_reward_potential(
+                state[learner_ix]["observation"],
+                learner_ix,
+                num_players,
+                episode_steps,
+                reward_cfg.production_weight,
+            )
+            traj.reward[-1] += reward_cfg.potential_weight * (
+                current_potential - previous_potential
+            )
+            previous_potential = current_potential
 
     final = env.steps[-1]
-    seat_rewards = [float(s.reward or 0.0) for s in final]
-    learner_reward = seat_rewards[learner_ix]
-    others = [r for i, r in enumerate(seat_rewards) if i != learner_ix]
-    margin = learner_reward - max(others) if others else learner_reward
+    seat_scores = [float(getattr(s, "score", s.reward or 0.0)) for s in final]
+    learner_score = seat_scores[learner_ix]
+    others = [r for i, r in enumerate(seat_scores) if i != learner_ix]
+    margin = learner_score - max(others) if others else learner_score
     traj.final_score = margin
-    traj.won = learner_reward > max(others) if others else True
-    traj.drawn = bool(others) and learner_reward == max(others)
-    traj.seat_rewards = seat_rewards
+    traj.won = learner_score > max(others) if others else True
+    traj.drawn = bool(others) and learner_score == max(others)
+    traj.seat_rewards = seat_scores
     traj.learner_seat = learner_ix
 
     if traj.won:

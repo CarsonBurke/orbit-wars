@@ -850,17 +850,7 @@ impl Game {
         if !self.done {
             return vec![0; self.num_players];
         }
-        let mut scores = vec![0; self.num_players];
-        for planet in &self.planets {
-            if planet.owner >= 0 {
-                scores[planet.owner as usize] += planet.ships;
-            }
-        }
-        for fleet in &self.fleets {
-            if fleet.owner >= 0 {
-                scores[fleet.owner as usize] += fleet.ships;
-            }
-        }
+        let scores = self.scores();
         let max_score = scores.iter().copied().max().unwrap_or(0);
         scores
             .into_iter()
@@ -872,6 +862,47 @@ impl Game {
                 }
             })
             .collect()
+    }
+
+    pub fn scores(&self) -> Vec<i32> {
+        let mut scores = vec![0; self.num_players];
+        for planet in &self.planets {
+            if planet.owner >= 0 {
+                scores[planet.owner as usize] += planet.ships;
+            }
+        }
+        for fleet in &self.fleets {
+            if fleet.owner >= 0 {
+                scores[fleet.owner as usize] += fleet.ships;
+            }
+        }
+        scores
+    }
+
+    pub fn projected_margin_potential(&self, player: usize, production_weight: f64) -> f32 {
+        let mut ships = vec![0.0; self.num_players];
+        let mut production = vec![0.0; self.num_players];
+        for planet in &self.planets {
+            if planet.owner >= 0 {
+                let owner = planet.owner as usize;
+                ships[owner] += f64::from(planet.ships);
+                production[owner] += f64::from(planet.production);
+            }
+        }
+        for fleet in &self.fleets {
+            if fleet.owner >= 0 {
+                ships[fleet.owner as usize] += f64::from(fleet.ships);
+            }
+        }
+        let turns_left = f64::from((self.episode_steps - self.step).max(0));
+        let projected = |idx: usize| ships[idx] + production_weight * turns_left * production[idx];
+        let own = projected(player);
+        let enemy = (0..self.num_players)
+            .filter(|&idx| idx != player)
+            .map(projected)
+            .fold(0.0, f64::max);
+        let denom = own + enemy + 1.0;
+        ((own - enemy) / denom.max(1.0)) as f32
     }
 }
 
@@ -1203,6 +1234,48 @@ mod tests {
         assert_eq!(game.fleets.len(), 1);
         assert_eq!(game.fleets[0].ships, 10);
         assert_eq!(game.fleets[0].owner, 0);
+    }
+
+    #[test]
+    fn projected_margin_potential_keeps_remaining_horizon_after_early_done() {
+        let planets = vec![
+            Planet {
+                id: 0,
+                owner: 0,
+                x: 20.0,
+                y: 20.0,
+                radius: 1.0,
+                ships: 10,
+                production: 2,
+            },
+            Planet {
+                id: 1,
+                owner: 1,
+                x: 80.0,
+                y: 80.0,
+                radius: 1.0,
+                ships: 20,
+                production: 1,
+            },
+        ];
+        let mut game = Game::from_state(
+            GameConfig::new(2, 100, 6.0),
+            GameState::new(
+                10,
+                0.03,
+                planets.clone(),
+                planets,
+                Vec::new(),
+                Vec::new(),
+                0,
+            ),
+        );
+        game.done = true;
+
+        let own = 10.0 + 90.0 * 2.0;
+        let enemy = 20.0 + 90.0;
+        let expected = (own - enemy) / (own + enemy + 1.0);
+        assert!((f64::from(game.projected_margin_potential(0, 1.0)) - expected).abs() < 1e-6);
     }
 
     #[test]

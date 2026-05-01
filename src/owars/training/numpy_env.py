@@ -555,9 +555,11 @@ class NumpyOrbitWarsEnv:
             orbital_radius = _distance((x, y), (CENTER, CENTER))
             if orbital_radius < SUN_RADIUS + r + 10:
                 continue
-            if orbital_radius + r >= ROTATION_RADIUS_LIMIT:
-                if x + r > BOARD_SIZE or x - r < 0 or y + r > BOARD_SIZE or y - r < 0:
-                    continue
+            if (
+                orbital_radius + r >= ROTATION_RADIUS_LIMIT
+                and (x + r > BOARD_SIZE or x - r < 0 or y + r > BOARD_SIZE or y - r < 0)
+            ):
+                continue
             ships = self.rng.randint(5, 30)
             temp = self._symmetric_group(id_counter, x, y, r, ships, prod)
             if self._valid_orbit_group(temp, planets, allow_same_mode=False):
@@ -604,12 +606,17 @@ class NumpyOrbitWarsEnv:
                     p[P_RADIUS] + tp[P_RADIUS] + PLANET_CLEARANCE
                 ):
                     return False
-                if (allow_same_mode or tp_rot != p_rot) and p_orb + p[P_RADIUS] >= ROTATION_RADIUS_LIMIT:
-                    if abs(tp_orb - p_orb) < tp[P_RADIUS] + p[P_RADIUS] + PLANET_CLEARANCE:
-                        return False
-                elif not allow_same_mode and tp_rot != p_rot:
-                    if abs(tp_orb - p_orb) < tp[P_RADIUS] + p[P_RADIUS] + PLANET_CLEARANCE:
-                        return False
+                orbit_spacing_tight = (
+                    abs(tp_orb - p_orb)
+                    < tp[P_RADIUS] + p[P_RADIUS] + PLANET_CLEARANCE
+                )
+                far_static_overlap = (
+                    (allow_same_mode or tp_rot != p_rot)
+                    and p_orb + p[P_RADIUS] >= ROTATION_RADIUS_LIMIT
+                )
+                split_mode_overlap = not allow_same_mode and tp_rot != p_rot
+                if orbit_spacing_tight and (far_static_overlap or split_mode_overlap):
+                    return False
         return True
 
     def _remove_expired_comets_before_launch(self) -> None:
@@ -1318,12 +1325,14 @@ class NumpyVecEnv:
 
     def _state(self, idx: int, actions: list[Any]) -> list[dict[str, Any]]:
         rewards = self._current_rewards(idx)
+        scores = self._current_scores(idx)
         status = "DONE" if self.done[idx] else "ACTIVE"
         base = self._observation_base(idx)
         return [
             {
                 "action": actions[player] if player < len(actions) else None,
                 "reward": rewards[player],
+                "score": scores[player],
                 "info": {},
                 "observation": self._observation(idx, player, base),
                 "status": status,
@@ -1377,6 +1386,45 @@ class NumpyVecEnv:
     def observation(self, idx: int, player: int) -> dict[str, Any]:
         """Materialize one player observation for non-learner Python agents."""
         return self._observation(idx, player, self._observation_base(idx))
+
+    def reward_potentials(
+        self,
+        rows: list[tuple[int, int]],
+        *,
+        production_weight: float,
+    ) -> np.ndarray:
+        values = np.empty(len(rows), dtype=np.float32)
+        for row, (idx, player) in enumerate(rows):
+            values[row] = self._reward_potential(
+                int(idx), int(player), float(production_weight)
+            )
+        return values
+
+    def _reward_potential(
+        self,
+        idx: int,
+        player: int,
+        production_weight: float,
+    ) -> float:
+        ships = np.zeros(self.num_players, dtype=np.float64)
+        production = np.zeros(self.num_players, dtype=np.float64)
+        for planet in self.planets[idx, self.planet_mask[idx]]:
+            owner = int(planet[P_OWNER])
+            if owner != -1:
+                ships[owner] += float(planet[P_SHIPS])
+                production[owner] += float(planet[P_PROD])
+        for fleet in self.fleets[idx, self.fleet_mask[idx]]:
+            owner = int(fleet[F_OWNER])
+            if owner != -1:
+                ships[owner] += float(fleet[F_SHIPS])
+        turns_left = max(0.0, float(self.episode_steps - int(self.step_count[idx])))
+        projected = ships + production_weight * turns_left * production
+        own = float(projected[player])
+        enemy = max(
+            (float(projected[p]) for p in range(self.num_players) if p != player),
+            default=0.0,
+        )
+        return (own - enemy) / max(1.0, own + enemy + 1.0)
 
     def policy_batch(
         self,
@@ -1599,6 +1647,7 @@ class NumpyVecEnv:
         return [
             SimpleNamespace(
                 reward=s["reward"],
+                score=s.get("score", s["reward"]),
                 status=s["status"],
                 action=s["action"],
                 observation=s["observation"],
@@ -2033,6 +2082,11 @@ class NumpyVecEnv:
     def _current_rewards(self, idx: int) -> list[int]:
         if not self.done[idx]:
             return [0] * self.num_players
+        scores = self._current_scores(idx)
+        max_score = max(scores)
+        return [1 if score == max_score and max_score > 0 else -1 for score in scores]
+
+    def _current_scores(self, idx: int) -> list[int]:
         scores = [0] * self.num_players
         for p in self.planets[idx, self.planet_mask[idx]]:
             owner = int(p[P_OWNER])
@@ -2040,5 +2094,4 @@ class NumpyVecEnv:
                 scores[owner] += int(p[P_SHIPS])
         for f in self.fleets[idx, self.fleet_mask[idx]]:
             scores[int(f[F_OWNER])] += int(f[F_SHIPS])
-        max_score = max(scores)
-        return [1 if score == max_score and max_score > 0 else -1 for score in scores]
+        return scores

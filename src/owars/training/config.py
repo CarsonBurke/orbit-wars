@@ -27,6 +27,8 @@ class ModelCfg:
     depth: int = 3
     n_heads: int = 4
     dropout: float = 0.0
+    planet_rope_fraction: float = 0.25
+    planet_rope_base: float = 10000.0
     encoder_backend: Literal["dense", "fleet_latent"] = "fleet_latent"
     num_fleet_latents: int = 64
     fleet_tokenizer_depth: int = 1
@@ -105,31 +107,23 @@ class OptimCfg:
 class PPOCfg:
     """PMPO + dreamer4-aligned distributional critic.
 
-    `gamma` defaults to 1.0 because Orbit Wars is finite-horizon (≤500 steps)
-    with terminal-only reward — no infinite-horizon variance issue, no
-    reason to decay the only signal we have. dreamer4 defaults to 0.997;
-    we deliberately diverge here because of the finite-horizon structure.
+    Dense potential rewards make the per-step signal informative, so use the
+    conventional PPO GAE setup: discounted returns with one fixed lambda for
+    both actor advantages and critic targets.
+    """
 
-    `lambda_critic = 1.0` makes the value target a Monte-Carlo return
-    (unbiased; the cold-start regime where bootstrapping hurts most). The
-    actor advantage always uses VAPO length-adaptive GAE:
-    `λ = 1 − 1/(α·l)` (VAPO §4.2)."""
-
-    gamma: float = 1.0
-    lambda_critic: float = 1.0
-    lambda_policy_alpha: float = 0.05
+    gamma: float = 0.997
+    gae_lambda: float = 0.95
     # PMPO surrogate replaces the clipped PPO surrogate (dreamer4
     # `dreamer4.py:4265-4296`). `tanh(adv).abs()` magnitude shaping plus a
     # pos/neg-advantage split with weight α gives a softer trust region
     # than ratio clipping. There is no `clip_eps` knob — the analytical
     # KL term below is the only trust-region signal.
     pmpo_pos_to_neg_weight: float = 0.5    # equal weight on pos and neg advantage (dreamer4 default)
-    pmpo_reverse_kl: bool = True            # dreamer4 default — KL(old ‖ new); False → forward KL(new ‖ old)
-    # Analytical reverse KL penalty `coef · KL(old ‖ new)` (dreamer4
-    # `pmpo_kl_div_loss_weight=0.3`). Bernoulli(launch) +
-    # P(launch)·(Categorical(target) + Beta(fraction)) closed-form per owned
-    # planet. Combined with bounded Beta concentration, this provides a
-    # structural-and-soft trust region without a hard clamp.
+    pmpo_reverse_kl: bool = True            # dreamer4 default direction. False is an ablation, not full joint forward KL.
+    # PMPO KL penalty. Launch uses full Bernoulli KL; target/fraction KL is
+    # weighted by the source launch probability, matching the analytical KL of
+    # the latent factored policy distribution.
     pmpo_kl_coef: float = 0.3
     # Distributional CE gradients are naturally bounded (per-bin
     # `softmax − target_probs` has ‖∇‖ ~ O(1)), unlike MSE which blew
@@ -163,14 +157,15 @@ class RolloutCfg:
     `num_envs` is the total rollout parallelism: each PPO update plays
     exactly this many episodes and batches policy forwards across all alive
     envs each step.
-    `numpy` uses the in-process fast rollout path. `numpy_mp` shards the same
-    fast path across CPU worker processes. `num_workers` is only used by
-    `numpy_mp`; the official Kaggle backend already runs one worker per env.
+    `rust` is the default fast training backend. `numpy` uses the in-process
+    Python/NumPy parity path. `numpy_mp` shards that path across CPU worker
+    processes. `num_workers` is only used by `numpy_mp`; the official Kaggle
+    backend already runs one worker per env.
     """
 
     num_envs: int = 128
     num_workers: int = 0  # 0 => backend default; set to physical cores for rollout-heavy runs
-    env_backend: str = "numpy_mp"  # "numpy", "numpy_mp", "rust", or "kaggle"
+    env_backend: str = "rust"  # "rust", "numpy", "numpy_mp", or "kaggle"
 
 
 @dataclass
@@ -193,23 +188,27 @@ class OpponentsCfg:
 
 @dataclass
 class RewardCfg:
-    """VAPO-style outcome reward by default: ±1 terminal, 0 mid-episode.
+    """Dense potential reward aligned with the terminal scoring rule.
 
-    Shaping fields default to 0 and exist only for ablation. The premise
-    is that GAE with γ=0.997 and λ=0.95 over a 500-step horizon will
-    bootstrap the value function back through the game from the terminal
-    sign alone — adding shaping injects non-stationary noise into
-    intermediate returns that fights the value head. If pure terminal
-    fails to learn we'll know from the rollout/win_rate scalar; turn the
-    shaping knobs on then."""
+    Per learner step, reward is:
 
-    win_value: float = 1.0
-    loss_value: float = -1.0
+        potential_weight * (Phi(s_next) - Phi(s))
+
+    where Phi is normalized projected population margin against the strongest
+    enemy. Population is current ships on owned planets plus ships in owned
+    fleets. Production is converted into projected future population by
+    `production_weight * turns_left`.
+
+    Terminal outcome fields default to zero because the dense potential
+    replaces the old ±1 terminal-only reward. They remain configurable for
+    ablations that want to mix outcome reward back in.
+    """
+
+    potential_weight: float = 1.0
+    production_weight: float = 1.0
+    win_value: float = 0.0
+    loss_value: float = 0.0
     draw_value: float = 0.0
-    # --- Shaping (default off; ablation only). ---
-    capture_bonus: float = 0.0
-    loss_penalty: float = 0.0
-    sun_loss_penalty: float = 0.0
     margin_scale: float = 0.0
 
 
@@ -224,7 +223,7 @@ class RunCfg:
     torch_num_threads: int = 8
     log_root: str = "runs"
     ckpt_root: str = "checkpoints"
-    total_updates: int = 200
+    total_updates: int = 1000
 
 
 @dataclass
@@ -249,8 +248,16 @@ class RunConfig:
                 if not hasattr(target, k):
                     raise KeyError(f"unknown {section}.{k}")
                 setattr(target, k, v)
-        if cfg.ppo.lambda_policy_alpha <= 0.0:
-            raise ValueError("ppo.lambda_policy_alpha must be positive")
+        if not 0.0 <= cfg.ppo.gae_lambda <= 1.0:
+            raise ValueError("ppo.gae_lambda must be in [0, 1]")
+        if not 0.0 < cfg.ppo.gamma <= 1.0:
+            raise ValueError("ppo.gamma must be in (0, 1]")
+        if not 0.0 <= cfg.model.planet_rope_fraction <= 1.0:
+            raise ValueError("model.planet_rope_fraction must be in [0, 1]")
+        if cfg.model.planet_rope_base <= 0.0:
+            raise ValueError("model.planet_rope_base must be positive")
+        if cfg.reward.production_weight < 0.0:
+            raise ValueError("reward.production_weight must be non-negative")
         return cfg
 
 

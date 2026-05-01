@@ -4,7 +4,7 @@ This file is **not** vanilla clipped PPO. It mirrors dreamer4's
 `learn_from_experience` pipeline (`dreamer4.py:4258–4548`) with the small
 adaptations the Orbit Wars action structure imposes:
 
-  1. **PMPO policy loss** (no PPO clip). On a per-action log-prob `lp`:
+  1. **PMPO policy loss** (no PPO clip). On a per-action-factor log-prob `lp`:
         scaled_lp = lp · |tanh(adv)|
      split by sign of `adv`:
         policy_loss = −α · mean(scaled_lp[adv ≥ 0])
@@ -13,19 +13,20 @@ adaptations the Orbit Wars action structure imposes:
      This is the principled replacement for the clipped surrogate when
      PMPO is on — running both at once double-counts the trust region.
 
-  2. **Reverse PMPO KL penalty** `λ · KL(old ‖ new)` (dreamer4
-     `pmpo_reverse_kl=True`, `dreamer4.py:4323-4324`):
+  2. **PMPO KL penalty**. `pmpo_reverse_kl=True` uses dreamer4's reverse-KL
+     direction for each modeled factor (`dreamer4.py:4323-4324`):
         Bernoulli launch: Σ p_old · (log p_old − log p_new)
-        Categorical target | launch: same, weighted by P(launch)
-        Beta fraction | launch: kl_divergence(old, new), weighted by P(launch)
-     The reverse direction punishes the *new* policy putting low mass
-     where the *old* policy put high mass — mass-covering w.r.t. old.
+        Categorical target | launch: same, weighted by source P(launch)
+        Beta fraction | launch: kl_divergence(old, new), weighted by source P(launch)
+     This is the analytical KL for the policy's latent factored action
+     distribution. The actor log-prob still uses the materialized action after
+     the legality layer, but the trust-region penalty follows dreamer4 and
+     regularizes the full distribution, not only sampled/executed branches.
 
-  3. **Decoupled GAE** stays — critic targets are λ_critic-weighted
-     returns (typically λ=1 → MC outcome) while the actor advantage uses
-     `λ_policy < 1`. Advantages are *not* z-score normalized — PMPO's
-     `tanh(adv).abs()` already bounds advantage magnitude (dreamer4
-     deliberately disables advantage normalization when `use_pmpo`).
+  3. **Conventional GAE** supplies both critic returns and actor advantages.
+     Advantages are *not* z-score normalized — PMPO's `tanh(adv).abs()` already
+     bounds advantage magnitude (dreamer4 deliberately disables advantage
+     normalization when `use_pmpo`).
 
   4. **Distributional value loss** (HL-Gauss CE, `dreamer4.py:4509-4515`).
      The critic emits `value_logits` over a fixed bin support; the loss
@@ -36,8 +37,8 @@ adaptations the Orbit Wars action structure imposes:
      σ (the re-encoded clipped scalar doesn't overlap with the return target,
      so clipped CE saturates at `−log(eps) ≈ 46` and dominates the loss).
 
-The cold-start fix — value pretraining with a frozen behavior policy —
-is in `train.py::pretrain_value`. This file is just the per-update math.
+Unlike dreamer4's world-model setup, this is a pure policy/value agent: policy
+gradients are allowed through the shared encoder.
 """
 
 from __future__ import annotations
@@ -139,6 +140,11 @@ def _weighted_max(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     masked = values.masked_fill(weights <= 0, float("-inf"))
     out = masked.max()
     return torch.where(torch.isfinite(out), out, values.sum() * 0.0)
+
+
+def _minibatch_loss_scale(row_weight: torch.Tensor) -> torch.Tensor:
+    """Scale padded-tail minibatch gradients by the fraction of real rows."""
+    return row_weight.sum().clamp_min(1.0) / max(1, row_weight.numel())
 
 
 def _safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
@@ -305,8 +311,11 @@ class _PPOMinibatchKernel(torch.nn.Module):
         ):
             out = self.model(feats)
 
-        launch_logits = out.launch_logits.float()
-        target_logits = _safe_target_logits(out.target_logits.float())
+        old_target_mask = torch.isfinite(old_target_logits)
+        has_legal_target = old_target_mask.any(dim=-1)
+        launch_logits = out.launch_logits.float().masked_fill(~has_legal_target, -20.0)
+        target_logits = out.target_logits.float().masked_fill(~old_target_mask, float("-inf"))
+        target_logits = _safe_target_logits(target_logits)
         fraction_alpha = out.fraction_alpha.float()
         fraction_beta = out.fraction_beta.float()
         value_logits = out.value_logits.float()
@@ -324,13 +333,20 @@ class _PPOMinibatchKernel(torch.nn.Module):
         frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
         chosen = launch_lp + launch_f * (target_lp + frac_lp)
 
+        factor_log_probs = torch.stack((launch_lp, target_lp, frac_lp), dim=-1)
+        factor_mask = torch.stack(
+            (torch.ones_like(launch_f), launch_f, launch_f),
+            dim=-1,
+        )
         adv_b = advantage.float().unsqueeze(-1).expand_as(chosen)
-        scaled_lp = chosen * adv_b.tanh().abs()
+        adv_f = advantage.float().unsqueeze(-1).unsqueeze(-1).expand_as(factor_log_probs)
+        scaled_lp = factor_log_probs * adv_f.tanh().abs()
         row_w = row_weight.to(device=owned_f.device, dtype=owned_f.dtype)
         row_w_b = row_w.unsqueeze(-1)
         owned_w = owned_f * row_w_b
-        pos_w = owned_w * (adv_b >= 0.0).to(owned_f.dtype)
-        neg_w = owned_w * (adv_b < 0.0).to(owned_f.dtype)
+        factor_w = owned_w.unsqueeze(-1) * factor_mask
+        pos_w = factor_w * (adv_f >= 0.0).to(owned_f.dtype)
+        neg_w = factor_w * (adv_f < 0.0).to(owned_f.dtype)
 
         pos_loss = _weighted_mean(scaled_lp, pos_w)
         neg_loss = _weighted_mean(scaled_lp, neg_w)
@@ -389,10 +405,9 @@ class _PPOMinibatchKernel(torch.nn.Module):
             old_launch_logits_f = old_launch_logits.float()
             old_alpha = old_fraction_alpha.float()
             old_beta = old_fraction_beta.float()
-
             if self.pmpo_reverse_kl:
                 launch_kl = _bernoulli_kl(old_launch_logits_f, launch_logits)
-                launch_weight = old_launch_logits_f.sigmoid()
+                conditional_kl_weight = old_launch_logits_f.sigmoid()
                 target_probs_old = old_target_log_probs.exp()
                 target_kl = (
                     target_probs_old * (log_p_old_safe - log_p_new_safe)
@@ -400,18 +415,18 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 frac_kl = _beta_kl(old_alpha, old_beta, fraction_alpha, fraction_beta)
             else:
                 launch_kl = _bernoulli_kl(launch_logits, old_launch_logits_f)
-                launch_weight = launch_logits.sigmoid()
+                conditional_kl_weight = launch_logits.sigmoid()
                 target_kl = (
                     target_dist_probs * (log_p_new_safe - log_p_old_safe)
                 ).sum(dim=-1)
                 frac_kl = _beta_kl(fraction_alpha, fraction_beta, old_alpha, old_beta)
-            planet_kl = launch_kl + launch_weight * (target_kl + frac_kl)
+            planet_kl = launch_kl + conditional_kl_weight * (target_kl + frac_kl)
             pmpo_kl = ((planet_kl * owned_w).sum() / denom).clamp_min(0.0)
             pmpo_target_kl = (
-                ((launch_weight * target_kl) * owned_w).sum() / denom
+                ((conditional_kl_weight * target_kl) * owned_w).sum() / denom
             ).clamp_min(0.0)
             pmpo_fraction_kl = (
-                ((launch_weight * frac_kl) * owned_w).sum() / denom
+                ((conditional_kl_weight * frac_kl) * owned_w).sum() / denom
             ).clamp_min(0.0)
 
         loss = (
@@ -422,7 +437,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         )
 
         kl = ((old_log_prob.float() - chosen) * owned_w).sum() / denom
-        pos_count = pos_w.sum()
+        pos_count = (owned_w * (adv_b >= 0.0).to(owned_f.dtype)).sum()
         total_owned = owned_w.sum().clamp_min(1.0)
         pos_frac = pos_count / total_owned
         metrics = torch.stack(
@@ -583,7 +598,7 @@ class PPOLog:
     value_loss: float
     entropy: float
     approx_kl: float       # importance-ratio diagnostic E[old_lp − new_lp]; PMPO does not use this for the loss
-    pmpo_kl: float         # analytical KL(old ‖ new) over the full distributions (the regularizer)
+    pmpo_kl: float         # launch KL plus probability-weighted conditional target/fraction KL
     pos_frac: float        # fraction of owned-planet samples whose advantage was ≥ 0
     target_entropy: float = 0.0
     fraction_entropy: float = 0.0
@@ -628,10 +643,6 @@ def compute_gae(
 
 def compute_mc_return(rewards: np.ndarray, gamma: float = 1.0) -> np.ndarray:
     """Plain Monte-Carlo discounted return Σ γ^k r_{t+k}.
-
-    With γ=1 and terminal-only ±1 reward this collapses to "every state
-    in this trajectory has target = the eventual game outcome", which is
-    exactly the value-pretraining target.
     """
     horizon = len(rewards)
     out = np.zeros(horizon, dtype=np.float32)
@@ -640,19 +651,6 @@ def compute_mc_return(rewards: np.ndarray, gamma: float = 1.0) -> np.ndarray:
         running = rewards[t] + gamma * running
         out[t] = running
     return out
-
-
-def length_adaptive_lambda(episode_length: int, alpha: float) -> float:
-    """λ = 1 − 1/(α l) (VAPO §4.2, eq. 5).
-
-    For α=0.05 (their value): l=100 → 0.80, l=200 → 0.90, l=500 → 0.96.
-    For Orbit Wars (l ~ 200–500) this lands close to a fixed 0.95 — the
-    knob matters more in regimes with high episode-length variance.
-    """
-    if alpha <= 0.0:
-        raise ValueError("lambda_policy_alpha must be positive for VAPO GAE")
-    denom = max(1.0, alpha * float(episode_length))
-    return max(0.0, min(0.999, 1.0 - 1.0 / denom))
 
 
 def ppo_update(
@@ -684,10 +682,13 @@ def ppo_update(
       `old_fraction_alpha` [B,P], `old_fraction_beta` [B,P].
 
     PMPO surrogate: `policy_loss = −α·mean(scaled[pos]) + (1−α)·mean(scaled[neg])`
-    where `scaled = chosen_log_prob · |tanh(advantage)|`. No PPO clip.
-    Trust region is purely the analytical reverse KL term
-    `pmpo_kl_coef · KL(old ‖ new)` (`pmpo_reverse_kl=True` matches
-    dreamer4 default; setting `False` flips to forward KL).
+    where `scaled = action_factor_log_prob · |tanh(advantage)|`. Launch is
+    always a factor; target/fraction are factors only for materialized launches.
+    No PPO clip.
+    Trust region is the PMPO KL term: full Bernoulli launch KL plus
+    probability-weighted conditional target/fraction KL. `pmpo_reverse_kl=True`
+    matches dreamer4's direction for each factor; setting `False` flips the
+    factor direction.
 
     Distributional value loss: cross-entropy against HL-Gauss-encoded
     returns (`value_encoder.target_probs(returns)`). No value clipping.
@@ -734,7 +735,7 @@ def ppo_update(
             )
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            (loss * _minibatch_loss_scale(row_weight)).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
@@ -784,11 +785,11 @@ def value_only_update(
 ) -> float:
     """Critic-only distributional CE update for the value-pretraining phase.
 
-    `batch["return"]` should be Monte-Carlo returns (γ=1 for terminal-only
-    reward → just the trajectory outcome). Run this for a few hundred
-    steps against a frozen behavior policy before turning on PPO. Mirrors
-    the same HL-Gauss CE loss `ppo_update` uses, so the cold-start critic
-    sees the same target distribution it'll be trained against later.
+    `batch["return"]` should be Monte-Carlo returns from the configured reward.
+    Run this for a few hundred steps against a frozen behavior policy before
+    turning on PPO. Mirrors the same HL-Gauss CE loss `ppo_update` uses, so the
+    cold-start critic sees the same target distribution it'll train against
+    later.
 
     Reports mean value loss over the pass.
     """
@@ -813,7 +814,7 @@ def value_only_update(
             )
 
             optimizer.zero_grad(set_to_none=True)
-            value_loss.backward()
+            (value_loss * _minibatch_loss_scale(row_weight)).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
