@@ -32,10 +32,10 @@ class RunChoice:
     path: Path | None
 
 
-def _latest_run(runs_root: Path) -> RunChoice:
+def _latest_run(runs_root: Path, ckpt_root: Path) -> RunChoice:
     event_files = list(runs_root.glob("*/*/events.out.tfevents.*"))
     if not event_files:
-        return _latest_checkpoint_run(Path("checkpoints"))
+        return _latest_checkpoint_run(ckpt_root)
     newest = max(event_files, key=lambda p: p.stat().st_mtime)
     run_dir = newest.parent
     return RunChoice(name=run_dir.parent.name, path=run_dir)
@@ -141,7 +141,7 @@ def main() -> None:
     run = (
         RunChoice(name=args.run, path=None)
         if args.run is not None
-        else _latest_run(args.runs_root)
+        else _latest_run(args.runs_root, args.ckpt_root)
     )
     ckpt = args.ckpt or _latest_checkpoint(args.ckpt_root, run.name)
     opponent_ckpt = args.opponent_ckpt or ckpt
