@@ -8,9 +8,11 @@ import pytest
 
 from owars.game.types import CENTER
 from owars.policies.sampling import (
+    LeadSolution,
     _continuous_lead_solution_from_point,
     _lead_angle,
     _lead_solution,
+    _route_clear_to_solution,
     _safe_flight_segment,
 )
 
@@ -227,4 +229,57 @@ def test_safety_filter_checks_future_intercept_segment_not_current_target():
     )
     assert not _safe_flight_segment(
         sx, sy, source_radius, solution.angle, solution.x, solution.y
+    )
+
+
+def test_route_filter_checks_orbiting_source_sweep():
+    source_x, source_y, source_radius = 80.0, 50.0, 1.0
+    omega = 0.05
+    solution = LeadSolution(angle=math.pi / 2.0, time=20.0, x=80.0, y=90.0)
+    blockers = [
+        (
+            0,
+            source_x,
+            source_y,
+            source_radius,
+            30.0,
+            0.0,
+        )
+    ]
+
+    assert not _route_clear_to_solution(
+        0,
+        1,
+        source_x,
+        source_y,
+        source_radius,
+        solution,
+        1,
+        blockers,
+        omega,
+    )
+
+
+def test_route_filter_checks_full_turn_sun_collision_after_intercept_point():
+    source_x, source_y, source_radius = 39.0, 50.0, 0.0
+    solution = LeadSolution(angle=0.0, time=1.0, x=40.0, y=50.0)
+
+    assert _safe_flight_segment(
+        source_x,
+        source_y,
+        source_radius,
+        solution.angle,
+        solution.x,
+        solution.y,
+    )
+    assert not _route_clear_to_solution(
+        0,
+        1,
+        source_x,
+        source_y,
+        source_radius,
+        solution,
+        1000,
+        [],
+        0.0,
     )

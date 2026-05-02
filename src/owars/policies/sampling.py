@@ -193,6 +193,129 @@ def _safe_flight_segment(
     return not _segment_crosses_sun(start_x, start_y, end_x, end_y)
 
 
+def _route_blocker_orbit_state(
+    x: float,
+    y: float,
+    radius: float,
+    angular_velocity: float,
+    *,
+    is_comet: bool,
+) -> tuple[float, float]:
+    if is_comet or abs(angular_velocity) <= 1e-12:
+        return 0.0, 0.0
+    orbit_radius = math.hypot(x - CENTER[0], y - CENTER[1])
+    if orbit_radius + radius >= ROTATION_RADIUS_LIMIT or orbit_radius <= 1e-9:
+        return 0.0, 0.0
+    return orbit_radius, math.atan2(y - CENTER[1], x - CENTER[0])
+
+
+def _route_blocker_position(
+    x: float,
+    y: float,
+    orbit_radius: float,
+    orbit_theta0: float,
+    angular_velocity: float,
+    steps: int,
+) -> tuple[float, float]:
+    if orbit_radius <= 0.0 or steps == 0:
+        return x, y
+    theta = orbit_theta0 + angular_velocity * steps
+    return (
+        CENTER[0] + orbit_radius * math.cos(theta),
+        CENTER[1] + orbit_radius * math.sin(theta),
+    )
+
+
+def _route_clear_to_solution(
+    source_id: int,
+    target_id: int,
+    source_x: float,
+    source_y: float,
+    source_radius: float,
+    solution: LeadSolution,
+    send: int,
+    blockers: Sequence[tuple[int, float, float, float, float, float]],
+    angular_velocity: float,
+) -> bool:
+    speed = fleet_speed(send)
+    if speed <= 0.0:
+        return False
+    start_x, start_y = _launch_start(source_x, source_y, source_radius, solution.angle)
+    direction_x = math.cos(solution.angle)
+    direction_y = math.sin(solution.angle)
+    final_turn = max(1, int(math.ceil(solution.time)))
+    final_x = start_x + direction_x * speed * final_turn
+    final_y = start_y + direction_y * speed * final_turn
+    if not _is_inside_board(start_x, start_y) or not _is_inside_board(final_x, final_y):
+        return False
+    if _segment_crosses_sun(start_x, start_y, final_x, final_y):
+        return False
+
+    moving: list[tuple[int, float, float, float, float, float]] = []
+    for blocker in blockers:
+        blocker_id, x, y, radius, orbit_radius, _orbit_theta0 = blocker
+        if blocker_id == target_id:
+            continue
+        if blocker_id == source_id:
+            if orbit_radius > 0.0:
+                moving.append(blocker)
+            continue
+        if orbit_radius > 0.0:
+            moving.append(blocker)
+            continue
+        if _point_to_segment_distance(x, y, start_x, start_y, final_x, final_y) < radius:
+            return False
+    if not moving:
+        return True
+
+    for turn in range(1, final_turn + 1):
+        old_x = start_x + direction_x * speed * (turn - 1)
+        old_y = start_y + direction_y * speed * (turn - 1)
+        new_x = start_x + direction_x * speed * turn
+        new_y = start_y + direction_y * speed * turn
+        for blocker_id, x, y, radius, orbit_radius, orbit_theta0 in moving:
+            bx, by = _route_blocker_position(
+                x, y, orbit_radius, orbit_theta0, angular_velocity, turn - 1
+            )
+            if blocker_id != source_id and (
+                _point_to_segment_distance(bx, by, old_x, old_y, new_x, new_y) < radius
+            ):
+                return False
+            if turn < final_turn:
+                nbx, nby = _route_blocker_position(
+                    x, y, orbit_radius, orbit_theta0, angular_velocity, turn
+                )
+                if _point_to_segment_distance(new_x, new_y, bx, by, nbx, nby) < radius:
+                    return False
+    return True
+
+
+def _route_blockers_from_rows(
+    planets: Any,
+    angular_velocity: float,
+    comet_planet_ids: Any,
+) -> list[tuple[int, float, float, float, float, float]]:
+    comet_ids = {int(pid) for pid in comet_planet_ids}
+    blockers = []
+    for planet in planets:
+        pid = _planet_id(planet)
+        x = _planet_x(planet)
+        y = _planet_y(planet)
+        radius = _planet_radius(planet)
+        blockers.append(
+            (
+                pid,
+                x,
+                y,
+                radius,
+                *_route_blocker_orbit_state(
+                    x, y, radius, angular_velocity, is_comet=pid in comet_ids
+                ),
+            )
+        )
+    return blockers
+
+
 def _lead_solution_from_point(
     mine_x: float,
     mine_y: float,
@@ -464,6 +587,22 @@ def _build_moves_from_lists(
     by_id = {pl.id: pl for pl in o.planets}
     remaining_by_id = {pl.id: int(pl.ships) for pl in o.planets}
     omega = o.angular_velocity
+    blockers = [
+        (
+            int(pl.id),
+            float(pl.x),
+            float(pl.y),
+            float(pl.radius),
+            *_route_blocker_orbit_state(
+                float(pl.x),
+                float(pl.y),
+                float(pl.radius),
+                omega,
+                is_comet=int(pl.id) in o.comet_planet_ids,
+            ),
+        )
+        for pl in o.planets
+    ]
     p = len(target_idx_l)
     for i in range(p):
         if not (owned_l[i] and pmask_l[i]):
@@ -501,8 +640,16 @@ def _build_moves_from_lists(
         )
         if solution is None:
             continue  # solver couldn't find a feasible intercept — silently no-op
-        if not _safe_flight_segment(
-            mine.x, mine.y, mine.radius, solution.angle, solution.x, solution.y
+        if not _route_clear_to_solution(
+            mine.id,
+            target.id,
+            mine.x,
+            mine.y,
+            mine.radius,
+            solution,
+            send,
+            blockers,
+            omega,
         ):
             continue
         moves.append(Move(mine.id, solution.angle, send))
@@ -583,6 +730,7 @@ def _target_legal_mask_from_planets(
     planet_fields = _planet_field_map(planets)
     comet_ids = {int(pid) for pid in comet_planet_ids}
     omega = float(angular_velocity)
+    blockers = _route_blockers_from_rows(planets, omega, comet_ids)
     target_fields = [
         (j, planet_fields[target_id])
         for j, target_id in enumerate(int(v) for v in ids_l)
@@ -620,13 +768,16 @@ def _target_legal_mask_from_planets(
             )
             if solution is None:
                 continue
-            if not _safe_flight_segment(
+            if not _route_clear_to_solution(
+                int(ids_l[i]),
+                int(ids_l[j]),
                 source_x,
                 source_y,
                 source_radius,
-                solution.angle,
-                solution.x,
-                solution.y,
+                solution,
+                send,
+                blockers,
+                omega,
             ):
                 continue
             mask[i][j] = True
@@ -646,6 +797,7 @@ def _target_legal_mask_from_packed_legality_fields(
     omega = float(angular_velocity)
     ids = [int(fields_l[j][4]) for j in range(p)]
     present = [float(fields_l[j][3]) >= 0.5 for j in range(p)]
+    blockers = _route_blockers_from_rows(planets, omega, comet_ids)
     target_fields = [
         (j, planet_fields[target_id])
         for j, target_id in enumerate(ids)
@@ -654,84 +806,6 @@ def _target_legal_mask_from_packed_legality_fields(
         and target_id not in comet_ids
         and target_id in planet_fields
     ]
-
-    if target_fields:
-        x = np.full(p, np.nan, dtype=np.float64)
-        y = np.full(p, np.nan, dtype=np.float64)
-        radius = np.zeros(p, dtype=np.float64)
-        ships = np.zeros(p, dtype=np.int32)
-        known = np.zeros(p, dtype=bool)
-        for idx, planet_id in enumerate(ids):
-            fields = planet_fields.get(planet_id)
-            if fields is None:
-                continue
-            x[idx], y[idx], radius[idx], ships[idx] = fields
-            known[idx] = True
-
-        source = (
-            (np.asarray(fields_l[:, 2], dtype=np.float64) >= 0.5)
-            & np.asarray(present, dtype=bool)
-            & known
-            & (ships >= 2)
-        )
-        static_target = np.asarray(present, dtype=bool) & known
-        if comet_ids:
-            static_target &= np.asarray([planet_id not in comet_ids for planet_id in ids], dtype=bool)
-        static_target &= np.asarray(ids, dtype=np.int64) >= 0
-        orbit_radius = np.hypot(x - CENTER[0], y - CENTER[1])
-        is_orbiting = (
-            (orbit_radius + radius < ROTATION_RADIUS_LIMIT)
-            & (abs(omega) > 1e-12)
-            & (orbit_radius > 1e-9)
-        )
-        static_target &= ~is_orbiting
-        source_idx = np.flatnonzero(source)
-        target_idx = np.flatnonzero(static_target)
-        if source_idx.size and target_idx.size:
-            frac = np.clip(np.asarray(fields_l[source_idx, 1], dtype=np.float64), 0.0, 1.0)
-            remaining = ships[source_idx].astype(np.float64)
-            send = np.rint(remaining * frac).astype(np.int32)
-            send = np.maximum(1, np.minimum(ships[source_idx] - 1, send))
-            speed = np.ones(send.shape, dtype=np.float64)
-            fast = send > 1
-            speed[fast] = 1.0 + 5.0 * (
-                np.log(send[fast].astype(np.float64)) / math.log(1000.0)
-            ) ** 1.5
-
-            dx = x[target_idx][None, :] - x[source_idx][:, None]
-            dy = y[target_idx][None, :] - y[source_idx][:, None]
-            distance = np.hypot(dx, dy)
-            pair_ok = distance / speed[:, None] <= LEAD_T_HORIZON_STEPS
-            pair_ok &= source_idx[:, None] != target_idx[None, :]
-
-            angle = np.arctan2(dy, dx)
-            offset = np.maximum(0.0, radius[source_idx] + 0.1)
-            start_x = x[source_idx][:, None] + np.cos(angle) * offset[:, None]
-            start_y = y[source_idx][:, None] + np.sin(angle) * offset[:, None]
-            end_x = x[target_idx][None, :]
-            end_y = y[target_idx][None, :]
-            pair_ok &= (
-                (start_x >= 0.0)
-                & (start_x <= BOARD_SIZE)
-                & (start_y >= 0.0)
-                & (start_y <= BOARD_SIZE)
-                & (end_x >= 0.0)
-                & (end_x <= BOARD_SIZE)
-                & (end_y >= 0.0)
-                & (end_y <= BOARD_SIZE)
-            )
-
-            seg_x = end_x - start_x
-            seg_y = end_y - start_y
-            denom = seg_x * seg_x + seg_y * seg_y
-            projection = ((CENTER[0] - start_x) * seg_x + (CENTER[1] - start_y) * seg_y)
-            t = np.divide(projection, denom, out=np.zeros_like(projection), where=denom > 0.0)
-            t = np.clip(t, 0.0, 1.0)
-            qx = start_x + t * seg_x
-            qy = start_y + t * seg_y
-            sun_distance = np.hypot(CENTER[0] - qx, CENTER[1] - qy)
-            pair_ok &= sun_distance >= SUN_RADIUS
-            mask[np.ix_(source_idx, target_idx)] = pair_ok
 
     for i in range(p):
         fields = fields_l[i]
@@ -750,13 +824,6 @@ def _target_legal_mask_from_packed_legality_fields(
         for j, target in target_fields:
             if j == i:
                 continue
-            target_orbit_radius = math.hypot(target[0] - CENTER[0], target[1] - CENTER[1])
-            if not (
-                target_orbit_radius + target[2] < ROTATION_RADIUS_LIMIT
-                and abs(omega) > 1e-12
-                and target_orbit_radius > 1e-9
-            ):
-                continue
             target_x, target_y, target_radius, _target_ships = target
             solution = _lead_solution(
                 source_x,
@@ -770,13 +837,16 @@ def _target_legal_mask_from_packed_legality_fields(
             )
             if solution is None:
                 continue
-            if not _safe_flight_segment(
+            if not _route_clear_to_solution(
+                ids[i],
+                ids[j],
                 source_x,
                 source_y,
                 source_radius,
-                solution.angle,
-                solution.x,
-                solution.y,
+                solution,
+                send,
+                blockers,
+                omega,
             ):
                 continue
             mask[i, j] = True
@@ -915,6 +985,22 @@ def _build_moves_from_packed_fields_with_mask(
     by_id = {pl.id: pl for pl in o.planets}
     remaining_by_id = {pl.id: int(pl.ships) for pl in o.planets}
     omega = o.angular_velocity
+    blockers = [
+        (
+            int(pl.id),
+            float(pl.x),
+            float(pl.y),
+            float(pl.radius),
+            *_route_blocker_orbit_state(
+                float(pl.x),
+                float(pl.y),
+                float(pl.radius),
+                omega,
+                is_comet=int(pl.id) in o.comet_planet_ids,
+            ),
+        )
+        for pl in o.planets
+    ]
     p = len(fields_l)
     for i in _candidate_action_indices(fields_l):
         i = int(i)
@@ -950,8 +1036,16 @@ def _build_moves_from_packed_fields_with_mask(
         )
         if solution is None:
             continue
-        if not _safe_flight_segment(
-            mine.x, mine.y, mine.radius, solution.angle, solution.x, solution.y
+        if not _route_clear_to_solution(
+            mine.id,
+            target.id,
+            mine.x,
+            mine.y,
+            mine.radius,
+            solution,
+            send,
+            blockers,
+            omega,
         ):
             continue
         moves.append(Move(mine.id, solution.angle, send))
@@ -982,6 +1076,7 @@ def _build_action_lists_from_packed_fields_raw_with_mask(
         (obs.get("angular_velocity", 0.0) if isinstance(obs, dict) else getattr(obs, "angular_velocity", 0.0))
         or 0.0
     )
+    blockers = _route_blockers_from_rows(planets, omega, comet_planet_ids)
     actions: list[list] = []
     materialized = [False] * len(fields_l)
     p = len(fields_l)
@@ -1019,13 +1114,16 @@ def _build_action_lists_from_packed_fields_raw_with_mask(
         )
         if solution is None:
             continue
-        if not _safe_flight_segment(
+        if not _route_clear_to_solution(
+            int(mine[0]),
+            int(target_id),
             float(mine[2]),
             float(mine[3]),
             float(mine[4]),
-            solution.angle,
-            solution.x,
-            solution.y,
+            solution,
+            send,
+            blockers,
+            omega,
         ):
             continue
         actions.append(
@@ -1045,6 +1143,100 @@ def _build_action_lists_from_packed_fields_raw_with_mask(
     return actions, materialized
 
 
+def _build_deterministic_action_lists_from_logits_raw(
+    legality_fields_l: Any,
+    target_logits_l: Any,
+    obs: Any,
+) -> list[list]:
+    planets = obs.get("planets", []) if isinstance(obs, dict) else getattr(obs, "planets", [])
+    by_id = {int(p[0]): p for p in planets}
+    remaining_by_id = {int(p[0]): int(p[5]) for p in planets}
+    comet_planet_ids = set(
+        obs.get("comet_planet_ids", []) if isinstance(obs, dict) else getattr(obs, "comet_planet_ids", [])
+    )
+    omega = float(
+        (obs.get("angular_velocity", 0.0) if isinstance(obs, dict) else getattr(obs, "angular_velocity", 0.0))
+        or 0.0
+    )
+    blockers = _route_blockers_from_rows(planets, omega, comet_planet_ids)
+    ids = [int(fields[4]) for fields in legality_fields_l]
+    present = [float(fields[3]) >= 0.5 for fields in legality_fields_l]
+    actions: list[list] = []
+    p = len(legality_fields_l)
+    for i, fields in enumerate(legality_fields_l):
+        if not (
+            float(fields[0]) >= 0.5
+            and float(fields[2]) >= 0.5
+            and present[i]
+            and ids[i] >= 0
+        ):
+            continue
+        mine = by_id.get(ids[i])
+        if mine is None:
+            continue
+        mine_ships = remaining_by_id.get(int(mine[0]), int(mine[5]))
+        if mine_ships < 2:
+            continue
+
+        frac = max(0.0, min(1.0, float(fields[1])))
+        send = max(1, min(mine_ships - 1, int(round(mine_ships * frac))))
+        if send <= 0:
+            continue
+
+        for ti in np.argsort(-target_logits_l[i], kind="stable"):
+            ti = int(ti)
+            if ti == i or ti < 0 or ti >= p or not present[ti]:
+                continue
+            if not np.isfinite(target_logits_l[i][ti]):
+                continue
+            target_id = ids[ti]
+            if target_id < 0 or target_id in comet_planet_ids:
+                continue
+            target = by_id.get(target_id)
+            if target is None:
+                continue
+
+            solution = _lead_solution(
+                float(mine[2]),
+                float(mine[3]),
+                float(mine[4]),
+                float(target[2]),
+                float(target[3]),
+                float(target[4]),
+                omega,
+                send,
+            )
+            if solution is None:
+                continue
+            if not _route_clear_to_solution(
+                int(mine[0]),
+                int(target_id),
+                float(mine[2]),
+                float(mine[3]),
+                float(mine[4]),
+                solution,
+                send,
+                blockers,
+                omega,
+            ):
+                continue
+            actions.append(
+                [
+                    int(mine[0]),
+                    float(solution.angle),
+                    int(send),
+                    int(target_id),
+                    float(solution.time),
+                    float(solution.x),
+                    float(solution.y),
+                ]
+            )
+            remaining_by_id[int(mine[0])] = mine_ships - send
+            break
+
+    return actions
+
+
 def _build_action_lists_from_packed_fields_context(
     fields_l: list[list[float]],
     context: ActionContext,
@@ -1060,6 +1252,7 @@ def _build_action_lists_from_packed_fields_context_with_mask(
     remaining_by_id = {int(p[0]): int(p[5]) for p in context.planets}
     comet_planet_ids = set(context.comet_planet_ids)
     omega = float(context.angular_velocity)
+    blockers = _route_blockers_from_rows(context.planets, omega, comet_planet_ids)
     actions: list[list] = []
     materialized = [False] * len(fields_l)
     p = len(fields_l)
@@ -1097,13 +1290,16 @@ def _build_action_lists_from_packed_fields_context_with_mask(
         )
         if solution is None:
             continue
-        if not _safe_flight_segment(
+        if not _route_clear_to_solution(
+            int(mine[0]),
+            int(target_id),
             float(mine[2]),
             float(mine[3]),
             float(mine[4]),
-            solution.angle,
-            solution.x,
-            solution.y,
+            solution,
+            send,
+            blockers,
+            omega,
         ):
             continue
         actions.append(
@@ -1726,6 +1922,16 @@ def sample_batch_actions_raw(
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
     )
+    if deterministic:
+        target_logits_l = target_logits.detach().float().cpu().numpy()
+        return [
+            _build_deterministic_action_lists_from_logits_raw(
+                legality_fields_l[k],
+                target_logits_l[k],
+                raw_observations[k],
+            )
+            for k in range(b_dim)
+        ]
     target_legal_mask_l = [
         _target_legal_mask_from_packed_legality_fields(
             legality_fields_l[k],

@@ -55,6 +55,27 @@ def _sun_crossing_only_obs():
     return obs
 
 
+def _blocked_los_obs(*, fallback: bool = True):
+    planets = [
+        [0, 0, 10.0, 10.0, 1.0, 50, 3],
+        [1, 1, 90.0, 10.0, 1.0, 30, 2],
+        [2, -1, 50.0, 5.0, 6.0, 10, 1],
+    ]
+    if fallback:
+        planets.append([3, -1, 10.0, 90.0, 1.0, 10, 1])
+    return {
+        "player": 0,
+        "step": 0,
+        "planets": planets,
+        "fleets": [],
+        "angular_velocity": 0.04,
+        "initial_planets": [row.copy() for row in planets],
+        "comet_planet_ids": [] if fallback else [2],
+        "comets": [],
+        "remainingOverageTime": 60.0,
+    }
+
+
 def _model() -> OrbitPolicy:
     return OrbitPolicy(OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2))
 
@@ -82,6 +103,40 @@ def _forced_move_output(feats) -> PolicyOutput:
         target_logits = target_logits[:1]
         fraction_alpha = fraction_alpha[:1]
         fraction_beta = fraction_beta[:1]
+        planet_owned_mask = feats.planet_owned_mask.unsqueeze(0)
+        planet_mask = feats.planet_mask.unsqueeze(0)
+        planet_ids = feats.planet_ids.unsqueeze(0)
+    else:
+        planet_owned_mask = feats.planet_owned_mask
+        planet_mask = feats.planet_mask
+        planet_ids = feats.planet_ids
+    return PolicyOutput(
+        launch_logits=launch_logits,
+        target_logits=target_logits,
+        fraction_alpha=fraction_alpha,
+        fraction_beta=fraction_beta,
+        value=torch.zeros(b),
+        value_logits=torch.zeros(b, 51),
+        planet_owned_mask=planet_owned_mask,
+        planet_mask=planet_mask,
+        planet_ids=planet_ids,
+    )
+
+
+def _forced_source_output(feats, target_scores: dict[int, float]) -> PolicyOutput:
+    batched = feats.planet_ids.dim() == 2
+    b = int(feats.planet_ids.shape[0]) if batched else 1
+    p = int(feats.planet_ids.shape[-1])
+    launch_logits = torch.full((b, p), -100.0)
+    launch_logits[:, 0] = 100.0
+    target_logits = torch.full((b, p, p), -100.0)
+    for target, score in target_scores.items():
+        target_logits[:, 0, target] = score
+    fraction_alpha = torch.full((b, p), 1.69)
+    fraction_alpha[:, 0] = 20.0
+    fraction_beta = torch.full((b, p), 1.69)
+    fraction_beta[:, 0] = 1.0
+    if not batched:
         planet_owned_mask = feats.planet_owned_mask.unsqueeze(0)
         planet_mask = feats.planet_mask.unsqueeze(0)
         planet_ids = feats.planet_ids.unsqueeze(0)
@@ -286,7 +341,9 @@ def test_batched_moves_only_sampler_matches_record_path_under_fixed_seed():
 
 
 def test_sampler_caps_duplicate_source_actions_to_remaining_garrison():
-    o = parse_observation(_obs())
+    obs = _obs()
+    obs["angular_velocity"] = 0.0
+    o = parse_observation(obs)
     actions = sample_batch_actions(_duplicate_source_output(), [o])[0]
 
     _assert_duplicate_source_actions_do_not_overlaunch([m.as_list() for m in actions])
@@ -294,6 +351,7 @@ def test_sampler_caps_duplicate_source_actions_to_remaining_garrison():
 
 def test_raw_and_context_samplers_cap_duplicate_source_actions():
     obs = _obs()
+    obs["angular_velocity"] = 0.0
     out = _duplicate_source_output()
     raw_actions = sample_batch_actions_raw(out, [obs])[0]
     context_actions = sample_batch_actions_context(
@@ -315,15 +373,69 @@ def test_sampler_masks_sun_crossing_target_to_legal_alternative():
     raw_actions, raw_records = sample_batch_with_records_raw(
         out, [obs], deterministic=True
     )
+    fast_raw_actions = sample_batch_actions_raw(out, [obs], deterministic=True)
 
     assert sample_actions(out, o, deterministic=True)
-    assert sample_batch_actions_raw(out, [obs], deterministic=True)
+    assert fast_raw_actions
     assert moves
     assert raw_actions[0]
+    assert fast_raw_actions[0][0][3] == 2
     assert record.launch[0].item() == 1.0
     assert raw_records[0].launch[0].item() == 1.0
     assert record.target_idx[0].item() == 2
     assert raw_records[0].target_idx[0].item() == 2
+
+
+def test_sampler_masks_planet_blocked_target_to_legal_alternative():
+    obs = _blocked_los_obs(fallback=True)
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_source_output(feats, {1: 100.0, 3: 90.0})
+    context = ActionContext(
+        planets=obs["planets"],
+        angular_velocity=obs["angular_velocity"],
+        comet_planet_ids=obs.get("comet_planet_ids", ()),
+    )
+
+    moves, record = sample_with_record(out, o, deterministic=True)
+    raw_actions, raw_records = sample_batch_with_records_raw(
+        out, [obs], deterministic=True
+    )
+    fast_raw_actions = sample_batch_actions_raw(out, [obs], deterministic=True)
+    context_actions, context_records = sample_batch_with_records_context(
+        out, [context], deterministic=True
+    )
+
+    assert moves
+    assert raw_actions[0]
+    assert fast_raw_actions[0]
+    assert context_actions[0]
+    assert fast_raw_actions[0][0][3] == 3
+    assert record.target_idx[0].item() == 3
+    assert raw_records[0].target_idx[0].item() == 3
+    assert context_records[0].target_idx[0].item() == 3
+    assert not record.target_legal_mask[0, 1]
+    assert record.target_legal_mask[0, 3]
+
+
+def test_sampler_records_noop_when_only_target_is_planet_blocked():
+    obs = _blocked_los_obs(fallback=False)
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_source_output(feats, {1: 100.0})
+
+    moves, record = sample_with_record(out, o, deterministic=True)
+    raw_actions, raw_records = sample_batch_with_records_raw(
+        out, [obs], deterministic=True
+    )
+    fast_raw_actions = sample_batch_actions_raw(out, [obs], deterministic=True)
+
+    assert moves == []
+    assert raw_actions == [[]]
+    assert fast_raw_actions == [[]]
+    assert record.launch[0].item() == 0.0
+    assert raw_records[0].launch[0].item() == 0.0
+    assert not record.target_legal_mask[0, 1]
 
 
 def test_sampler_records_noop_when_no_legal_target_exists():
@@ -336,8 +448,10 @@ def test_sampler_records_noop_when_no_legal_target_exists():
     raw_actions, raw_records = sample_batch_with_records_raw(
         out, [obs], deterministic=True
     )
+    fast_raw_actions = sample_batch_actions_raw(out, [obs], deterministic=True)
     assert moves == []
     assert raw_actions == [[]]
+    assert fast_raw_actions == [[]]
     assert record.launch[0].item() == 0.0
     assert raw_records[0].launch[0].item() == 0.0
     assert not record.target_legal_mask[0].any()

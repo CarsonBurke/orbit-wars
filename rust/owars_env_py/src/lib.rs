@@ -31,6 +31,7 @@ struct LeadSolution {
 }
 
 struct TargetMotion {
+    id: i32,
     x: f64,
     y: f64,
     radius: f64,
@@ -40,9 +41,8 @@ struct TargetMotion {
 
 struct LegalMaskState {
     planet_limit: usize,
-    target_motions: Vec<TargetMotion>,
-    static_legal: Vec<bool>,
-    orbiting_targets: Vec<usize>,
+    target_motions: Vec<Option<TargetMotion>>,
+    target_cols: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -787,16 +787,24 @@ fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
     FIds: Fn(usize) -> i32,
 {
     let planets_by_col = planets_by_col(game, planets_len, &id_at, &mask_at);
-    let target_motions = planets_by_col
-        .iter()
-        .map(|planet| {
-            planet.map(|target| target_motion(&target, game.angular_velocity, game.ship_speed))
-        })
-        .collect::<Vec<_>>();
     let is_comet_col = (0..planets_len)
         .map(|col| {
             let target_id = id_at(col);
             target_id >= 0 && is_comet_planet(game, target_id)
+        })
+        .collect::<Vec<_>>();
+    let target_motions = planets_by_col
+        .iter()
+        .enumerate()
+        .map(|(col, planet)| {
+            planet.map(|target| {
+                target_motion(
+                    &target,
+                    game.angular_velocity,
+                    game.ship_speed,
+                    is_comet_col[col],
+                )
+            })
         })
         .collect::<Vec<_>>();
     for i in 0..planets_len {
@@ -813,6 +821,10 @@ fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
         if send <= 0 {
             continue;
         }
+        let speed = fleet_speed_local(send, game.ship_speed);
+        if speed <= 0.0 {
+            continue;
+        }
         for j in 0..planets_len {
             if i == j || !mask_at(j) {
                 continue;
@@ -823,17 +835,18 @@ fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
             let Some(target) = target_motions[j].as_ref() else {
                 continue;
             };
-            let Some(solution) = lead_solution_cached(&source, target, send, game.ship_speed)
-            else {
+            let Some(solution) = lead_solution_cached_with_speed(&source, target, speed) else {
                 continue;
             };
-            if !safe_flight_segment(
+            if !route_clear_to_solution(
+                source.id,
+                target.id,
                 source.x,
                 source.y,
                 source.radius,
-                solution.angle,
-                solution.x,
-                solution.y,
+                &solution,
+                speed,
+                &target_motions,
             ) {
                 continue;
             }
@@ -868,25 +881,28 @@ fn fill_legal_mask_row_from_state<FFrac>(
             continue;
         }
         let src_offset = i * planets_len;
-        for j in 0..planet_limit {
-            out[src_offset + j] = state.static_legal[src_offset + j];
-        }
-        for &j in &state.orbiting_targets {
+        for &j in &state.target_cols {
             if i == j {
                 continue;
             }
-            let Some(solution) =
-                lead_solution_cached_with_speed(&source, &state.target_motions[j], speed)
-            else {
+            let Some(solution) = lead_solution_cached_with_speed(
+                &source,
+                state.target_motions[j]
+                    .as_ref()
+                    .expect("target column is present"),
+                speed,
+            ) else {
                 continue;
             };
-            if !safe_flight_segment(
+            if !route_clear_to_solution(
+                source.id,
+                game.planets[j].id,
                 source.x,
                 source.y,
                 source.radius,
-                solution.angle,
-                solution.x,
-                solution.y,
+                &solution,
+                speed,
+                &state.target_motions,
             ) {
                 continue;
             }
@@ -897,42 +913,33 @@ fn fill_legal_mask_row_from_state<FFrac>(
 
 fn legal_mask_state(game: &Game, planets_len: usize) -> LegalMaskState {
     let planet_limit = planets_len.min(game.planets.len());
-    let target_motions = game
-        .planets
-        .iter()
-        .take(planet_limit)
-        .map(|target| target_motion(target, game.angular_velocity, game.ship_speed))
-        .collect::<Vec<_>>();
     let is_comet_col = game
         .planets
         .iter()
         .take(planet_limit)
         .map(|target| is_comet_planet(game, target.id))
         .collect::<Vec<_>>();
-    let orbiting_targets = target_motions
+    let target_motions = game
+        .planets
         .iter()
+        .take(planet_limit)
         .enumerate()
-        .filter_map(|(idx, target)| (target.is_orbiting && !is_comet_col[idx]).then_some(idx))
+        .map(|(idx, target)| {
+            Some(target_motion(
+                target,
+                game.angular_velocity,
+                game.ship_speed,
+                is_comet_col[idx],
+            ))
+        })
         .collect::<Vec<_>>();
-    let mut static_legal = vec![false; planets_len * planets_len];
-    for (i, source) in game.planets.iter().take(planet_limit).copied().enumerate() {
-        let src_offset = i * planets_len;
-        for j in 0..planet_limit {
-            if i == j || is_comet_col[j] || target_motions[j].is_orbiting {
-                continue;
-            }
-            let target = &target_motions[j];
-            let angle = (target.y - source.y).atan2(target.x - source.x);
-            if safe_flight_segment(source.x, source.y, source.radius, angle, target.x, target.y) {
-                static_legal[src_offset + j] = true;
-            }
-        }
-    }
+    let target_cols = (0..planet_limit)
+        .filter(|&idx| !is_comet_col[idx])
+        .collect::<Vec<_>>();
     LegalMaskState {
         planet_limit,
         target_motions,
-        static_legal,
-        orbiting_targets,
+        target_cols,
     }
 }
 
@@ -1044,6 +1051,18 @@ where
         .iter()
         .map(|p| (p.id, p.ships))
         .collect::<HashMap<_, _>>();
+    let blockers = game
+        .planets
+        .iter()
+        .map(|planet| {
+            Some(target_motion(
+                planet,
+                game.angular_velocity,
+                game.ship_speed,
+                comet_ids.contains(&planet.id),
+            ))
+        })
+        .collect::<Vec<_>>();
     let mut result = RowActionResult {
         actions: Vec::new(),
         materialized: vec![false; planets_len],
@@ -1075,6 +1094,10 @@ where
         if send <= 0 {
             continue;
         }
+        let speed = fleet_speed_local(send, game.ship_speed);
+        if speed <= 0.0 {
+            continue;
+        }
         let Some(solution) = lead_solution(
             &source,
             &target,
@@ -1084,13 +1107,15 @@ where
         ) else {
             continue;
         };
-        if !safe_flight_segment(
+        if !route_clear_to_solution(
+            source.id,
+            target_id,
             source.x,
             source.y,
             source.radius,
-            solution.angle,
-            solution.x,
-            solution.y,
+            &solution,
+            speed,
+            &blockers,
         ) {
             continue;
         }
@@ -1128,6 +1153,19 @@ where
         .iter()
         .flat_map(|group| group.planet_ids.iter().copied())
         .collect::<std::collections::HashSet<_>>();
+    let blockers = game
+        .planets
+        .iter()
+        .take(planet_limit)
+        .map(|planet| {
+            Some(target_motion(
+                planet,
+                game.angular_velocity,
+                game.ship_speed,
+                comet_ids.contains(&planet.id),
+            ))
+        })
+        .collect::<Vec<_>>();
     let mut result = RowActionResult {
         actions: Vec::new(),
         materialized: vec![false; planets_len],
@@ -1160,6 +1198,10 @@ where
         if send <= 0 {
             continue;
         }
+        let speed = fleet_speed_local(send, game.ship_speed);
+        if speed <= 0.0 {
+            continue;
+        }
         let Some(solution) = lead_solution(
             &source,
             &target,
@@ -1169,13 +1211,15 @@ where
         ) else {
             continue;
         };
-        if !safe_flight_segment(
+        if !route_clear_to_solution(
+            source.id,
+            target_id,
             source.x,
             source.y,
             source.radius,
-            solution.angle,
-            solution.x,
-            solution.y,
+            &solution,
+            speed,
+            &blockers,
         ) {
             continue;
         }
@@ -1210,13 +1254,20 @@ fn fleet_speed_local(ships: i32, max_speed: f64) -> f64 {
     (1.0 + (max_speed - 1.0) * frac.powf(1.5)).min(max_speed)
 }
 
-fn target_motion(target: &Planet, angular_velocity: f64, max_speed: f64) -> TargetMotion {
+fn target_motion(
+    target: &Planet,
+    angular_velocity: f64,
+    max_speed: f64,
+    is_comet: bool,
+) -> TargetMotion {
     let orbit_radius = ((target.x - CENTER).powi(2) + (target.y - CENTER).powi(2)).sqrt();
-    let is_orbiting = orbit_radius + target.radius < ROTATION_RADIUS_LIMIT
+    let is_orbiting = !is_comet
+        && orbit_radius + target.radius < ROTATION_RADIUS_LIMIT
         && angular_velocity.abs() > 1e-12
         && orbit_radius > 1e-9;
     if !is_orbiting {
         return TargetMotion {
+            id: target.id,
             x: target.x,
             y: target.y,
             radius: target.radius,
@@ -1237,21 +1288,13 @@ fn target_motion(target: &Planet, angular_velocity: f64, max_speed: f64) -> Targ
         })
         .collect();
     TargetMotion {
+        id: target.id,
         x: target.x,
         y: target.y,
         radius: target.radius,
         is_orbiting: true,
         positions,
     }
-}
-
-fn lead_solution_cached(
-    source: &Planet,
-    target: &TargetMotion,
-    send: i32,
-    max_speed: f64,
-) -> Option<LeadSolution> {
-    lead_solution_cached_with_speed(source, target, fleet_speed_local(send, max_speed))
 }
 
 fn lead_solution_cached_with_speed(
@@ -1440,22 +1483,91 @@ fn lead_solution_from_point(
     None
 }
 
-fn safe_flight_segment(
+fn motion_position_at(motion: &TargetMotion, steps: usize) -> (f64, f64) {
+    if !motion.is_orbiting || steps == 0 {
+        return (motion.x, motion.y);
+    }
+    motion
+        .positions
+        .get(steps)
+        .copied()
+        .unwrap_or_else(|| *motion.positions.last().unwrap_or(&(motion.x, motion.y)))
+}
+
+fn route_clear_to_solution(
+    source_id: i32,
+    target_id: i32,
     source_x: f64,
     source_y: f64,
     source_radius: f64,
-    angle: f64,
-    end_x: f64,
-    end_y: f64,
+    solution: &LeadSolution,
+    speed: f64,
+    blockers: &[Option<TargetMotion>],
 ) -> bool {
-    let offset = (source_radius + 0.1).max(0.0);
-    let start_x = source_x + angle.cos() * offset;
-    let start_y = source_y + angle.sin() * offset;
-    if !inside_board(start_x, start_y) || !inside_board(end_x, end_y) {
+    if speed <= 0.0 {
         return false;
     }
-    point_to_segment_distance_local((CENTER, CENTER), (start_x, start_y), (end_x, end_y))
-        >= SUN_RADIUS
+    let offset = (source_radius + 0.1).max(0.0);
+    let dir_x = solution.angle.cos();
+    let dir_y = solution.angle.sin();
+    let start = (source_x + dir_x * offset, source_y + dir_y * offset);
+    let final_turn = (solution.time.ceil() as usize).max(1);
+    let final_point = (
+        start.0 + dir_x * speed * final_turn as f64,
+        start.1 + dir_y * speed * final_turn as f64,
+    );
+    if !inside_board(start.0, start.1) || !inside_board(final_point.0, final_point.1) {
+        return false;
+    }
+    if point_to_segment_distance_local((CENTER, CENTER), start, final_point) < SUN_RADIUS {
+        return false;
+    }
+
+    for motion in blockers.iter().flatten() {
+        if motion.id == source_id || motion.id == target_id || motion.is_orbiting {
+            continue;
+        }
+        if point_to_segment_distance_local((motion.x, motion.y), start, final_point) < motion.radius
+        {
+            return false;
+        }
+    }
+    if !blockers
+        .iter()
+        .flatten()
+        .any(|motion| motion.id != target_id && motion.is_orbiting)
+    {
+        return true;
+    }
+
+    for turn in 1..=final_turn {
+        let old = (
+            start.0 + dir_x * speed * (turn - 1) as f64,
+            start.1 + dir_y * speed * (turn - 1) as f64,
+        );
+        let new = (
+            start.0 + dir_x * speed * turn as f64,
+            start.1 + dir_y * speed * turn as f64,
+        );
+        for motion in blockers.iter().flatten() {
+            if motion.id == target_id || !motion.is_orbiting {
+                continue;
+            }
+            let pos = motion_position_at(motion, turn - 1);
+            if motion.id != source_id
+                && point_to_segment_distance_local(pos, old, new) < motion.radius
+            {
+                return false;
+            }
+            if turn < final_turn {
+                let next_pos = motion_position_at(motion, turn);
+                if point_to_segment_distance_local(new, pos, next_pos) < motion.radius {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn inside_board(x: f64, y: f64) -> bool {
