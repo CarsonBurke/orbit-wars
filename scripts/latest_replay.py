@@ -20,8 +20,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from owars.agents import HeuristicAgent, random_agent, sniper_agent
 from owars.agents.learned import LearnedAgent
 
@@ -126,7 +124,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--ship-speed", type=float, default=6.0)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--out", type=Path, default=None)
     return parser
@@ -180,6 +178,7 @@ def main() -> None:
         print(f"run_dir: {run.path}")
     print(f"ckpt: {ckpt}")
     print(f"opponent: {args.opponent}")
+    print(f"device: {args.device}")
     print(f"rewards: {rewards}")
     print(f"statuses: {statuses}")
     print(f"replay: {out.resolve()}")

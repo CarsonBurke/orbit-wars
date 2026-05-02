@@ -32,6 +32,7 @@ def test_latest_replay_defaults_to_learned_self_play():
     args = mod._parser().parse_args([])
 
     assert args.opponent == "learned"
+    assert args.device == "cuda"
 
 
 def test_latest_run_fallback_uses_configured_checkpoint_root(tmp_path):
