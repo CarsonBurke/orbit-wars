@@ -16,11 +16,38 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
-# Make the vendored package importable regardless of how the runner cwd's.
-_HERE = Path(__file__).resolve().parent
+
+def _bundle_root() -> Path:
+    candidates: list[Path] = []
+    file_name = globals().get("__file__")
+    if file_name:
+        candidates.append(Path(str(file_name)).resolve().parent)
+    candidates.append(Path.cwd().resolve())
+    candidates.extend(Path(p).resolve() for p in reversed(sys.path) if p)
+    for candidate in candidates:
+        if (candidate / "owars").exists() or (candidate / "weights").exists():
+            return candidate
+    return candidates[0]
+
+
+# Make the vendored package importable regardless of how the runner executes
+# the raw Python. Kaggle's validator execs this file without defining
+# `__file__`, but it appends the bundle directory to `sys.path` first.
+_HERE = _bundle_root()
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+# Local repo shake-down runs use src/ instead of a vendored owars/ package.
+_REPO_SRC = _HERE.parent / "src"
+if _REPO_SRC.exists() and str(_REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPO_SRC))
+
+def _heuristic_agent():
+    from owars.agents.heuristic import HeuristicAgent
+
+    return HeuristicAgent()
+
 
 def _build_agent():
     weights = _HERE / "weights" / "policy.pt"
@@ -30,15 +57,13 @@ def _build_agent():
         return LearnedAgent(weights, deterministic=True)
     # Fallback so the bundle still plays a game even without weights —
     # useful for the validation episode and for shake-down runs.
-    from owars.agents.heuristic import HeuristicAgent
-
-    return HeuristicAgent()
+    return _heuristic_agent()
 
 
 _AGENT = _build_agent()
 
 
-def agent(obs):
+def agent(obs: Any, *_args: Any) -> list[list]:
     return _AGENT(obs)
 
 
