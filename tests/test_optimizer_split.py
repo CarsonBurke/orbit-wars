@@ -1,6 +1,7 @@
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
 from owars.training.config import OptimCfg
+from owars.training.ppo import _grad_clip_groups
 from owars.training.train import _build_optimizer, _split_params
 
 
@@ -47,6 +48,7 @@ def test_optimizer_split_matches_parameter_golf_boundary():
         "launch_head.bias",
         "fraction_head.weight",
         "fraction_head.bias",
+        "fraction_log_std",
         "value_head.0.weight",
         "value_head.2.weight",
     ):
@@ -78,3 +80,38 @@ def test_optimizer_group_lrs_follow_split():
         optim_cfg.control_lr,
         optim_cfg.head_lr,
     ]
+
+
+def test_grad_clip_groups_match_real_policy_roles():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    actor, critic, shared = _grad_clip_groups(model)
+    by_id = {
+        id(param): label
+        for label, params in (
+            ("actor", actor),
+            ("critic", critic),
+            ("shared", shared),
+        )
+        for param in params
+    }
+    groups = {name: by_id[id(param)] for name, param in model.named_parameters()}
+
+    for name in (
+        "target_query.weight",
+        "target_key.weight",
+        "target_q_gain",
+        "launch_head.weight",
+        "launch_head.bias",
+        "fraction_head.weight",
+        "fraction_head.bias",
+        "fraction_log_std",
+    ):
+        assert groups[name] == "actor"
+
+    assert groups["value_head.0.weight"] == "critic"
+    assert groups["value_head.2.weight"] == "critic"
+    assert groups["planet_embed.weight"] == "shared"
+    assert groups["actor_token"] == "shared"
+    assert groups["critic_token"] == "shared"
+    assert groups["layers.0.attn.c_q.weight"] == "shared"

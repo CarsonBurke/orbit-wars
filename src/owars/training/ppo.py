@@ -13,6 +13,8 @@ per bin.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -137,7 +139,7 @@ def _bernoulli_entropy(logits: torch.Tensor) -> torch.Tensor:
 def _conditional_action_entropy(
     launch_logits: torch.Tensor,
     target_log_probs: torch.Tensor,
-    beta_entropy: torch.Tensor,
+    fraction_entropy: torch.Tensor,
 ) -> torch.Tensor:
     """Entropy of launch + P(launch) * (target + fraction)."""
     min_real = torch.finfo(target_log_probs.dtype).min
@@ -147,35 +149,35 @@ def _conditional_action_entropy(
     )
     launch_prob = launch_logits.sigmoid()
     return _bernoulli_entropy(launch_logits) + launch_prob * (
-        target_entropy + beta_entropy
+        target_entropy + fraction_entropy
     )
 
 
-def _beta_log_normalizer(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-    return torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
+SQUASH_EPS: float = 1e-6
 
 
-def _beta_log_prob(
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-    value: torch.Tensor,
+def _squashed_normal_log_prob(
+    mean: torch.Tensor,
+    log_std: torch.Tensor,
+    fraction: torch.Tensor,
 ) -> torch.Tensor:
-    return (
-        (alpha - 1.0) * value.log()
-        + (beta - 1.0) * torch.log1p(-value)
-        - _beta_log_normalizer(alpha, beta)
+    u = (2.0 * fraction.float() - 1.0).clamp(
+        -1.0 + SQUASH_EPS, 1.0 - SQUASH_EPS
     )
+    z = torch.atanh(u)
+    log_std = log_std.float()
+    inv_std = torch.exp(-log_std)
+    log_prob_z = (
+        -0.5 * ((z - mean.float()) * inv_std).square()
+        - log_std
+        - 0.5 * math.log(2.0 * math.pi)
+    )
+    squash_correction = torch.log(1.0 - u.square() + SQUASH_EPS)
+    return log_prob_z - squash_correction
 
 
-def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-    log_norm = _beta_log_normalizer(alpha, beta)
-    total = alpha + beta
-    return (
-        log_norm
-        - (alpha - 1.0) * torch.digamma(alpha)
-        - (beta - 1.0) * torch.digamma(beta)
-        + (total - 2.0) * torch.digamma(total)
-    )
+def _squashed_normal_entropy(log_std: torch.Tensor) -> torch.Tensor:
+    return log_std.float() + 0.5 * (1.0 + math.log(2.0 * math.pi))
 
 
 def _module_device(model: torch.nn.Module) -> torch.device:
@@ -183,6 +185,105 @@ def _module_device(model: torch.nn.Module) -> torch.device:
         return next(model.parameters()).device
     except StopIteration:
         return torch.device("cpu")
+
+
+_ACTOR_CLIP_PATTERNS: tuple[str, ...] = (
+    "target_query",
+    "target_key",
+    "target_q_gain",
+    "launch_head",
+    "fraction_head",
+    "fraction_log_std",
+)
+
+_CRITIC_CLIP_PATTERNS: tuple[str, ...] = ("value_head",)
+
+
+def _grad_clip_groups(
+    model: torch.nn.Module,
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    cache = model.__dict__.get("_owars_grad_clip_groups")
+    if cache is not None:
+        return cache
+    actor: list[torch.nn.Parameter] = []
+    critic: list[torch.nn.Parameter] = []
+    shared: list[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if any(pattern in name for pattern in _ACTOR_CLIP_PATTERNS):
+            actor.append(param)
+        elif any(pattern in name for pattern in _CRITIC_CLIP_PATTERNS):
+            critic.append(param)
+        else:
+            shared.append(param)
+    cache = (actor, critic, shared)
+    model.__dict__["_owars_grad_clip_groups"] = cache
+    return cache
+
+
+def _clip_grad_norm(
+    params: list[torch.nn.Parameter],
+    max_norm: float,
+    device: torch.device,
+) -> torch.Tensor:
+    if not params:
+        return torch.zeros((), device=device)
+    return torch.nn.utils.clip_grad_norm_(params, max_norm)
+
+
+def _clone_grads(
+    params: list[torch.nn.Parameter],
+) -> list[tuple[torch.nn.Parameter, torch.Tensor]]:
+    return [
+        (param, param.grad.detach().clone())
+        for param in params
+        if param.grad is not None
+    ]
+
+
+def _clear_grads(params: Iterable[torch.nn.Parameter]) -> None:
+    for param in params:
+        param.grad = None
+
+
+def _add_grads(saved: list[tuple[torch.nn.Parameter, torch.Tensor]]) -> None:
+    for param, grad in saved:
+        if param.grad is None:
+            param.grad = grad
+        else:
+            param.grad.add_(grad)
+
+
+def _backward_actor_critic_with_separate_clips(
+    model: torch.nn.Module,
+    actor_loss: torch.Tensor,
+    critic_loss: torch.Tensor,
+    max_norm: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backprop actor and critic losses with independent clipping.
+
+    The shared encoder receives both policy and value gradients, but the two
+    norms are clipped before they are added together. This prevents value CE
+    from setting the policy step size through a single combined norm.
+    """
+    actor, critic, shared = _grad_clip_groups(model)
+    device = _module_device(model)
+    if max_norm <= 0.0:
+        (actor_loss + critic_loss).backward()
+        zero = torch.zeros((), device=device)
+        return zero, zero
+
+    actor_params = actor + shared
+    critic_params = critic + shared
+
+    actor_loss.backward(retain_graph=True)
+    actor_norm = _clip_grad_norm(actor_params, max_norm, device)
+    actor_grads = _clone_grads(actor_params)
+    _clear_grads(model.parameters())
+
+    critic_loss.backward()
+    critic_norm = _clip_grad_norm(critic_params, max_norm, device)
+    _add_grads(actor_grads)
+    return actor_norm, critic_norm
 
 
 class _PPOMinibatchKernel(torch.nn.Module):
@@ -234,7 +335,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         ret: torch.Tensor,
         owned_mask: torch.Tensor,
         target_legal_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
             planet_mask=planet_mask,
@@ -254,8 +355,8 @@ class _PPOMinibatchKernel(torch.nn.Module):
         launch_logits = out.launch_logits.float().masked_fill(~has_legal_target, -20.0)
         target_logits = out.target_logits.float().masked_fill(~target_legal_mask, float("-inf"))
         target_logits = _safe_target_logits(target_logits)
-        fraction_alpha = out.fraction_alpha.float()
-        fraction_beta = out.fraction_beta.float()
+        fraction_mean = out.fraction_mean.float()
+        fraction_log_std = out.fraction_log_std.float()
         value_logits = out.value_logits.float()
 
         owned_f = owned_mask.float()
@@ -268,7 +369,9 @@ class _PPOMinibatchKernel(torch.nn.Module):
         target_log_probs = F.log_softmax(target_logits, dim=-1)
         target_dist_probs = target_log_probs.exp()
         target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-        frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
+        frac_lp = _squashed_normal_log_prob(
+            fraction_mean, fraction_log_std, fraction.float()
+        )
         chosen = launch_lp + launch_f * (target_lp + frac_lp)
 
         adv_b = advantage.float().unsqueeze(-1).expand_as(chosen)
@@ -300,10 +403,10 @@ class _PPOMinibatchKernel(torch.nn.Module):
         value_ce = -(target_probs * log_v_probs).sum(dim=-1)
         value_loss = _weighted_mean(value_ce, row_w)
 
-        beta_entropy = _beta_entropy(fraction_alpha, fraction_beta)
+        frac_entropy_per_planet = _squashed_normal_entropy(fraction_log_std)
         p_move_current = launch_logits.sigmoid()
         planet_entropy = _conditional_action_entropy(
-            launch_logits, target_log_probs, beta_entropy
+            launch_logits, target_log_probs, frac_entropy_per_planet
         )
         entropy = (planet_entropy * owned_w).sum() / denom
         launch_entropy = (_bernoulli_entropy(launch_logits) * owned_w).sum() / denom
@@ -313,33 +416,33 @@ class _PPOMinibatchKernel(torch.nn.Module):
         ).sum(dim=-1)
         target_entropy = ((p_move_current * target_entropy_per_planet) * owned_w).sum()
         target_entropy = target_entropy / denom
-        fraction_entropy = ((p_move_current * beta_entropy) * owned_w).sum() / denom
+        fraction_entropy = ((p_move_current * frac_entropy_per_planet) * owned_w).sum() / denom
         move_prob = (p_move_current * owned_w).sum() / denom
         target_confidence = (target_dist_probs.amax(dim=-1) * owned_w).sum() / denom
-        fraction_alpha_mean = (fraction_alpha * owned_w).sum() / denom
-        fraction_alpha_max = _weighted_max(fraction_alpha, owned_w)
-        fraction_beta_mean = (fraction_beta * owned_w).sum() / denom
-        fraction_beta_max = _weighted_max(fraction_beta, owned_w)
-        fraction_concentration = fraction_alpha + fraction_beta - 2.0
-        fraction_mode = (
-            (fraction_alpha - 1.0)
-            / fraction_concentration.clamp_min(torch.finfo(fraction_alpha.dtype).eps)
-        )
-        fraction_mode_mean = (fraction_mode * owned_w).sum() / denom
-        fraction_concentration_mean = (fraction_concentration * owned_w).sum() / denom
-        fraction_concentration_max = _weighted_max(fraction_concentration, owned_w)
+        fraction_mean_mean = (fraction_mean * owned_w).sum() / denom
+        fraction_mean_abs_max = _weighted_max(fraction_mean.abs(), owned_w)
+        fraction_log_std_mean = (fraction_log_std * owned_w).sum() / denom
+        fraction_log_std_min = -_weighted_max(-fraction_log_std, owned_w)
+        fraction_log_std_max = _weighted_max(fraction_log_std, owned_w)
+        deterministic_fraction = 0.5 * (torch.tanh(fraction_mean) + 1.0)
+        deterministic_fraction_mean = (deterministic_fraction * owned_w).sum() / denom
         entropy_bonus = (
             self.target_entropy_coef * (launch_entropy + target_entropy)
             + self.fraction_entropy_coef * fraction_entropy
         )
 
-        loss = (
-            policy_loss
-            + self.value_coef * value_loss
-            - entropy_bonus
-        )
+        actor_loss = policy_loss - entropy_bonus
+        critic_loss = self.value_coef * value_loss
 
-        kl = (((ratio - 1.0) - log_ratio) * owned_w).sum() / denom
+        # CleanRL-style PPO KL diagnostic: collapse the factorized per-planet
+        # log-probs into one joint action log-prob per rollout row, then apply
+        # Joschu's k3 approximation `E[(r - 1) - log r]`. The policy surrogate
+        # above remains per-source-planet; this is only the reported KL scale.
+        row_log_ratio = (log_ratio * owned_f).sum(dim=-1)
+        row_log_ratio = torch.where(row_w > 0.0, row_log_ratio, row_log_ratio * 0.0)
+        row_ratio = row_log_ratio.exp()
+        row_denom = row_w.sum().clamp_min(1.0)
+        kl = (((row_ratio - 1.0) - row_log_ratio) * row_w).sum() / row_denom
         pos_count = (owned_w * (adv_b >= 0.0).to(owned_f.dtype)).sum()
         total_owned = owned_w.sum().clamp_min(1.0)
         pos_frac = pos_count / total_owned
@@ -355,16 +458,15 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 fraction_entropy.detach(),
                 move_prob.detach(),
                 target_confidence.detach(),
-                fraction_alpha_mean.detach(),
-                fraction_alpha_max.detach(),
-                fraction_beta_mean.detach(),
-                fraction_beta_max.detach(),
-                fraction_mode_mean.detach(),
-                fraction_concentration_mean.detach(),
-                fraction_concentration_max.detach(),
+                fraction_mean_mean.detach(),
+                fraction_mean_abs_max.detach(),
+                fraction_log_std_mean.detach(),
+                fraction_log_std_min.detach(),
+                fraction_log_std_max.detach(),
+                deterministic_fraction_mean.detach(),
             ]
         ).float()
-        return loss, metrics
+        return actor_loss, critic_loss, metrics
 
 
 class _ValueOnlyMinibatchKernel(torch.nn.Module):
@@ -505,13 +607,12 @@ class PPOLog:
     fraction_entropy: float = 0.0
     move_prob: float = 0.0
     target_confidence: float = 0.0
-    fraction_alpha_mean: float = 0.0
-    fraction_alpha_max: float = 0.0
-    fraction_beta_mean: float = 0.0
-    fraction_beta_max: float = 0.0
-    fraction_mode_mean: float = 0.0
-    fraction_concentration_mean: float = 0.0
-    fraction_concentration_max: float = 0.0
+    fraction_mean_mean: float = 0.0
+    fraction_mean_abs_max: float = 0.0
+    fraction_log_std_mean: float = 0.0
+    fraction_log_std_min: float = 0.0
+    fraction_log_std_max: float = 0.0
+    deterministic_fraction_mean: float = 0.0
 
 
 def compute_gae(
@@ -587,6 +688,7 @@ def ppo_update(
     device = batch["planet_feats"].device
 
     metric_sum: torch.Tensor | None = None
+    last_metrics: torch.Tensor | None = None
     n_steps = 0
 
     kernel = _get_ppo_kernel(
@@ -601,8 +703,9 @@ def ppo_update(
     )
     for _ in range(epochs):
         for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
-            _mark_cuda_graph_step(device)
-            loss, metrics = kernel(
+            if compile_mode is not None:
+                _mark_cuda_graph_step(device)
+            actor_loss, critic_loss, metrics = kernel(
                 batch["planet_feats"][mb],
                 batch["planet_mask"][mb],
                 batch["planet_owned_mask"][mb],
@@ -622,39 +725,53 @@ def ppo_update(
             )
 
             optimizer.zero_grad(set_to_none=True)
-            (loss * _minibatch_loss_scale(row_weight)).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            loss_scale = _minibatch_loss_scale(row_weight)
+            _backward_actor_critic_with_separate_clips(
+                model,
+                actor_loss * loss_scale,
+                critic_loss * loss_scale,
+                grad_clip,
+            )
             optimizer.step()
 
             if metric_sum is None:
                 metric_sum = torch.zeros_like(metrics)
             metric_sum += metrics
+            last_metrics = metrics
             n_steps += 1
 
     n_steps = max(1, n_steps)
-    logs = (
-        [0.0] * 17
+    mean_logs = (
+        [0.0] * 16
         if metric_sum is None
         else (metric_sum / n_steps).detach().cpu().tolist()
     )
+    # Match CleanRL's PPO KL logging: `approx_kl` is the latest minibatch's
+    # estimate after the PPO epoch loop, not an epoch mean. The surrounding
+    # diagnostics stay averaged to preserve their lower-noise TensorBoard
+    # behavior.
+    kl_logs = (
+        [0.0] * 16
+        if last_metrics is None
+        else last_metrics.detach().cpu().tolist()
+    )
     return PPOLog(
-        policy_loss=float(logs[0]),
-        value_loss=float(logs[1]),
-        entropy=float(logs[2]),
-        approx_kl=float(logs[3]),
-        spo_penalty=float(logs[4]),
-        pos_frac=float(logs[5]),
-        target_entropy=float(logs[6]),
-        fraction_entropy=float(logs[7]),
-        move_prob=float(logs[8]),
-        target_confidence=float(logs[9]),
-        fraction_alpha_mean=float(logs[10]),
-        fraction_alpha_max=float(logs[11]),
-        fraction_beta_mean=float(logs[12]),
-        fraction_beta_max=float(logs[13]),
-        fraction_mode_mean=float(logs[14]),
-        fraction_concentration_mean=float(logs[15]),
-        fraction_concentration_max=float(logs[16]),
+        policy_loss=float(mean_logs[0]),
+        value_loss=float(mean_logs[1]),
+        entropy=float(mean_logs[2]),
+        approx_kl=float(kl_logs[3]),
+        spo_penalty=float(mean_logs[4]),
+        pos_frac=float(mean_logs[5]),
+        target_entropy=float(mean_logs[6]),
+        fraction_entropy=float(mean_logs[7]),
+        move_prob=float(mean_logs[8]),
+        target_confidence=float(mean_logs[9]),
+        fraction_mean_mean=float(mean_logs[10]),
+        fraction_mean_abs_max=float(mean_logs[11]),
+        fraction_log_std_mean=float(mean_logs[12]),
+        fraction_log_std_min=float(mean_logs[13]),
+        fraction_log_std_max=float(mean_logs[14]),
+        deterministic_fraction_mean=float(mean_logs[15]),
     )
 
 
@@ -685,7 +802,8 @@ def value_only_update(
     kernel = _get_value_only_kernel(model, compile_mode=compile_mode)
     for _ in range(epochs):
         for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
-            _mark_cuda_graph_step(device)
+            if compile_mode is not None:
+                _mark_cuda_graph_step(device)
             value_loss, metric = kernel(
                 batch["planet_feats"][mb],
                 batch["planet_mask"][mb],

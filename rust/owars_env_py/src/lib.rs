@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use numpy::ndarray::{Array1, Array2, Array3};
-use numpy::{IntoPyArray, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{IntoPyArray, PyReadonlyArray2, PyReadonlyArray3, PyUntypedArrayMethods};
 use owars_env::{Action, Game, GameConfig, Planet, PlayerAction};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -30,19 +30,32 @@ struct LeadSolution {
     y: f64,
 }
 
+#[derive(Clone)]
 struct TargetMotion {
     id: i32,
     x: f64,
     y: f64,
     radius: f64,
+    radius_sq: f64,
     is_orbiting: bool,
     positions: Vec<(f64, f64)>,
 }
 
+#[derive(Clone)]
 struct LegalMaskState {
     planet_limit: usize,
     target_motions: Vec<Option<TargetMotion>>,
     target_cols: Vec<usize>,
+    source_cols_by_player: Vec<Vec<usize>>,
+    static_cols: Vec<usize>,
+    moving_cols: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct LegalMaskCacheEntry {
+    step: i32,
+    planets_len: usize,
+    state: Arc<LegalMaskState>,
 }
 
 #[derive(Clone)]
@@ -60,6 +73,7 @@ struct NativeActionList {
 #[pyclass]
 struct RustCoreVecEnv {
     games: Vec<Game>,
+    legal_mask_cache: Vec<Option<LegalMaskCacheEntry>>,
     num_envs: usize,
     num_players: usize,
     episode_steps: i32,
@@ -79,6 +93,7 @@ impl RustCoreVecEnv {
     ) -> Self {
         let mut env = Self {
             games: Vec::new(),
+            legal_mask_cache: Vec::new(),
             num_envs,
             num_players,
             episode_steps,
@@ -125,6 +140,11 @@ impl RustCoreVecEnv {
             let action_obj = actions.get_item(pos)?;
             actions_by_env[env_idx] =
                 Some((pos, parse_env_actions(&action_obj, self.num_players)?));
+        }
+        for &env_idx in &indices {
+            if env_idx < self.legal_mask_cache.len() {
+                self.legal_mask_cache[env_idx] = None;
+            }
         }
         let mut results = py.detach(|| {
             self.games
@@ -238,7 +258,7 @@ impl RustCoreVecEnv {
     }
 
     fn legal_target_mask_from_state<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         rows: Vec<(usize, usize)>,
         frac: PyReadonlyArray2<'_, f32>,
@@ -251,52 +271,54 @@ impl RustCoreVecEnv {
             ));
         }
         let frac_v = frac.as_array().to_owned();
-        let games = &self.games;
-        let mut groups = Vec::new();
-        let mut start = 0;
-        while start < batch {
-            let env_idx = rows[start].0;
-            let mut end = start + 1;
-            while end < batch && rows[end].0 == env_idx {
-                end += 1;
-            }
-            groups.push((start, end, env_idx));
-            start = end;
+        self.legal_target_mask_from_state_arrays(py, rows, frac_v, None, batch, planets)
+    }
+
+    fn legal_target_mask_from_state_active<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        frac: PyReadonlyArray2<'_, f32>,
+        active_source: PyReadonlyArray2<'_, bool>,
+    ) -> PyResult<Bound<'py, numpy::PyArray3<bool>>> {
+        let shape = frac.shape();
+        let active_shape = active_source.shape();
+        if shape != active_shape {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "active_source shape must match frac shape",
+            ));
         }
-        let stride = planets * planets;
-        let flat = py.detach(|| {
-            let group_results = groups
-                .into_par_iter()
-                .map(|(start, end, env_idx)| {
-                    let game = &games[env_idx];
-                    let legal_state = legal_mask_state(game, planets);
-                    let mut out = vec![false; (end - start) * stride];
-                    for row in start..end {
-                        let player = rows[row].1;
-                        let offset = (row - start) * stride;
-                        fill_legal_mask_row_from_state(
-                            game,
-                            &legal_state,
-                            player,
-                            planets,
-                            |col| frac_v[[row, col]] as f64,
-                            &mut out[offset..offset + stride],
-                        );
-                    }
-                    (start, out)
-                })
-                .collect::<Vec<_>>();
-            let mut flat = vec![false; batch * stride];
-            for (start, group) in group_results {
-                let offset = start * stride;
-                flat[offset..offset + group.len()].copy_from_slice(&group);
-            }
-            flat
-        });
-        let out = Array3::from_shape_vec((batch, planets, planets), flat).map_err(|err| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build legal mask: {err}"))
-        })?;
-        Ok(out.into_pyarray(py))
+        let (batch, planets) = (shape[0], shape[1]);
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        let frac_v = frac.as_array().to_owned();
+        let active_v = active_source.as_array().to_owned();
+        self.legal_target_mask_from_state_arrays(py, rows, frac_v, Some(active_v), batch, planets)
+    }
+
+    fn legal_target_mask_from_state_active_fields<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        fields: PyReadonlyArray3<'_, f32>,
+    ) -> PyResult<Bound<'py, numpy::PyArray3<bool>>> {
+        let shape = fields.shape();
+        let (batch, planets, field_width) = (shape[0], shape[1], shape[2]);
+        if field_width < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "fields must have shape [batch, planets, >=2]",
+            ));
+        }
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        let fields_v = fields.as_array().to_owned();
+        self.legal_target_mask_from_state_active_field_array(py, rows, fields_v, batch, planets)
     }
 
     fn materialize_actions<'py>(
@@ -386,6 +408,87 @@ impl RustCoreVecEnv {
         build_materialized_actions_dict(py, batch, planets, native, &results)
     }
 
+    fn materialize_masked_actions_from_state<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        launch: PyReadonlyArray2<'_, f32>,
+        target_idx: PyReadonlyArray2<'_, i64>,
+        frac: PyReadonlyArray2<'_, f32>,
+        native: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let shape = launch.shape();
+        let (batch, planets) = (shape[0], shape[1]);
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        let launch_v = launch.as_array().to_owned();
+        let target_v = target_idx.as_array().to_owned();
+        let frac_v = frac.as_array().to_owned();
+        let games = &self.games;
+        let results = py.detach(|| {
+            (0..batch)
+                .into_par_iter()
+                .map(|row| {
+                    let (env_idx, player) = rows[row];
+                    materialize_masked_action_row_from_state(
+                        &games[env_idx],
+                        player,
+                        planets,
+                        |col| launch_v[[row, col]] as f64,
+                        |col| target_v[[row, col]] as usize,
+                        |col| frac_v[[row, col]] as f64,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        build_materialized_actions_dict(py, batch, planets, native, &results)
+    }
+
+    fn materialize_masked_action_fields_from_state<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        fields: PyReadonlyArray3<'_, f32>,
+        native: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let shape = fields.shape();
+        let (batch, planets, field_width) = (shape[0], shape[1], shape[2]);
+        if field_width < 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "fields must have shape [batch, planets, >=3]",
+            ));
+        }
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        let fields_v = fields.as_array().to_owned();
+        let games = &self.games;
+        let results = py.detach(|| {
+            (0..batch)
+                .into_par_iter()
+                .map(|row| {
+                    let (env_idx, player) = rows[row];
+                    materialize_masked_action_row_from_state(
+                        &games[env_idx],
+                        player,
+                        planets,
+                        |col| fields_v[[row, col, 0]] as f64,
+                        |col| fields_v[[row, col, 1]].round().max(0.0) as usize,
+                        |col| fields_v[[row, col, 2]] as f64,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        build_materialized_actions_dict(py, batch, planets, native, &results)
+    }
+
     fn policy_batch<'py>(
         &self,
         py: Python<'py>,
@@ -404,6 +507,83 @@ impl RustCoreVecEnv {
 }
 
 impl RustCoreVecEnv {
+    fn legal_target_mask_from_state_arrays<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        frac_v: Array2<f32>,
+        active_v: Option<Array2<bool>>,
+        batch: usize,
+        planets: usize,
+    ) -> PyResult<Bound<'py, numpy::PyArray3<bool>>> {
+        let row_states = rows
+            .iter()
+            .map(|(env_idx, _)| self.legal_mask_state_cached(*env_idx, planets))
+            .collect::<Vec<_>>();
+        let stride = planets * planets;
+        let games = &self.games;
+        let flat = py.detach(|| {
+            let mut flat = vec![false; batch * stride];
+            flat.par_chunks_mut(stride)
+                .enumerate()
+                .for_each(|(row, row_out)| {
+                    let (env_idx, player) = rows[row];
+                    fill_legal_mask_row_from_state(
+                        &games[env_idx],
+                        &row_states[row],
+                        player,
+                        planets,
+                        |col| frac_v[[row, col]] as f64,
+                        |col| active_v.as_ref().is_none_or(|active| active[[row, col]]),
+                        row_out,
+                    );
+                });
+            flat
+        });
+        let out = Array3::from_shape_vec((batch, planets, planets), flat).map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build legal mask: {err}"))
+        })?;
+        Ok(out.into_pyarray(py))
+    }
+
+    fn legal_target_mask_from_state_active_field_array<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        fields_v: Array3<f32>,
+        batch: usize,
+        planets: usize,
+    ) -> PyResult<Bound<'py, numpy::PyArray3<bool>>> {
+        let row_states = rows
+            .iter()
+            .map(|(env_idx, _)| self.legal_mask_state_cached(*env_idx, planets))
+            .collect::<Vec<_>>();
+        let stride = planets * planets;
+        let games = &self.games;
+        let flat = py.detach(|| {
+            let mut flat = vec![false; batch * stride];
+            flat.par_chunks_mut(stride)
+                .enumerate()
+                .for_each(|(row, row_out)| {
+                    let (env_idx, player) = rows[row];
+                    fill_legal_mask_row_from_state(
+                        &games[env_idx],
+                        &row_states[row],
+                        player,
+                        planets,
+                        |col| fields_v[[row, col, 0]] as f64,
+                        |col| fields_v[[row, col, 1]] >= 0.5,
+                        row_out,
+                    );
+                });
+            flat
+        });
+        let out = Array3::from_shape_vec((batch, planets, planets), flat).map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build legal mask: {err}"))
+        })?;
+        Ok(out.into_pyarray(py))
+    }
+
     fn reset_core(&mut self) {
         self.games = (0..self.num_envs)
             .map(|idx| {
@@ -413,6 +593,35 @@ impl RustCoreVecEnv {
                 )
             })
             .collect();
+        self.legal_mask_cache = vec![None; self.games.len()];
+    }
+
+    fn legal_mask_state_cached(
+        &mut self,
+        env_idx: usize,
+        planets_len: usize,
+    ) -> Arc<LegalMaskState> {
+        let game = &self.games[env_idx];
+        let step = game.step;
+        if let Some(entry) = self
+            .legal_mask_cache
+            .get(env_idx)
+            .and_then(|entry| entry.as_ref())
+        {
+            if entry.step == step && entry.planets_len == planets_len {
+                return Arc::clone(&entry.state);
+            }
+        }
+        let state = Arc::new(legal_mask_state(game, planets_len));
+        if env_idx >= self.legal_mask_cache.len() {
+            self.legal_mask_cache.resize(env_idx + 1, None);
+        }
+        self.legal_mask_cache[env_idx] = Some(LegalMaskCacheEntry {
+            step,
+            planets_len,
+            state: Arc::clone(&state),
+        });
+        state
     }
 }
 
@@ -855,19 +1064,27 @@ fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
     }
 }
 
-fn fill_legal_mask_row_from_state<FFrac>(
+fn fill_legal_mask_row_from_state<FFrac, FActive>(
     game: &Game,
     state: &LegalMaskState,
     player: usize,
     planets_len: usize,
     frac_at: FFrac,
+    active_at: FActive,
     out: &mut [bool],
 ) where
     FFrac: Fn(usize) -> f64,
+    FActive: Fn(usize) -> bool,
 {
     let planet_limit = state.planet_limit.min(planets_len);
 
-    for i in 0..planet_limit {
+    let Some(source_cols) = state.source_cols_by_player.get(player) else {
+        return;
+    };
+    for &i in source_cols {
+        if i >= planet_limit || !active_at(i) {
+            continue;
+        }
         let source = game.planets[i];
         if source.owner != player as i32 || source.ships < 2 {
             continue;
@@ -894,7 +1111,7 @@ fn fill_legal_mask_row_from_state<FFrac>(
             ) else {
                 continue;
             };
-            if !route_clear_to_solution(
+            if !route_clear_to_solution_with_cols(
                 source.id,
                 game.planets[j].id,
                 source.x,
@@ -903,6 +1120,8 @@ fn fill_legal_mask_row_from_state<FFrac>(
                 &solution,
                 speed,
                 &state.target_motions,
+                &state.static_cols,
+                &state.moving_cols,
             ) {
                 continue;
             }
@@ -936,10 +1155,43 @@ fn legal_mask_state(game: &Game, planets_len: usize) -> LegalMaskState {
     let target_cols = (0..planet_limit)
         .filter(|&idx| !is_comet_col[idx])
         .collect::<Vec<_>>();
+    let mut source_cols_by_player = vec![Vec::new(); game.num_players];
+    for (idx, planet) in game.planets.iter().take(planet_limit).enumerate() {
+        if planet.owner < 0 || planet.ships < 2 {
+            continue;
+        }
+        let owner = planet.owner as usize;
+        if let Some(cols) = source_cols_by_player.get_mut(owner) {
+            cols.push(idx);
+        }
+    }
+    let static_cols = target_motions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, motion)| {
+            motion
+                .as_ref()
+                .is_some_and(|motion| !motion.is_orbiting)
+                .then_some(idx)
+        })
+        .collect::<Vec<_>>();
+    let moving_cols = target_motions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, motion)| {
+            motion
+                .as_ref()
+                .is_some_and(|motion| motion.is_orbiting)
+                .then_some(idx)
+        })
+        .collect::<Vec<_>>();
     LegalMaskState {
         planet_limit,
         target_motions,
         target_cols,
+        source_cols_by_player,
+        static_cols,
+        moving_cols,
     }
 }
 
@@ -1148,24 +1400,7 @@ where
     FFrac: Fn(usize) -> f64,
 {
     let planet_limit = planets_len.min(game.planets.len());
-    let comet_ids = game
-        .comets
-        .iter()
-        .flat_map(|group| group.planet_ids.iter().copied())
-        .collect::<std::collections::HashSet<_>>();
-    let blockers = game
-        .planets
-        .iter()
-        .take(planet_limit)
-        .map(|planet| {
-            Some(target_motion(
-                planet,
-                game.angular_velocity,
-                game.ship_speed,
-                comet_ids.contains(&planet.id),
-            ))
-        })
-        .collect::<Vec<_>>();
+    let mut blockers: Option<Vec<Option<TargetMotion>>> = None;
     let mut result = RowActionResult {
         actions: Vec::new(),
         materialized: vec![false; planets_len],
@@ -1191,7 +1426,7 @@ where
         }
         let target = game.planets[ti];
         let target_id = target.id;
-        if comet_ids.contains(&target_id) {
+        if is_comet_planet(game, target_id) {
             continue;
         }
         let send = ships_to_send(source_ships, frac_at(i));
@@ -1211,6 +1446,20 @@ where
         ) else {
             continue;
         };
+        let blockers = blockers.get_or_insert_with(|| {
+            game.planets
+                .iter()
+                .take(planet_limit)
+                .map(|planet| {
+                    Some(target_motion(
+                        planet,
+                        game.angular_velocity,
+                        game.ship_speed,
+                        is_comet_planet(game, planet.id),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
         if !route_clear_to_solution(
             source.id,
             target_id,
@@ -1219,7 +1468,108 @@ where
             source.radius,
             &solution,
             speed,
-            &blockers,
+            blockers,
+        ) {
+            continue;
+        }
+        result.actions.push(Action {
+            from_planet_id: source.id,
+            angle: solution.angle,
+            ships: send,
+            target_id,
+            eta: solution.time,
+            target_x: solution.x,
+            target_y: solution.y,
+        });
+        result.materialized[i] = true;
+        remaining[i] = source_ships - send;
+    }
+    result
+}
+
+fn materialize_masked_action_row_from_state<FLaunch, FTarget, FFrac>(
+    game: &Game,
+    player: usize,
+    planets_len: usize,
+    launch_at: FLaunch,
+    target_at: FTarget,
+    frac_at: FFrac,
+) -> RowActionResult
+where
+    FLaunch: Fn(usize) -> f64,
+    FTarget: Fn(usize) -> usize,
+    FFrac: Fn(usize) -> f64,
+{
+    let planet_limit = planets_len.min(game.planets.len());
+    let mut blockers: Option<Vec<Option<TargetMotion>>> = None;
+    let mut result = RowActionResult {
+        actions: Vec::new(),
+        materialized: vec![false; planets_len],
+    };
+    let mut remaining = game
+        .planets
+        .iter()
+        .take(planet_limit)
+        .map(|planet| planet.ships)
+        .collect::<Vec<_>>();
+    for i in 0..planet_limit {
+        if launch_at(i) < 0.5 {
+            continue;
+        }
+        let source = game.planets[i];
+        let source_ships = remaining[i];
+        if source.owner != player as i32 || source_ships < 2 {
+            continue;
+        }
+        let ti = target_at(i);
+        if ti == i || ti >= planet_limit {
+            continue;
+        }
+        let target = game.planets[ti];
+        let target_id = target.id;
+        if is_comet_planet(game, target_id) {
+            continue;
+        }
+        let send = ships_to_send(source_ships, frac_at(i));
+        if send <= 0 {
+            continue;
+        }
+        let speed = fleet_speed_local(send, game.ship_speed);
+        if speed <= 0.0 {
+            continue;
+        }
+        let Some(solution) = lead_solution(
+            &source,
+            &target,
+            game.angular_velocity,
+            send,
+            game.ship_speed,
+        ) else {
+            continue;
+        };
+        let blockers = blockers.get_or_insert_with(|| {
+            game.planets
+                .iter()
+                .take(planet_limit)
+                .map(|planet| {
+                    Some(target_motion(
+                        planet,
+                        game.angular_velocity,
+                        game.ship_speed,
+                        is_comet_planet(game, planet.id),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+        if !route_clear_to_solution(
+            source.id,
+            target_id,
+            source.x,
+            source.y,
+            source.radius,
+            &solution,
+            speed,
+            blockers,
         ) {
             continue;
         }
@@ -1271,6 +1621,7 @@ fn target_motion(
             x: target.x,
             y: target.y,
             radius: target.radius,
+            radius_sq: target.radius * target.radius,
             is_orbiting: false,
             positions: Vec::new(),
         };
@@ -1292,6 +1643,7 @@ fn target_motion(
         x: target.x,
         y: target.y,
         radius: target.radius,
+        radius_sq: target.radius * target.radius,
         is_orbiting: true,
         positions,
     }
@@ -1519,7 +1871,9 @@ fn route_clear_to_solution(
     if !inside_board(start.0, start.1) || !inside_board(final_point.0, final_point.1) {
         return false;
     }
-    if point_to_segment_distance_local((CENTER, CENTER), start, final_point) < SUN_RADIUS {
+    if point_to_segment_distance_sq_local((CENTER, CENTER), start, final_point)
+        < SUN_RADIUS * SUN_RADIUS
+    {
         return false;
     }
 
@@ -1527,7 +1881,8 @@ fn route_clear_to_solution(
         if motion.id == source_id || motion.id == target_id || motion.is_orbiting {
             continue;
         }
-        if point_to_segment_distance_local((motion.x, motion.y), start, final_point) < motion.radius
+        if point_to_segment_distance_sq_local((motion.x, motion.y), start, final_point)
+            < motion.radius_sq
         {
             return false;
         }
@@ -1555,13 +1910,102 @@ fn route_clear_to_solution(
             }
             let pos = motion_position_at(motion, turn - 1);
             if motion.id != source_id
-                && point_to_segment_distance_local(pos, old, new) < motion.radius
+                && point_to_segment_distance_sq_local(pos, old, new) < motion.radius_sq
             {
                 return false;
             }
             if turn < final_turn {
                 let next_pos = motion_position_at(motion, turn);
-                if point_to_segment_distance_local(new, pos, next_pos) < motion.radius {
+                if point_to_segment_distance_sq_local(new, pos, next_pos) < motion.radius_sq {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn route_clear_to_solution_with_cols(
+    source_id: i32,
+    target_id: i32,
+    source_x: f64,
+    source_y: f64,
+    source_radius: f64,
+    solution: &LeadSolution,
+    speed: f64,
+    blockers: &[Option<TargetMotion>],
+    static_cols: &[usize],
+    moving_cols: &[usize],
+) -> bool {
+    if speed <= 0.0 {
+        return false;
+    }
+    let offset = (source_radius + 0.1).max(0.0);
+    let dir_x = solution.angle.cos();
+    let dir_y = solution.angle.sin();
+    let start = (source_x + dir_x * offset, source_y + dir_y * offset);
+    let final_turn = (solution.time.ceil() as usize).max(1);
+    let final_point = (
+        start.0 + dir_x * speed * final_turn as f64,
+        start.1 + dir_y * speed * final_turn as f64,
+    );
+    if !inside_board(start.0, start.1) || !inside_board(final_point.0, final_point.1) {
+        return false;
+    }
+    if point_to_segment_distance_sq_local((CENTER, CENTER), start, final_point)
+        < SUN_RADIUS * SUN_RADIUS
+    {
+        return false;
+    }
+
+    for &idx in static_cols {
+        let Some(motion) = blockers[idx].as_ref() else {
+            continue;
+        };
+        if motion.id == source_id || motion.id == target_id {
+            continue;
+        }
+        if point_to_segment_distance_sq_local((motion.x, motion.y), start, final_point)
+            < motion.radius_sq
+        {
+            return false;
+        }
+    }
+    if moving_cols.is_empty()
+        || moving_cols.iter().all(|&idx| {
+            blockers[idx]
+                .as_ref()
+                .is_none_or(|motion| motion.id == target_id)
+        })
+    {
+        return true;
+    }
+
+    for turn in 1..=final_turn {
+        let old = (
+            start.0 + dir_x * speed * (turn - 1) as f64,
+            start.1 + dir_y * speed * (turn - 1) as f64,
+        );
+        let new = (
+            start.0 + dir_x * speed * turn as f64,
+            start.1 + dir_y * speed * turn as f64,
+        );
+        for &idx in moving_cols {
+            let Some(motion) = blockers[idx].as_ref() else {
+                continue;
+            };
+            if motion.id == target_id {
+                continue;
+            }
+            let pos = motion_position_at(motion, turn - 1);
+            if motion.id != source_id
+                && point_to_segment_distance_sq_local(pos, old, new) < motion.radius_sq
+            {
+                return false;
+            }
+            if turn < final_turn {
+                let next_pos = motion_position_at(motion, turn);
+                if point_to_segment_distance_sq_local(new, pos, next_pos) < motion.radius_sq {
                     return false;
                 }
             }
@@ -1574,17 +2018,25 @@ fn inside_board(x: f64, y: f64) -> bool {
     (0.0..=BOARD_SIZE).contains(&x) && (0.0..=BOARD_SIZE).contains(&y)
 }
 
-fn point_to_segment_distance_local(point: (f64, f64), start: (f64, f64), end: (f64, f64)) -> f64 {
+fn point_to_segment_distance_sq_local(
+    point: (f64, f64),
+    start: (f64, f64),
+    end: (f64, f64),
+) -> f64 {
     let seg_x = end.0 - start.0;
     let seg_y = end.1 - start.1;
     let l2 = seg_x * seg_x + seg_y * seg_y;
     if l2 == 0.0 {
-        return ((point.0 - start.0).powi(2) + (point.1 - start.1).powi(2)).sqrt();
+        let dx = point.0 - start.0;
+        let dy = point.1 - start.1;
+        return dx * dx + dy * dy;
     }
     let raw_t = ((point.0 - start.0) * seg_x + (point.1 - start.1) * seg_y) / l2;
     let t = raw_t.clamp(0.0, 1.0);
     let proj = (start.0 + t * seg_x, start.1 + t * seg_y);
-    ((point.0 - proj.0).powi(2) + (point.1 - proj.1).powi(2)).sqrt()
+    let dx = point.0 - proj.0;
+    let dy = point.1 - proj.1;
+    dx * dx + dy * dy
 }
 
 fn angle_delta(a: f64, b: f64) -> f64 {

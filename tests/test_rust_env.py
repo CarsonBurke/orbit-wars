@@ -390,6 +390,30 @@ def test_rust_state_legal_mask_matches_feature_legal_mask():
     frac = torch.full(fast.planet_mask.shape, 0.75, dtype=torch.float32).numpy()
 
     state_mask = rust._core.legal_target_mask_from_state(rows, frac)
+    active_state_mask = rust._core.legal_target_mask_from_state_active(
+        rows,
+        frac,
+        np.ones_like(frac, dtype=bool),
+    )
+    inactive_state_mask = rust._core.legal_target_mask_from_state_active(
+        rows,
+        frac,
+        np.zeros_like(frac, dtype=bool),
+    )
+    mixed_active = np.zeros_like(frac, dtype=bool)
+    owned_sources = (
+        fast.planet_owned_mask.numpy().astype(bool)
+        & fast.planet_mask.numpy().astype(bool)
+    )
+    for row, cols in enumerate(owned_sources):
+        source_cols = np.flatnonzero(cols)
+        if len(source_cols) > 0 and row % 2 == 0:
+            mixed_active[row, source_cols[0]] = True
+    mixed_state_mask = rust._core.legal_target_mask_from_state_active(
+        rows,
+        frac,
+        mixed_active,
+    )
     feature_mask = rust._core.legal_target_mask(
         rows,
         frac,
@@ -400,6 +424,11 @@ def test_rust_state_legal_mask_matches_feature_legal_mask():
 
     assert state_mask.any()
     assert np.array_equal(state_mask, feature_mask)
+    assert np.array_equal(active_state_mask, state_mask)
+    assert not inactive_state_mask.any()
+    expected_mixed = np.zeros_like(state_mask)
+    expected_mixed[mixed_active] = state_mask[mixed_active]
+    assert np.array_equal(mixed_state_mask, expected_mixed)
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
@@ -456,6 +485,18 @@ def test_rust_state_sampler_matches_feature_sampler_after_comets_4p():
         frac_np,
         False,
     )
+    masked_materialized = rust._core.materialize_masked_actions_from_state(
+        rows,
+        launch,
+        target_idx,
+        frac_np,
+        False,
+    )
+    masked_fields_materialized = rust._core.materialize_masked_action_fields_from_state(
+        rows,
+        np.stack((launch, target_idx.astype(np.float32), frac_np), axis=-1),
+        False,
+    )
     feature_materialized = rust._core.materialize_actions(
         rows,
         launch,
@@ -468,9 +509,19 @@ def test_rust_state_sampler_matches_feature_sampler_after_comets_4p():
     )
 
     assert state_materialized["actions"] == feature_materialized["actions"]
+    assert masked_materialized["actions"] == state_materialized["actions"]
+    assert masked_fields_materialized["actions"] == state_materialized["actions"]
     assert np.array_equal(
         state_materialized["materialized"],
         feature_materialized["materialized"],
+    )
+    assert np.array_equal(
+        masked_materialized["materialized"],
+        state_materialized["materialized"],
+    )
+    assert np.array_equal(
+        masked_fields_materialized["materialized"],
+        state_materialized["materialized"],
     )
 
 
@@ -541,8 +592,8 @@ def test_rust_vec_env_native_sampler_matches_context_sampler():
     out = PolicyOutput(
         launch_logits=launch_logits,
         target_logits=target_logits,
-        fraction_alpha=torch.full((b, p), 20.0),
-        fraction_beta=torch.full((b, p), 2.0),
+        fraction_mean=torch.full((b, p), 3.0),
+        fraction_log_std=torch.zeros((b, p)),
         value=torch.zeros(b),
         value_logits=torch.zeros(b, 51),
         planet_owned_mask=fast.planet_owned_mask,

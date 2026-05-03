@@ -13,7 +13,6 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as nn_functional
-from torch.distributions import Beta
 
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.features import MAX_FLEETS, MAX_PLANETS, EncodedObs
@@ -22,7 +21,9 @@ from owars.policies.sampling import sample_batch_with_records
 from owars.training.ppo import (
     _conditional_action_entropy,
     _fixed_minibatches,
+    _backward_actor_critic_with_separate_clips,
     _minibatch_loss_scale,
+    _squashed_normal_log_prob,
     ppo_update,
     value_only_update,
 )
@@ -128,13 +129,12 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         "fraction_entropy",
         "move_prob",
         "target_confidence",
-        "fraction_alpha_mean",
-        "fraction_alpha_max",
-        "fraction_beta_mean",
-        "fraction_beta_max",
-        "fraction_mode_mean",
-        "fraction_concentration_mean",
-        "fraction_concentration_max",
+        "fraction_mean_mean",
+        "fraction_mean_abs_max",
+        "fraction_log_std_mean",
+        "fraction_log_std_min",
+        "fraction_log_std_max",
+        "deterministic_fraction_mean",
     ):
         v = getattr(log, name)
         assert math.isfinite(v), f"{name}={v!r}"
@@ -173,7 +173,9 @@ def test_log_prob_recompute_matches_sample_time():
     launch_logits = out.launch_logits.masked_fill(~target_legal_mask.any(dim=-1), -20.0)
     target_log_probs = torch.log_softmax(target_logits, dim=-1)
     target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-    frac_lp = Beta(out.fraction_alpha, out.fraction_beta).log_prob(batch["fraction"])
+    frac_lp = _squashed_normal_log_prob(
+        out.fraction_mean, out.fraction_log_std, batch["fraction"]
+    )
     launch_lp = -nn_functional.binary_cross_entropy_with_logits(
         launch_logits, launch, reduction="none"
     )
@@ -189,9 +191,11 @@ def test_conditional_entropy_weights_fraction_by_current_move_probability():
     # P(launch)=0.25, uniform categorical over two targets -> H=log(2).
     launch_logits = torch.logit(torch.tensor([0.25]))
     target_log_probs = torch.log_softmax(torch.zeros(1, 2), dim=-1)
-    beta_entropy = torch.tensor([1.5])
+    fraction_entropy = torch.tensor([1.5])
 
-    entropy = _conditional_action_entropy(launch_logits, target_log_probs, beta_entropy)
+    entropy = _conditional_action_entropy(
+        launch_logits, target_log_probs, fraction_entropy
+    )
 
     expected_launch_entropy = -(0.25 * math.log(0.25) + 0.75 * math.log(0.75))
     expected = expected_launch_entropy + 0.25 * (math.log(2.0) + 1.5)
@@ -231,6 +235,32 @@ def test_minibatch_loss_scale_downweights_padded_tail_step():
     assert torch.allclose(_minibatch_loss_scale(weight), torch.tensor(0.4))
 
 
+def test_policy_value_grad_clip_separates_shared_actor_and_critic_grads():
+    class Toy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.launch_head = torch.nn.Linear(1, 1, bias=False)
+            self.value_head = torch.nn.Linear(1, 1, bias=False)
+            self.shared = torch.nn.Linear(1, 1, bias=False)
+
+    model = Toy()
+    actor_loss = 3.0 * model.launch_head.weight.sum() + 4.0 * model.shared.weight.sum()
+    critic_loss = 30.0 * model.value_head.weight.sum() + 40.0 * model.shared.weight.sum()
+
+    actor_norm, critic_norm = _backward_actor_critic_with_separate_clips(
+        model,
+        actor_loss,
+        critic_loss,
+        1.0,
+    )
+
+    assert torch.allclose(actor_norm, torch.tensor(5.0))
+    assert torch.allclose(critic_norm, torch.tensor(50.0))
+    assert torch.allclose(model.launch_head.weight.grad, torch.tensor([[0.6]]))
+    assert torch.allclose(model.value_head.weight.grad, torch.tensor([[0.6]]))
+    assert torch.allclose(model.shared.weight.grad, torch.tensor([[1.6]]))
+
+
 class _FixedPolicy(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -240,8 +270,8 @@ class _FixedPolicy(torch.nn.Module):
         self.new_target_logits = torch.log(
             torch.tensor([[[0.20, 0.80], [0.50, 0.50]]])
         )
-        self.new_alpha = torch.tensor([[4.0, 4.0]])
-        self.new_beta = torch.tensor([[3.0, 3.0]])
+        self.new_fraction_mean = torch.tensor([[0.0, 0.0]])
+        self.new_fraction_log_std = torch.tensor([[-0.25, -0.25]])
 
     def forward(self, feats, *, detach_actor: bool = False):
         b = feats.planet_feats.shape[0]
@@ -254,12 +284,12 @@ class _FixedPolicy(torch.nn.Module):
                 self.new_launch_logits.expand(b, -1).to(feats.planet_feats.device)
                 + self.dummy * 0.0
             ),
-            fraction_alpha=(
-                self.new_alpha.expand(b, -1).to(feats.planet_feats.device)
+            fraction_mean=(
+                self.new_fraction_mean.expand(b, -1).to(feats.planet_feats.device)
                 + self.dummy * 0.0
             ),
-            fraction_beta=(
-                self.new_beta.expand(b, -1).to(feats.planet_feats.device)
+            fraction_log_std=(
+                self.new_fraction_log_std.expand(b, -1).to(feats.planet_feats.device)
                 + self.dummy * 0.0
             ),
             value_logits=(
@@ -274,12 +304,17 @@ def _fixed_policy_batch(
     launch: float,
     advantage: float,
     old_log_prob: torch.Tensor,
+    owned_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    launch_t = torch.tensor([[launch, 0.0]])
+    launch_t = torch.tensor([[launch, launch]])
+    if owned_mask is None:
+        owned_mask = torch.tensor([[True, False]])
+    if old_log_prob.shape[1] == 1:
+        old_log_prob = torch.cat((old_log_prob, torch.zeros(1, 1)), dim=1)
     return {
         "planet_feats": torch.zeros(1, 2, 19),
         "planet_mask": torch.ones(1, 2, dtype=torch.bool),
-        "planet_owned_mask": torch.tensor([[True, False]]),
+        "planet_owned_mask": owned_mask,
         "planet_ids": torch.arange(2).reshape(1, 2),
         "planet_garrison": torch.ones(1, 2),
         "fleet_feats": torch.zeros(1, 1, 20),
@@ -287,8 +322,8 @@ def _fixed_policy_batch(
         "launch": launch_t,
         "target_idx": torch.ones(1, 2, dtype=torch.long),
         "fraction": torch.full((1, 2), 0.5),
-        "old_log_prob": torch.cat((old_log_prob, torch.zeros(1, 1)), dim=1),
-        "owned_mask": torch.tensor([[True, False]]),
+        "old_log_prob": old_log_prob,
+        "owned_mask": owned_mask,
         "advantage": torch.tensor([advantage]),
         "return": torch.zeros(1),
         "target_legal_mask": torch.ones(1, 2, 2, dtype=torch.bool),
@@ -299,8 +334,10 @@ def test_spo_asym_policy_loss_uses_high_eps_when_drift_agrees_with_advantage():
     model = _FixedPolicy()
     launch_lp = torch.log(model.new_launch_logits.sigmoid()[0, 0])
     target_lp = torch.log(model.new_target_logits.exp()[0, 0, 1])
-    frac_lp = Beta(model.new_alpha[0, 0], model.new_beta[0, 0]).log_prob(
-        torch.tensor(0.5)
+    frac_lp = _squashed_normal_log_prob(
+        model.new_fraction_mean[0, 0],
+        model.new_fraction_log_std[0, 0],
+        torch.tensor(0.5),
     )
     new_log_prob = (launch_lp + target_lp + frac_lp).reshape(1, 1)
     old_log_prob = new_log_prob - math.log(1.5)
@@ -330,12 +367,105 @@ def test_spo_asym_policy_loss_uses_high_eps_when_drift_agrees_with_advantage():
     assert math.isclose(log.approx_kl, expected_kl, rel_tol=1e-6)
 
 
+def test_approx_kl_sums_owned_planet_log_probs_cleanrl_style():
+    model = _FixedPolicy()
+    launch_lp = torch.log(model.new_launch_logits.sigmoid())
+    target_lp = torch.log(torch.tensor([[0.80, 0.50]]))
+    frac_lp = _squashed_normal_log_prob(
+        model.new_fraction_mean,
+        model.new_fraction_log_std,
+        torch.full((1, 2), 0.5),
+    )
+    new_log_prob = launch_lp + target_lp + frac_lp
+    old_log_prob = new_log_prob - torch.log(torch.tensor([[1.5, 1.2]]))
+    batch = _fixed_policy_batch(
+        launch=1.0,
+        advantage=1.0,
+        old_log_prob=old_log_prob,
+        owned_mask=torch.tensor([[True, True]]),
+    )
+    optim = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    log = ppo_update(
+        model, optim, batch,
+        value_coef=0.0,
+        target_entropy_coef=0.0,
+        fraction_entropy_coef=0.0,
+        norm_advantage=False,
+        spo_eps_low=0.2,
+        spo_eps_high=0.28,
+        epochs=1, minibatch_size=1, grad_clip=1.0,
+    )
+
+    joint_ratio = 1.5 * 1.2
+    expected_kl = (joint_ratio - 1.0) - math.log(joint_ratio)
+    assert math.isclose(log.approx_kl, expected_kl, rel_tol=1e-6)
+
+
+def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
+    model = _FixedPolicy()
+    launch_lp = torch.log(model.new_launch_logits.sigmoid()[0, 0])
+    target_lp = torch.log(model.new_target_logits.exp()[0, 0, 1])
+    frac_lp = _squashed_normal_log_prob(
+        model.new_fraction_mean[0, 0],
+        model.new_fraction_log_std[0, 0],
+        torch.tensor(0.5),
+    )
+    new_log_prob = launch_lp + target_lp + frac_lp
+    ratios = torch.tensor([1.2, 1.8])
+    batch = {
+        "planet_feats": torch.zeros(2, 2, 19),
+        "planet_mask": torch.ones(2, 2, dtype=torch.bool),
+        "planet_owned_mask": torch.tensor([[True, False], [True, False]]),
+        "planet_ids": torch.arange(2).expand(2, -1),
+        "planet_garrison": torch.ones(2, 2),
+        "fleet_feats": torch.zeros(2, 1, 20),
+        "fleet_mask": torch.zeros(2, 1, dtype=torch.bool),
+        "launch": torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+        "target_idx": torch.ones(2, 2, dtype=torch.long),
+        "fraction": torch.full((2, 2), 0.5),
+        "old_log_prob": torch.stack(
+            (
+                torch.tensor([new_log_prob - torch.log(ratios[0]), 0.0]),
+                torch.tensor([new_log_prob - torch.log(ratios[1]), 0.0]),
+            )
+        ),
+        "owned_mask": torch.tensor([[True, False], [True, False]]),
+        "advantage": torch.ones(2),
+        "return": torch.zeros(2),
+        "target_legal_mask": torch.ones(2, 2, 2, dtype=torch.bool),
+    }
+    torch.manual_seed(7)
+    expected_order = torch.randperm(2)
+    expected_ratio = float(ratios[int(expected_order[-1])])
+    torch.manual_seed(7)
+    optim = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    log = ppo_update(
+        model, optim, batch,
+        value_coef=0.0,
+        target_entropy_coef=0.0,
+        fraction_entropy_coef=0.0,
+        norm_advantage=False,
+        spo_eps_low=0.2,
+        spo_eps_high=0.28,
+        epochs=1, minibatch_size=1, grad_clip=1.0,
+    )
+
+    latest_kl = (expected_ratio - 1.0) - math.log(expected_ratio)
+    mean_kl = torch.mean((ratios - 1.0) - torch.log(ratios)).item()
+    assert math.isclose(log.approx_kl, latest_kl, rel_tol=1e-6, abs_tol=1e-7)
+    assert not math.isclose(log.approx_kl, mean_kl, rel_tol=1e-6)
+
+
 def test_spo_asym_policy_loss_uses_low_eps_when_drift_opposes_advantage():
     model = _FixedPolicy()
     launch_lp = torch.log(model.new_launch_logits.sigmoid()[0, 0])
     target_lp = torch.log(model.new_target_logits.exp()[0, 0, 1])
-    frac_lp = Beta(model.new_alpha[0, 0], model.new_beta[0, 0]).log_prob(
-        torch.tensor(0.5)
+    frac_lp = _squashed_normal_log_prob(
+        model.new_fraction_mean[0, 0],
+        model.new_fraction_log_std[0, 0],
+        torch.tensor(0.5),
     )
     new_log_prob = (launch_lp + target_lp + frac_lp).reshape(1, 1)
     old_log_prob = new_log_prob + math.log(2.0)

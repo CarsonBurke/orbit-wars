@@ -22,13 +22,13 @@ having to go autoregressive.
 
 We deliberately do **not** down-project after the actor concat: target_query
 and fraction_head take 2d-wide inputs and project to their natural output
-dim (d for query/key, 2 for the Beta's mean/concentration heads). Down-projecting
+dim (d for query/key, 1 for the squashed-Gaussian mean head). Down-projecting
 `[planet_h || h_actor]` back to d would discard exactly the global-context
 capacity the extra token was added to provide.
 
 **Action factorization.** Per source planet, the actor emits a Bernoulli
 launch decision, a masked categorical target distribution conditional on
-launching, and a Beta fraction distribution conditional on launching. This
+launching, and a tanh-squashed Gaussian fraction distribution conditional on launching. This
 keeps "should this planet act?" independent of the number of legal target
 planets; target count should affect *where* probability mass goes, not whether
 the source launches at all.
@@ -36,15 +36,11 @@ the source launches at all.
 **No angle head.** The launch angle is computed exactly via an iterative
 lead-intercept solver in `sampling.py`.
 
-**Fraction head is a Beta(α, β)** on [0, 1] — the natural distribution for
-"fraction of garrison to send." The network predicts Beta mode μ and extra
-concentration c, then derives:
-    α = 1 + c · μ
-    β = 1 + c · (1 − μ)
-This keeps α,β ≥ 1 (unimodal/concave; Chou et al. 2017) without letting the
-max-spread floor become an absorbing state. If concentration bottoms out,
-the mode still has a direct gradient through both α and β. Concentration is
-bounded, giving a persistent exploration floor without an entropy bonus.
+**Fraction head is a tanh-squashed Gaussian** mapped from pre-squash
+z ∈ ℝ to fraction ∈ [0, 1]. The network predicts the pre-squash mean per
+source planet and uses one direct learned log std parameter expanded over
+planets. PPO stores the post-squash fraction that the simulator executes, and
+log-prob recomputation inverts it with atanh plus the tanh Jacobian correction.
 
 **Distributional value head (HL-Gauss).** dreamer4 (`dreamer4.py:722–805`)
 predicts a categorical over a fixed bin support and trains it with
@@ -78,7 +74,6 @@ action space wants.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -621,12 +616,10 @@ class FleetLatentTokenizer(nn.Module):
         return self.final_norm(latents)
 
 
-# Bounds for the mode+concentration Beta fraction head. Extra concentration
-# c is bounded to [min, max]; α=1+c·μ and β=1+c·(1−μ), so α,β stay ≥1.
-FRACTION_MEAN_EPS: float = 1e-4
-FRACTION_CONCENTRATION_MIN: float = 1.0
-FRACTION_CONCENTRATION_INIT: float = 1.4
-FRACTION_CONCENTRATION_MAX: float = 20.0
+# Direct log std for the tanh-squashed Gaussian fraction head. A scalar
+# parameter is expanded over source planets, CleanRL-style, so the readout only
+# predicts the state-dependent pre-squash mean.
+FRACTION_LOG_STD_INIT: float = 0.0
 
 
 class HLGaussLoss(nn.Module):
@@ -710,38 +703,12 @@ def _symlog(x: torch.Tensor) -> torch.Tensor:
 def _symexp(x: torch.Tensor) -> torch.Tensor:
     return x.sign() * torch.expm1(x.abs())
 
-def _logit(p: float) -> float:
-    return math.log(p / (1.0 - p))
-
-
-def _fraction_beta_params(
-    mode_logit: torch.Tensor,
-    concentration_logit: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map raw fraction heads to Beta(α, β) through mode+concentration.
-
-    Mode uses a sigmoid range instead of a clamp, preserving gradients until
-    true logit saturation. Concentration may saturate at its floor, but μ can
-    still move α and β, so the lower-concentration state is not absorbing.
-    """
-    mode = FRACTION_MEAN_EPS + (1.0 - 2.0 * FRACTION_MEAN_EPS) * torch.sigmoid(
-        mode_logit
-    )
-    span = FRACTION_CONCENTRATION_MAX - FRACTION_CONCENTRATION_MIN
-    concentration = FRACTION_CONCENTRATION_MIN + span * torch.sigmoid(
-        concentration_logit
-    )
-    alpha = 1.0 + concentration * mode
-    beta = 1.0 + concentration * (1.0 - mode)
-    return alpha, beta
-
-
 @dataclass
 class PolicyOutput:
     launch_logits: torch.Tensor       # [B, P] Bernoulli logits
     target_logits: torch.Tensor       # [B, P, P] masked target categorical logits
-    fraction_alpha: torch.Tensor      # [B, P]  Beta α from mode+concentration
-    fraction_beta: torch.Tensor       # [B, P]  Beta β from mode+concentration
+    fraction_mean: torch.Tensor       # [B, P] pre-squash Normal mean
+    fraction_log_std: torch.Tensor    # [B, P] direct learned Normal log std
     value: torch.Tensor               # [B] — scalar value E[V] recovered from value_logits
     value_logits: torch.Tensor        # [B, num_bins] — distributional value head logits
     planet_owned_mask: torch.Tensor   # [B, P] bool
@@ -857,19 +824,15 @@ class OrbitPolicy(nn.Module):
         self.launch_head = CastedLinear(2 * cfg.dim, 1)
         nn.init.zeros_(self.launch_head.weight)
         nn.init.constant_(self.launch_head.bias, -1.5)
-        # 2·dim input for the same reason as target_query. Outputs raw
-        # (mode_logit, concentration_logit) for the Beta fraction distribution.
-        self.fraction_head = CastedLinear(2 * cfg.dim, 2)
+        # 2·dim input for the same reason as target_query. Outputs the
+        # pre-squash Normal mean for the tanh-squashed fraction distribution.
+        self.fraction_head = CastedLinear(2 * cfg.dim, 1)
+        self.fraction_log_std = nn.Parameter(torch.tensor(FRACTION_LOG_STD_INIT))
         # gain=0.01 — cleanrl PPO's canonical actor-readout init
-        # (`ppo_continuous_action.py:127`). Bias the concentration head so
-        # init is Beta(1.7, 1.7), matching the old near-uniform cold start.
+        # (`ppo_continuous_action.py:127`). Zero bias starts the deterministic
+        # fraction at 0.5 via tanh(0).
         nn.init.orthogonal_(self.fraction_head.weight, gain=0.01)
         nn.init.zeros_(self.fraction_head.bias)
-        conc_p = (
-            (FRACTION_CONCENTRATION_INIT - FRACTION_CONCENTRATION_MIN)
-            / (FRACTION_CONCENTRATION_MAX - FRACTION_CONCENTRATION_MIN)
-        )
-        nn.init.constant_(self.fraction_head.bias[1], _logit(conc_p))
         # Distributional value head — emits logits over `value_num_bins`
         # bins. Scalar V is recovered from these via `HLGaussLoss.bins_to_scalar`.
         # The default uses Dreamer4-style symlog buckets over a wide raw
@@ -1043,7 +1006,7 @@ class OrbitPolicy(nn.Module):
             f,
         )
 
-    def forward(self, feats: EncodedObs) -> PolicyOutput:
+    def forward(self, feats: EncodedObs, *, include_value: bool = True) -> PolicyOutput:
         planet_h, _fleet_h, h_actor, h_critic, _token_mask = self.encode(feats)
         b, p, d = planet_h.shape
 
@@ -1094,24 +1057,26 @@ class OrbitPolicy(nn.Module):
         launch_logits = launch_logits.masked_fill(valid_target_count <= 0, -20.0)
         target_logits = logits  # [B, P, P]
 
-        # Fraction head: raw (mode_logit, concentration_logit) → Beta(α, β).
-        # Mode remains trainable even when concentration hits its floor.
-        offs = self.fraction_head(planet_with_ctx).float()
-        fraction_alpha, fraction_beta = _fraction_beta_params(
-            offs[..., 0], offs[..., 1]
-        )
+        # Fraction head: pre-squash Normal mean plus a direct learned log std
+        # expanded over planets, matching the CleanRL squashed-Gaussian idiom.
+        fraction_mean = self.fraction_head(planet_with_ctx).squeeze(-1).float()
+        fraction_log_std = self.fraction_log_std.float().expand_as(fraction_mean)
 
-        # Value: distributional head over the dedicated critic token.
-        # Logits are returned for distributional CE loss + value clipping;
-        # the scalar `value` is recovered via E[V] = Σ p_i · center_i.
-        value_logits = self.value_head(h_critic)  # [B, num_bins]
-        value = self.value_encoder.bins_to_scalar(value_logits)
+        if include_value:
+            # Value: distributional head over the dedicated critic token.
+            # Logits are returned for distributional CE loss + value clipping;
+            # the scalar `value` is recovered via E[V] = Σ p_i · center_i.
+            value_logits = self.value_head(h_critic)  # [B, num_bins]
+            value = self.value_encoder.bins_to_scalar(value_logits)
+        else:
+            value = h_critic.new_empty((b,), dtype=torch.float32)
+            value_logits = h_critic.new_empty((b, 0), dtype=torch.float32)
 
         return PolicyOutput(
             launch_logits=launch_logits,
             target_logits=target_logits,
-            fraction_alpha=fraction_alpha,
-            fraction_beta=fraction_beta,
+            fraction_mean=fraction_mean,
+            fraction_log_std=fraction_log_std,
             value=value,
             value_logits=value_logits,
             planet_owned_mask=planet_owned,

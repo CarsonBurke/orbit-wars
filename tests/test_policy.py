@@ -2,7 +2,7 @@ import torch
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
-from owars.policies.model import HLGaussLoss, _fraction_beta_params
+from owars.policies.model import HLGaussLoss
 from owars.policies.sampling import _deterministic_fraction
 
 
@@ -43,8 +43,8 @@ def test_policy_forward_shapes():
     # batch dim was added implicitly by the encoder fast path.
     assert out.launch_logits.shape == (1, 64)
     assert out.target_logits.shape == (1, 64, 64)
-    assert out.fraction_alpha.shape == (1, 64)
-    assert out.fraction_beta.shape == (1, 64)
+    assert out.fraction_mean.shape == (1, 64)
+    assert out.fraction_log_std.shape == (1, 64)
     assert out.value.shape == (1,)
     # Distributional value head: per-bin logits over the configured support.
     assert out.value_logits.shape == (1, cfg.value_num_bins)
@@ -158,28 +158,23 @@ def test_launch_prior_is_stable_across_planet_counts():
     assert torch.allclose(large.sigmoid()[0, 0], expected, atol=1e-5)
 
 
-def test_fraction_mode_keeps_gradient_at_concentration_floor():
-    mode_logit = torch.tensor([0.0], requires_grad=True)
-    concentration_logit = torch.tensor([-80.0], requires_grad=True)
+def test_fraction_log_std_is_direct_parameter_expanded_over_planets():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
+    model = OrbitPolicy(cfg)
+    out = model(encode_observation(parse_observation(_obs())))
 
-    alpha, beta = _fraction_beta_params(mode_logit, concentration_logit)
-    loss = -(alpha - beta).mean()
-    loss.backward()
-
-    assert mode_logit.grad is not None
-    assert abs(float(mode_logit.grad.item())) > 0.1
+    assert "fraction_log_std" in dict(model.named_parameters())
+    expected = model.fraction_log_std.detach().expand_as(out.fraction_log_std)
+    assert torch.allclose(out.fraction_log_std, expected)
 
 
-def test_deterministic_fraction_uses_parameterized_mode_not_beta_mean():
-    mode = torch.tensor([0.1, 0.9])
-    concentration = torch.ones_like(mode)
-    alpha = 1.0 + concentration * mode
-    beta = 1.0 + concentration * (1.0 - mode)
+def test_deterministic_fraction_uses_squashed_mean():
+    fraction = torch.tensor([0.1, 0.9])
+    mean = torch.atanh(2.0 * fraction - 1.0)
 
-    got = _deterministic_fraction(alpha, beta)
+    got = _deterministic_fraction(mean)
 
-    assert torch.allclose(got, mode)
-    assert not torch.allclose(got, alpha / (alpha + beta))
+    assert torch.allclose(got, fraction, atol=1e-6)
 
 
 def test_policy_accepts_legacy_fleet_feature_width():
@@ -212,8 +207,8 @@ def test_policy_ignores_padded_token_features():
     valid_cols = feats.planet_mask.unsqueeze(0)
     assert torch.allclose(clean_out.value, noisy_out.value)
     assert torch.allclose(
-        clean_out.fraction_alpha[valid_planets],
-        noisy_out.fraction_alpha[valid_planets],
+        clean_out.fraction_mean[valid_planets],
+        noisy_out.fraction_mean[valid_planets],
     )
     assert torch.allclose(
         clean_out.launch_logits[valid_planets],

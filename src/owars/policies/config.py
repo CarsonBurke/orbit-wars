@@ -35,7 +35,7 @@ class OrbitPolicyConfig:
     # Action factorization. For each owned planet we emit:
     #   - a Bernoulli launch logit
     #   - masked categorical target logits, conditional on launching
-    #   - a mode+concentration Beta(α, β) fraction, conditional on launching.
+    #   - a tanh-squashed Gaussian fraction, conditional on launching.
     # Launch angle is derived from the chosen target via an iterative
     # lead-intercept solver in `sampling.py` — no learned angle component.
 

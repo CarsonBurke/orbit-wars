@@ -200,8 +200,8 @@ def test_numpy_vec_fast_policy_batch_matches_raw_observations():
     out = PolicyOutput(
         launch_logits=launch_logits,
         target_logits=logits,
-        fraction_alpha=torch.full((b, p), 20.0),
-        fraction_beta=torch.ones((b, p)),
+        fraction_mean=torch.full((b, p), 3.0),
+        fraction_log_std=torch.zeros((b, p)),
         value=torch.zeros(b),
         value_logits=torch.zeros(b, 51),
         planet_owned_mask=fast.planet_owned_mask,

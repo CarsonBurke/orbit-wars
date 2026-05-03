@@ -32,6 +32,7 @@ import random
 from collections import defaultdict
 from contextlib import suppress
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -84,6 +85,7 @@ _HEAD_LR_PATTERNS: tuple[str, ...] = (
     "target_query",
     "target_key",
     "fraction_head",
+    "fraction_log_std",
     "launch_head",
     "value_head",
 )
@@ -589,6 +591,8 @@ def _ppo_loop(
         learner_seats = alternating_learner_seats(
             cfg.rollout.num_envs, cfg.game.num_players, offset=update
         )
+        update_t0 = perf_counter()
+        phase_t0 = update_t0
         trajs = rollout_episodes_batched(
             model,
             vec,
@@ -599,7 +603,9 @@ def _ppo_loop(
             reward_cfg=cfg.reward,
             compile_mode=_compile_mode_for_model(model, cfg),
         )
+        rollout_s = perf_counter() - phase_t0
 
+        phase_t0 = perf_counter()
         if vec.last_replay_html is not None:
             (replays_dir / f"update_{update:04d}.html").write_text(
                 vec.last_replay_html
@@ -613,14 +619,21 @@ def _ppo_loop(
                 play_count[s.name] += 1
                 if traj.won:
                     win_count[s.name] += 1
+        bookkeeping_s = perf_counter() - phase_t0
 
+        phase_t0 = perf_counter()
         batch = _stack_trajectories(
             trajs,
             gamma=cfg.ppo.gamma,
             gae_lambda=cfg.ppo.gae_lambda,
         )
-        batch = {k: v.to(device) for k, v in batch.items()}
+        stack_s = perf_counter() - phase_t0
 
+        phase_t0 = perf_counter()
+        batch = {k: v.to(device) for k, v in batch.items()}
+        batch_to_device_s = perf_counter() - phase_t0
+
+        phase_t0 = perf_counter()
         log = ppo_update(
             model,
             optimizer,
@@ -636,7 +649,9 @@ def _ppo_loop(
             grad_clip=cfg.optim.grad_clip,
             compile_mode=_compile_mode_for_model(model, cfg),
         )
+        ppo_s = perf_counter() - phase_t0
 
+        phase_t0 = perf_counter()
         margins = [float(t.final_score) for t in trajs]
         win_rate = float(np.mean([t.won for t in trajs]))
         margin = float(np.mean(margins))
@@ -650,6 +665,9 @@ def _ppo_loop(
         cumulative_games += len(margins)
         cumulative_mean_margin = cumulative_margin / max(1, cumulative_games)
         snapshot_elos = [elo.get(n) for n in pool.snapshot_names()]
+        metrics_s = perf_counter() - phase_t0
+
+        phase_t0 = perf_counter()
         logger.scalars(
             "loss",
             {
@@ -682,13 +700,12 @@ def _ppo_loop(
         logger.scalars(
             "fraction",
             {
-                "alpha_mean": log.fraction_alpha_mean,
-                "alpha_max": log.fraction_alpha_max,
-                "beta_mean": log.fraction_beta_mean,
-                "beta_max": log.fraction_beta_max,
-                "mode_mean": log.fraction_mode_mean,
-                "concentration_mean": log.fraction_concentration_mean,
-                "concentration_max": log.fraction_concentration_max,
+                "mean_mean": log.fraction_mean_mean,
+                "mean_abs_max": log.fraction_mean_abs_max,
+                "log_std_mean": log.fraction_log_std_mean,
+                "log_std_min": log.fraction_log_std_min,
+                "log_std_max": log.fraction_log_std_max,
+                "deterministic_mean": log.deterministic_fraction_mean,
             },
             update,
         )
@@ -714,6 +731,9 @@ def _ppo_loop(
             },
             update,
         )
+        logging_s = perf_counter() - phase_t0
+
+        phase_t0 = perf_counter()
         summary["updates"].append(
             {
                 "update": update,
@@ -728,6 +748,27 @@ def _ppo_loop(
         if (update + 1) % cfg.opponents.snapshot_every == 0:
             ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / f"snapshot_{update:04d}.pt"
             pool.add_snapshot(f"{update:04d}", model, ckpt)
+        snapshot_s = perf_counter() - phase_t0
+        update_s = perf_counter() - update_t0
+
+        logger.scalars(
+            "timing",
+            {
+                "update_s": update_s,
+                "rollout_s": rollout_s,
+                "bookkeeping_s": bookkeeping_s,
+                "stack_s": stack_s,
+                "batch_to_device_s": batch_to_device_s,
+                "ppo_s": ppo_s,
+                "metrics_s": metrics_s,
+                "logging_s": logging_s,
+                "snapshot_s": snapshot_s,
+                "learner_steps_per_s": (
+                    sum(len(t.reward) for t in trajs) / max(rollout_s, 1e-9)
+                ),
+            },
+            update,
+        )
 
     final_path = Path(cfg.run.ckpt_root) / cfg.run.name / "final.pt"
     final_path.parent.mkdir(parents=True, exist_ok=True)

@@ -155,10 +155,17 @@ class _FleetTargetTracker:
 
 
 class _InferenceForwardKernel(nn.Module):
-    def __init__(self, model: OrbitPolicy, *, autocast_enabled: bool) -> None:
+    def __init__(
+        self,
+        model: OrbitPolicy,
+        *,
+        autocast_enabled: bool,
+        include_value: bool,
+    ) -> None:
         super().__init__()
         self.model = model
         self.autocast_enabled = bool(autocast_enabled)
+        self.include_value = bool(include_value)
 
     def forward(
         self,
@@ -184,7 +191,7 @@ class _InferenceForwardKernel(nn.Module):
             dtype=torch.bfloat16,
             enabled=self.autocast_enabled,
         ):
-            return self.model(feats)
+            return self.model(feats, include_value=self.include_value)
 
 
 def _mark_cuda_graph_step(device: torch.device) -> None:
@@ -223,8 +230,8 @@ def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
     return PolicyOutput(
         launch_logits=out.launch_logits[:rows],
         target_logits=out.target_logits[:rows],
-        fraction_alpha=out.fraction_alpha[:rows],
-        fraction_beta=out.fraction_beta[:rows],
+        fraction_mean=out.fraction_mean[:rows],
+        fraction_log_std=out.fraction_log_std[:rows],
         value=out.value[:rows],
         value_logits=out.value_logits[:rows],
         planet_owned_mask=out.planet_owned_mask[:rows],
@@ -261,7 +268,7 @@ class LearnedAgent:
             if self.compile_mode is not None and compile_graph_rows is not None
             else None
         )
-        self._forward_kernels: dict[int, nn.Module] = {}
+        self._forward_kernels: dict[tuple[int, bool], nn.Module] = {}
         self._tracker = _FleetTargetTracker()
         self._batch_trackers: dict[tuple[Any, ...], _FleetTargetTracker] = {}
         if self.compile_graph_rows is not None:
@@ -300,9 +307,15 @@ class LearnedAgent:
             fleet_mask=torch.zeros(rows, MAX_FLEETS, dtype=torch.bool, device=device),
         )
         with torch.inference_mode():
-            self._forward(feats, rows)
+            self._forward(feats, rows, include_value=False)
 
-    def _forward(self, feats: EncodedObs, rows: int) -> PolicyOutput:
+    def _forward(
+        self,
+        feats: EncodedObs,
+        rows: int,
+        *,
+        include_value: bool = True,
+    ) -> PolicyOutput:
         device = torch.device(self.device)
         if self.compile_graph_rows is not None:
             graph_rows = (
@@ -315,11 +328,13 @@ class LearnedAgent:
         else:
             graph_rows = rows
         graph_feats = _pad_encoded(feats, graph_rows) if graph_rows != rows else feats
-        kernel = self._forward_kernels.get(graph_rows)
+        kernel_key = (graph_rows, bool(include_value))
+        kernel = self._forward_kernels.get(kernel_key)
         if kernel is None:
             kernel = _InferenceForwardKernel(
                 self.model,
                 autocast_enabled=device.type == "cuda",
+                include_value=include_value,
             )
             if self.compile_mode is not None:
                 kernel = torch.compile(
@@ -328,8 +343,9 @@ class LearnedAgent:
                     fullgraph=True,
                     mode=self.compile_mode,
                 )
-            self._forward_kernels[graph_rows] = kernel
-        _mark_cuda_graph_step(device)
+            self._forward_kernels[kernel_key] = kernel
+        if self.compile_mode is not None:
+            _mark_cuda_graph_step(device)
         out = kernel(
             graph_feats.planet_feats,
             graph_feats.planet_mask,
@@ -345,7 +361,7 @@ class LearnedAgent:
     def __call__(self, obs: Any) -> list[list]:
         annotated = self._tracker.annotate(obs)
         feats = encode_raw_observations([annotated], device=self.device)
-        out = self._forward(feats, 1)
+        out = self._forward(feats, 1, include_value=False)
         actions = sample_batch_actions_raw(
             out,
             [annotated],
@@ -370,7 +386,7 @@ class LearnedAgent:
             device=self.device,
             pin_memory=torch.device(self.device).type == "cuda",
         )
-        out = self._forward(feats, len(annotated))
+        out = self._forward(feats, len(annotated), include_value=False)
         actions_list = sample_batch_actions_raw(
             out,
             annotated,

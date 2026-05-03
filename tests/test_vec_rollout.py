@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
+from owars.policies.features import EncodedObs
 from owars.agents.learned import _FleetTargetTracker
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
@@ -17,6 +19,7 @@ from owars.training.vec_rollout import (
     _normalize_learner_seats,
     _obs_reward_potential,
     _resolve_seat_agents,
+    _trim_fleets_for_forward,
     _state_reward_potential,
     alternating_learner_seats,
     rollout_episodes_batched,
@@ -54,6 +57,26 @@ def test_normalize_learner_seats_validates_length_and_range():
         _normalize_learner_seats([0, 1], num_envs=3, num_players=2)
     with pytest.raises(ValueError):
         _normalize_learner_seats([0, 2, 1], num_envs=3, num_players=2)
+
+
+def test_trim_fleets_for_forward_keeps_planet_tensors_and_trims_fleets():
+    feats = EncodedObs(
+        planet_feats=torch.zeros(2, 64, 19),
+        planet_mask=torch.ones(2, 64, dtype=torch.bool),
+        planet_owned_mask=torch.zeros(2, 64, dtype=torch.bool),
+        planet_ids=torch.arange(64).expand(2, -1),
+        planet_garrison=torch.zeros(2, 64),
+        fleet_feats=torch.zeros(2, 384, 20),
+        fleet_mask=torch.zeros(2, 384, dtype=torch.bool),
+    )
+    feats.fleet_mask[0, 3] = True
+    feats.fleet_mask[1, 18] = True
+
+    trimmed = _trim_fleets_for_forward(feats)
+
+    assert trimmed.fleet_feats.shape[1] == 19
+    assert trimmed.planet_feats.data_ptr() == feats.planet_feats.data_ptr()
+    assert trimmed.planet_mask.data_ptr() == feats.planet_mask.data_ptr()
 
 
 def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():

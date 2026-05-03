@@ -60,10 +60,8 @@ optim:
   lr: 3.0e-4
   head_lr: 3.0e-4
   weight_decay: 1.0e-4
-  grad_clip: 0.3   # parameter-golf default; tighter than the canonical 0.5.
-                   # The single most impactful per-step lever for keeping
-                   # PPO ratios close to 1: it caps gradient magnitude
-                   # *before* Muon/AdamW transform it into a parameter step.
+  grad_clip: 0.5   # actor and critic gradients are clipped separately, including
+                   # their shared-trunk components, then summed before step.
   minibatch_size: 4096
   epochs_per_update: 4
 
@@ -71,12 +69,12 @@ ppo:
   gamma: 0.997
   gae_lambda: 0.95
   norm_advantage: true
-  spo_eps_low: 0.2
-  spo_eps_high: 0.28
+  spo_eps_low: 0.4
+  spo_eps_high: 0.56
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
 
   target_entropy_coef: 0.01     # categorical target distribution has no structural floor, so keep it from collapsing
-  fraction_entropy_coef: 0.0    # do not reward the Beta fraction head toward max-entropy Beta(1,1)
+  fraction_entropy_coef: 0.0    # squashed-Gaussian Normal entropy approximation; keep off by default
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`
                         # warms V on a state distribution PPO immediately

@@ -74,7 +74,7 @@ class Trajectory:
     encoded: list[EncodedObs]
     launch: list[torch.Tensor]                # [P] float 0/1
     target_idx: list[torch.Tensor]            # [P] long
-    fraction: list[torch.Tensor]              # [P] float — Beta sample in (eps, 1-eps); PPO recomputes log_prob at this value
+    fraction: list[torch.Tensor]              # [P] float — executed squashed fraction; PPO recomputes log_prob at this value
     log_prob: list[torch.Tensor]              # [P] float
     value: list[torch.Tensor]                 # scalar tensors (no .item() in the hot loop)
     reward: list[float]

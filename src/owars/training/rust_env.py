@@ -22,6 +22,7 @@ from ..policies.sampling import (
     ActionContext,
     _apply_target_legal_mask,
     _batch_record_from_materialized_launch,
+    _ensure_deterministic_launch_if_idle,
     _mask_impossible_launches,
     _sample_launch_fraction,
     _sample_target,
@@ -173,21 +174,61 @@ class RustVecEnv:
         *,
         deterministic: bool = False,
         record_rows: list[int] | None = None,
+        record_source_mask: Any | None = None,
+        deterministic_fallback: bool = False,
         native_actions: bool = False,
     ) -> tuple[list[list[list]], Any]:
         row_pairs = [(int(idx), int(player)) for idx, player in rows]
+        if record_rows is None:
+            record_rows = list(range(len(rows)))
         launch_logits = out.launch_logits
         target_logits = out.target_logits
-        fraction_alpha = out.fraction_alpha
-        fraction_beta = out.fraction_beta
+        fraction_mean = out.fraction_mean
+        fraction_log_std = out.fraction_log_std
         launch, frac = _sample_launch_fraction(
-            launch_logits, fraction_alpha, fraction_beta, deterministic
+            launch_logits, fraction_mean, fraction_log_std, deterministic
         )
-        frac_np = _numpy_from_tensor(frac.float())
-        target_legal_mask_np = self._core.legal_target_mask_from_state(
-            row_pairs,
-            frac_np,
+        active_fields_masker = getattr(
+            self._core,
+            "legal_target_mask_from_state_active_fields",
+            None,
         )
+        active_masker = getattr(self._core, "legal_target_mask_from_state_active", None)
+        has_active_fields_masker = callable(active_fields_masker)
+        if has_active_fields_masker:
+            active_fields_np = _numpy_from_tensor(
+                torch.stack((frac.float(), launch.float()), dim=-1)
+            )
+            if deterministic_fallback:
+                active_fields_np[:, :, 1] = 1.0
+            elif record_rows:
+                active_fields_np[record_rows, :, 1] = 1.0
+            frac_np = active_fields_np[:, :, 0]
+            target_legal_mask_np = active_fields_masker(row_pairs, active_fields_np)
+        else:
+            frac_np = _numpy_from_tensor(frac.float())
+        if not has_active_fields_masker and callable(active_masker):
+            active_source = launch.to(dtype=torch.bool)
+            if deterministic_fallback:
+                active_source = torch.ones_like(active_source, dtype=torch.bool)
+            elif record_rows:
+                active_source = active_source.clone()
+                record_idx = torch.as_tensor(
+                    record_rows,
+                    device=active_source.device,
+                    dtype=torch.long,
+                )
+                active_source.index_fill_(0, record_idx, True)
+            target_legal_mask_np = active_masker(
+                row_pairs,
+                frac_np,
+                _numpy_from_tensor(active_source),
+            )
+        elif not has_active_fields_masker:
+            target_legal_mask_np = self._core.legal_target_mask_from_state(
+                row_pairs,
+                frac_np,
+            )
         target_legal_mask = torch.as_tensor(
             target_legal_mask_np, device=target_logits.device, dtype=torch.bool
         )
@@ -205,17 +246,44 @@ class RustVecEnv:
             out.planet_owned_mask,
             out.planet_mask,
         )
-        target_idx = _sample_target(target_logits, deterministic)
-        materialized = self._core.materialize_actions_from_state(
-            row_pairs,
-            _numpy_from_tensor(launch.float()),
-            _numpy_from_tensor(target_idx.to(torch.int64)),
-            frac_np,
-            bool(native_actions),
+        launch = _ensure_deterministic_launch_if_idle(
+            launch_logits,
+            launch,
+            target_legal_mask,
+            out.planet_owned_mask,
+            out.planet_mask,
+            deterministic_fallback,
         )
+        target_idx = _sample_target(target_logits, deterministic)
+        materialize_fields = getattr(
+            self._core,
+            "materialize_masked_action_fields_from_state",
+            None,
+        )
+        if callable(materialize_fields):
+            action_fields = torch.stack(
+                (launch.float(), target_idx.float(), frac.float()),
+                dim=-1,
+            )
+            materialized = materialize_fields(
+                row_pairs,
+                _numpy_from_tensor(action_fields),
+                bool(native_actions),
+            )
+        else:
+            materializer = getattr(
+                self._core,
+                "materialize_masked_actions_from_state",
+                self._core.materialize_actions_from_state,
+            )
+            materialized = materializer(
+                row_pairs,
+                _numpy_from_tensor(launch.float()),
+                _numpy_from_tensor(target_idx.to(torch.int64)),
+                frac_np,
+                bool(native_actions),
+            )
         actions_list = materialized["actions"]
-        if record_rows is None:
-            record_rows = list(range(len(rows)))
         materialized_rows = materialized["materialized"][record_rows]
         records = _batch_record_from_materialized_launch(
             launch,
@@ -223,11 +291,32 @@ class RustVecEnv:
             frac,
             launch_logits,
             target_logits,
-            fraction_alpha,
-            fraction_beta,
+            fraction_mean,
+            fraction_log_std,
             materialized_rows,
             record_rows,
         )
+        record_target_legal = np.ascontiguousarray(target_legal_mask_np[record_rows])
+        if len(record_rows) > 0:
+            if record_source_mask is None:
+                source_mask_np = _numpy_from_tensor(
+                    (out.planet_owned_mask & out.planet_mask).to(dtype=torch.bool)
+                )[record_rows]
+            else:
+                source_mask_np = np.asarray(record_source_mask, dtype=bool)
+                if source_mask_np.shape[0] == len(rows):
+                    source_mask_np = source_mask_np[record_rows]
+                elif source_mask_np.shape[0] != len(record_rows):
+                    raise ValueError(
+                        "record_source_mask must have one row per batch row "
+                        "or one row per record row"
+                    )
+            record_target_legal = np.where(
+                source_mask_np[:, :, None],
+                record_target_legal,
+                True,
+            )
+        records.target_legal_mask = torch.as_tensor(record_target_legal, dtype=torch.bool)
         return actions_list, records
 
     def sample_batch_actions(
@@ -243,6 +332,7 @@ class RustVecEnv:
             rows,
             deterministic=deterministic,
             record_rows=[],
+            deterministic_fallback=deterministic,
             native_actions=native_actions,
         )
         return actions

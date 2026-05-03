@@ -123,8 +123,8 @@ class PPOCfg:
     # of `value_coef=1.0` (separate `value_optim`, `dreamer4.py:4543`).
     value_coef: float = 1.0
     # Categorical target entropy has no structural floor, so keep it from
-    # collapsing. The Beta fraction already has a concentration floor; do not
-    # reward collapse toward max-entropy Beta(1,1).
+    # collapsing. Fraction entropy uses the squashed-Gaussian Normal entropy
+    # approximation and is usually left off for PPO.
     target_entropy_coef: float = 0.01
     fraction_entropy_coef: float = 0.0
     # No value clipping. dreamer4-style clipping (`max(ce, ce_of_clipped_v)`)

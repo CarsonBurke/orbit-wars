@@ -3,8 +3,8 @@
 The policy emits, per owned planet:
   - a Bernoulli launch decision
   - a masked Categorical over target planets, conditional on launch
-  - a Beta(α, β) on [0, 1] for the fraction-of-garrison to send, conditional
-    on launch
+  - a tanh-squashed Gaussian on [0, 1] for the fraction-of-garrison to send,
+    conditional on launch
 
 The simulator's action format is `[from_planet_id, angle_radians, num_ships]`.
 Fleets fly in *straight lines* at constant speed (`fleet_speed(num_ships)`),
@@ -14,12 +14,12 @@ intercept equation in closed form (see `_lead_angle`) — no fixed-point
 iteration that might oscillate.
 
 For PPO we need, *per owned planet*, the Bernoulli + conditional
-Categorical/Beta log-prob of the actually-sampled action. `sample_with_record`
-returns those alongside the moves; `sample_actions` is the thin moves-only
-wrapper used by inference paths that don't care about log-probs. The Beta
-sample is the action — there is no separate latent (vs the previous
-tanh-Gaussian, which had pre-squash `z` and post-squash fraction);
-`Beta.log_prob(fraction)` is direct and exact.
+Categorical/fraction log-prob of the actually-sampled action.
+`sample_with_record` returns those alongside the moves; `sample_actions` is
+the thin moves-only wrapper used by inference paths that don't care about
+log-probs. The recorded fraction is the post-squash action executed by the
+simulator; log-prob recomputation recovers the pre-squash latent with atanh
+and applies the tanh Jacobian correction.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as nn_functional
-from torch.distributions import Beta
 
 from ..game import angle_to
 from ..game.observation import Observation
@@ -40,27 +39,55 @@ from ..game.physics import fleet_speed
 from ..game.types import BOARD_SIZE, CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS, Move
 from .model import PolicyOutput
 
-# Sample clamp for digamma/log stability in `Beta.log_prob`. With α,β ≥ 1
-# (post-parameterization) `log_prob` is finite on the closed [0, 1] but the Beta-
-# Jacobian `(α-1) log z + (β-1) log(1-z)` blows up if a sampled z hits
-# exactly 0 or 1 with α=1 or β=1 (where the corresponding term is 0·log 0).
+# Numerical floors for Gumbel sampling and atanh/log-Jacobian inversion.
 SAMPLE_EPS: float = 1e-7
+SQUASH_EPS: float = 1e-6
+DETERMINISTIC_LAUNCH_FALLBACK_LOGIT: float = -3.0
 
 
 def _deterministic_fraction(
-    fraction_alpha: torch.Tensor,
-    fraction_beta: torch.Tensor,
+    fraction_mean: torch.Tensor,
+    fraction_log_std: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return the deterministic fraction represented by the Beta head.
+    """Return the deterministic fraction represented by the squashed Normal.
 
-    The policy parameterizes α=1+c·μ and β=1+c·(1−μ), so μ is recoverable as
-    the Beta mode `(α−1)/(α+β−2)`. This is the intended deterministic action;
-    the ordinary Beta mean is deliberately pulled toward 0.5 by the +1 floor.
+    `fraction_log_std` is accepted for API symmetry with the stochastic path.
     """
-    concentration = (fraction_alpha + fraction_beta - 2.0).clamp_min(SAMPLE_EPS)
-    return ((fraction_alpha - 1.0) / concentration).clamp(
-        SAMPLE_EPS, 1.0 - SAMPLE_EPS
+    del fraction_log_std
+    return (0.5 * (torch.tanh(fraction_mean.float()) + 1.0)).clamp(
+        SQUASH_EPS, 1.0 - SQUASH_EPS
     )
+
+
+def _squashed_normal_log_prob(
+    mean: torch.Tensor,
+    log_std: torch.Tensor,
+    fraction: torch.Tensor,
+) -> torch.Tensor:
+    """CleanRL/SAC-style log-prob for fraction = 0.5 * (tanh(z) + 1).
+
+    The affine half-range term is constant and ratio-invariant, so like the
+    referenced CleanRL implementation we omit it from both sample-time and
+    PPO recompute log-probs.
+    """
+    u = (2.0 * fraction.float() - 1.0).clamp(
+        -1.0 + SQUASH_EPS, 1.0 - SQUASH_EPS
+    )
+    z = torch.atanh(u)
+    log_std = log_std.float()
+    inv_std = torch.exp(-log_std)
+    log_prob_z = (
+        -0.5 * ((z - mean.float()) * inv_std).square()
+        - log_std
+        - 0.5 * math.log(2.0 * math.pi)
+    )
+    squash_correction = torch.log(1.0 - u.square() + SQUASH_EPS)
+    return log_prob_z - squash_correction
+
+
+def _squashed_normal_entropy(log_std: torch.Tensor) -> torch.Tensor:
+    """Approximate squashed entropy with the unsquashed Normal entropy."""
+    return log_std.float() + 0.5 * (1.0 + math.log(2.0 * math.pi))
 
 
 # Lead-intercept solver. The intercept condition for a fleet leaving source
@@ -94,15 +121,15 @@ class SampleRecord:
     The target legality mask is recorded so PPO can recompute the current
     policy log-prob under the same action support used during rollout.
 
-    The Beta sample IS the action (no separate latent), so we only carry
-    `fraction` ∈ (eps, 1-eps); recomputing `log_prob` at that value uses
-    `Beta.log_prob` directly with no Jacobian gymnastics.
+    The fraction is the post-squash action, so PPO carries only
+    `fraction` ∈ (eps, 1-eps); recomputing `log_prob` recovers the
+    pre-squash latent with atanh.
     """
 
     launch: torch.Tensor       # [P] float 0/1 Bernoulli sample
     target_idx: torch.Tensor   # [P] long, in [0, P)
-    fraction: torch.Tensor     # [P] float in (eps, 1-eps) — Beta sample, used both for the move and for PPO's log_prob recompute
-    log_prob: torch.Tensor     # [P] float — Bernoulli + launch*(Categorical + Beta)
+    fraction: torch.Tensor     # [P] float in (eps, 1-eps) — executed squashed fraction
+    log_prob: torch.Tensor     # [P] float — Bernoulli + launch*(Categorical + fraction)
     target_legal_mask: torch.Tensor   # [P, P] bool
 
 
@@ -948,21 +975,76 @@ def _mask_impossible_launches(
     return launch_logits, launch
 
 
+def _ensure_deterministic_launch_if_idle(
+    launch_logits: torch.Tensor,
+    launch: torch.Tensor,
+    target_legal_mask: torch.Tensor,
+    owned: torch.Tensor,
+    pmask: torch.Tensor,
+    deterministic: bool,
+) -> torch.Tensor:
+    """For moves-only deterministic inference, try plausible legal sources.
+
+    Training samples the Bernoulli. A policy can learn useful launch
+    probabilities below 0.5, in which case the Bernoulli mode is a permanent
+    no-op. Submission/replay inference should still act by selecting legal
+    sources above a low confidence floor when the thresholded mode launches
+    nothing.
+    """
+    if not deterministic:
+        return launch
+    source = (owned.to(dtype=torch.bool) & pmask.to(dtype=torch.bool)).to(
+        device=launch.device
+    )
+    has_legal = target_legal_mask.to(device=launch.device, dtype=torch.bool).any(
+        dim=-1
+    )
+    confident = (
+        launch_logits.float().to(launch.device)
+        >= DETERMINISTIC_LAUNCH_FALLBACK_LOGIT
+    )
+    eligible = source & has_legal & confident
+    active = launch.to(dtype=torch.bool) & eligible
+    if launch.dim() == 1:
+        if bool(active.any()) or not bool(eligible.any()):
+            return launch
+        out = launch.clone()
+        out[eligible] = 1.0
+        return out
+
+    row_active = active.any(dim=-1)
+    row_eligible = eligible.any(dim=-1)
+    rows = torch.nonzero(~row_active & row_eligible, as_tuple=False).flatten()
+    if rows.numel() == 0:
+        return launch
+    out = launch.clone()
+    out[rows] = eligible[rows].to(dtype=out.dtype)
+    return out
+
+
 def _sample_launch_fraction(
     launch_logits: torch.Tensor,
-    fraction_alpha: torch.Tensor,
-    fraction_beta: torch.Tensor,
+    fraction_mean: torch.Tensor,
+    fraction_log_std: torch.Tensor,
     deterministic: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     launch_logits = launch_logits.float()
-    fraction_alpha = fraction_alpha.float()
-    fraction_beta = fraction_beta.float()
+    fraction_mean = fraction_mean.float()
+    fraction_log_std = fraction_log_std.float()
     if deterministic:
-        launch = (launch_logits > 0.0).to(fraction_alpha.dtype)
-        frac = _deterministic_fraction(fraction_alpha, fraction_beta)
+        launch = (launch_logits > 0.0).to(fraction_mean.dtype)
+        frac = _deterministic_fraction(fraction_mean, fraction_log_std)
         return launch, frac
-    launch = torch.distributions.Bernoulli(logits=launch_logits).sample()
-    frac = Beta(fraction_alpha, fraction_beta).sample().clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+    launch = (torch.rand_like(launch_logits) < launch_logits.sigmoid()).to(
+        fraction_mean.dtype
+    )
+    with torch.no_grad():
+        z = fraction_mean + torch.exp(fraction_log_std) * torch.randn_like(
+            fraction_mean
+        )
+    frac = (0.5 * (torch.tanh(z) + 1.0)).clamp(
+        SQUASH_EPS, 1.0 - SQUASH_EPS
+    )
     return launch, frac
 
 
@@ -973,7 +1055,9 @@ def _sample_target(
     safe_target_logits = _safe_target_logits(target_logits.float())
     if deterministic:
         return safe_target_logits.argmax(dim=-1)
-    return torch.distributions.Categorical(logits=safe_target_logits).sample()
+    uniform = torch.rand_like(safe_target_logits).clamp_(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+    gumbel = -torch.log(-torch.log(uniform))
+    return (safe_target_logits + gumbel).argmax(dim=-1)
 
 
 def _build_moves_from_packed_fields_with_mask(
@@ -1364,34 +1448,21 @@ def _safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
     return torch.where(finite, target_logits, torch.zeros_like(target_logits))
 
 
-def _beta_log_prob(
-    alpha: torch.Tensor,
-    beta: torch.Tensor,
-    value: torch.Tensor,
-) -> torch.Tensor:
-    log_norm = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
-    return (
-        (alpha - 1.0) * value.log()
-        + (beta - 1.0) * torch.log1p(-value)
-        - log_norm
-    )
-
-
 def _record_from_materialized_launch(
     launch: torch.Tensor,
     target_idx: torch.Tensor,
     frac: torch.Tensor,
     launch_logits: torch.Tensor,
     target_logits: torch.Tensor,
-    fraction_alpha: torch.Tensor,
-    fraction_beta: torch.Tensor,
+    fraction_mean: torch.Tensor,
+    fraction_log_std: torch.Tensor,
     materialized: list[bool],
 ) -> SampleRecord:
     del launch
     actual_launch = torch.as_tensor(
         materialized,
         device=target_idx.device,
-        dtype=fraction_alpha.dtype,
+        dtype=fraction_mean.dtype,
     )
     safe_target_logits = _safe_target_logits(target_logits.float())
     launch_lp = -nn_functional.binary_cross_entropy_with_logits(
@@ -1404,7 +1475,11 @@ def _record_from_materialized_launch(
         -1,
         target_idx.clamp(0, safe_target_logits.shape[-1] - 1).unsqueeze(-1),
     ).squeeze(-1)
-    frac_lp = _beta_log_prob(fraction_alpha.float(), fraction_beta.float(), frac.float())
+    frac_lp = _squashed_normal_log_prob(
+        fraction_mean.detach().float(),
+        fraction_log_std.detach().float(),
+        frac.detach().float(),
+    )
     log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
     return SampleRecord(
         launch=actual_launch,
@@ -1421,8 +1496,8 @@ def _batch_record_from_materialized_launch(
     frac: torch.Tensor,
     launch_logits: torch.Tensor,
     target_logits: torch.Tensor,
-    fraction_alpha: torch.Tensor,
-    fraction_beta: torch.Tensor,
+    fraction_mean: torch.Tensor,
+    fraction_log_std: torch.Tensor,
     materialized: Any,
     rows: Sequence[int],
 ) -> SampleBatchRecord:
@@ -1440,8 +1515,8 @@ def _batch_record_from_materialized_launch(
     target_idx_r = target_idx.index_select(0, row_idx)
     frac_r = frac.index_select(0, row_idx)
     target_logits_r = target_logits.index_select(0, row_idx)
-    fraction_alpha_r = fraction_alpha.index_select(0, row_idx)
-    fraction_beta_r = fraction_beta.index_select(0, row_idx)
+    fraction_mean_r = fraction_mean.index_select(0, row_idx)
+    fraction_log_std_r = fraction_log_std.index_select(0, row_idx)
 
     safe_target_logits = _safe_target_logits(target_logits_r.float())
     launch_lp = -nn_functional.binary_cross_entropy_with_logits(
@@ -1454,10 +1529,10 @@ def _batch_record_from_materialized_launch(
         -1,
         target_idx_r.clamp(0, safe_target_logits.shape[-1] - 1).unsqueeze(-1),
     ).squeeze(-1)
-    frac_lp = _beta_log_prob(
-        fraction_alpha_r.float(),
-        fraction_beta_r.float(),
-        frac_r.float(),
+    frac_lp = _squashed_normal_log_prob(
+        fraction_mean_r.detach().float(),
+        fraction_log_std_r.detach().float(),
+        frac_r.detach().float(),
     )
     log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
     return SampleBatchRecord(
@@ -1480,14 +1555,14 @@ def sample_with_record(
     """
     launch_logits = out.launch_logits[0]
     target_logits = out.target_logits[0]  # [P, P]
-    fraction_alpha = out.fraction_alpha[0]
-    fraction_beta = out.fraction_beta[0]
+    fraction_mean = out.fraction_mean[0]
+    fraction_log_std = out.fraction_log_std[0]
     owned = out.planet_owned_mask[0]
     pmask = out.planet_mask[0]
     ids = out.planet_ids[0]
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_alpha, fraction_beta, deterministic
+        launch_logits, fraction_mean, fraction_log_std, deterministic
     )
     target_legal_mask = _target_legal_mask_from_observation(
         frac, launch, owned, pmask, ids, o
@@ -1509,8 +1584,8 @@ def sample_with_record(
         frac,
         launch_logits,
         target_logits,
-        fraction_alpha,
-        fraction_beta,
+        fraction_mean,
+        fraction_log_std,
         materialized,
     )
     return moves, record
@@ -1524,13 +1599,13 @@ def sample_actions(
     """Moves-only wrapper for inference paths (eval, agent submission)."""
     launch_logits = out.launch_logits[0]
     target_logits = out.target_logits[0]
-    fraction_alpha = out.fraction_alpha[0]
-    fraction_beta = out.fraction_beta[0]
+    fraction_mean = out.fraction_mean[0]
+    fraction_log_std = out.fraction_log_std[0]
     owned = out.planet_owned_mask[0]
     pmask = out.planet_mask[0]
     ids = out.planet_ids[0]
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_alpha, fraction_beta, deterministic
+        launch_logits, fraction_mean, fraction_log_std, deterministic
     )
     target_legal_mask = _target_legal_mask_from_observation(
         frac, launch, owned, pmask, ids, o
@@ -1540,6 +1615,9 @@ def sample_actions(
     )
     _launch_logits, launch = _mask_impossible_launches(
         launch_logits, launch, target_legal_mask, owned, pmask
+    )
+    launch = _ensure_deterministic_launch_if_idle(
+        launch_logits, launch, target_legal_mask, owned, pmask, deterministic
     )
     target_idx = _sample_target(target_logits, deterministic)
     return _build_moves(
@@ -1567,19 +1645,19 @@ def sample_batch_with_records(
     `SampleRecord` per element for legacy callers. When `record_rows` is
     provided, it returns a single `SampleBatchRecord` for those rows only.
 
-    The Bernoulli/Categorical/Beta samples are drawn once over the full [B, P]
+    The Bernoulli/Categorical/fraction samples are drawn once over the full [B, P]
     tensor — that's where the GPU win comes from. The per-element
     `_build_moves` walk is pure Python but cheap (one loop per env).
     """
     launch_logits = out.launch_logits      # [B, P]
     target_logits = out.target_logits      # [B, P, P]
-    fraction_alpha = out.fraction_alpha    # [B, P]
-    fraction_beta = out.fraction_beta      # [B, P]
+    fraction_mean = out.fraction_mean      # [B, P]
+    fraction_log_std = out.fraction_log_std  # [B, P]
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_alpha, fraction_beta, deterministic
+        launch_logits, fraction_mean, fraction_log_std, deterministic
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -1635,8 +1713,8 @@ def sample_batch_with_records(
                     frac[k],
                     launch_logits[k],
                     target_logits[k],
-                    fraction_alpha[k],
-                    fraction_beta[k],
+                    fraction_mean[k],
+                    fraction_log_std[k],
                     materialized,
                 )
             )
@@ -1649,8 +1727,8 @@ def sample_batch_with_records(
             frac,
             launch_logits,
             target_logits,
-            fraction_alpha,
-            fraction_beta,
+            fraction_mean,
+            fraction_log_std,
             [row for row in materialized_rows if row is not None],
             record_rows,
         )
@@ -1666,13 +1744,13 @@ def sample_batch_with_records_raw(
     """Batched sampler that builds Kaggle action lists from raw obs dicts."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_alpha = out.fraction_alpha
-    fraction_beta = out.fraction_beta
+    fraction_mean = out.fraction_mean
+    fraction_log_std = out.fraction_log_std
     b_dim, p, _ = target_logits.shape
     assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_alpha, fraction_beta, deterministic
+        launch_logits, fraction_mean, fraction_log_std, deterministic
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -1736,8 +1814,8 @@ def sample_batch_with_records_raw(
                     frac[k],
                     launch_logits[k],
                     target_logits[k],
-                    fraction_alpha[k],
-                    fraction_beta[k],
+                    fraction_mean[k],
+                    fraction_log_std[k],
                     materialized,
                 )
             )
@@ -1750,8 +1828,8 @@ def sample_batch_with_records_raw(
             frac,
             launch_logits,
             target_logits,
-            fraction_alpha,
-            fraction_beta,
+            fraction_mean,
+            fraction_log_std,
             [row for row in materialized_rows if row is not None],
             record_rows,
         )
@@ -1767,13 +1845,13 @@ def sample_batch_with_records_context(
     """Batched sampler that builds action lists from fast env contexts."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_alpha = out.fraction_alpha
-    fraction_beta = out.fraction_beta
+    fraction_mean = out.fraction_mean
+    fraction_log_std = out.fraction_log_std
     b_dim, p, _ = target_logits.shape
     assert len(contexts) == b_dim, (len(contexts), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_alpha, fraction_beta, deterministic
+        launch_logits, fraction_mean, fraction_log_std, deterministic
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -1828,8 +1906,8 @@ def sample_batch_with_records_context(
                     frac[k],
                     launch_logits[k],
                     target_logits[k],
-                    fraction_alpha[k],
-                    fraction_beta[k],
+                    fraction_mean[k],
+                    fraction_log_std[k],
                     materialized,
                 )
             )
@@ -1842,8 +1920,8 @@ def sample_batch_with_records_context(
             frac,
             launch_logits,
             target_logits,
-            fraction_alpha,
-            fraction_beta,
+            fraction_mean,
+            fraction_log_std,
             [row for row in materialized_rows if row is not None],
             record_rows,
         )
@@ -1858,13 +1936,13 @@ def sample_batch_actions(
     """Batched moves-only sampler for eval and opponent inference paths."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_alpha = out.fraction_alpha
-    fraction_beta = out.fraction_beta
+    fraction_mean = out.fraction_mean
+    fraction_log_std = out.fraction_log_std
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_alpha, fraction_beta, deterministic
+        launch_logits, fraction_mean, fraction_log_std, deterministic
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -1891,6 +1969,15 @@ def sample_batch_actions(
         out.planet_owned_mask,
         out.planet_mask,
     )
+    launch = _ensure_deterministic_launch_if_idle(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+        deterministic,
+    )
+    legality_fields_l[..., 0] = launch.detach().cpu().numpy()
     target_idx = _sample_target(target_logits, deterministic)
 
     fields_l = _packed_action_fields_from_legality_fields(
@@ -1911,27 +1998,17 @@ def sample_batch_actions_raw(
     """Batched moves-only sampler for raw Kaggle-style observations."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_alpha = out.fraction_alpha
-    fraction_beta = out.fraction_beta
+    fraction_mean = out.fraction_mean
+    fraction_log_std = out.fraction_log_std
     b_dim, p, _ = target_logits.shape
     assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_alpha, fraction_beta, deterministic
+        launch_logits, fraction_mean, fraction_log_std, deterministic
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
     )
-    if deterministic:
-        target_logits_l = target_logits.detach().float().cpu().numpy()
-        return [
-            _build_deterministic_action_lists_from_logits_raw(
-                legality_fields_l[k],
-                target_logits_l[k],
-                raw_observations[k],
-            )
-            for k in range(b_dim)
-        ]
     target_legal_mask_l = [
         _target_legal_mask_from_packed_legality_fields(
             legality_fields_l[k],
@@ -1963,6 +2040,15 @@ def sample_batch_actions_raw(
         out.planet_owned_mask,
         out.planet_mask,
     )
+    launch = _ensure_deterministic_launch_if_idle(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+        deterministic,
+    )
+    legality_fields_l[..., 0] = launch.detach().cpu().numpy()
     target_idx = _sample_target(target_logits, deterministic)
 
     fields_l = _packed_action_fields_from_legality_fields(
@@ -1984,13 +2070,13 @@ def sample_batch_actions_context(
     """Batched moves-only sampler for fast env action contexts."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_alpha = out.fraction_alpha
-    fraction_beta = out.fraction_beta
+    fraction_mean = out.fraction_mean
+    fraction_log_std = out.fraction_log_std
     b_dim, p, _ = target_logits.shape
     assert len(contexts) == b_dim, (len(contexts), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_alpha, fraction_beta, deterministic
+        launch_logits, fraction_mean, fraction_log_std, deterministic
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -2017,6 +2103,15 @@ def sample_batch_actions_context(
         out.planet_owned_mask,
         out.planet_mask,
     )
+    launch = _ensure_deterministic_launch_if_idle(
+        launch_logits,
+        launch,
+        target_legal_mask,
+        out.planet_owned_mask,
+        out.planet_mask,
+        deterministic,
+    )
+    legality_fields_l[..., 0] = launch.detach().cpu().numpy()
     target_idx = _sample_target(target_logits, deterministic)
 
     fields_l = _packed_action_fields_from_legality_fields(

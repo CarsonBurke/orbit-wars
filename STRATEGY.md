@@ -19,7 +19,7 @@ These numbers are aspirational until we run them — they're the expectations ag
 ## TL;DR
 
 1. **Baselines**: `random`, `sniper` (nearest-planet starter), `heuristic` (production-weighted target picker with one-step orbit prediction). Free strategy floor.
-2. **Main model**: a small set-transformer over `(planet, fleet)` tokens, with target-attention and a Beta-distributed fraction-of-garrison head; PPO trained against an opponent pool that mixes self, frozen snapshots, and the heuristic baselines.
+2. **Main model**: a small set-transformer over `(planet, fleet)` tokens, with target-attention and a tanh-squashed Gaussian fraction-of-garrison head; PPO trained against an opponent pool that mixes self, frozen snapshots, and the heuristic baselines.
 3. **Architecture**: token-set encoder (no rasterization); shared transformer backbone for actor and critic. Per-owned-planet decode picks a target (or no-op) and a send-fraction. Orbit *parameters* (radius, angular velocity, current direction-of-motion) baked into planet features so the model can project to any horizon; owner one-hot is seat-relative (`self / neutral / enemy_0..2`) for FFA symmetry. Fleets carry source-planet provenance.
 4. **Critic**: VAPO/VC-PPO-style. ±1 terminal reward, γ=1, **value-pretraining** against a frozen behavior policy (heuristic) before PPO turns on, **decoupled GAE** (λ_critic=1 → MC return, λ_policy=0.95 for variance reduction), token-level (per-owned-planet-step) policy loss.
 5. **Validation is local self-play vs fixed baselines.** Win-rate per opponent + mean ship-margin. Kaggle ladder is the only thing that ranks for prizes, but it's noisy and slow.
@@ -37,7 +37,7 @@ A vanilla MLP can't handle variable counts without a fixed-padding hack. A graph
 - **Tokens**: each planet and each fleet becomes one token, with a per-type linear projection into `dim`.
 - **Self-attention**: every token attends to every other token. Owner-relative one-hot lets the model treat enemies symmetrically.
 - **Per-planet target attention**: each *owned* planet's encoded representation is the query; every planet's representation is a key. Logits over all planets + a no-op slot. This is the natural inductive bias for "pick a target".
-- **Fraction-of-garrison head**: a small Beta(α, β) over `[0, 1]`. Continuous, bounded, and `α, β > 1` lets us decode a deterministic mode at inference time.
+- **Fraction-of-garrison head**: a tanh-squashed Gaussian mapped to `[0, 1]`. The network predicts a pre-squash mean and uses one direct learned log std expanded over planets; deterministic inference applies the squash to the mean.
 
 ## Architecture (in `src/owars/policies/model.py`)
 
@@ -49,7 +49,7 @@ A vanilla MLP can't handle variable counts without a fixed-padding hack. A graph
                                                                       │     for each owned planet,
                                                                       │     attend over all planets
                                                                       │     to score targets;
-                                                                      │     plus a Beta head for
+                                                                      │     plus a squashed-Gaussian head for
                                                                       │     fraction-of-garrison.
                                                                       └─► value: pool over real
                                                                             tokens, MLP scalar.
@@ -63,7 +63,7 @@ Key choices:
 - **Orbit parameters, not predicted positions.** We hand the model `(orbital_radius, angular_velocity, direction-of-motion)` and let it project forward as needed. Cheaper, cleaner, and lets the model trade off horizon vs. confidence implicitly.
 - **Seat-relative owner one-hot**: `[self, neutral, enemy_0, enemy_1, enemy_2]`. Enemy slots are stable under `(owner - player) mod 4`, so a 4-player FFA sees three canonical enemy slots. No "ally" slot — the competition is FFA / 1v1.
 - **Padded fixed caps** (`MAX_PLANETS=64`, `MAX_FLEETS=384`) plus boolean masks. 64 covers 40 base planets + ~8 comet overlap with comfortable headroom; 384 covers heavy 4-player endgame. Batching is a stack-of-tensors with masks, no per-step `pack_padded`.
-- **Action factorization** (`policies/sampling.py`): `(target_planet | no-op) × Beta(fraction)`. The target is a discrete categorical (cheap, no exploration headache); the fraction is continuous so we don't have to bucket "send 12.5% of garrison". Angle is *derived* from the target bearing, not predicted — adding a continuous angle head almost always degenerates to "aim at center of mass".
+- **Action factorization** (`policies/sampling.py`): `(target_planet | no-op) × squashed-Gaussian(fraction)`. The target is a discrete categorical (cheap, no exploration headache); the fraction is continuous so we don't have to bucket "send 12.5% of garrison". Angle is *derived* from the target bearing, not predicted — adding a continuous angle head almost always degenerates to "aim at center of mass".
 
 ## Position sizing → action sizing
 
@@ -71,7 +71,7 @@ Hull Tactical's "Kelly under a vol cap" pattern doesn't apply here directly — 
 
 - **Reserve a garrison** (in `HeuristicAgent`) so a planet can't be one-shot the turn we attack from it.
 - **Aim at predicted position** for orbiting targets (1-step prediction baked into features; the policy can learn to over/under-shoot if it wants to lead more).
-- **Don't drain to zero** — the Beta head's mode is at `(α-1)/(α+β-2)`, which the `fraction_concentration` knob biases away from 0/1 endpoints.
+- **Don't drain to zero** — the squashed head naturally bounds actions; tactical reserve pressure still has to come from rewards/opponents because the distribution can saturate near endpoints.
 
 ## Self-play loop & opponent pool
 
