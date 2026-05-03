@@ -7,7 +7,8 @@ Layout (built by `scripts/bundle.py`):
       owars/...            <-- vendored package
 
 Kaggle's runner imports `main.agent` from this file with no internet
-access. Lazy-load the model on first call so import is cheap.
+access. Build the agent at import time so Torch/model loading happens before
+the first timed action call.
 """
 
 from __future__ import annotations
@@ -20,9 +21,6 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
-
-_AGENT = None
-
 
 def _build_agent():
     weights = _HERE / "weights" / "policy.pt"
@@ -37,10 +35,10 @@ def _build_agent():
     return HeuristicAgent()
 
 
+_AGENT = _build_agent()
+
+
 def agent(obs):
-    global _AGENT
-    if _AGENT is None:
-        _AGENT = _build_agent()
     return _AGENT(obs)
 
 

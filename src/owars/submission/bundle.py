@@ -48,7 +48,8 @@ def build_submission(
     shutil.copy(main_py, staging / "main.py")
     (staging / "weights").mkdir()
     shutil.copy(ckpt_path, staging / "weights" / "policy.pt")
-    shutil.copytree(package_root, staging / "owars")
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+    shutil.copytree(package_root, staging / "owars", ignore=ignore)
     for package in runtime_packages:
         _copy_runtime_package(package, staging)
 
