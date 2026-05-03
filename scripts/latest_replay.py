@@ -3,9 +3,10 @@
 
 Default behavior:
   1. Pick the newest TensorBoard run directory under runs/<name>/<timestamp>.
-  2. Pick final.pt under checkpoints/<name>/, falling back to the newest
-     non-init checkpoint if the run has not written final weights yet.
-  3. Run final learned weights against themselves in the official Kaggle
+  2. Pick the newest checkpoint under checkpoints/<name>/, ignoring
+     snapshot_init.pt. A stale final.pt from an older architecture should not
+     beat fresh snapshots from the active run.
+  3. Run the selected learned weights against themselves in the official Kaggle
      environment.
   4. Write an HTML replay under the run's eval_replays/ directory.
 """
@@ -60,9 +61,6 @@ def _latest_checkpoint(ckpt_root: Path, run_name: str) -> Path:
     run_dir = ckpt_root / run_name
     if not run_dir.exists():
         raise FileNotFoundError(f"checkpoint directory not found: {run_dir}")
-    final = run_dir / "final.pt"
-    if final.is_file():
-        return final
     candidates = [
         p for p in run_dir.glob("*.pt")
         if p.name != "snapshot_init.pt" and p.is_file()

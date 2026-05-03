@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -15,7 +16,7 @@ def _latest_replay_module():
     return module
 
 
-def test_latest_replay_prefers_final_checkpoint(tmp_path):
+def test_latest_replay_uses_newest_checkpoint(tmp_path):
     mod = _latest_replay_module()
     run_dir = tmp_path / "ppo_base"
     run_dir.mkdir()
@@ -23,6 +24,24 @@ def test_latest_replay_prefers_final_checkpoint(tmp_path):
     final = run_dir / "final.pt"
     snapshot.write_bytes(b"snapshot")
     final.write_bytes(b"final")
+
+    os.utime(final, (1.0, 1.0))
+    os.utime(snapshot, (2.0, 2.0))
+
+    assert mod._latest_checkpoint(tmp_path, "ppo_base") == snapshot
+
+
+def test_latest_replay_uses_final_when_it_is_newest(tmp_path):
+    mod = _latest_replay_module()
+    run_dir = tmp_path / "ppo_base"
+    run_dir.mkdir()
+    snapshot = run_dir / "snapshot_9999.pt"
+    final = run_dir / "final.pt"
+    snapshot.write_bytes(b"snapshot")
+    final.write_bytes(b"final")
+
+    os.utime(snapshot, (1.0, 1.0))
+    os.utime(final, (2.0, 2.0))
 
     assert mod._latest_checkpoint(tmp_path, "ppo_base") == final
 
