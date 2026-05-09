@@ -109,6 +109,20 @@ def test_planet_rope_can_be_disabled():
     assert out.launch_logits.shape == (1, 64)
 
 
+def test_grouped_query_attention_forward_shapes():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2, n_kv_heads=1)
+    model = OrbitPolicy(cfg)
+    out = model(encode_observation(parse_observation(_obs())))
+
+    assert model.layers[0].attn.n_kv_heads == 1
+    assert model.layers[0].attn.c_k.weight.shape == (16, 32)
+    assert model.fleet_tokenizer is not None
+    assert model.fleet_tokenizer.layers[0].cross_attn.n_kv_heads == 1
+    assert model.fleet_tokenizer.layers[0].cross_attn.c_k.weight.shape == (16, 32)
+    assert out.launch_logits.shape == (1, 64)
+    assert out.target_logits.shape == (1, 64, 64)
+
+
 def test_fleet_latent_encoder_compresses_fleet_tokens():
     cfg = OrbitPolicyConfig(
         dim=32,

@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 import yaml
 
+from owars.policies.config import normalize_attention_config
+
 
 @dataclass
 class GameCfg:
@@ -26,6 +28,9 @@ class ModelCfg:
     ff_dim: int = 256
     depth: int = 3
     n_heads: int = 4
+    # Grouped-query attention. `None` uses ordinary MHA (`n_heads` KV heads);
+    # set to `1` for MQA or another divisor of `n_heads` for GQA.
+    n_kv_heads: int | None = None
     dropout: float = 0.0
     planet_rope_fraction: float = 0.25
     planet_rope_base: float = 10000.0
@@ -252,6 +257,14 @@ class RunConfig:
             raise ValueError("model.planet_rope_fraction must be in [0, 1]")
         if cfg.model.planet_rope_base <= 0.0:
             raise ValueError("model.planet_rope_base must be positive")
+        try:
+            normalize_attention_config(
+                cfg.model.dim,
+                cfg.model.n_heads,
+                cfg.model.n_kv_heads,
+            )
+        except ValueError as exc:
+            raise ValueError(f"model.{exc}") from exc
         if cfg.model.value_min >= cfg.model.value_max:
             raise ValueError("model.value_min must be less than model.value_max")
         if cfg.reward.production_weight < 0.0:

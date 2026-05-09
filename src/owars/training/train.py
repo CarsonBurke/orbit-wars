@@ -191,6 +191,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         ff_dim=cfg.model.ff_dim,
         depth=cfg.model.depth,
         n_heads=cfg.model.n_heads,
+        n_kv_heads=cfg.model.n_kv_heads,
         dropout=cfg.model.dropout,
         planet_rope_fraction=cfg.model.planet_rope_fraction,
         planet_rope_base=cfg.model.planet_rope_base,

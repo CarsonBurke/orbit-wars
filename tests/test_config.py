@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 from owars.training.config import RunConfig, deep_override
@@ -13,61 +14,63 @@ def test_load_default():
 
 
 def test_unknown_key_raises():
-    try:
+    with pytest.raises(KeyError):
         RunConfig.from_dict({"model": {"not_a_real_field": 1}})
-    except KeyError:
-        return
-    raise AssertionError("expected KeyError for unknown model field")
 
 
 def test_invalid_gae_lambda_raises():
-    try:
+    with pytest.raises(ValueError):
         RunConfig.from_dict({"ppo": {"gae_lambda": 1.5}})
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for invalid gae_lambda")
 
 
 def test_invalid_gamma_raises():
-    try:
+    with pytest.raises(ValueError):
         RunConfig.from_dict({"ppo": {"gamma": 1.01}})
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for invalid gamma")
 
 
-def test_invalid_spo_eps_raises():
-    for ppo_cfg in (
+@pytest.mark.parametrize(
+    "ppo_cfg",
+    [
         {"spo_eps_low": 0.0},
         {"spo_eps_high": 0.0},
         {"spo_eps_low": 0.3, "spo_eps_high": 0.2},
-    ):
-        try:
-            RunConfig.from_dict({"ppo": ppo_cfg})
-        except ValueError:
-            continue
-        raise AssertionError(f"expected ValueError for {ppo_cfg}")
+    ],
+)
+def test_invalid_spo_eps_raises(ppo_cfg):
+    with pytest.raises(ValueError):
+        RunConfig.from_dict({"ppo": ppo_cfg})
 
 
-def test_invalid_planet_rope_config_raises():
-    for model_cfg in (
+@pytest.mark.parametrize(
+    "model_cfg",
+    [
         {"planet_rope_fraction": -0.1},
         {"planet_rope_fraction": 1.1},
         {"planet_rope_base": 0.0},
-    ):
-        try:
-            RunConfig.from_dict({"model": model_cfg})
-        except ValueError:
-            continue
-        raise AssertionError(f"expected ValueError for {model_cfg}")
+    ],
+)
+def test_invalid_planet_rope_config_raises(model_cfg):
+    with pytest.raises(ValueError):
+        RunConfig.from_dict({"model": model_cfg})
+
+
+@pytest.mark.parametrize(
+    "model_cfg",
+    [
+        {"n_heads": 0},
+        {"n_kv_heads": 0},
+        {"n_heads": 4, "n_kv_heads": 3},
+        {"dim": 31, "n_heads": 4},
+    ],
+)
+def test_invalid_attention_head_config_raises(model_cfg):
+    with pytest.raises(ValueError):
+        RunConfig.from_dict({"model": model_cfg})
 
 
 def test_invalid_value_support_raises():
-    try:
+    with pytest.raises(ValueError):
         RunConfig.from_dict({"model": {"value_min": 1.0, "value_max": 1.0}})
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for invalid value support")
 
 
 def test_deep_override_merges():
@@ -90,7 +93,9 @@ def test_real_yaml_loads():
 
 
 def test_learned_configs_use_conventional_gae():
-    for path in ("configs/ppo_base.yaml", "configs/ppo_4p.yaml"):
+    paths = sorted(Path("configs").glob("ppo*.yaml"))
+    assert paths
+    for path in paths:
         with open(path) as f:
             cfg = RunConfig.from_dict(yaml.safe_load(f))
         assert cfg.ppo.gamma == 0.997
@@ -109,4 +114,7 @@ def test_ablation_yaml_keys_load():
                 for part in parts[:-1]:
                     cursor = cursor.setdefault(part, {})
                 cursor[parts[-1]] = value
-            RunConfig.from_dict(deep_override(base, nested))
+            try:
+                RunConfig.from_dict(deep_override(base, nested))
+            except (KeyError, ValueError) as exc:
+                raise AssertionError(f"{matrix_path} cell {cell} does not load") from exc

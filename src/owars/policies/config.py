@@ -6,6 +6,27 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 
+def normalize_attention_config(
+    dim: int,
+    n_heads: int,
+    n_kv_heads: int | None,
+) -> tuple[int, int, int]:
+    """Return normalized `(n_kv_heads, head_dim, kv_dim)` for attention."""
+    if n_heads <= 0:
+        raise ValueError("n_heads must be positive")
+    if dim % n_heads != 0:
+        raise ValueError(f"dim {dim} not divisible by n_heads {n_heads}")
+    if n_kv_heads is None:
+        n_kv_heads = n_heads
+    if n_kv_heads <= 0:
+        raise ValueError("n_kv_heads must be positive")
+    if n_heads % n_kv_heads != 0:
+        raise ValueError("n_heads must be divisible by n_kv_heads")
+    head_dim = dim // n_heads
+    kv_dim = n_kv_heads * head_dim
+    return n_kv_heads, head_dim, kv_dim
+
+
 @dataclass
 class OrbitPolicyConfig:
     # Per-token feature widths (set by `features.encode_observation`).
@@ -17,6 +38,9 @@ class OrbitPolicyConfig:
     ff_dim: int = 256
     depth: int = 3
     n_heads: int = 4
+    # Grouped-query attention. `None` uses ordinary MHA (`n_heads` KV heads);
+    # set to `1` for MQA or another divisor of `n_heads` for GQA.
+    n_kv_heads: int | None = None
     dropout: float = 0.0
     # Apply 2D RoPE to this fraction of each self-attention head for physical
     # planet tokens. Summary/fleet tokens keep the ordinary content attention.

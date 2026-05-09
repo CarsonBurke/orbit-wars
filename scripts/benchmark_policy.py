@@ -43,6 +43,7 @@ def _bench(
     ff_dim: int,
     depth: int,
     n_heads: int,
+    n_kv_heads: int | None,
     num_fleet_latents: int,
     warmup: int,
     iters: int,
@@ -53,6 +54,7 @@ def _bench(
         ff_dim=ff_dim,
         depth=depth,
         n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
         encoder_backend=backend,  # type: ignore[arg-type]
         num_fleet_latents=num_fleet_latents,
     )
@@ -86,6 +88,12 @@ def main() -> None:
     parser.add_argument("--ff-dim", type=int, default=256)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--n-heads", type=int, default=4)
+    parser.add_argument(
+        "--n-kv-heads",
+        type=int,
+        default=None,
+        help="KV heads for GQA/MQA; omit for ordinary MHA.",
+    )
     parser.add_argument("--num-fleet-latents", type=int, default=64)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
@@ -120,6 +128,7 @@ def main() -> None:
             ff_dim=args.ff_dim,
             depth=args.depth,
             n_heads=args.n_heads,
+            n_kv_heads=args.n_kv_heads,
             num_fleet_latents=args.num_fleet_latents,
             warmup=args.warmup,
             iters=args.iters,

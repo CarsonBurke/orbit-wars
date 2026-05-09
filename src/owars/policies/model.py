@@ -81,7 +81,7 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from hl_gauss_pytorch import HLGaussLoss as _LibraryHLGaussLoss
 
-from .config import OrbitPolicyConfig
+from .config import OrbitPolicyConfig, normalize_attention_config
 from .features import EncodedObs
 
 _PLANET_XY_SCALE: float = 100.0
@@ -313,16 +313,25 @@ class SelfAttention(nn.Module):
       5. Output projection (zero-init for cold-start identity).
     """
 
-    def __init__(self, dim: int, n_heads: int, qk_gain_init: float = 5.0):
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        qk_gain_init: float = 5.0,
+        *,
+        n_kv_heads: int | None = None,
+    ):
         super().__init__()
-        if dim % n_heads != 0:
-            raise ValueError(f"dim {dim} not divisible by n_heads {n_heads}")
+        n_kv_heads, head_dim, kv_dim = normalize_attention_config(
+            dim, n_heads, n_kv_heads
+        )
         self.n_heads = n_heads
-        self.head_dim = dim // n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
         # Three separate Q/K/V projections (parameter-golf style).
         self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, dim, bias=False)
-        self.c_v = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.out_proj = CastedLinear(dim, dim, bias=False)
         # Per-head scalar gain on Q after RMSNorm — sets the attention
         # softmax temperature. Init 5.0 ≈ parameter-golf's `qk_gain_init`.
@@ -356,8 +365,8 @@ class SelfAttention(nn.Module):
         # `x` is a dense padded tensor [B, T, D] with `valid_mask=True` for
         # real tokens.
         q = self.c_q(x).unflatten(-1, (self.n_heads, self.head_dim))
-        k = self.c_k(x).unflatten(-1, (self.n_heads, self.head_dim))
-        v = self.c_v(x).unflatten(-1, (self.n_heads, self.head_dim))
+        k = self.c_k(x).unflatten(-1, (self.n_kv_heads, self.head_dim))
+        v = self.c_v(x).unflatten(-1, (self.n_kv_heads, self.head_dim))
         q = F.rms_norm(q, (self.head_dim,))
         k = F.rms_norm(k, (self.head_dim,))
         if rope is not None and rope_cache is not None and rope_slice is not None:
@@ -378,7 +387,14 @@ class SelfAttention(nn.Module):
         attn_mask = None
         if valid_mask is not None:
             attn_mask = valid_mask[:, None, None, :]
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
+        o = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=False,
+            enable_gqa=self.n_kv_heads != self.n_heads,
+        )
         o = o.transpose(1, 2).flatten(-2)  # [B, T, H*head_dim]
         return self.out_proj(o)
 
@@ -386,15 +402,24 @@ class SelfAttention(nn.Module):
 class CrossAttention(nn.Module):
     """Cross-attention where a fixed latent set queries a masked source set."""
 
-    def __init__(self, dim: int, n_heads: int, qk_gain_init: float = 1.0):
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        qk_gain_init: float = 1.0,
+        *,
+        n_kv_heads: int | None = None,
+    ):
         super().__init__()
-        if dim % n_heads != 0:
-            raise ValueError(f"dim {dim} not divisible by n_heads {n_heads}")
+        n_kv_heads, head_dim, kv_dim = normalize_attention_config(
+            dim, n_heads, n_kv_heads
+        )
         self.n_heads = n_heads
-        self.head_dim = dim // n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, dim, bias=False)
-        self.c_v = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.out_proj = CastedLinear(dim, dim, bias=False)
         self.q_gain = nn.Parameter(torch.full((n_heads,), float(qk_gain_init)))
 
@@ -418,8 +443,8 @@ class CrossAttention(nn.Module):
         keys_values = keys_values.masked_fill(~key_mask.unsqueeze(-1), 0.0)
 
         q = self.c_q(queries).unflatten(-1, (self.n_heads, self.head_dim))
-        k = self.c_k(keys_values).unflatten(-1, (self.n_heads, self.head_dim))
-        v = self.c_v(keys_values).unflatten(-1, (self.n_heads, self.head_dim))
+        k = self.c_k(keys_values).unflatten(-1, (self.n_kv_heads, self.head_dim))
+        v = self.c_v(keys_values).unflatten(-1, (self.n_kv_heads, self.head_dim))
         q = F.rms_norm(q, (self.head_dim,))
         k = F.rms_norm(k, (self.head_dim,))
         q = q * self.q_gain.to(q.dtype)[None, None, :, None]
@@ -428,7 +453,13 @@ class CrossAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         attn_mask = safe_mask[:, None, None, :]
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        o = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            enable_gqa=self.n_kv_heads != self.n_heads,
+        )
         o = o.transpose(1, 2).flatten(-2)
         return self.out_proj(o)
 
@@ -441,6 +472,7 @@ class TransformerBlock(nn.Module):
         n_heads: int,
         dropout: float = 0.0,
         *,
+        n_kv_heads: int | None = None,
         layer_idx: int = 0,
     ):
         super().__init__()
@@ -451,7 +483,7 @@ class TransformerBlock(nn.Module):
         # those explicit params and isn't routed to the scalar AdamW group.
         self.ln1 = nn.RMSNorm(dim, elementwise_affine=False)
         self.ln2 = nn.RMSNorm(dim, elementwise_affine=False)
-        self.attn = SelfAttention(dim, n_heads)
+        self.attn = SelfAttention(dim, n_heads, n_kv_heads=n_kv_heads)
         # Depth attenuation disabled (no-op constant). Was `1/√(layer+1)`
         # following parameter-golf `Block.ln_scale_factor`, but with ortho
         # init at gain=0.1 the residual-stream growth is already bounded
@@ -539,18 +571,20 @@ class FleetLatentBlock(nn.Module):
         n_heads: int,
         dropout: float = 0.0,
         *,
+        n_kv_heads: int | None = None,
         layer_idx: int = 0,
     ):
         super().__init__()
         self.latent_norm = nn.RMSNorm(dim, elementwise_affine=False)
         self.fleet_norm = nn.RMSNorm(dim, elementwise_affine=False)
-        self.cross_attn = CrossAttention(dim, n_heads)
+        self.cross_attn = CrossAttention(dim, n_heads, n_kv_heads=n_kv_heads)
         self.cross_scale = nn.Parameter(torch.ones(dim))
         self.self_block = TransformerBlock(
             dim,
             ff_dim,
             n_heads,
             dropout,
+            n_kv_heads=n_kv_heads,
             layer_idx=layer_idx,
         )
 
@@ -581,6 +615,8 @@ class FleetLatentTokenizer(nn.Module):
         num_latents: int,
         depth: int,
         dropout: float = 0.0,
+        *,
+        n_kv_heads: int | None,
     ):
         super().__init__()
         if num_latents < 1:
@@ -598,6 +634,7 @@ class FleetLatentTokenizer(nn.Module):
                     ff_dim,
                     n_heads,
                     dropout,
+                    n_kv_heads=n_kv_heads,
                     layer_idx=i,
                 )
                 for i in range(depth)
@@ -736,6 +773,7 @@ class OrbitPolicy(nn.Module):
                 dim=cfg.dim,
                 ff_dim=cfg.ff_dim,
                 n_heads=cfg.n_heads,
+                n_kv_heads=cfg.n_kv_heads,
                 num_latents=cfg.num_fleet_latents,
                 depth=cfg.fleet_tokenizer_depth,
                 dropout=cfg.dropout,
@@ -772,6 +810,7 @@ class OrbitPolicy(nn.Module):
                     cfg.ff_dim,
                     cfg.n_heads,
                     cfg.dropout,
+                    n_kv_heads=cfg.n_kv_heads,
                     layer_idx=i,
                 )
                 for i in range(cfg.depth)
