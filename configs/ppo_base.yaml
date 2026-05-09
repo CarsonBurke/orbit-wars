@@ -1,12 +1,10 @@
 # Main PPO config — the "primary" learned model.
 #
-# 2-player by default. Switch `game.num_players` to 4 for the FFA variant —
-# the model architecture is the same; only the opponent pool composition
-# and reward shaping should be tuned per-mode.
+# 2-player PPO config.
 #
 # Defaults baked in:
-#   - CleanRL SPO-asym surrogate with `spo_eps_low = 0.2`,
-#     `spo_eps_high = 0.28`, and minibatch advantage normalization.
+#   - CleanRL SPO-asym surrogate with `spo_eps_low = 0.4`,
+#     `spo_eps_high = 0.56`, and minibatch advantage normalization.
 #   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
 #   - Distributional value head (symlog HL-Gauss CE on ±100k raw margin / 153 bins), unclipped.
@@ -37,6 +35,7 @@ model:
                    # footprint vs the canonical 4·dim.
   depth: 3
   n_heads: 4
+  n_kv_heads: 1
   dropout: 0.0
   planet_rope_fraction: 0.25   # partial 2D RoPE over 8/32 dims per head, planets only
   planet_rope_base: 10000.0

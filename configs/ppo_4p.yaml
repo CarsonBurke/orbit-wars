@@ -5,10 +5,7 @@
 #   - longer training (4-player games have longer credit-assignment chains)
 #   - larger snapshot pool (FFA strategy collapse is steeper, so a deeper
 #     league of past selves helps)
-#   - more pretraining (sparser per-trajectory variance — random and
-#     heuristic FFAs land more decisively on a "winner takes all" outcome,
-#     so the value target distribution is more bimodal and easier to
-#     pre-fit).
+#   - higher target entropy to keep diverse FFA strategies alive.
 
 run:
   name: ppo_4p
@@ -27,6 +24,7 @@ model:
   ff_dim: 384
   depth: 4
   n_heads: 4
+  n_kv_heads: 1
   dropout: 0.0
   planet_rope_fraction: 0.25
   planet_rope_base: 10000.0
@@ -50,12 +48,12 @@ ppo:
   gamma: 0.997
   gae_lambda: 0.95
   norm_advantage: true
-  spo_eps_low: 0.2
-  spo_eps_high: 0.28
+  spo_eps_low: 0.4
+  spo_eps_high: 0.56
   value_coef: 1.0
-  target_entropy_coef: 0.015   # a touch higher to keep diverse strategies alive in FFA
+  target_entropy_coef: 0.015
   fraction_entropy_coef: 0.0
-  pretrain_updates: 75
+  pretrain_updates: 0
   pretrain_episodes: 32
   pretrain_lr: 1.0e-3
   pretrain_behavior: heuristic
@@ -66,8 +64,9 @@ rollout:
   env_backend: rust
 
 opponents:
-  snapshot_every: 25
-  top_k: 12              # FFA wants more snapshot diversity
+  snapshot_device: train
+  snapshot_every: 1
+  top_k: 12
   self_play_prob: 0.8
   initial_rating: 1500.0
   k_factor: 32.0
@@ -78,3 +77,4 @@ reward:
   win_value: 0.0
   loss_value: 0.0
   draw_value: 0.0
+  margin_scale: 0.0

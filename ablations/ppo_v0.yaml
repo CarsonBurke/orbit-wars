@@ -15,9 +15,9 @@ cells:
   - { run.name: lr_1em3, optim.lr: 1.0e-3 }
 
   # CleanRL SPO-asym penalty bound in the helpful drift direction
-  - { run.name: spo_high_020, ppo.spo_eps_high: 0.20 }
-  - { run.name: spo_high_028, ppo.spo_eps_high: 0.28 }
   - { run.name: spo_high_040, ppo.spo_eps_high: 0.40 }
+  - { run.name: spo_high_056, ppo.spo_eps_high: 0.56 }
+  - { run.name: spo_high_080, ppo.spo_eps_high: 0.80 }
 
   # target entropy coef; fraction entropy stays disabled in the base config
   - { run.name: ent_001,  ppo.target_entropy_coef: 0.001 }
