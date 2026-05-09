@@ -6,15 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "owars"
 version = "0.0.1"
 description = "Orbit Wars — RL bot for the Kaggle Orbit Wars simulation competition"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
-  "torch>=2.3",
+  "torch>=2.5",
   "tensorboard>=2.16",
   "tqdm>=4.66",
   "pyyaml>=6.0",
   "rich>=13.7",
-  "kaggle-environments>=1.16",
+  "kaggle-environments>=1.29.0",
   "hl-gauss-pytorch>=0.2.3",
 ]
 
@@ -42,7 +42,7 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "N"]
@@ -51,3 +51,4 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["src"]
