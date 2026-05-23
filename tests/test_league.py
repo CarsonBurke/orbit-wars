@@ -75,6 +75,25 @@ def test_sampling_only_picks_alive_snapshots(tmp_path: Path):
         assert s.name in alive
 
 
+def test_eviction_unlinks_checkpoint_file(tmp_path: Path):
+    """Evicted snapshots must delete their on-disk checkpoint, otherwise
+    runs with `snapshot_every: 1` accumulate ~1 file per update forever."""
+    elo = EloTracker(initial_rating=1500.0)
+    pool = OpponentPool(elo=elo, top_k=2, self_play_prob=0.0, rng=random.Random(0))
+    model = _tiny_model()
+
+    low = tmp_path / "low.pt"
+    mid = tmp_path / "mid.pt"
+    high = tmp_path / "high.pt"
+    pool.add_snapshot("low", model, low, seed_rating=1400.0)
+    pool.add_snapshot("mid", model, mid, seed_rating=1500.0)
+    pool.add_snapshot("high", model, high, seed_rating=1700.0)
+
+    assert not low.exists()
+    assert mid.exists()
+    assert high.exists()
+
+
 def test_new_snapshot_inherits_learner_rating(tmp_path: Path):
     elo = EloTracker(initial_rating=1500.0)
     elo.set(LEARNER_NAME, 1700.0)

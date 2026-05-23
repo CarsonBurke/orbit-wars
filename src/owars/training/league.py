@@ -78,6 +78,7 @@ class OpponentPool:
         self.device = device
         self.rng = rng or random.Random()
         self._frozen: dict[str, AgentFn] = {}
+        self._frozen_paths: dict[str, Path] = {}
 
     # --- snapshot management -------------------------------------------------
 
@@ -123,6 +124,7 @@ class OpponentPool:
             device=self.device,
             deterministic=False,
         )
+        self._frozen_paths[name] = ckpt_path
         if seed_rating is None:
             seed_rating = self.elo.get(LEARNER_NAME)
         self.elo.set(name, float(seed_rating))
@@ -139,6 +141,9 @@ class OpponentPool:
         ranked = sorted(self._frozen.keys(), key=lambda n: self.elo.ucb(n), reverse=True)
         for name in ranked[self.top_k :]:
             self._frozen.pop(name, None)
+            path = self._frozen_paths.pop(name, None)
+            if path is not None:
+                path.unlink(missing_ok=True)
             # Leave the rating in EloTracker — it's history; cheap to keep.
 
     def snapshot_names(self) -> list[str]:
