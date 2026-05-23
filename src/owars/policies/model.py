@@ -616,7 +616,7 @@ class FleetLatentTokenizer(nn.Module):
         depth: int,
         dropout: float = 0.0,
         *,
-        n_kv_heads: int | None,
+        n_kv_heads: int | None = None,
     ):
         super().__init__()
         if num_latents < 1:
