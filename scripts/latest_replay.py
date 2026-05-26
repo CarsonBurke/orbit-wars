@@ -23,6 +23,7 @@ from typing import Any
 
 from owars.agents import HeuristicAgent, random_agent, sniper_agent
 from owars.agents.learned import LearnedAgent
+from owars.agents.sac_agent import SACAgent
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,14 @@ def _latest_checkpoint(ckpt_root: Path, run_name: str) -> Path:
     return max(candidates, key=lambda p: (p.stat().st_mtime, _snapshot_num(p)))
 
 
+def _is_sac_checkpoint(ckpt: Path) -> bool:
+    """A SAC checkpoint stores `actor`/`actor_cfg`; PPO stores `model`/`config`."""
+    import torch
+
+    state = torch.load(ckpt, map_location="cpu", weights_only=False)
+    return "actor" in state and "actor_cfg" in state
+
+
 def _agent_factory(
     name: str,
     ckpt: Path,
@@ -78,6 +87,9 @@ def _agent_factory(
     deterministic: bool,
 ) -> Callable[[Any], list[list]]:
     if name == "learned":
+        # Auto-detect SAC vs PPO checkpoint format so one flag works for both.
+        if _is_sac_checkpoint(ckpt):
+            return SACAgent(ckpt, device=device, deterministic=deterministic)
         return LearnedAgent(
             ckpt,
             device=device,

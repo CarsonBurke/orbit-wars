@@ -299,6 +299,30 @@ class Rotary2DCache:
     sin_y: torch.Tensor
 
 
+def _splice_rope(
+    full: torch.Tensor,
+    rotated: torch.Tensor,
+    rope_slice: slice,
+    rotate_dim: int,
+) -> torch.Tensor:
+    """Out-of-place splice of `rotated` into `full[:, rope_slice, :, :rotate_dim]`.
+
+    The previous in-place assignment (`full[:, rope_slice, :, :rotate_dim] =
+    rotated`) bumps `full`'s autograd version, which is fine when `full` is
+    consumed by exactly one backward pass after the mutation (PPO's per-
+    minibatch forward/backward) but breaks under SAC's actor update where the
+    encoder is forwarded twice within a single update — the second forward's
+    backward sees an "expected version 0, got version 1" error. This helper
+    rebuilds the tensor via `torch.cat`, which keeps the autograd graph
+    monotonic across multi-backward training loops.
+    """
+    pre = full[:, : rope_slice.start]
+    mid_keep = full[:, rope_slice, :, rotate_dim:]
+    new_mid = torch.cat([rotated, mid_keep], dim=-1)
+    post = full[:, rope_slice.stop :]
+    return torch.cat([pre, new_mid, post], dim=1)
+
+
 class SelfAttention(nn.Module):
     """Multi-head self-attention with QK-norm + per-head q_gain.
 
@@ -371,8 +395,8 @@ class SelfAttention(nn.Module):
         k = F.rms_norm(k, (self.head_dim,))
         if rope is not None and rope_cache is not None and rope_slice is not None:
             q_planet, k_planet = rope(q[:, rope_slice], k[:, rope_slice], rope_cache)
-            q[:, rope_slice, :, : rope.rotate_dim] = q_planet
-            k[:, rope_slice, :, : rope.rotate_dim] = k_planet
+            q = _splice_rope(q, q_planet, rope_slice, rope.rotate_dim)
+            k = _splice_rope(k, k_planet, rope_slice, rope.rotate_dim)
         q = q * self.q_gain.to(q.dtype)[None, None, :, None]
         # SDPA expects [B, H, j, head_dim]. Caller is responsible for
         # bf16 autocast on CUDA — that's what enables FA-2 dispatch.

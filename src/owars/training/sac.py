@@ -1,0 +1,1606 @@
+"""SAC trainer for Orbit Wars.
+
+Hybrid discrete+continuous variant — the actor emits the SAME factored action
+PPO uses: a per-source-planet Bernoulli launch, a masked Categorical target,
+and a tanh-squashed Normal fraction. The launch *angle* is solved analytically
+from the chosen target by the lead-intercept solver (see `sac_sampling.py`),
+so the policy never has to learn a raw absolute angle.
+
+SAC treatment:
+  * discrete-SAC (closed-form Bernoulli+categorical entropy) for launch+target;
+  * cleanrl reparameterized tanh-Normal for the fraction.
+The critic is **factored (dueling)**: Q(s, a) = V(s) + Σ_i A_i(s, a_i) over owned
+source planets, with each planet's per-option advantage enumerable (`SACSoftQ`).
+This makes the soft-value expectation Σ_a π(a)·Q(s, a) tractable in *closed
+form*: the discrete launch+target gradient is the exact, baseline-free policy
+gradient (no REINFORCE / no (Q−b) variance), and the fraction uses the
+pathwise/reparam gradient. Two entropy temperatures are tuned independently:
+`alpha_discrete` (launch+target) and `alpha_continuous` (fraction).
+
+Value scale: the factored critic is **distributional**. The state value is an
+HL-Gauss two-hot distribution over symlog-spaced bins; the scalar advantages tilt
+it in logit space (Q_logits = nV + adv·value_shift) and the TD loss is
+cross-entropy against the two-hot encoding of the real soft Bellman target.
+Decoding clamps to `[value_min, value_max]`, so the heavy-tailed potential reward
+(capture events spike `Φ` by `production·turns_left`) cannot make the bootstrap
+diverge — this replaces the earlier scalar symlog-MSE critic, whose loss gradient
+vanished at large |Q| and let the deadly triad run the value away.
+
+Orbit Wars-specific adaptations vs cleanrl `sac_continuous_action.py`:
+
+* Replay-buffer state is the structured `EncodedObs` (planet/fleet token
+  tensors + masks), not a flat vector. The stored action is factored
+  (`launch[P]`, `target_idx[P]`, `fraction[P]`) plus the legal-target masks for
+  s and s' (the q-step samples a'~π(·|s') and must mask to s' legal support).
+* Self-play opponent pool reused from `league.py`. Per episode an opponent is
+  sampled (own model or builtin baseline); only learner-seat transitions are
+  pushed to replay.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn.functional as F  # noqa: N812
+from torch.utils.tensorboard import SummaryWriter
+
+from ..policies.config import OrbitPolicyConfig
+from ..policies.features import (
+    MAX_FLEETS,
+    MAX_PLANETS,
+    EncodedObs,
+    encode_raw_observations,
+)
+from ..policies.sac_model import (
+    QComponents,
+    SACActor,
+    SACSoftQ,
+    assemble_expected,
+    assemble_taken,
+    expected_advantage,
+    make_targets,
+    polyak_update,
+)
+from ..policies.sac_sampling import (
+    flatten_policy_output,
+    get_sac_heads_kernel,
+    record_to_cpu,
+    run_sac_heads,
+    sample_batch_actions_raw,
+    sample_batch_with_records_raw,
+)
+from .config import RunConfig
+from .elo import EloTracker
+from .league import BUILTIN, LEARNER_NAME, OpponentPool
+from .rollout import _obs_reward_potential
+from .vec_env import VecEnv
+
+
+def _owned_gate(feats: EncodedObs) -> torch.Tensor:
+    """Owned & alive planet mask `[B, P]` float for assembling factored Q."""
+    owned = feats.planet_owned_mask
+    pmask = feats.planet_mask
+    if owned.dim() == 1:
+        owned = owned.unsqueeze(0)
+        pmask = pmask.unsqueeze(0)
+    return (owned & pmask).float()
+
+
+# ---------------------------------------------------------------------------
+# Replay buffer
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SACBatch:
+    """One sampled minibatch, all tensors on the trainer device."""
+
+    feats: EncodedObs
+    next_feats: EncodedObs
+    launch: torch.Tensor               # [B, P] float 0/1
+    target_idx: torch.Tensor           # [B, P] int64
+    fraction: torch.Tensor             # [B, P] float
+    target_legal_mask: torch.Tensor    # [B, P, P] bool — legal support at s
+    next_target_legal_mask: torch.Tensor  # [B, P, P] bool — legal support at s'
+    reward: torch.Tensor               # [B]
+    done: torch.Tensor                 # [B] float (0/1)
+
+
+class ReplayBuffer:
+    """Circular buffer of factored-action transitions over `EncodedObs` states.
+
+    All storage lives on `device` (CPU by default to spare GPU memory). At
+    sample time the gathered minibatch is moved to `train_device`.
+
+    Per transition we store the factored action (`launch`, `target_idx`,
+    `fraction`) and the legal-target mask for BOTH s and s'. The next-state mask
+    is needed because the soft Bellman target samples a'~π(·|s') and must mask
+    the target categorical to s' legal support. Two `[P, P]` bool masks at
+    `MAX_PLANETS=64` cost `2·64·64 = 8 KB`/row (~410 MB at 50k) — acceptable.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        *,
+        planet_features: int,
+        fleet_features: int,
+        device: str | torch.device = "cpu",
+    ):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = int(capacity)
+        self.device = torch.device(device)
+        f32 = torch.float32
+        i64 = torch.int64
+
+        def state_block() -> dict[str, torch.Tensor]:
+            return {
+                "planet_feats": torch.zeros(
+                    (capacity, MAX_PLANETS, planet_features), dtype=f32, device=self.device
+                ),
+                "planet_mask": torch.zeros(
+                    (capacity, MAX_PLANETS), dtype=torch.bool, device=self.device
+                ),
+                "planet_owned_mask": torch.zeros(
+                    (capacity, MAX_PLANETS), dtype=torch.bool, device=self.device
+                ),
+                "planet_ids": torch.full(
+                    (capacity, MAX_PLANETS), -1, dtype=i64, device=self.device
+                ),
+                "planet_garrison": torch.zeros(
+                    (capacity, MAX_PLANETS), dtype=f32, device=self.device
+                ),
+                "fleet_feats": torch.zeros(
+                    (capacity, MAX_FLEETS, fleet_features), dtype=f32, device=self.device
+                ),
+                "fleet_mask": torch.zeros(
+                    (capacity, MAX_FLEETS), dtype=torch.bool, device=self.device
+                ),
+            }
+
+        self.state = state_block()
+        self.next_state = state_block()
+        self.launch = torch.zeros(
+            (capacity, MAX_PLANETS), dtype=f32, device=self.device
+        )
+        self.target_idx = torch.zeros(
+            (capacity, MAX_PLANETS), dtype=i64, device=self.device
+        )
+        self.fraction = torch.zeros(
+            (capacity, MAX_PLANETS), dtype=f32, device=self.device
+        )
+        self.target_legal_mask = torch.zeros(
+            (capacity, MAX_PLANETS, MAX_PLANETS), dtype=torch.bool, device=self.device
+        )
+        self.next_target_legal_mask = torch.zeros(
+            (capacity, MAX_PLANETS, MAX_PLANETS), dtype=torch.bool, device=self.device
+        )
+        self.reward = torch.zeros((capacity,), dtype=f32, device=self.device)
+        self.done = torch.zeros((capacity,), dtype=f32, device=self.device)
+
+        self.ptr = 0
+        self.size = 0
+
+    def __len__(self) -> int:
+        return self.size
+
+    def add(
+        self,
+        feats: EncodedObs,
+        launch: torch.Tensor,
+        target_idx: torch.Tensor,
+        fraction: torch.Tensor,
+        target_legal_mask: torch.Tensor,
+        next_target_legal_mask: torch.Tensor,
+        reward: float,
+        done: bool,
+        next_feats: EncodedObs,
+    ) -> None:
+        """Insert one transition. All tensors must be unbatched (no leading B)."""
+        idx = self.ptr
+
+        def _check_unbatched(t: torch.Tensor, name: str, want_dim: int) -> torch.Tensor:
+            if t.dim() == want_dim + 1 and t.shape[0] == 1:
+                return t.squeeze(0)
+            if t.dim() != want_dim:
+                raise ValueError(f"{name} expected {want_dim}D, got {tuple(t.shape)}")
+            return t
+
+        def _write_state(block: dict[str, torch.Tensor], s: EncodedObs) -> None:
+            block["planet_feats"][idx].copy_(
+                _check_unbatched(s.planet_feats, "planet_feats", 2).to(
+                    self.device, dtype=torch.float32, non_blocking=False
+                )
+            )
+            block["planet_mask"][idx].copy_(
+                _check_unbatched(s.planet_mask, "planet_mask", 1).to(self.device)
+            )
+            block["planet_owned_mask"][idx].copy_(
+                _check_unbatched(s.planet_owned_mask, "planet_owned_mask", 1).to(
+                    self.device
+                )
+            )
+            block["planet_ids"][idx].copy_(
+                _check_unbatched(s.planet_ids, "planet_ids", 1).to(
+                    self.device, dtype=torch.int64
+                )
+            )
+            block["planet_garrison"][idx].copy_(
+                _check_unbatched(s.planet_garrison, "planet_garrison", 1).to(
+                    self.device, dtype=torch.float32
+                )
+            )
+            block["fleet_feats"][idx].copy_(
+                _check_unbatched(s.fleet_feats, "fleet_feats", 2).to(
+                    self.device, dtype=torch.float32
+                )
+            )
+            block["fleet_mask"][idx].copy_(
+                _check_unbatched(s.fleet_mask, "fleet_mask", 1).to(self.device)
+            )
+
+        _write_state(self.state, feats)
+        _write_state(self.next_state, next_feats)
+        self.launch[idx].copy_(
+            _check_unbatched(launch, "launch", 1).to(self.device, dtype=torch.float32)
+        )
+        self.target_idx[idx].copy_(
+            _check_unbatched(target_idx, "target_idx", 1).to(
+                self.device, dtype=torch.int64
+            )
+        )
+        self.fraction[idx].copy_(
+            _check_unbatched(fraction, "fraction", 1).to(
+                self.device, dtype=torch.float32
+            )
+        )
+        self.target_legal_mask[idx].copy_(
+            _check_unbatched(target_legal_mask, "target_legal_mask", 2).to(self.device)
+        )
+        self.next_target_legal_mask[idx].copy_(
+            _check_unbatched(
+                next_target_legal_mask, "next_target_legal_mask", 2
+            ).to(self.device)
+        )
+        self.reward[idx] = float(reward)
+        self.done[idx] = float(bool(done))
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int, *, device: str | torch.device) -> SACBatch:
+        if self.size < batch_size:
+            raise ValueError(
+                f"requested batch_size {batch_size} > buffer size {self.size}"
+            )
+        idx = torch.randint(
+            0, self.size, (batch_size,), dtype=torch.long, device=self.device
+        )
+        out_device = torch.device(device)
+
+        def _gather_state(block: dict[str, torch.Tensor]) -> EncodedObs:
+            return EncodedObs(
+                planet_feats=block["planet_feats"].index_select(0, idx).to(out_device),
+                planet_mask=block["planet_mask"].index_select(0, idx).to(out_device),
+                planet_owned_mask=block["planet_owned_mask"]
+                .index_select(0, idx)
+                .to(out_device),
+                planet_ids=block["planet_ids"].index_select(0, idx).to(out_device),
+                planet_garrison=block["planet_garrison"]
+                .index_select(0, idx)
+                .to(out_device),
+                fleet_feats=block["fleet_feats"].index_select(0, idx).to(out_device),
+                fleet_mask=block["fleet_mask"].index_select(0, idx).to(out_device),
+            )
+
+        return SACBatch(
+            feats=_gather_state(self.state),
+            next_feats=_gather_state(self.next_state),
+            launch=self.launch.index_select(0, idx).to(out_device),
+            target_idx=self.target_idx.index_select(0, idx).to(out_device),
+            fraction=self.fraction.index_select(0, idx).to(out_device),
+            target_legal_mask=self.target_legal_mask.index_select(0, idx).to(out_device),
+            next_target_legal_mask=self.next_target_legal_mask.index_select(0, idx).to(
+                out_device
+            ),
+            reward=self.reward.index_select(0, idx).to(out_device),
+            done=self.done.index_select(0, idx).to(out_device),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Rollout helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_elimination(obs: Any, num_players: int) -> bool:
+    """True absorbing terminal (a player has no planets *and* no fleets), as
+    opposed to the step-`episode_steps` timeout.
+
+    Orbit Wars ends early only when ≤1 player has anything left; otherwise it
+    ends by the clock at `episode_steps`. SAC must bootstrap through the timeout
+    (a truncation — the value continues) but zero the bootstrap on a true
+    absorbing terminal. We detect the latter by a player with zero presence.
+    """
+    get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+    present = [0] * num_players
+    for planet in get("planets", []) or []:
+        owner = int(planet[1])
+        if owner != -1:
+            present[owner] += 1
+    for fleet in get("fleets", []) or []:
+        owner = int(fleet[1])
+        if owner != -1:
+            present[owner] += 1
+    return any(c == 0 for c in present)
+
+
+# ---------------------------------------------------------------------------
+# SAC update step
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SACUpdateOutput:
+    qf1_loss: float
+    qf2_loss: float
+    qf1_value: float
+    qf2_value: float
+    qf_grad_norm: float
+    boot_value: float          # hard (entropy-free) bootstrap value, real units
+    boot_entropy_bonus: float  # entropy contribution to the soft target, real units
+    alpha_disc: float
+    alpha_cont: float
+    # Actor-side metrics; `None` on a logging tick where no actor update ran
+    # (possible only when num_envs*gradient_steps < policy_frequency).
+    actor_loss: float | None
+    actor_grad_norm: float | None
+    alpha_disc_loss: float | None
+    alpha_cont_loss: float | None
+    h_disc_mean: float | None          # achieved discrete entropy, summed over owned (batch mean)
+    h_disc_per_planet: float | None    # achieved per-owned-planet discrete entropy
+    target_h_disc: float | None        # per-owned-planet target entropy α_disc drives toward
+    logp_frac_mean: float | None       # p-weighted Σ g·p·logp_frac (= -H_cont)
+    target_h_cont: float | None        # launch-mass-scaled target entropy α_cont drives toward
+
+
+# ---------------------------------------------------------------------------
+# Compiled update kernels (autocast → FA-2; torch.compile fusion)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the PPO minibatch-kernel idiom (`ppo.py`): a flat-tensor `nn.Module`
+# whose forward wraps the network passes in `torch.autocast(bf16)` — the *outer*
+# autocast is what dispatches the encoder's `scaled_dot_product_attention` to
+# FlashAttention-2 (see `model.py` SDPA note) — then computes the loss. The
+# whole forward is `torch.compile`d (`dynamic=False, fullgraph=True`) so inductor
+# fuses the ~10⁴ eager ops into a handful of kernels. Backward, optimizer steps,
+# and the (scalar) alpha updates stay eager.
+#
+# The two alphas are passed as tensor inputs so the graph stays static; `gamma`
+# is a compile-time constant baked into __init__.
+
+
+def _encoded_args(feats: EncodedObs) -> tuple[torch.Tensor, ...]:
+    """EncodedObs → its seven tensors in field order (flat kernel inputs)."""
+    return (
+        feats.planet_feats,
+        feats.planet_mask,
+        feats.planet_owned_mask,
+        feats.planet_ids,
+        feats.planet_garrison,
+        feats.fleet_feats,
+        feats.fleet_mask,
+    )
+
+
+def _encoded_row(feats: EncodedObs, i: int) -> EncodedObs:
+    """One row of a batched `EncodedObs` as an unbatched state (for replay)."""
+    return EncodedObs(
+        planet_feats=feats.planet_feats[i],
+        planet_mask=feats.planet_mask[i],
+        planet_owned_mask=feats.planet_owned_mask[i],
+        planet_ids=feats.planet_ids[i],
+        planet_garrison=feats.planet_garrison[i],
+        fleet_feats=feats.fleet_feats[i],
+        fleet_mask=feats.fleet_mask[i],
+    )
+
+
+def _encoded_from_args(
+    planet_feats: torch.Tensor,
+    planet_mask: torch.Tensor,
+    planet_owned_mask: torch.Tensor,
+    planet_ids: torch.Tensor,
+    planet_garrison: torch.Tensor,
+    fleet_feats: torch.Tensor,
+    fleet_mask: torch.Tensor,
+) -> EncodedObs:
+    return EncodedObs(
+        planet_feats=planet_feats,
+        planet_mask=planet_mask,
+        planet_owned_mask=planet_owned_mask,
+        planet_ids=planet_ids,
+        planet_garrison=planet_garrison,
+        fleet_feats=fleet_feats,
+        fleet_mask=fleet_mask,
+    )
+
+
+def _compile_kernel(
+    kernel: torch.nn.Module, *, device: torch.device, compile_mode: str | None
+) -> torch.nn.Module:
+    """`torch.compile` the kernel on CUDA (PPO settings); identity otherwise."""
+    if device.type != "cuda" or not compile_mode:
+        return kernel
+    return torch.compile(kernel, dynamic=False, fullgraph=True, mode=compile_mode)
+
+
+def _mark_cuda_graph_step(device: torch.device) -> None:
+    """Open a new CUDA-graph-trees step at the start of one learner iteration.
+
+    The SAC update path compiles TWO kernels (`q_kernel`, `actor_kernel`) that
+    SHARE the `qf1`/`qf2` modules and runs them interleaved, each with an eager
+    `.backward()`. CUDA-graph trees (`reduce-overhead`) record one memory pool
+    across a tree of graph executions; everything between two
+    `cudagraph_mark_step_begin()` calls is ONE step with coherent buffer-liveness
+    tracking. The mark must therefore bracket a *whole* learner iteration — the
+    critic update, the actor burst, and the polyak — as a single step.
+
+    Marking before *each* kernel instead (the natural-looking choice) splits the
+    critic and actor into separate steps, so the tree reclaims the shared-critic
+    pool slot mid-lineage and the actor backward reads a buffer a later
+    critic-graph replay overwrote: "accessing tensor output of CUDAGraphs that
+    has been overwritten by a subsequent run", raised inside
+    `actor_loss.backward()`. One mark per iteration keeps the shared `qf1`/`qf2`
+    forward activations valid through both backwards. (Empirically verified; see
+    `ppo.py`, whose single-kernel loop marks once per minibatch for the same
+    reason.) No-op off CUDA / pre-2.x torch.
+    """
+    if device.type != "cuda":
+        return
+    mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+    if callable(mark):
+        mark()
+
+
+class _SACQKernel(torch.nn.Module):
+    """Twin-Q soft-Bellman loss as one compiled graph.
+
+    Resamples a'~π(·|s') (no grad), assembles the per-twin closed-form expected
+    target Q DISTRIBUTION, decodes the bounded scalar `bins_to_scalar`, forms the
+    soft value and the bootstrapped REAL target `y`; then trains each twin's
+    `Q_taken(s, a_buffer)` DISTRIBUTION with the HL-Gauss cross-entropy loss
+    (`−Σ target_probs(y)·log_softmax(Q_logits)`). The decoded value is clamped to
+    `[value_min, value_max]`, so the bootstrap is structurally bounded — the
+    deadly-triad runaway the old symlog-MSE scalar critic suffered cannot occur.
+    Returns `(q_loss, qf1_loss, qf2_loss, q1_scalar, q2_scalar)` (q scalars REAL).
+    """
+
+    def __init__(
+        self,
+        actor: SACActor,
+        qf1: SACSoftQ,
+        qf2: SACSoftQ,
+        qf1_target: SACSoftQ,
+        qf2_target: SACSoftQ,
+        *,
+        gamma: float,
+        autocast_enabled: bool,
+    ) -> None:
+        super().__init__()
+        self.actor = actor
+        self.qf1 = qf1
+        self.qf2 = qf2
+        self.qf1_target = qf1_target
+        self.qf2_target = qf2_target
+        self.gamma = float(gamma)
+        self.autocast_enabled = bool(autocast_enabled)
+
+    def forward(
+        self,
+        pf: torch.Tensor,
+        pm: torch.Tensor,
+        pom: torch.Tensor,
+        pid: torch.Tensor,
+        pg: torch.Tensor,
+        ff: torch.Tensor,
+        fm: torch.Tensor,
+        npf: torch.Tensor,
+        npm: torch.Tensor,
+        npom: torch.Tensor,
+        npid: torch.Tensor,
+        npg: torch.Tensor,
+        nff: torch.Tensor,
+        nfm: torch.Tensor,
+        launch: torch.Tensor,
+        target_idx: torch.Tensor,
+        fraction: torch.Tensor,
+        legal: torch.Tensor,
+        next_legal: torch.Tensor,
+        reward: torch.Tensor,
+        done: torch.Tensor,
+        alpha_d: torch.Tensor,
+        alpha_c: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm)
+        next_feats = _encoded_from_args(npf, npm, npom, npid, npg, nff, nfm)
+        gate = (feats.planet_owned_mask & feats.planet_mask).float()
+        next_gate = (next_feats.planet_owned_mask & next_feats.planet_mask).float()
+
+        with torch.no_grad():
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+            ):
+                next_action = self.actor.get_action(
+                    next_feats, next_legal, deterministic=False
+                )
+                # Entropy term enters in TILT space, the SAME coordinate the actor
+                # optimizes (`adv + α·H`) and where α is tuned. We tilt the
+                # next-state value distribution by the SOFT advantage `adv + α·H`
+                # (add α·H along value_shift, on top of the advantage tilt already
+                # in `logits_next`) THEN decode. So α is consistently "value-per-nat
+                # in tilt space" in both the actor and this bootstrap — a single,
+                # well-scaled α. The decode maps the tilt-space term to a
+                # state-aware real-units contribution (≈ Var_Q·(1+|Q|)·α·H); adding
+                # α·H directly to the real-units decoded value instead (tilt-tuned α
+                # ~O(1) vs real value O(10³)) makes it negligible — a near-hard
+                # critic. The contribution is SIGNED: H_disc ≥ 0 but H_cont is a
+                # differential entropy that can be negative (a confident, low-spread
+                # fraction), so a sharply-tuned continuous policy can make ent_tilt
+                # slightly negative — the standard max-ent semantics, matching the
+                # actor's identical `+α·H` term. Reward adds OUTSIDE the decode
+                # (real units), so y = r + γ·V_soft(s') is still a valid contraction.
+                ent_tilt = (
+                    alpha_d * next_action.H_disc + alpha_c * next_action.H_cont
+                ).unsqueeze(-1)  # [B, 1]
+                soft_v_next_twin = []
+                hard_v_next_twin = []  # entropy-free decode, diagnostic only
+                for qt in (self.qf1_target, self.qf2_target):
+                    comp = qt.components(next_feats, next_action.fraction)
+                    logits_next = assemble_expected(
+                        comp,
+                        next_action.launch_p,
+                        next_action.target_probs,
+                        next_gate,
+                        qt.value_shift,
+                    )
+                    soft_logits = logits_next + ent_tilt * qt.value_shift
+                    soft_v_next_twin.append(qt.bins_to_scalar(soft_logits))
+                    hard_v_next_twin.append(qt.bins_to_scalar(logits_next))
+            soft_v_next = torch.minimum(soft_v_next_twin[0], soft_v_next_twin[1])
+            hard_v_next = torch.minimum(hard_v_next_twin[0], hard_v_next_twin[1])
+            y = reward + (1.0 - done) * self.gamma * soft_v_next
+
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            comp1 = self.qf1.components(feats, fraction)
+            comp2 = self.qf2.components(feats, fraction)
+        logits1 = assemble_taken(comp1, launch, target_idx, gate, self.qf1.value_shift)
+        logits2 = assemble_taken(comp2, launch, target_idx, gate, self.qf2.value_shift)
+        # HL-Gauss distributional loss: cross-entropy of each twin's assembled Q
+        # distribution against the Gaussian-smoothed two-hot encoding of the REAL
+        # bootstrap target `y` (`target_probs` applies symlog + clamps to the
+        # support internally). Run in fp32 — the CE over symlog-spaced bins is
+        # precision-sensitive and the encoder forces fp32 buffers anyway. The
+        # twins share an identical HL-Gauss config, so `target_probs(y)` is the
+        # same for both; compute it once.
+        tp = self.qf1.hlgauss.target_probs(y.float())  # [B, num_bins]
+        qf1_loss = -(tp * F.log_softmax(logits1.float(), dim=-1)).sum(-1).mean()
+        qf2_loss = -(tp * F.log_softmax(logits2.float(), dim=-1)).sum(-1).mean()
+        q_loss = qf1_loss + qf2_loss
+        # Bootstrap diagnostics (real units): the hard value and the SIGNED entropy
+        # contribution the soft tilt actually injects into y (usually positive;
+        # can be slightly negative when the continuous differential entropy is).
+        # In tilt space the contribution is state-aware and non-negligible; watch
+        # bootstrap/entropy_bonus_frac to confirm it didn't collapse to ~0 (which
+        # would mean a near-hard critic — the bug this fixes).
+        boot_value = hard_v_next.mean().detach()
+        boot_entropy_bonus = (soft_v_next - hard_v_next).mean().detach()
+        return (
+            q_loss,
+            qf1_loss.detach(),
+            qf2_loss.detach(),
+            self.qf1.bins_to_scalar(logits1).mean().detach(),  # REAL value units
+            self.qf2.bins_to_scalar(logits2).mean().detach(),
+            boot_value,
+            boot_entropy_bonus,
+        )
+
+
+class _SACActorKernel(torch.nn.Module):
+    """Closed-form actor objective as one compiled graph.
+
+    Resamples a~π(·|s); assembles the per-twin closed-form expected SCALAR
+    advantage `E_a[adv_j]` (A0 detached as a baseline, AL live for the pathwise
+    fraction grad, launch_p/target_probs live for the discrete grad); the loss is
+    `-(min_j E_a[adv_j] + α_d·H_disc + α_c·H_cont)`. The actor ascends the scalar
+    advantage DIRECTLY — not the value distribution it tilts — because the state
+    value V is action-independent (zero policy gradient) and routing the advantage
+    through the value softmax would make the value/entropy trade-off
+    state-dependent (the symlog Jacobian varies by state). The raw advantage is
+    linear, well-conditioned, and naturally O(1-10) (tilt-space), so a single
+    global α balances it everywhere. Returns the actor loss plus the detached
+    entropy bookkeeping the eager dual-alpha step consumes.
+    """
+
+    def __init__(
+        self,
+        actor: SACActor,
+        qf1: SACSoftQ,
+        qf2: SACSoftQ,
+        *,
+        autocast_enabled: bool,
+    ) -> None:
+        super().__init__()
+        self.actor = actor
+        self.qf1 = qf1
+        self.qf2 = qf2
+        self.autocast_enabled = bool(autocast_enabled)
+
+    def forward(
+        self,
+        pf: torch.Tensor,
+        pm: torch.Tensor,
+        pom: torch.Tensor,
+        pid: torch.Tensor,
+        pg: torch.Tensor,
+        ff: torch.Tensor,
+        fm: torch.Tensor,
+        legal: torch.Tensor,
+        alpha_d: torch.Tensor,
+        alpha_c: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm)
+        gate = (feats.planet_owned_mask & feats.planet_mask).float()
+
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            action = self.actor.get_action(feats, legal, deterministic=False)
+            adv_per_twin = []
+            for qf in (self.qf1, self.qf2):
+                comp = qf.components(feats, action.fraction)
+                # nA0 detached (no-launch baseline), nAL live (pathwise fraction
+                # grad). nV is unused by the scalar advantage — the actor ascends
+                # `adv`, not the value distribution it would tilt.
+                comp_actor = QComponents(
+                    nV=comp.nV.detach(), nA0=comp.nA0.detach(), nAL=comp.nAL
+                )
+                adv_per_twin.append(
+                    expected_advantage(
+                        comp_actor, action.launch_p, action.target_probs, gate
+                    )
+                )
+        # Pessimistic over twins on the SCALAR advantage (the action-dependent part
+        # of Q; the V baseline contributes no policy gradient). adv is linear and
+        # state-independent, so `adv + α·H` has a state-invariant value/entropy
+        # trade-off — a single global α balances it everywhere (unlike routing adv
+        # through the value softmax, whose slope varies by state).
+        adv_min = torch.minimum(adv_per_twin[0], adv_per_twin[1])
+        soft_v = adv_min + alpha_d * action.H_disc + alpha_c * action.H_cont
+        actor_loss = -soft_v.mean()
+        return (
+            actor_loss,
+            action.H_disc.detach(),
+            action.h_disc_max.detach(),
+            action.cont_logp_sum.detach(),
+            action.n_owned.detach(),
+            action.eff_cont_dim.detach(),
+        )
+
+
+def _clip_optimizer_grads(
+    optimizer: torch.optim.Optimizer, grad_clip: float
+) -> torch.Tensor:
+    """Clip the optimizer's grad-norm to `grad_clip` (no clip when ≤0) and return
+    the PRE-clip total L2 norm.
+
+    The norm is returned as a GPU scalar and NOT materialized — the caller
+    `.item()`s it (with the rest of the metrics) only on logging ticks, so the
+    grad-norm logging costs no per-update CUDA sync. `max_norm=inf` measures
+    without rescaling (clip coef clamps to 1.0).
+    """
+    params = [p for group in optimizer.param_groups for p in group["params"]]
+    max_norm = grad_clip if grad_clip > 0.0 else float("inf")
+    return torch.nn.utils.clip_grad_norm_(params, max_norm)
+
+
+@dataclass
+class _QStats:
+    """Critic-step metrics as un-materialized GPU scalars (`.item()` at log time).
+
+    Tensor fields (not floats) so the hot loop never CUDA-syncs. `_q_step`
+    `.clone()`s the cudagraph-output fields before wrapping them here, so these
+    references survive arbitrary later kernel replays (see `_q_step`).
+    """
+
+    qf1_loss: torch.Tensor
+    qf2_loss: torch.Tensor
+    qf1_value: torch.Tensor
+    qf2_value: torch.Tensor
+    grad_norm: torch.Tensor
+    boot_value: torch.Tensor          # hard (entropy-free) bootstrap value, real units
+    boot_entropy_bonus: torch.Tensor  # entropy contribution to soft_v_next, real units
+
+
+@dataclass
+class _ActorStats:
+    """Actor/alpha-step metrics as un-materialized GPU scalars (`.item()` at log time)."""
+
+    actor_loss: torch.Tensor
+    alpha_disc_loss: torch.Tensor
+    alpha_cont_loss: torch.Tensor
+    grad_norm: torch.Tensor
+    h_disc: torch.Tensor             # achieved discrete entropy, summed over owned (batch mean)
+    h_disc_per_planet: torch.Tensor  # achieved per-owned-planet discrete entropy (α_disc target quantity)
+    target_h_disc: torch.Tensor      # per-owned-planet target entropy α_disc drives toward
+    cont_logp: torch.Tensor          # p-weighted Σ g·p·logp_frac (= -H_cont)
+    target_h_cont: torch.Tensor      # launch-mass-scaled target entropy α_cont drives toward
+
+
+def _q_step(
+    *,
+    q_kernel: torch.nn.Module,
+    q_optimizer: torch.optim.Optimizer,
+    log_alpha_disc: torch.Tensor,
+    log_alpha_cont: torch.Tensor,
+    batch: SACBatch,
+    grad_clip: float,
+) -> _QStats:
+    """Twin-Q TD update against the soft Bellman target (factored critic).
+
+      soft_V' = min_j bins_to_scalar[ nV_j(s') + (adv_j + α_d·H'+α_c·H')·vs_j ]
+      y       = r + (1-d)·γ·soft_V'                           # REAL soft target
+      loss    = Σ_twin CE( target_probs(y), Q_logits_j(s, a_buffer) )
+
+    The entropy bonus enters in TILT space (added to the advantage before the
+    Esscher tilt + decode), so α is "value-per-nat in tilt space" consistently in
+    both the critic bootstrap and the actor objective — a single, well-scaled α.
+    The forward+loss runs inside the compiled `q_kernel` (autocast → FA-2); the
+    gradient clip and optimizer step stay eager. The critic is DISTRIBUTIONAL
+    (HL-Gauss two-hot over symlog bins): `y` is the standard real soft Bellman
+    target, encoded to bin probabilities and fit by cross-entropy. The decoded Q
+    is clamped to `[value_min, value_max]`, structurally bounding the bootstrap.
+    """
+    alpha_d = log_alpha_disc.exp().detach()
+    alpha_c = log_alpha_cont.exp().detach()
+    q_loss, qf1_loss, qf2_loss, q1_scalar, q2_scalar, boot_value, boot_ent = q_kernel(
+        *_encoded_args(batch.feats),
+        *_encoded_args(batch.next_feats),
+        batch.launch,
+        batch.target_idx,
+        batch.fraction,
+        batch.target_legal_mask,
+        batch.next_target_legal_mask,
+        batch.reward,
+        batch.done,
+        alpha_d,
+        alpha_c,
+    )
+
+    q_optimizer.zero_grad(set_to_none=True)
+    q_loss.backward()
+    grad_norm = _clip_optimizer_grads(q_optimizer, grad_clip)
+    q_optimizer.step()
+    # Return un-materialized GPU scalars; the caller `.item()`s on logging ticks
+    # only, so the hot loop never CUDA-syncs. The four kernel outputs alias the
+    # cudagraph static output buffers (reduce-overhead) and the caller HOLDS the
+    # latest stats across subsequent iterations (each a new cudagraph step that
+    # overwrites those buffers), so `.clone()` them — PyTorch's documented remedy
+    # for retained cudagraph outputs. A 0-dim clone is async (no CPU sync).
+    # grad_norm is an eager (non-cudagraph) tensor, already safe to hold.
+    return _QStats(
+        qf1_loss=qf1_loss.clone(),
+        qf2_loss=qf2_loss.clone(),
+        qf1_value=q1_scalar.clone(),
+        qf2_value=q2_scalar.clone(),
+        grad_norm=grad_norm,
+        boot_value=boot_value.clone(),
+        boot_entropy_bonus=boot_ent.clone(),
+    )
+
+
+def _actor_alpha_step(
+    *,
+    actor_kernel: torch.nn.Module,
+    actor_optimizer: torch.optim.Optimizer,
+    alpha_disc_optimizer: torch.optim.Optimizer,
+    alpha_cont_optimizer: torch.optim.Optimizer,
+    log_alpha_disc: torch.Tensor,
+    log_alpha_cont: torch.Tensor,
+    disc_target_entropy_ratio: float,
+    target_entropy_per_dim: float,
+    batch: SACBatch,
+    grad_clip: float,
+) -> _ActorStats:
+    """Actor + dual-alpha update (closed-form, no REINFORCE).
+
+    The closed-form soft-value objective (with the detach routing — nV/nA0
+    detached, nAL live for the pathwise fraction grad, launch_p/target_probs live
+    for the exact discrete grad) runs inside the compiled `actor_kernel`
+    (autocast → FA-2). The actor optimizer step and the two scalar entropy-
+    temperature updates stay eager.
+
+    Returns un-materialized GPU scalars (`_ActorStats`); the caller `.item()`s
+    them on logging ticks only.
+    """
+    alpha_d = log_alpha_disc.exp().detach()
+    alpha_c = log_alpha_cont.exp().detach()
+    (
+        actor_loss,
+        h_disc_d,
+        h_disc_max_d,
+        cont_logp_d,
+        n_owned,
+        eff_cont_dim,
+    ) = actor_kernel(
+        *_encoded_args(batch.feats),
+        batch.target_legal_mask,
+        alpha_d,
+        alpha_c,
+    )
+
+    actor_optimizer.zero_grad(set_to_none=True)
+    actor_loss.backward()
+    actor_grad_norm = _clip_optimizer_grads(actor_optimizer, grad_clip)
+    actor_optimizer.step()
+
+    # ---- dual-alpha updates (per-state targets; kernel pre-detached all) ----
+    denom = n_owned.clamp_min(1.0)
+
+    # Discrete: tune on the PER-PLANET average entropy so the target does not
+    # scale with the owned-planet count (the old summed target ran α to 1.6).
+    # cleanrl `sac_atari.py` form `Σ_a p_a·(-α·(logp_a + H_target)) = α·(H - H_t)`
+    # with α = exp(log_α) LIVE (here H, H_t are the achieved / target entropies
+    # already expectation-weighted in the kernel). The α-weighting self-damps,
+    # so α_disc equilibrates at achieved == target (a reachable fraction of max)
+    # by policy feedback — the old `log_α·(...)` form needed a ceiling clamp to
+    # stop upward runaway; the atari form doesn't.
+    achieved_disc = h_disc_d / denom  # avg per-owned-planet discrete entropy
+    target_disc = disc_target_entropy_ratio * (h_disc_max_d / denom)
+    alpha_disc_loss = (
+        log_alpha_disc.exp() * (achieved_disc - target_disc)
+    ).mean()  # ↑α when achieved < target
+    alpha_disc_optimizer.zero_grad(set_to_none=True)
+    alpha_disc_loss.backward()
+    alpha_disc_optimizer.step()
+
+    # Continuous: cont_logp is p-weighted (Σ g·p·logp_frac), so the target must
+    # scale by the expected launch count Σ g·p — matching that weighting. Scaling
+    # by the full n_owned instead drives α_cont → 0 whenever launches are rare
+    # (the conservative early policy), starving the fraction of entropy pressure.
+    #
+    # Use cleanrl's α-weighted loss `-(α·(logp + target))` with α = exp(log_α)
+    # LIVE (not `-(log_α·(...))`): its d/d(log_α) = -α·residual self-damps as α
+    # shrinks, so a transiently-negative residual (the bounded fraction's natural
+    # entropy can exceed the target while the cold critic hasn't concentrated it
+    # yet) no longer collapses α_cont exponentially — it recovers once the critic
+    # pushes logp past the target. This is the Haarnoja (2018) dual objective.
+    h_target_frac = target_entropy_per_dim * eff_cont_dim  # [B]
+    alpha_cont_loss = -(log_alpha_cont.exp() * (cont_logp_d + h_target_frac)).mean()
+    alpha_cont_optimizer.zero_grad(set_to_none=True)
+    alpha_cont_loss.backward()
+    alpha_cont_optimizer.step()
+
+    # Un-materialized GPU scalars: achieved/target entropies ride along for the
+    # achieved-vs-target α diagnostic. `actor_loss` aliases a cudagraph output
+    # buffer (reduce-overhead) and the caller holds it across later iterations
+    # that overwrite the buffer, so `.clone()` it (0-dim clone is async, no CPU
+    # sync). Every other field is a fresh eager tensor (`.mean()` / eager
+    # arithmetic / grad-norm), already safe to hold.
+    return _ActorStats(
+        actor_loss=actor_loss.detach().clone(),
+        alpha_disc_loss=alpha_disc_loss.detach(),
+        alpha_cont_loss=alpha_cont_loss.detach(),
+        grad_norm=actor_grad_norm,
+        h_disc=h_disc_d.mean(),
+        h_disc_per_planet=achieved_disc.mean(),
+        target_h_disc=target_disc.mean(),
+        cont_logp=cont_logp_d.mean(),
+        target_h_cont=h_target_frac.mean(),
+    )
+
+
+def _target_step(
+    qf1: SACSoftQ,
+    qf2: SACSoftQ,
+    qf1_target: SACSoftQ,
+    qf2_target: SACSoftQ,
+    tau: float,
+) -> None:
+    polyak_update(qf1_target, qf1, tau)
+    polyak_update(qf2_target, qf2, tau)
+
+
+def _build_update_output(
+    q: _QStats,
+    a: _ActorStats | None,
+    alpha_disc: float,
+    alpha_cont: float,
+) -> SACUpdateOutput:
+    """Materialize the held GPU-scalar stats to CPU floats — the ONLY place that
+    `.item()`s update metrics, and called only on logging ticks (so the hot loop
+    never CUDA-syncs). The held tensors carry the last update's values."""
+    out = SACUpdateOutput(
+        qf1_loss=q.qf1_loss.item(),
+        qf2_loss=q.qf2_loss.item(),
+        qf1_value=q.qf1_value.item(),
+        qf2_value=q.qf2_value.item(),
+        qf_grad_norm=q.grad_norm.item(),
+        boot_value=q.boot_value.item(),
+        boot_entropy_bonus=q.boot_entropy_bonus.item(),
+        alpha_disc=alpha_disc,
+        alpha_cont=alpha_cont,
+        actor_loss=None,
+        actor_grad_norm=None,
+        alpha_disc_loss=None,
+        alpha_cont_loss=None,
+        h_disc_mean=None,
+        h_disc_per_planet=None,
+        target_h_disc=None,
+        logp_frac_mean=None,
+        target_h_cont=None,
+    )
+    if a is not None:
+        out.actor_loss = a.actor_loss.item()
+        out.actor_grad_norm = a.grad_norm.item()
+        out.alpha_disc_loss = a.alpha_disc_loss.item()
+        out.alpha_cont_loss = a.alpha_cont_loss.item()
+        out.h_disc_mean = a.h_disc.item()
+        out.h_disc_per_planet = a.h_disc_per_planet.item()
+        out.target_h_disc = a.target_h_disc.item()
+        out.logp_frac_mean = a.cont_logp.item()
+        out.target_h_cont = a.target_h_cont.item()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main training entry point
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SACState:
+    """Lightweight container for everything the trainer keeps across steps."""
+
+    actor: SACActor
+    qf1: SACSoftQ
+    qf2: SACSoftQ
+    qf1_target: SACSoftQ
+    qf2_target: SACSoftQ
+    q_kernel: torch.nn.Module
+    actor_kernel: torch.nn.Module
+    compile_mode: str | None  # None ⇒ eager kernels (skip cudagraph step marks)
+    q_optimizer: torch.optim.Optimizer
+    actor_optimizer: torch.optim.Optimizer
+    log_alpha_disc: torch.Tensor
+    log_alpha_cont: torch.Tensor
+    alpha_disc_optimizer: torch.optim.Optimizer
+    alpha_cont_optimizer: torch.optim.Optimizer
+    rng: random.Random
+    pool: OpponentPool
+    writer: SummaryWriter
+    ckpt_dir: Path
+    disc_target_entropy_ratio: float
+    target_entropy_per_dim: float
+    builtin_agents: dict[str, Any]
+    builtin_prob: float
+
+
+def _build_policy_cfg(cfg: RunConfig) -> OrbitPolicyConfig:
+    m = cfg.model
+    pcfg = OrbitPolicyConfig(
+        dim=m.dim,
+        ff_dim=m.ff_dim,
+        depth=m.depth,
+        n_heads=m.n_heads,
+        n_kv_heads=m.n_kv_heads,
+        dropout=m.dropout,
+        planet_rope_fraction=m.planet_rope_fraction,
+        planet_rope_base=m.planet_rope_base,
+        encoder_backend=m.encoder_backend,
+        num_fleet_latents=m.num_fleet_latents,
+        fleet_tokenizer_depth=m.fleet_tokenizer_depth,
+        value_hidden=m.value_hidden,
+        value_num_bins=m.value_num_bins,
+        value_min=m.value_min,
+        value_max=m.value_max,
+        value_symlog=m.value_symlog,
+    )
+    return pcfg
+
+
+def _build_state(cfg: RunConfig, device: torch.device) -> SACState:
+    pcfg = _build_policy_cfg(cfg)
+    sac = cfg.sac
+
+    actor = SACActor(
+        pcfg,
+        log_std_min=sac.log_std_min,
+        log_std_max=sac.log_std_max,
+    ).to(device)
+    qf1 = SACSoftQ(pcfg).to(device)
+    qf2 = SACSoftQ(pcfg).to(device)
+    qf1_target = make_targets(qf1).to(device)
+    qf2_target = make_targets(qf2).to(device)
+
+    # Compiled update kernels (autocast → FA-2; inductor fusion + CUDA-graphs).
+    # `compile_mode` is the shared RunConfig knob PPO uses; on CPU it's a no-op
+    # identity. Both kernels keep the configured cudagraph mode; the interleaved
+    # shared-qf1/qf2 backward is made cudagraph-safe by marking ONE step per
+    # learner iteration in `_run_updates` (see `_mark_cuda_graph_step`).
+    autocast_enabled = device.type == "cuda"
+    compile_mode = cfg.run.compile_mode or None
+    q_kernel = _compile_kernel(
+        _SACQKernel(
+            actor,
+            qf1,
+            qf2,
+            qf1_target,
+            qf2_target,
+            gamma=sac.gamma,
+            autocast_enabled=autocast_enabled,
+        ),
+        device=device,
+        compile_mode=compile_mode,
+    )
+    actor_kernel = _compile_kernel(
+        _SACActorKernel(actor, qf1, qf2, autocast_enabled=autocast_enabled),
+        device=device,
+        compile_mode=compile_mode,
+    )
+
+    q_optimizer = torch.optim.Adam(
+        list(qf1.parameters()) + list(qf2.parameters()),
+        lr=sac.q_lr,
+        weight_decay=sac.weight_decay,
+    )
+    actor_optimizer = torch.optim.Adam(
+        actor.parameters(),
+        lr=sac.policy_lr,
+        weight_decay=sac.weight_decay,
+    )
+
+    # Two independent entropy temperatures: discrete (launch+target) and
+    # continuous (fraction). Each has its own log_alpha scalar + Adam.
+    log_alpha_disc = torch.tensor(
+        math.log(max(1e-8, sac.alpha_discrete)),
+        device=device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    log_alpha_cont = torch.tensor(
+        math.log(max(1e-8, sac.alpha_continuous)),
+        device=device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    alpha_disc_optimizer = torch.optim.Adam(
+        [log_alpha_disc], lr=sac.alpha_discrete_lr
+    )
+    alpha_cont_optimizer = torch.optim.Adam(
+        [log_alpha_cont], lr=sac.alpha_continuous_lr
+    )
+
+    run_dir = Path(cfg.run.log_root) / cfg.run.name / time.strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(run_dir.as_posix())
+    ckpt_dir = Path(cfg.run.ckpt_root) / cfg.run.name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    elo = EloTracker(
+        initial_rating=cfg.opponents.initial_rating,
+        k_factor=cfg.opponents.k_factor,
+    )
+    elo.set(LEARNER_NAME, cfg.opponents.initial_rating)
+    builtin_agents = {name: BUILTIN[name] for name in sac.builtin_opponents}
+    for name in builtin_agents:
+        elo.set(name, cfg.opponents.initial_rating)
+    pool_device = (
+        cfg.run.device
+        if cfg.opponents.snapshot_device == "train"
+        else cfg.opponents.snapshot_device
+    )
+    # SAC checkpoints don't load through the PPO `LearnedAgent` snapshot path,
+    # so we never `add_snapshot` here. Opponent diversity comes from
+    # `builtin_agents` mixed in by `_select_opponent_for_episode`. The pool is
+    # kept for Elo bookkeeping symmetry with the PPO trainer.
+    pool = OpponentPool(
+        elo=elo,
+        top_k=cfg.opponents.top_k,
+        self_play_prob=cfg.opponents.self_play_prob,
+        device=pool_device,
+    )
+
+    rng = random.Random(cfg.run.seed)
+    return SACState(
+        actor=actor,
+        qf1=qf1,
+        qf2=qf2,
+        qf1_target=qf1_target,
+        qf2_target=qf2_target,
+        q_kernel=q_kernel,
+        actor_kernel=actor_kernel,
+        compile_mode=compile_mode,
+        q_optimizer=q_optimizer,
+        actor_optimizer=actor_optimizer,
+        log_alpha_disc=log_alpha_disc,
+        log_alpha_cont=log_alpha_cont,
+        alpha_disc_optimizer=alpha_disc_optimizer,
+        alpha_cont_optimizer=alpha_cont_optimizer,
+        rng=rng,
+        pool=pool,
+        writer=writer,
+        ckpt_dir=ckpt_dir,
+        disc_target_entropy_ratio=sac.disc_target_entropy_ratio,
+        target_entropy_per_dim=sac.target_entropy_per_dim,
+        builtin_agents=builtin_agents,
+        builtin_prob=sac.builtin_prob,
+    )
+
+
+def _save_checkpoint(state: SACState, step: int, *, label: str = "latest") -> Path:
+    path = state.ckpt_dir / f"sac_{label}.pt"
+    payload: dict[str, Any] = {
+        "step": step,
+        "actor": state.actor.state_dict(),
+        "qf1": state.qf1.state_dict(),
+        "qf2": state.qf2.state_dict(),
+        "qf1_target": state.qf1_target.state_dict(),
+        "qf2_target": state.qf2_target.state_dict(),
+        "actor_cfg": state.actor.cfg.to_dict(),
+        "log_std_min": state.actor.log_std_min,
+        "log_std_max": state.actor.log_std_max,
+        "log_alpha_disc": state.log_alpha_disc.detach().cpu(),
+        "log_alpha_cont": state.log_alpha_cont.detach().cpu(),
+    }
+    torch.save(payload, path)
+    return path
+
+
+def _select_opponent_for_episode(state: SACState) -> tuple[str, Any]:
+    """Pick one opponent for the upcoming 2-player episode.
+
+    With probability `builtin_prob` (and when any builtins are configured) the
+    seat is a uniformly-chosen builtin baseline; otherwise it's self-play
+    (`(LEARNER_NAME, None)`, the loop drives the learner actor on that seat).
+    Mixing fixed baselines in is the guard against self-play strategy collapse.
+    """
+    if state.builtin_agents and state.rng.random() < state.builtin_prob:
+        name = state.rng.choice(list(state.builtin_agents.keys()))
+        return name, state.builtin_agents[name]
+    return LEARNER_NAME, None
+
+
+def _run_updates(
+    state: SACState,
+    replay: ReplayBuffer,
+    sac: Any,
+    device: torch.device,
+    *,
+    num_envs: int,
+    learn_step: int,
+    tick: int,
+    global_step: int,
+    start_time: float,
+) -> int:
+    """One learning phase, interleaved exactly like cleanrl SAC.
+
+    Each tick collected `num_envs` transitions, so we run `num_envs *
+    gradient_steps` critic updates (UTD = `gradient_steps` updates per collected
+    transition; `gradient_steps=1` ⇒ cleanrl's UTD=1). A PERSISTENT `learn_step`
+    counter drives the cadence so it is continuous across ticks — every
+    `policy_frequency`-th critic update runs `policy_frequency` delayed
+    actor+alpha updates (cleanrl's compensation loop ⇒ net 1:1 actor:critic),
+    and every `target_network_frequency`-th critic update runs the target
+    polyak. Returns the advanced `learn_step`.
+
+    Performance: the step functions return un-materialized GPU scalars; we only
+    keep the LATEST `_QStats`/`_ActorStats` and `.item()` them (in
+    `_build_update_output`) on logging ticks. So the hot loop does ZERO GPU→CPU
+    syncs — the logged value is the tick's last update (a snapshot, standard for
+    SAC dashboards). The step functions `.clone()` their cudagraph-output scalars
+    before returning, so the held stats are safe to read after later replays.
+    """
+    q_stats: _QStats | None = None
+    a_stats: _ActorStats | None = None
+
+    n_critic = num_envs * sac.gradient_steps
+    for _ in range(n_critic):
+        # One CUDA-graph step per learner iteration: brackets the critic update,
+        # the actor burst, and the polyak as a single step so the shared qf1/qf2
+        # forward activations stay valid through both backwards (see
+        # `_mark_cuda_graph_step` — marking per-kernel instead crashes). Gated on
+        # compile_mode like PPO: eager kernels have no cudagraph to mark.
+        if state.compile_mode is not None:
+            _mark_cuda_graph_step(device)
+        learn_step += 1
+        batch = replay.sample(sac.batch_size, device=device)
+        q_stats = _q_step(
+            q_kernel=state.q_kernel,
+            q_optimizer=state.q_optimizer,
+            log_alpha_disc=state.log_alpha_disc,
+            log_alpha_cont=state.log_alpha_cont,
+            batch=batch,
+            grad_clip=sac.grad_clip,
+        )
+
+        # Delayed actor+alpha: every policy_frequency-th critic step, run
+        # policy_frequency updates (cleanrl compensation ⇒ net 1:1 actor:critic).
+        if learn_step % sac.policy_frequency == 0:
+            for _ in range(sac.policy_frequency):
+                batch = replay.sample(sac.batch_size, device=device)
+                a_stats = _actor_alpha_step(
+                    actor_kernel=state.actor_kernel,
+                    actor_optimizer=state.actor_optimizer,
+                    alpha_disc_optimizer=state.alpha_disc_optimizer,
+                    alpha_cont_optimizer=state.alpha_cont_optimizer,
+                    log_alpha_disc=state.log_alpha_disc,
+                    log_alpha_cont=state.log_alpha_cont,
+                    disc_target_entropy_ratio=state.disc_target_entropy_ratio,
+                    target_entropy_per_dim=state.target_entropy_per_dim,
+                    batch=batch,
+                    grad_clip=sac.grad_clip,
+                )
+
+        # Target polyak per cleanrl cadence (once every target_network_frequency
+        # critic updates, NOT once per tick).
+        if learn_step % sac.target_network_frequency == 0:
+            _target_step(
+                state.qf1, state.qf2, state.qf1_target, state.qf2_target, sac.tau
+            )
+
+    # Materialize metrics to CPU only on logging ticks (the one place we sync).
+    if tick % sac.log_metrics_every == 0 and q_stats is not None:
+        metrics = _build_update_output(
+            q_stats,
+            a_stats,
+            float(state.log_alpha_disc.exp().item()),
+            float(state.log_alpha_cont.exp().item()),
+        )
+        _log_metrics(state.writer, metrics, global_step, start_time)
+
+    return learn_step
+
+
+def train(cfg: RunConfig) -> None:
+    sac = cfg.sac
+    if cfg.game.num_players != 2:
+        raise NotImplementedError(
+            "SAC test branch supports 2-player games only; got num_players="
+            f"{cfg.game.num_players}"
+        )
+    device = torch.device(cfg.run.device)
+    if cfg.run.torch_num_threads > 0:
+        torch.set_num_threads(cfg.run.torch_num_threads)
+    torch.manual_seed(cfg.run.seed)
+
+    state = _build_state(cfg, device)
+    pcfg = _build_policy_cfg(cfg)
+    replay = ReplayBuffer(
+        sac.buffer_size,
+        planet_features=pcfg.planet_features,
+        fleet_features=pcfg.fleet_features,
+        device="cpu",
+    )
+
+    num_players = cfg.game.num_players
+    num_envs = max(1, cfg.rollout.num_envs)
+    total_env_steps = int(cfg.run.total_updates)  # env-step (transition) budget
+
+    # Compiled + autocast(bf16) actor-heads kernel for batched rollout inference
+    # (FA-2 via SDPA on CUDA; eager identity on CPU). Same knob PPO uses.
+    compile_mode = cfg.run.compile_mode or None
+    heads_kernel = get_sac_heads_kernel(
+        state.actor, device=device, compile_mode=compile_mode
+    )
+
+    def potential(obs: Any, seat: int) -> float:
+        return _obs_reward_potential(
+            obs,
+            seat,
+            num_players,
+            cfg.game.episode_steps,
+            cfg.reward.production_weight,
+        )
+
+    # Per-env episode bookkeeping. Seats start alternated across envs so the
+    # learner sees both initial conditions from step 0 (symmetry paranoia).
+    vec = VecEnv(num_envs, num_players, cfg.game.episode_steps, cfg.game.ship_speed)
+    start_time = time.time()
+    games_vs: dict[str, int] = defaultdict(int)
+    wins_vs: dict[str, float] = defaultdict(float)
+    margin_vs: dict[str, float] = defaultdict(float)
+
+    try:
+        states = vec.reset()
+        learner_seat = [e % num_players for e in range(num_envs)]
+        opp_seat = [(s + 1) % num_players for s in learner_seat]
+        opponents = [_select_opponent_for_episode(state) for _ in range(num_envs)]
+        previous_potential = [
+            potential(states[e][learner_seat[e]]["observation"], learner_seat[e])
+            for e in range(num_envs)
+        ]
+        episode_return = [0.0] * num_envs
+
+        global_step = 0
+        tick = 0
+        learn_step = 0  # persistent critic-update counter (drives cleanrl cadence)
+        last_snapshot_step = 0
+        last_latest_step = 0
+
+        while global_step < total_env_steps:
+            warmup = global_step < sac.learning_starts
+
+            # ---- act: one batched forward per identity (learner / opponent) ----
+            # Each forward's PolicyOutput may alias cudagraph buffers, so we
+            # sample + materialize records to CPU before the next forward. Both
+            # warmup and learned paths share `sampling.py`'s lead-solved geometry
+            # so stored (launch, target_idx, fraction, mask) and executed moves
+            # always agree.
+            learner_obs = [
+                states[e][learner_seat[e]]["observation"] for e in range(num_envs)
+            ]
+            learner_enc = encode_raw_observations(learner_obs, device=device)
+            learner_out = run_sac_heads(heads_kernel, learner_enc, device=device)
+            if warmup:
+                learner_out = flatten_policy_output(learner_out)
+            learner_actions, learner_records = sample_batch_with_records_raw(
+                learner_out, learner_obs, deterministic=False
+            )
+            learner_records = [record_to_cpu(r) for r in learner_records]
+
+            opp_obs = [
+                states[e][opp_seat[e]]["observation"] for e in range(num_envs)
+            ]
+            # The opponent forward covers every env (static batch for compile);
+            # builtin-opponent seats are then overwritten with the Python agent.
+            opp_enc = encode_raw_observations(opp_obs, device=device)
+            opp_out = run_sac_heads(heads_kernel, opp_enc, device=device)
+            opp_actions = sample_batch_actions_raw(
+                opp_out, opp_obs, deterministic=False
+            )
+            for e in range(num_envs):
+                _name, agent = opponents[e]
+                if agent is not None:
+                    opp_actions[e] = agent(opp_obs[e])
+
+            # ---- step every env in parallel ----
+            # 7-element learner/self-play actions carry the tracker payload the
+            # worker uses to keep encoded fleet features in sync; the worker
+            # strips sidecars before stepping the official env.
+            actions_list: list[list[Any]] = []
+            for e in range(num_envs):
+                acts: list[Any] = [None] * num_players
+                acts[learner_seat[e]] = learner_actions[e]
+                acts[opp_seat[e]] = opp_actions[e]
+                actions_list.append(acts)
+            results = vec.step_subset(list(range(num_envs)), actions_list)
+            next_states: list[Any] = [None] * num_envs
+            dones = [False] * num_envs
+            finals: list[Any] = [None] * num_envs
+            for e, (st, dn, fn) in results.items():
+                next_states[e] = st
+                dones[e] = dn
+                finals[e] = fn
+
+            # ---- s' legal-target support for the q-step's a'~π(·|s') resample ----
+            next_learner_obs = [
+                next_states[e][learner_seat[e]]["observation"]
+                for e in range(num_envs)
+            ]
+            next_learner_enc = encode_raw_observations(next_learner_obs, device=device)
+            next_out = run_sac_heads(heads_kernel, next_learner_enc, device=device)
+            _next_actions, next_records = sample_batch_with_records_raw(
+                next_out, next_learner_obs, deterministic=False
+            )
+            next_records = [record_to_cpu(r) for r in next_records]
+
+            # ---- reward, terminal flag, replay insert, episode logging ----
+            for e in range(num_envs):
+                cur_pot = potential(next_learner_obs[e], learner_seat[e])
+                step_reward = cfg.reward.potential_weight * (
+                    cur_pot - previous_potential[e]
+                )
+                previous_potential[e] = cur_pot
+                # Only a true absorbing terminal (elimination) zeroes the
+                # bootstrap; the step-`episode_steps` timeout is a truncation and
+                # must still bootstrap from s'.
+                terminal = dones[e] and _is_elimination(
+                    next_learner_obs[e], num_players
+                )
+
+                if dones[e]:
+                    opp_name = opponents[e][0]
+                    seat_scores = [
+                        float(getattr(s, "score", s.reward or 0.0))
+                        for s in finals[e]
+                    ]
+                    ours = seat_scores[learner_seat[e]]
+                    theirs = seat_scores[opp_seat[e]]
+                    won = ours > theirs
+                    drawn = ours == theirs
+                    outcome = (
+                        cfg.reward.win_value if won
+                        else cfg.reward.draw_value if drawn
+                        else cfg.reward.loss_value
+                    )
+                    margin = ours - theirs
+                    step_reward += outcome + cfg.reward.margin_scale * margin
+
+                    outcome_for_elo = 1.0 if won else 0.5 if drawn else 0.0
+                    state.pool.elo.update_pair(LEARNER_NAME, opp_name, outcome_for_elo)
+                    games_vs[opp_name] += 1
+                    wins_vs[opp_name] += outcome_for_elo
+                    margin_vs[opp_name] += margin
+                    n_vs = games_vs[opp_name]
+
+                    # Distinct x per finishing env within this tick's step range.
+                    log_step = global_step + e
+                    state.writer.add_scalar(
+                        "episode/return", episode_return[e] + step_reward, log_step
+                    )
+                    state.writer.add_scalar("episode/win_rate", float(won), log_step)
+                    state.writer.add_scalar("episode/margin", margin, log_step)
+                    state.writer.add_scalar(
+                        f"winrate/{opp_name}", float(won), log_step
+                    )
+                    state.writer.add_scalar(
+                        f"winrate_cumulative/{opp_name}",
+                        wins_vs[opp_name] / n_vs,
+                        log_step,
+                    )
+                    state.writer.add_scalar(
+                        f"margin_cumulative/{opp_name}",
+                        margin_vs[opp_name] / n_vs,
+                        log_step,
+                    )
+                    state.writer.add_scalar(
+                        "league/elo_learner",
+                        state.pool.elo.get(LEARNER_NAME),
+                        log_step,
+                    )
+                    for _bname in state.builtin_agents:
+                        state.writer.add_scalar(
+                            f"league/elo_{_bname}",
+                            state.pool.elo.get(_bname),
+                            log_step,
+                        )
+
+                replay.add(
+                    _encoded_row(learner_enc, e),
+                    learner_records[e].launch,
+                    learner_records[e].target_idx,
+                    learner_records[e].fraction,
+                    learner_records[e].target_legal_mask,
+                    next_records[e].target_legal_mask,
+                    step_reward,
+                    terminal,
+                    _encoded_row(next_learner_enc, e),
+                )
+                episode_return[e] += step_reward
+
+            global_step += num_envs
+            tick += 1
+
+            # ---- advance live envs; reset+rematch finished ones ----
+            for e in range(num_envs):
+                if not dones[e]:
+                    states[e] = next_states[e]
+            done_envs = [e for e in range(num_envs) if dones[e]]
+            if done_envs:
+                reset_states = vec.reset_subset(done_envs)
+                for e in done_envs:
+                    states[e] = reset_states[e]
+                    learner_seat[e] = (learner_seat[e] + 1) % num_players  # flip seat
+                    opp_seat[e] = (learner_seat[e] + 1) % num_players
+                    opponents[e] = _select_opponent_for_episode(state)
+                    previous_potential[e] = potential(
+                        states[e][learner_seat[e]]["observation"], learner_seat[e]
+                    )
+                    episode_return[e] = 0.0
+
+            # ---- learn ----
+            if global_step >= sac.learning_starts and len(replay) >= sac.batch_size:
+                learn_step = _run_updates(
+                    state,
+                    replay,
+                    sac,
+                    device,
+                    num_envs=num_envs,
+                    learn_step=learn_step,
+                    tick=tick,
+                    global_step=global_step,
+                    start_time=start_time,
+                )
+
+            # ---- snapshot / rolling-latest (threshold-based: global_step jumps
+            # by num_envs per tick, so exact modulo is unreliable) ----
+            if (
+                sac.snapshot_every > 0
+                and global_step >= sac.learning_starts
+                and global_step - last_snapshot_step >= sac.snapshot_every
+            ):
+                _save_checkpoint(state, global_step, label=f"{global_step:08d}")
+                last_snapshot_step = global_step
+
+            if (
+                sac.latest_ckpt_every > 0
+                and global_step >= sac.learning_starts
+                and global_step - last_latest_step >= sac.latest_ckpt_every
+            ):
+                _save_checkpoint(state, global_step, label="latest")
+                last_latest_step = global_step
+
+        _save_checkpoint(state, global_step, label="final")
+    finally:
+        vec.close()
+        state.writer.close()
+
+
+def _log_metrics(
+    writer: SummaryWriter,
+    m: SACUpdateOutput,
+    step: int,
+    start_time: float,
+) -> None:
+    writer.add_scalar("losses/qf1_loss", m.qf1_loss, step)
+    writer.add_scalar("losses/qf2_loss", m.qf2_loss, step)
+    writer.add_scalar("losses/qf1_value", m.qf1_value, step)
+    writer.add_scalar("losses/qf2_value", m.qf2_value, step)
+    writer.add_scalar("losses/qf_grad_norm", m.qf_grad_norm, step)
+    writer.add_scalar("losses/alpha_disc", m.alpha_disc, step)
+    writer.add_scalar("losses/alpha_cont", m.alpha_cont, step)
+    # Soft-value scale consistency: the real-units entropy bonus the tilt-space
+    # α·H actually injects into the bootstrap target, vs the hard value it rides
+    # on. entropy_bonus_frac near 0 ⇒ a near-hard critic (the failure the
+    # tilt-space soft value fixes); a healthy fraction confirms the soft target.
+    writer.add_scalar("bootstrap/value", m.boot_value, step)
+    writer.add_scalar("bootstrap/entropy_bonus", m.boot_entropy_bonus, step)
+    writer.add_scalar(
+        "bootstrap/entropy_bonus_frac",
+        abs(m.boot_entropy_bonus) / (abs(m.boot_value) + 1.0),
+        step,
+    )
+    # Actor-side metrics (absent on a logging tick with no actor update).
+    if m.actor_loss is not None:
+        writer.add_scalar("losses/actor_loss", m.actor_loss, step)
+    if m.actor_grad_norm is not None:
+        writer.add_scalar("losses/actor_grad_norm", m.actor_grad_norm, step)
+    if m.alpha_disc_loss is not None:
+        writer.add_scalar("losses/alpha_disc_loss", m.alpha_disc_loss, step)
+    if m.alpha_cont_loss is not None:
+        writer.add_scalar("losses/alpha_cont_loss", m.alpha_cont_loss, step)
+    # Entropy diagnostics: achieved vs the per-state target each α drives toward.
+    if m.h_disc_mean is not None:
+        writer.add_scalar("entropy/H_disc", m.h_disc_mean, step)
+    if m.h_disc_per_planet is not None:
+        writer.add_scalar("entropy/H_disc_per_planet", m.h_disc_per_planet, step)
+    if m.target_h_disc is not None:
+        writer.add_scalar("entropy/target_H_disc", m.target_h_disc, step)
+    if m.logp_frac_mean is not None:
+        # p-weighted Σ g·p·logp_frac (= −H_cont, summed per state).
+        writer.add_scalar("entropy/cont_logp", m.logp_frac_mean, step)
+        writer.add_scalar("entropy/H_cont", -m.logp_frac_mean, step)
+    if m.target_h_cont is not None:
+        writer.add_scalar("entropy/target_H_cont", m.target_h_cont, step)
+    elapsed = max(1e-6, time.time() - start_time)
+    writer.add_scalar("charts/SPS", step / elapsed, step)
+
+
+__all__ = [
+    "ReplayBuffer",
+    "SACBatch",
+    "SACState",
+    "SACUpdateOutput",
+    "train",
+]

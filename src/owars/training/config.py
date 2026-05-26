@@ -148,6 +148,102 @@ class PPOCfg:
 
 
 @dataclass
+class SACCfg:
+    """Soft Actor-Critic (hybrid discrete+continuous variant).
+
+    The actor emits the SAME factored action PPO uses: per owned source planet
+    a Bernoulli launch, a masked Categorical target, and a tanh-squashed Normal
+    fraction on (0, 1). The launch *angle* is solved analytically from the
+    chosen target by the lead-intercept solver (not learned). The fraction is
+    the only continuous action dim.
+
+    SAC treatment: discrete-SAC (closed-form Bernoulli+categorical entropy) for
+    launch+target; cleanrl reparameterized tanh-Normal for the fraction. The
+    critic is a single JOINT scalar Q(s, a) with the HL-Gauss symlog
+    distributional head. The joint Q makes closed-form discrete-SAC intractable,
+    so the launch/target gradient is a score-function (REINFORCE) estimator with
+    a batch-mean baseline and the fraction uses the pathwise/reparam gradient.
+
+    Two entropy temperatures are tuned independently: `alpha_discrete` for the
+    launch+target factors and `alpha_continuous` for the fraction.
+
+    Three independent set-transformer networks (actor, qf1, qf2) plus EMA
+    target copies of qf1/qf2; no encoder sharing between actor and critics.
+    """
+
+    gamma: float = 0.99
+    tau: float = 0.005                # Polyak coefficient for target net
+    # Initial entropy temperatures. `alpha`/`autotune` are retained for
+    # RunConfig parity; the hybrid actor always tunes the two split alphas.
+    alpha: float = 0.2
+    autotune: bool = True
+    alpha_discrete: float = 0.2       # initial launch+target entropy temperature
+    alpha_continuous: float = 0.2     # initial fraction entropy temperature
+    alpha_discrete_lr: float = 1.0e-3
+    alpha_continuous_lr: float = 1.0e-3
+    # Discrete target entropy is tuned on the PER-PLANET AVERAGE: α_disc drives
+    # `H_disc / n_owned` toward `ratio · (h_disc_max / n_owned)`, where
+    # h_disc_max = Σ_i g_i·log(n_legal_i+1) is the max attainable launch+target
+    # entropy (the joint (n_legal+1)-way choice {noop} ∪ {launch→t}). Averaging
+    # keeps the target bounded so α_disc does not run away as the owned-planet
+    # count grows. 0.7 keeps selection exploratory without forcing uniform.
+    disc_target_entropy_ratio: float = 0.7
+    # Per-launched-dim target entropy for the (single) continuous fraction,
+    # scaled by the per-sample launch mass Σ g·p (see _actor_alpha_step). -1.0
+    # nat/dim is the cleanrl default (= -dim). It pairs with the α-weighted alpha
+    # loss `-(α·(logp + target))` (α = log_alpha.exp()) in _actor_alpha_step:
+    # that loss self-damps as α shrinks, so a target temporarily below the
+    # bounded fraction's natural entropy no longer collapses α_cont — a floor
+    # clamp is not needed.
+    target_entropy_per_dim: float = -1.0
+    # No-op threshold for the post-squash fraction. Below this, the planet
+    # silently skips its launch at action-translation time. The simulator
+    # already coerces send=0 to no-op, but an explicit threshold keeps the
+    # buffer's stored fraction comparable to what the env actually executed.
+    no_op_fraction: float = 0.02
+    # Standard SAC pre-squash log-std clamp (cleanrl uses SpinUp's tanh
+    # remap of a Linear-output log_std into [-5, 2]).
+    log_std_min: float = -5.0
+    log_std_max: float = 2.0
+
+    buffer_size: int = 100_000        # transitions; per-env-step pushes
+    batch_size: int = 256
+    learning_starts: int = 5_000      # uniform-random action until this many transitions
+    # Cadence counts CRITIC UPDATES (continuous across rollout ticks): an
+    # actor+alpha step every policy_frequency-th critic update, run
+    # policy_frequency times (cleanrl compensation ⇒ net 1:1 actor:critic); a
+    # target polyak every target_network_frequency-th critic update.
+    policy_frequency: int = 2
+    target_network_frequency: int = 1
+    gradient_steps: int = 1           # UTD: critic updates per collected transition
+
+    q_lr: float = 1.0e-3
+    policy_lr: float = 3.0e-4
+    alpha_lr: float = 1.0e-3
+    weight_decay: float = 0.0
+    grad_clip: float = 0.0            # 0 disables clipping (cleanrl default)
+
+    log_metrics_every: int = 100
+    snapshot_every: int = 25_000      # transitions between labeled archive checkpoints
+    # Rolling `sac_latest.pt` overwrite cadence. Cheap single-file checkpoint so
+    # `scripts/latest_replay.py` always finds a current policy to render while
+    # training runs. 0 disables. Distinct from the labeled snapshot archive.
+    latest_ckpt_every: int = 2_000
+
+    # Opponent slate. SAC snapshots can't load through the PPO `LearnedAgent`
+    # path, so the snapshot pool isn't populated on this branch; matchmaking
+    # is therefore self-play vs. the builtin Python baselines. Per episode,
+    # with probability `builtin_prob` the opponent seat is one of
+    # `builtin_opponents` (chosen uniformly); otherwise it's self-play. Mixing
+    # in fixed baselines is the standard guard against self-play strategy
+    # collapse (see AGENTS.md "Self-play strategy collapse").
+    builtin_opponents: list[str] = field(
+        default_factory=lambda: ["random", "sniper", "heuristic"]
+    )
+    builtin_prob: float = 0.5
+
+
+@dataclass
 class RolloutCfg:
     """Per-update rollout settings.
 
@@ -230,6 +326,7 @@ class RunConfig:
     model: ModelCfg = field(default_factory=ModelCfg)
     optim: OptimCfg = field(default_factory=OptimCfg)
     ppo: PPOCfg = field(default_factory=PPOCfg)
+    sac: SACCfg = field(default_factory=SACCfg)
     rollout: RolloutCfg = field(default_factory=RolloutCfg)
     opponents: OpponentsCfg = field(default_factory=OpponentsCfg)
     reward: RewardCfg = field(default_factory=RewardCfg)
@@ -269,6 +366,26 @@ class RunConfig:
             raise ValueError("model.value_min must be less than model.value_max")
         if cfg.reward.production_weight < 0.0:
             raise ValueError("reward.production_weight must be non-negative")
+        if not 0.0 <= cfg.sac.builtin_prob <= 1.0:
+            raise ValueError("sac.builtin_prob must be in [0, 1]")
+        if not 0.0 <= cfg.sac.disc_target_entropy_ratio <= 1.0:
+            raise ValueError("sac.disc_target_entropy_ratio must be in [0, 1]")
+        if cfg.sac.alpha_discrete <= 0.0 or cfg.sac.alpha_continuous <= 0.0:
+            raise ValueError("sac.alpha_discrete/continuous must be positive")
+        if cfg.sac.alpha_discrete_lr <= 0.0 or cfg.sac.alpha_continuous_lr <= 0.0:
+            raise ValueError("sac.alpha_discrete_lr/continuous_lr must be positive")
+        from .league import BUILTIN
+
+        unknown = set(cfg.sac.builtin_opponents) - set(BUILTIN)
+        if unknown:
+            raise ValueError(
+                f"sac.builtin_opponents has unknown agents {sorted(unknown)}; "
+                f"valid: {sorted(BUILTIN)}"
+            )
+        if cfg.sac.builtin_prob > 0.0 and not cfg.sac.builtin_opponents:
+            raise ValueError(
+                "sac.builtin_prob > 0 requires a non-empty sac.builtin_opponents"
+            )
         return cfg
 
 
