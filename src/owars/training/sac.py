@@ -443,28 +443,6 @@ class _ReplayPrefetcher:
 # ---------------------------------------------------------------------------
 
 
-def _is_elimination(obs: Any, num_players: int) -> bool:
-    """True absorbing terminal (a player has no planets *and* no fleets), as
-    opposed to the step-`episode_steps` timeout.
-
-    Orbit Wars ends early only when ≤1 player has anything left; otherwise it
-    ends by the clock at `episode_steps`. SAC must bootstrap through the timeout
-    (a truncation — the value continues) but zero the bootstrap on a true
-    absorbing terminal. We detect the latter by a player with zero presence.
-    """
-    get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
-    present = [0] * num_players
-    for planet in get("planets", []) or []:
-        owner = int(planet[1])
-        if owner != -1:
-            present[owner] += 1
-    for fleet in get("fleets", []) or []:
-        owner = int(fleet[1])
-        if owner != -1:
-            present[owner] += 1
-    return any(c == 0 for c in present)
-
-
 def _time_feat_from_obs(
     obs_list: list[Any], episode_steps: int, device: torch.device | str
 ) -> torch.Tensor:
@@ -497,6 +475,8 @@ class SACUpdateOutput:
     boot_value: float          # hard (entropy-free) bootstrap value, real units
     boot_entropy_bonus: float  # entropy contribution to the soft target, real units
     explained_var: float       # EV of taken-Q vs bootstrap target (critic health)
+    adv_explained_var: float   # EV of the action-dependent advantage vs target residual
+    adv_spread: float          # std of the decoded advantage contribution (real units)
     alpha_disc: float
     alpha_cont: float
     # Actor-side metrics; `None` on a logging tick where no actor update ran
@@ -705,6 +685,7 @@ class _SACQKernel(torch.nn.Module):
                 ).unsqueeze(-1)  # [B, 1]
                 soft_v_next_twin = []
                 hard_v_next_twin = []  # entropy-free decode, diagnostic only
+                v_only_next_twin = []  # nV decode (no advantage tilt), diagnostic only
                 for qt in (self.qf1_target, self.qf2_target):
                     comp = qt.components(
                         next_feats, next_action.fraction, time_feat=next_time
@@ -719,8 +700,10 @@ class _SACQKernel(torch.nn.Module):
                     soft_logits = logits_next + ent_tilt * qt.value_shift
                     soft_v_next_twin.append(qt.bins_to_scalar(soft_logits))
                     hard_v_next_twin.append(qt.bins_to_scalar(logits_next))
+                    v_only_next_twin.append(qt.bins_to_scalar(comp.nV))
             soft_v_next = torch.minimum(soft_v_next_twin[0], soft_v_next_twin[1])
             hard_v_next = torch.minimum(hard_v_next_twin[0], hard_v_next_twin[1])
+            v_only_next = torch.minimum(v_only_next_twin[0], v_only_next_twin[1])
             y = reward + (1.0 - done) * self.gamma * soft_v_next
 
         with torch.autocast(
@@ -759,6 +742,25 @@ class _SACQKernel(torch.nn.Module):
         explained_var = (
             1.0 - (y_f - q1_full).var() / y_f.var().clamp_min(1e-8)
         ).detach()
+        # Advantage EV: does the critic's ACTION-DEPENDENT part explain the
+        # action-relevant residual of the target, or is `explained_var` above just
+        # the critic predicting its own (action-independent) state value? Decompose
+        # Q_taken = V(s) + adv_contrib with V = decode(nV) (the dueling baseline,
+        # zero policy gradient); strip the discounted next-state V baseline from y
+        # to isolate the residual the advantage SHOULD predict (reward + value
+        # change + the next-state entropy tilt). If the advantages are inert (the
+        # suspected failure — Q≈V, entropy_bonus_frac≈0), adv_contrib≈const ⇒
+        # adv_explained_var≈0 AND adv_spread≈0 even while explained_var≈1, proving
+        # the headline EV is vacuous self-prediction. adv_spread (real-units std of
+        # adv_contrib) disambiguates inert (≈0) from noisy-but-uncorrelated (large
+        # spread, low EV) — the two ways adv_explained_var can sit near 0.
+        v_only = self.qf1.bins_to_scalar(comp1.nV).float()
+        adv_contrib = q1_full - v_only
+        y_resid = y_f - self.gamma * (1.0 - done.float()) * v_only_next.float()
+        adv_explained_var = (
+            1.0 - (y_resid - adv_contrib).var() / y_resid.var().clamp_min(1e-8)
+        ).detach()
+        adv_spread = adv_contrib.std().detach()
         return (
             q_loss,
             qf1_loss.detach(),
@@ -768,6 +770,8 @@ class _SACQKernel(torch.nn.Module):
             boot_value,
             boot_entropy_bonus,
             explained_var,
+            adv_explained_var,
+            adv_spread,
         )
 
 
@@ -889,6 +893,8 @@ class _QStats:
     boot_value: torch.Tensor          # hard (entropy-free) bootstrap value, real units
     boot_entropy_bonus: torch.Tensor  # entropy contribution to soft_v_next, real units
     explained_var: torch.Tensor       # EV of taken-Q vs bootstrap target (critic health)
+    adv_explained_var: torch.Tensor   # EV of the action-dependent advantage vs target residual
+    adv_spread: torch.Tensor          # std of the decoded advantage contribution (real units)
 
 
 @dataclass
@@ -941,6 +947,8 @@ def _q_step(
         boot_value,
         boot_ent,
         explained_var,
+        adv_explained_var,
+        adv_spread,
     ) = q_kernel(
         *_encoded_args(batch.feats),
         *_encoded_args(batch.next_feats),
@@ -977,6 +985,8 @@ def _q_step(
         boot_value=boot_value.clone(),
         boot_entropy_bonus=boot_ent.clone(),
         explained_var=explained_var.clone(),
+        adv_explained_var=adv_explained_var.clone(),
+        adv_spread=adv_spread.clone(),
     )
 
 
@@ -1111,6 +1121,8 @@ def _build_update_output(
         boot_value=q.boot_value.item(),
         boot_entropy_bonus=q.boot_entropy_bonus.item(),
         explained_var=q.explained_var.item(),
+        adv_explained_var=q.adv_explained_var.item(),
+        adv_spread=q.adv_spread.item(),
         alpha_disc=alpha_disc,
         alpha_cont=alpha_cont,
         actor_loss=None,
@@ -1654,12 +1666,17 @@ def train(cfg: RunConfig) -> None:
                     cur_prod_margin - previous_prod_margin[e]
                 )
                 previous_prod_margin[e] = cur_prod_margin
-                # Only a true absorbing terminal (elimination) zeroes the
-                # bootstrap; the step-`episode_steps` timeout is a truncation and
-                # must still bootstrap from s'.
-                terminal = dones[e] and _is_elimination(
-                    next_learner_obs[e], num_players
-                )
+                # Every episode end is a genuine TERMINAL here, so it zeroes the
+                # bootstrap. Orbit Wars is a finite-horizon, time-limited task (the
+                # game ends at `episode_steps`; the objective is ships at the end)
+                # and the policy/critic OBSERVE the game clock (the FiLM time
+                # feature), so this is a time-aware MDP: both episode ends —
+                # elimination and the step-limit timeout — are true terminals with
+                # no t>1 future to bootstrap from (Pardo et al., "Time Limits in
+                # RL"). Bootstrapping the timeout would read γ·V of the auto-reset
+                # next_obs (a FRESH game) and inflate the value — the qf1_value≫
+                # realized-return overestimation. Hence terminal == done.
+                terminal = bool(dones[e])
 
                 if dones[e]:
                     opp_name = opponents[e][0]
@@ -1811,6 +1828,12 @@ def _log_metrics(
     writer.add_scalar("losses/qf1_value", m.qf1_value, step)
     writer.add_scalar("losses/qf2_value", m.qf2_value, step)
     writer.add_scalar("losses/explained_variance", m.explained_var, step)
+    # Action-dependent EV + advantage spread: distinguishes a critic that tracks
+    # state-conditional value (high adv_explained_var) from one that only predicts
+    # its own state value (explained_variance≈1 while adv_explained_var≈0). When
+    # adv_spread≈0 the advantages are inert and the actor gets ~no action gradient.
+    writer.add_scalar("losses/adv_explained_variance", m.adv_explained_var, step)
+    writer.add_scalar("losses/adv_spread", m.adv_spread, step)
     writer.add_scalar("losses/qf_grad_norm", m.qf_grad_norm, step)
     writer.add_scalar("losses/alpha_disc", m.alpha_disc, step)
     writer.add_scalar("losses/alpha_cont", m.alpha_cont, step)

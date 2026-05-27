@@ -973,7 +973,15 @@ def _mask_impossible_launches(
     has_legal_target = target_legal_mask.to(device=launch.device, dtype=torch.bool).any(dim=-1)
     impossible = source & ~has_legal_target
     launch_logits = launch_logits.float().masked_fill(impossible, -20.0)
-    launch = launch.masked_fill(impossible, 0.0)
+    # Gate the sampled ACTION to legal launch sources only: zero it on every slot
+    # that is not an owned, present source WITH a legal target — i.e. owned-but-
+    # no-legal-target (as before) AND non-owned / padded slots (whose Bernoulli
+    # draw is otherwise left at ~0.5). Moves are built from a path that already
+    # filters non-source slots, so this changes no materialized move; it only
+    # makes `launch`/`raw_launch` (SAC's stored action and the materialize_gap
+    # metric) reflect real owned-source launches. `launch_logits` keep their
+    # original masking, so PPO's log-prob is unchanged (it never reads raw_launch).
+    launch = launch * (source & has_legal_target).to(launch.dtype)
     return launch_logits, launch
 
 

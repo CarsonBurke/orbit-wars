@@ -102,8 +102,12 @@ ppo:
   pretrain_updates: 0
 
 sac:
-  # cleanrl SAC standard. Φ already projects to game-end (production·turns_left),
-  # so a γ<1 still values the endgame — no need for γ=1.
+  # cleanrl SAC standard. NOTE: SAC's Φ is the bare production-RATE margin (no
+  # turns_left projection — that's the PPO potential), so the delta reward's
+  # discounted return is the (1−γ)-weighted INTEGRAL of the margin, effective
+  # horizon ~1/(1−γ)=100 steps. γ=0.99 is therefore near-term-weighted over a
+  # 500-step game; the FiLM time feature is what carries endgame value. Raise
+  # toward 0.997 (horizon ~330) if late-game play needs more weight.
   gamma: 0.99
   tau: 0.005
   alpha: 0.2

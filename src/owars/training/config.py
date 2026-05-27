@@ -159,10 +159,15 @@ class SACCfg:
 
     SAC treatment: discrete-SAC (closed-form Bernoulli+categorical entropy) for
     launch+target; cleanrl reparameterized tanh-Normal for the fraction. The
-    critic is a single JOINT scalar Q(s, a) with the HL-Gauss symlog
-    distributional head. The joint Q makes closed-form discrete-SAC intractable,
-    so the launch/target gradient is a score-function (REINFORCE) estimator with
-    a batch-mean baseline and the fraction uses the pathwise/reparam gradient.
+    critic is FACTORED (dueling) and DISTRIBUTIONAL: the state value V is an
+    HL-Gauss two-hot distribution over symlog-spaced bins, and per-planet scalar
+    advantages A_i(s, a_i) TILT that distribution in logit space
+    (Q_logits = n·V + adv·value_shift). Because the scalar adv = Σ_i A_i is
+    LINEAR in the policy probs, the soft-value expectation E_a[Q] stays
+    closed-form — so the launch/target gradient is EXACT (no REINFORCE / no
+    score-function baseline); only the fraction uses the pathwise/reparam
+    gradient. The actor ascends the scalar advantage (which is monotone in the
+    decoded Q), treating V as an action-independent baseline.
 
     Two entropy temperatures are tuned independently: `alpha_discrete` for the
     launch+target factors and `alpha_continuous` for the fraction.
@@ -280,20 +285,25 @@ class OpponentsCfg:
 
 @dataclass
 class RewardCfg:
-    """Dense potential reward aligned with the terminal scoring rule.
+    """Dense per-step potential reward: `potential_weight * (Phi(s') - Phi(s))`.
 
-    Per learner step, reward is:
+    The two trainers use DIFFERENT potentials Phi (both own-minus-strongest-enemy):
 
-        potential_weight * (Phi(s_next) - Phi(s))
+      - PPO (`rollout._obs_reward_potential`): PROJECTED population margin —
+        current ships on owned planets + ships in owned fleets, plus production
+        converted to projected future ships by `production_weight * turns_left`.
+        O(±10^3).
+      - SAC (`rollout._obs_production_margin`): PRODUCTION-RATE margin only —
+        Σ production over owned planets (comets included), NO ship counts and NO
+        turns_left projection. O(±10^2), which keeps the distributional critic's
+        value bounded (see configs/sac_base.yaml). `production_weight` is unused
+        by this one.
 
-    where Phi is raw projected population margin against the strongest enemy.
-    Population is current ships on owned planets plus ships in owned fleets.
-    Production is converted into projected future population by
-    `production_weight * turns_left`.
-
-    Terminal outcome fields default to zero because the dense potential
-    replaces the old ±1 terminal-only reward. They remain configurable for
-    ablations that want to mix outcome reward back in.
+    The dense delta is the SOLE reward: the terminal outcome fields
+    (win/loss/draw_value, margin_scale) default to zero. They stay configurable
+    for ablations, but note that under gamma<1 over a 500-step horizon a sparse
+    terminal term is discounted to near-zero for early actions, so it is a weak
+    lever — the dense potential carries the signal.
     """
 
     potential_weight: float = 1.0
