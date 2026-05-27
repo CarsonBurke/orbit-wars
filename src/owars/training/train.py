@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import random
-from collections import defaultdict
 from contextlib import suppress
 from pathlib import Path
 from time import perf_counter
@@ -448,6 +447,10 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     if not torch.cuda.is_available():
         raise RuntimeError("training requires CUDA")
     device = torch.device("cuda")
+    # TF32 tensor cores for residual float32 matmuls only; the model runs in
+    # bf16 (explicit master-cast below + autocast), so attention/Linear stay
+    # bf16 and are unaffected — this just upgrades the leftover fp32 GEMMs.
+    torch.set_float32_matmul_precision("high")
     model = _build_model(cfg).to(device)
     # parameter-golf fp32-master pattern: cast everything to bf16, then
     # restore fp32 for the params that actually need precision (Linear
@@ -579,9 +582,6 @@ def _ppo_loop(
     replays_dir.mkdir(parents=True, exist_ok=True)
 
     for update in range(cfg.run.total_updates):
-        play_count: dict[str, int] = defaultdict(int)
-        win_count: dict[str, int] = defaultdict(int)
-
         # Sample opponents once per env, then play all envs in parallel.
         # Each env's seat assignment is fixed for the episode; the rollout
         # batches the *policy forward* across envs each step.
@@ -616,10 +616,6 @@ def _ppo_loop(
             slots = opponents_per_env[env_idx]
             seat_names = _seat_names(traj.learner_seat, slots)
             elo.update_from_game(list(zip(seat_names, traj.seat_rewards, strict=True)))
-            for s in slots:
-                play_count[s.name] += 1
-                if traj.won:
-                    win_count[s.name] += 1
         bookkeeping_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()

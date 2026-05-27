@@ -60,6 +60,31 @@ def _obs_reward_potential(
     return own - enemy
 
 
+def _obs_production_margin(obs: Any, player: int, num_players: int) -> float:
+    """Production margin Φ = (own production) − (max opponent production).
+
+    The SAC reward is the per-step DELTA of this quantity, Φ(s')−Φ(s): the agent
+    is rewarded the step it grows its own production (a capture) and penalized
+    the step the enemy grows theirs, so credit lands on the action that caused
+    the swing. Φ is fully observable (production + ownership are per-planet
+    features) and O(±10²), keeping the critic value well-conditioned. The
+    delta's value-to-go still depends on the remaining horizon (less time and
+    territory left to swing), so the SAC encoder is FiLM-conditioned on a global
+    time feature to keep the endgame value learnable.
+    """
+    get = obs.get if isinstance(obs, dict) else lambda key, default=None: getattr(obs, key, default)
+    production = [0.0] * num_players
+    for planet in get("planets", []) or []:
+        owner = int(planet[1])
+        if owner != -1:
+            production[owner] += float(planet[6])
+    own = production[player]
+    enemy = max(
+        (production[p] for p in range(num_players) if p != player), default=0.0
+    )
+    return own - enemy
+
+
 @dataclass
 class Trajectory:
     """Per-step records for the *learning* agent only.

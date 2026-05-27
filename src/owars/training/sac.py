@@ -21,20 +21,25 @@ Value scale: the factored critic is **distributional**. The state value is an
 HL-Gauss two-hot distribution over symlog-spaced bins; the scalar advantages tilt
 it in logit space (Q_logits = nV + adv·value_shift) and the TD loss is
 cross-entropy against the two-hot encoding of the real soft Bellman target.
-Decoding clamps to `[value_min, value_max]`, so the heavy-tailed potential reward
-(capture events spike `Φ` by `production·turns_left`) cannot make the bootstrap
-diverge — this replaces the earlier scalar symlog-MSE critic, whose loss gradient
-vanished at large |Q| and let the deadly triad run the value away.
+Decoding clamps to `[value_min, value_max]`, bounding the bootstrap — this
+replaces the earlier scalar symlog-MSE critic, whose loss gradient vanished at
+large |Q| and let the deadly triad run the value away. The reward is the
+per-step production-margin delta (O(±10²); see `RewardCfg` and
+`rollout._obs_production_margin`), and the encoder is FiLM-conditioned on a
+global time feature so the value-to-go can depend on the remaining horizon.
 
 Orbit Wars-specific adaptations vs cleanrl `sac_continuous_action.py`:
 
 * Replay-buffer state is the structured `EncodedObs` (planet/fleet token
   tensors + masks), not a flat vector. The stored action is factored
-  (`launch[P]`, `target_idx[P]`, `fraction[P]`) plus the legal-target masks for
-  s and s' (the q-step samples a'~π(·|s') and must mask to s' legal support).
-* Self-play opponent pool reused from `league.py`. Per episode an opponent is
-  sampled (own model or builtin baseline); only learner-seat transitions are
-  pushed to replay.
+  (`raw_launch[P]` — the policy's raw Bernoulli sample, i.e. the action the
+  actor optimizes and the critic conditions on, NOT the env-materialized
+  launch — `target_idx[P]`, `fraction[P]`) plus the legal-target masks for s
+  and s' (the q-step samples a'~π(·|s') and must mask to s' legal support).
+* Self-play uses the LIVE model only: per episode the opponent seat is either a
+  builtin baseline (prob `builtin_prob`) or the current learner itself — no
+  frozen snapshot copies are kept. `league.py` is used only for Elo
+  bookkeeping. Only learner-seat transitions are pushed to replay.
 """
 
 from __future__ import annotations
@@ -79,7 +84,7 @@ from ..policies.sac_sampling import (
 from .config import RunConfig
 from .elo import EloTracker
 from .league import BUILTIN, LEARNER_NAME, OpponentPool
-from .rollout import _obs_reward_potential
+from .rollout import _obs_production_margin
 from .vec_env import VecEnv
 
 
@@ -111,19 +116,26 @@ class SACBatch:
     next_target_legal_mask: torch.Tensor  # [B, P, P] bool — legal support at s'
     reward: torch.Tensor               # [B]
     done: torch.Tensor                 # [B] float (0/1)
+    time: torch.Tensor                 # [B] game-clock ∈ [0,1] at s (FiLM cond)
+    next_time: torch.Tensor            # [B] game-clock ∈ [0,1] at s'
 
 
 class ReplayBuffer:
     """Circular buffer of factored-action transitions over `EncodedObs` states.
 
-    All storage lives on `device` (CPU by default to spare GPU memory). At
-    sample time the gathered minibatch is moved to `train_device`.
+    Storage lives on `device` (CPU by default to spare GPU memory and let the
+    buffer scale into system RAM). `sample` moves the gathered minibatch to the
+    train device per update — the standard SAC replay pattern.
 
     Per transition we store the factored action (`launch`, `target_idx`,
     `fraction`) and the legal-target mask for BOTH s and s'. The next-state mask
     is needed because the soft Bellman target samples a'~π(·|s') and must mask
-    the target categorical to s' legal support. Two `[P, P]` bool masks at
-    `MAX_PLANETS=64` cost `2·64·64 = 8 KB`/row (~410 MB at 50k) — acceptable.
+    the target categorical to s' legal support. Footprint is ~83 KB/transition,
+    dominated by `fleet_feats [MAX_FLEETS=384, 20] f32` for s and s' (≈61 KB);
+    the two `[64, 64]` bool masks add 8 KB. So capacity × 83 KB (50k ≈ 4.2 GB
+    of RAM). At large `batch_size × UTD` the per-update H2D move of these obs is
+    the dominant learn-phase cost, so `sample` supports a pinned `non_blocking`
+    transfer that `_ReplayPrefetcher` overlaps with compute on a side stream.
     """
 
     def __init__(
@@ -185,6 +197,8 @@ class ReplayBuffer:
         )
         self.reward = torch.zeros((capacity,), dtype=f32, device=self.device)
         self.done = torch.zeros((capacity,), dtype=f32, device=self.device)
+        self.time = torch.zeros((capacity,), dtype=f32, device=self.device)
+        self.next_time = torch.zeros((capacity,), dtype=f32, device=self.device)
 
         self.ptr = 0
         self.size = 0
@@ -203,6 +217,8 @@ class ReplayBuffer:
         reward: float,
         done: bool,
         next_feats: EncodedObs,
+        time: float,
+        next_time: float,
     ) -> None:
         """Insert one transition. All tensors must be unbatched (no leading B)."""
         idx = self.ptr
@@ -272,11 +288,19 @@ class ReplayBuffer:
         )
         self.reward[idx] = float(reward)
         self.done[idx] = float(bool(done))
+        self.time[idx] = float(time)
+        self.next_time[idx] = float(next_time)
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int, *, device: str | torch.device) -> SACBatch:
+    def sample(
+        self,
+        batch_size: int,
+        *,
+        device: str | torch.device,
+        non_blocking: bool = False,
+    ) -> SACBatch:
         if self.size < batch_size:
             raise ValueError(
                 f"requested batch_size {batch_size} > buffer size {self.size}"
@@ -285,35 +309,133 @@ class ReplayBuffer:
             0, self.size, (batch_size,), dtype=torch.long, device=self.device
         )
         out_device = torch.device(device)
+        # CPU→CUDA: route the gathered rows through pinned host memory so the H2D
+        # is true DMA and `non_blocking` actually overlaps (the copy source must
+        # be page-locked, or the flag is ignored and the copy is synchronous).
+        # PyTorch's caching host allocator recycles the pinned blocks and gates
+        # reuse on copy completion, so no manual double-buffering is needed; the
+        # transfer/compute overlap is driven by `_ReplayPrefetcher`. `index_select`
+        # produces a fresh (pageable) tensor, so we pin that result, not the
+        # buffer storage (pinning the buffer wouldn't survive the gather).
+        pin = non_blocking and out_device.type == "cuda" and self.device.type == "cpu"
+
+        def _move(t: torch.Tensor) -> torch.Tensor:
+            gathered = t.index_select(0, idx)
+            if pin:
+                return gathered.pin_memory().to(out_device, non_blocking=True)
+            return gathered.to(out_device)
 
         def _gather_state(block: dict[str, torch.Tensor]) -> EncodedObs:
             return EncodedObs(
-                planet_feats=block["planet_feats"].index_select(0, idx).to(out_device),
-                planet_mask=block["planet_mask"].index_select(0, idx).to(out_device),
-                planet_owned_mask=block["planet_owned_mask"]
-                .index_select(0, idx)
-                .to(out_device),
-                planet_ids=block["planet_ids"].index_select(0, idx).to(out_device),
-                planet_garrison=block["planet_garrison"]
-                .index_select(0, idx)
-                .to(out_device),
-                fleet_feats=block["fleet_feats"].index_select(0, idx).to(out_device),
-                fleet_mask=block["fleet_mask"].index_select(0, idx).to(out_device),
+                planet_feats=_move(block["planet_feats"]),
+                planet_mask=_move(block["planet_mask"]),
+                planet_owned_mask=_move(block["planet_owned_mask"]),
+                planet_ids=_move(block["planet_ids"]),
+                planet_garrison=_move(block["planet_garrison"]),
+                fleet_feats=_move(block["fleet_feats"]),
+                fleet_mask=_move(block["fleet_mask"]),
             )
 
         return SACBatch(
             feats=_gather_state(self.state),
             next_feats=_gather_state(self.next_state),
-            launch=self.launch.index_select(0, idx).to(out_device),
-            target_idx=self.target_idx.index_select(0, idx).to(out_device),
-            fraction=self.fraction.index_select(0, idx).to(out_device),
-            target_legal_mask=self.target_legal_mask.index_select(0, idx).to(out_device),
-            next_target_legal_mask=self.next_target_legal_mask.index_select(0, idx).to(
-                out_device
-            ),
-            reward=self.reward.index_select(0, idx).to(out_device),
-            done=self.done.index_select(0, idx).to(out_device),
+            launch=_move(self.launch),
+            target_idx=_move(self.target_idx),
+            fraction=_move(self.fraction),
+            target_legal_mask=_move(self.target_legal_mask),
+            next_target_legal_mask=_move(self.next_target_legal_mask),
+            reward=_move(self.reward),
+            done=_move(self.done),
+            time=_move(self.time),
+            next_time=_move(self.next_time),
         )
+
+
+def _record_batch_stream(batch: SACBatch, stream: torch.cuda.Stream) -> None:
+    """Tell the caching allocator every tensor in `batch` is consumed on
+    `stream`, so the side-stream-allocated GPU memory isn't recycled until the
+    compute that reads it has finished (the NVIDIA/timm prefetch idiom). Without
+    this, the allocator could hand the block back to a later `sample` while the
+    current update is still reading it.
+    """
+
+    def _rec(t: torch.Tensor) -> None:
+        t.record_stream(stream)
+
+    for obs in (batch.feats, batch.next_feats):
+        _rec(obs.planet_feats)
+        _rec(obs.planet_mask)
+        _rec(obs.planet_owned_mask)
+        _rec(obs.planet_ids)
+        _rec(obs.planet_garrison)
+        _rec(obs.fleet_feats)
+        _rec(obs.fleet_mask)
+    for t in (
+        batch.launch,
+        batch.target_idx,
+        batch.fraction,
+        batch.target_legal_mask,
+        batch.next_target_legal_mask,
+        batch.reward,
+        batch.done,
+        batch.time,
+        batch.next_time,
+    ):
+        _rec(t)
+
+
+class _ReplayPrefetcher:
+    """1-deep async minibatch prefetcher: overlaps the CPU→GPU H2D copy of the
+    NEXT minibatch with the compute on the CURRENT one. The replay stays
+    CPU-resident; each `next()` returns a fresh uniform-random minibatch already
+    on the train device.
+
+    On CUDA: samples on a dedicated side stream with pinned, `non_blocking` H2D,
+    so the DMA runs concurrently with the compute stream's kernels.
+    `wait_stream` serializes the consume after the copy completes, and
+    `_record_batch_stream` keeps the side-stream allocation alive until the
+    compute stream is done reading it. On CPU/eager (no CUDA stream) it degrades
+    to a plain synchronous `replay.sample`, so the same call site works in tests.
+
+    NOTE — UNVERIFIED ON GPU HERE: the side-stream H2D + `record_stream`
+    interaction with `torch.compile` `reduce-overhead` cudagraph trees is novel
+    for this repo (no GPU in this environment). The compiled kernels copy these
+    batch tensors into their own static input buffers — a normal op on the
+    compute stream — so each prefetched tensor is read once on the compute
+    stream and `record_stream(compute)` covers that lifetime. Validate
+    throughput and correctness on a GPU before relying on the overlap.
+    """
+
+    def __init__(
+        self, replay: ReplayBuffer, batch_size: int, device: torch.device
+    ) -> None:
+        self._replay = replay
+        self._batch_size = batch_size
+        self._device = device
+        self._use_stream = device.type == "cuda" and replay.device.type == "cpu"
+        self._stream = torch.cuda.Stream(device) if self._use_stream else None
+        self._next: SACBatch | None = None
+        if self._use_stream:
+            self._preload()
+
+    def _preload(self) -> None:
+        with torch.cuda.stream(self._stream):
+            self._next = self._replay.sample(
+                self._batch_size, device=self._device, non_blocking=True
+            )
+
+    def next(self) -> SACBatch:
+        if not self._use_stream:
+            return self._replay.sample(self._batch_size, device=self._device)
+        compute = torch.cuda.current_stream(self._device)
+        # Block the compute stream until the prefetched H2D copy lands, then keep
+        # its allocation alive across the compute that reads it.
+        compute.wait_stream(self._stream)
+        batch = self._next
+        assert batch is not None  # always primed: __init__/next() re-preload
+        _record_batch_stream(batch, compute)
+        self._preload()
+        return batch
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +465,23 @@ def _is_elimination(obs: Any, num_players: int) -> bool:
     return any(c == 0 for c in present)
 
 
+def _time_feat_from_obs(
+    obs_list: list[Any], episode_steps: int, device: torch.device | str
+) -> torch.Tensor:
+    """Per-env game-clock scalar ∈ [0,1] (`step / episode_steps`) for FiLM.
+
+    The production-margin reward's value-to-go shrinks with the remaining
+    horizon, so the encoder conditions on this clock to make the endgame value
+    learnable (see `SACEncoder.time_film`).
+    """
+    vals = []
+    for o in obs_list:
+        get = o.get if isinstance(o, dict) else lambda k, d=None: getattr(o, k, d)
+        step = float(get("step", 0) or 0)
+        vals.append(min(1.0, max(0.0, step / float(episode_steps))))
+    return torch.tensor(vals, dtype=torch.float32, device=device)
+
+
 # ---------------------------------------------------------------------------
 # SAC update step
 # ---------------------------------------------------------------------------
@@ -357,6 +496,7 @@ class SACUpdateOutput:
     qf_grad_norm: float
     boot_value: float          # hard (entropy-free) bootstrap value, real units
     boot_entropy_bonus: float  # entropy contribution to the soft target, real units
+    explained_var: float       # EV of taken-Q vs bootstrap target (critic health)
     alpha_disc: float
     alpha_cont: float
     # Actor-side metrics; `None` on a logging tick where no actor update ran
@@ -527,6 +667,8 @@ class _SACQKernel(torch.nn.Module):
         next_legal: torch.Tensor,
         reward: torch.Tensor,
         done: torch.Tensor,
+        time: torch.Tensor,
+        next_time: torch.Tensor,
         alpha_d: torch.Tensor,
         alpha_c: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
@@ -540,7 +682,7 @@ class _SACQKernel(torch.nn.Module):
                 device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
             ):
                 next_action = self.actor.get_action(
-                    next_feats, next_legal, deterministic=False
+                    next_feats, next_legal, deterministic=False, time_feat=next_time
                 )
                 # Entropy term enters in TILT space, the SAME coordinate the actor
                 # optimizes (`adv + α·H`) and where α is tuned. We tilt the
@@ -564,7 +706,9 @@ class _SACQKernel(torch.nn.Module):
                 soft_v_next_twin = []
                 hard_v_next_twin = []  # entropy-free decode, diagnostic only
                 for qt in (self.qf1_target, self.qf2_target):
-                    comp = qt.components(next_feats, next_action.fraction)
+                    comp = qt.components(
+                        next_feats, next_action.fraction, time_feat=next_time
+                    )
                     logits_next = assemble_expected(
                         comp,
                         next_action.launch_p,
@@ -582,8 +726,8 @@ class _SACQKernel(torch.nn.Module):
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
-            comp1 = self.qf1.components(feats, fraction)
-            comp2 = self.qf2.components(feats, fraction)
+            comp1 = self.qf1.components(feats, fraction, time_feat=time)
+            comp2 = self.qf2.components(feats, fraction, time_feat=time)
         logits1 = assemble_taken(comp1, launch, target_idx, gate, self.qf1.value_shift)
         logits2 = assemble_taken(comp2, launch, target_idx, gate, self.qf2.value_shift)
         # HL-Gauss distributional loss: cross-entropy of each twin's assembled Q
@@ -605,14 +749,25 @@ class _SACQKernel(torch.nn.Module):
         # would mean a near-hard critic — the bug this fixes).
         boot_value = hard_v_next.mean().detach()
         boot_entropy_bonus = (soft_v_next - hard_v_next).mean().detach()
+        # Explained variance of the taken-action Q vs the bootstrap target across
+        # the batch: ev = 1 − Var(y − Q_taken)/Var(y). A critic that only predicts
+        # the marginal (the failure mode at the old value scale) sits at ev≈0; a
+        # critic that tracks state-conditional value approaches 1. This is the
+        # decisive health check for the value-scale / observability fix.
+        q1_full = self.qf1.bins_to_scalar(logits1).float()
+        y_f = y.float()
+        explained_var = (
+            1.0 - (y_f - q1_full).var() / y_f.var().clamp_min(1e-8)
+        ).detach()
         return (
             q_loss,
             qf1_loss.detach(),
             qf2_loss.detach(),
-            self.qf1.bins_to_scalar(logits1).mean().detach(),  # REAL value units
+            q1_full.mean().detach(),  # REAL value units
             self.qf2.bins_to_scalar(logits2).mean().detach(),
             boot_value,
             boot_entropy_bonus,
+            explained_var,
         )
 
 
@@ -656,6 +811,7 @@ class _SACActorKernel(torch.nn.Module):
         ff: torch.Tensor,
         fm: torch.Tensor,
         legal: torch.Tensor,
+        time: torch.Tensor,
         alpha_d: torch.Tensor,
         alpha_c: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
@@ -665,10 +821,12 @@ class _SACActorKernel(torch.nn.Module):
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
-            action = self.actor.get_action(feats, legal, deterministic=False)
+            action = self.actor.get_action(
+                feats, legal, deterministic=False, time_feat=time
+            )
             adv_per_twin = []
             for qf in (self.qf1, self.qf2):
-                comp = qf.components(feats, action.fraction)
+                comp = qf.components(feats, action.fraction, time_feat=time)
                 # nA0 detached (no-launch baseline), nAL live (pathwise fraction
                 # grad). nV is unused by the scalar advantage — the actor ascends
                 # `adv`, not the value distribution it would tilt.
@@ -730,6 +888,7 @@ class _QStats:
     grad_norm: torch.Tensor
     boot_value: torch.Tensor          # hard (entropy-free) bootstrap value, real units
     boot_entropy_bonus: torch.Tensor  # entropy contribution to soft_v_next, real units
+    explained_var: torch.Tensor       # EV of taken-Q vs bootstrap target (critic health)
 
 
 @dataclass
@@ -773,7 +932,16 @@ def _q_step(
     """
     alpha_d = log_alpha_disc.exp().detach()
     alpha_c = log_alpha_cont.exp().detach()
-    q_loss, qf1_loss, qf2_loss, q1_scalar, q2_scalar, boot_value, boot_ent = q_kernel(
+    (
+        q_loss,
+        qf1_loss,
+        qf2_loss,
+        q1_scalar,
+        q2_scalar,
+        boot_value,
+        boot_ent,
+        explained_var,
+    ) = q_kernel(
         *_encoded_args(batch.feats),
         *_encoded_args(batch.next_feats),
         batch.launch,
@@ -783,6 +951,8 @@ def _q_step(
         batch.next_target_legal_mask,
         batch.reward,
         batch.done,
+        batch.time,
+        batch.next_time,
         alpha_d,
         alpha_c,
     )
@@ -792,7 +962,7 @@ def _q_step(
     grad_norm = _clip_optimizer_grads(q_optimizer, grad_clip)
     q_optimizer.step()
     # Return un-materialized GPU scalars; the caller `.item()`s on logging ticks
-    # only, so the hot loop never CUDA-syncs. The four kernel outputs alias the
+    # only, so the hot loop never CUDA-syncs. The kernel outputs alias the
     # cudagraph static output buffers (reduce-overhead) and the caller HOLDS the
     # latest stats across subsequent iterations (each a new cudagraph step that
     # overwrites those buffers), so `.clone()` them — PyTorch's documented remedy
@@ -806,6 +976,7 @@ def _q_step(
         grad_norm=grad_norm,
         boot_value=boot_value.clone(),
         boot_entropy_bonus=boot_ent.clone(),
+        explained_var=explained_var.clone(),
     )
 
 
@@ -845,6 +1016,7 @@ def _actor_alpha_step(
     ) = actor_kernel(
         *_encoded_args(batch.feats),
         batch.target_legal_mask,
+        batch.time,
         alpha_d,
         alpha_c,
     )
@@ -938,6 +1110,7 @@ def _build_update_output(
         qf_grad_norm=q.grad_norm.item(),
         boot_value=q.boot_value.item(),
         boot_entropy_bonus=q.boot_entropy_bonus.item(),
+        explained_var=q.explained_var.item(),
         alpha_disc=alpha_disc,
         alpha_cont=alpha_cont,
         actor_loss=None,
@@ -994,6 +1167,9 @@ class SACState:
     target_entropy_per_dim: float
     builtin_agents: dict[str, Any]
     builtin_prob: float
+    # Training horizon — recorded into checkpoints so the agent replays with the
+    # same step/episode_steps the encoder FiLM was conditioned on.
+    episode_steps: int
 
 
 def _build_policy_cfg(cfg: RunConfig) -> OrbitPolicyConfig:
@@ -1110,10 +1286,10 @@ def _build_state(cfg: RunConfig, device: torch.device) -> SACState:
         if cfg.opponents.snapshot_device == "train"
         else cfg.opponents.snapshot_device
     )
-    # SAC checkpoints don't load through the PPO `LearnedAgent` snapshot path,
-    # so we never `add_snapshot` here. Opponent diversity comes from
-    # `builtin_agents` mixed in by `_select_opponent_for_episode`. The pool is
-    # kept for Elo bookkeeping symmetry with the PPO trainer.
+    # Self-play uses the LIVE model only (no frozen snapshot copies): the
+    # opponent seat is driven by the current actor, and diversity comes from the
+    # builtin baselines mixed in by `_select_opponent_for_episode`. The pool is
+    # kept purely for Elo bookkeeping symmetry with the PPO trainer.
     pool = OpponentPool(
         elo=elo,
         top_k=cfg.opponents.top_k,
@@ -1145,6 +1321,7 @@ def _build_state(cfg: RunConfig, device: torch.device) -> SACState:
         target_entropy_per_dim=sac.target_entropy_per_dim,
         builtin_agents=builtin_agents,
         builtin_prob=sac.builtin_prob,
+        episode_steps=cfg.game.episode_steps,
     )
 
 
@@ -1162,6 +1339,10 @@ def _save_checkpoint(state: SACState, step: int, *, label: str = "latest") -> Pa
         "log_std_max": state.actor.log_std_max,
         "log_alpha_disc": state.log_alpha_disc.detach().cpu(),
         "log_alpha_cont": state.log_alpha_cont.detach().cpu(),
+        # The encoder FiLM conditions on step/episode_steps, so the agent must
+        # replay with the SAME horizon it trained on; ship it in the checkpoint
+        # rather than relying on the SACAgent default.
+        "episode_steps": state.episode_steps,
     }
     torch.save(payload, path)
     return path
@@ -1172,8 +1353,9 @@ def _select_opponent_for_episode(state: SACState) -> tuple[str, Any]:
 
     With probability `builtin_prob` (and when any builtins are configured) the
     seat is a uniformly-chosen builtin baseline; otherwise it's self-play
-    (`(LEARNER_NAME, None)`, the loop drives the learner actor on that seat).
-    Mixing fixed baselines in is the guard against self-play strategy collapse.
+    (`(LEARNER_NAME, None)`, the loop drives the live learner actor on that
+    seat). Mixing fixed baselines in is the guard against self-play strategy
+    collapse.
     """
     if state.builtin_agents and state.rng.random() < state.builtin_prob:
         name = state.rng.choice(list(state.builtin_agents.keys()))
@@ -1183,7 +1365,7 @@ def _select_opponent_for_episode(state: SACState) -> tuple[str, Any]:
 
 def _run_updates(
     state: SACState,
-    replay: ReplayBuffer,
+    prefetcher: "_ReplayPrefetcher",
     sac: Any,
     device: torch.device,
     *,
@@ -1210,6 +1392,10 @@ def _run_updates(
     syncs — the logged value is the tick's last update (a snapshot, standard for
     SAC dashboards). The step functions `.clone()` their cudagraph-output scalars
     before returning, so the held stats are safe to read after later replays.
+
+    Minibatches come from `prefetcher.next()`, which keeps one minibatch's
+    pinned, async H2D copy in flight on a side stream so it overlaps the previous
+    update's compute (the CPU-resident replay never lives on the GPU).
     """
     q_stats: _QStats | None = None
     a_stats: _ActorStats | None = None
@@ -1224,7 +1410,7 @@ def _run_updates(
         if state.compile_mode is not None:
             _mark_cuda_graph_step(device)
         learn_step += 1
-        batch = replay.sample(sac.batch_size, device=device)
+        batch = prefetcher.next()
         q_stats = _q_step(
             q_kernel=state.q_kernel,
             q_optimizer=state.q_optimizer,
@@ -1238,7 +1424,7 @@ def _run_updates(
         # policy_frequency updates (cleanrl compensation ⇒ net 1:1 actor:critic).
         if learn_step % sac.policy_frequency == 0:
             for _ in range(sac.policy_frequency):
-                batch = replay.sample(sac.batch_size, device=device)
+                batch = prefetcher.next()
                 a_stats = _actor_alpha_step(
                     actor_kernel=state.actor_kernel,
                     actor_optimizer=state.actor_optimizer,
@@ -1280,12 +1466,22 @@ def train(cfg: RunConfig) -> None:
             f"{cfg.game.num_players}"
         )
     device = torch.device(cfg.run.device)
+    if device.type == "cuda":
+        # TF32 tensor cores for the residual *float32* matmuls only — the value
+        # decode / critic-head math that runs OUTSIDE autocast. The encoder and
+        # attention run under bf16 autocast (SDPA → FlashAttention-2), so they
+        # stay bf16 and are untouched by this; it just upgrades the leftover
+        # fp32 GEMMs from full precision to TF32 (the warning's recommendation).
+        torch.set_float32_matmul_precision("high")
     if cfg.run.torch_num_threads > 0:
         torch.set_num_threads(cfg.run.torch_num_threads)
     torch.manual_seed(cfg.run.seed)
 
     state = _build_state(cfg, device)
     pcfg = _build_policy_cfg(cfg)
+    # CPU-resident buffer (the standard SAC pattern): keeps the large replay off
+    # the GPU (system RAM scales further than VRAM), and each sampled minibatch
+    # is moved to the train device per update in `ReplayBuffer.sample`.
     replay = ReplayBuffer(
         sac.buffer_size,
         planet_features=pcfg.planet_features,
@@ -1304,14 +1500,8 @@ def train(cfg: RunConfig) -> None:
         state.actor, device=device, compile_mode=compile_mode
     )
 
-    def potential(obs: Any, seat: int) -> float:
-        return _obs_reward_potential(
-            obs,
-            seat,
-            num_players,
-            cfg.game.episode_steps,
-            cfg.reward.production_weight,
-        )
+    def production_margin(obs: Any, seat: int) -> float:
+        return _obs_production_margin(obs, seat, num_players)
 
     # Per-env episode bookkeeping. Seats start alternated across envs so the
     # learner sees both initial conditions from step 0 (symmetry paranoia).
@@ -1326,8 +1516,8 @@ def train(cfg: RunConfig) -> None:
         learner_seat = [e % num_players for e in range(num_envs)]
         opp_seat = [(s + 1) % num_players for s in learner_seat]
         opponents = [_select_opponent_for_episode(state) for _ in range(num_envs)]
-        previous_potential = [
-            potential(states[e][learner_seat[e]]["observation"], learner_seat[e])
+        previous_prod_margin = [
+            production_margin(states[e][learner_seat[e]]["observation"], learner_seat[e])
             for e in range(num_envs)
         ]
         episode_return = [0.0] * num_envs
@@ -1337,6 +1527,17 @@ def train(cfg: RunConfig) -> None:
         learn_step = 0  # persistent critic-update counter (drives cleanrl cadence)
         last_snapshot_step = 0
         last_latest_step = 0
+        # Async minibatch prefetcher (pinned, side-stream, overlapped H2D). Built
+        # lazily on the first learn tick — `sample` needs len(replay) >=
+        # batch_size, which is guaranteed by the same gate that runs updates.
+        prefetcher: _ReplayPrefetcher | None = None
+        # Materialization-gap diagnostic (defect C): running fraction of raw
+        # policy launches the env no-ops (no move could be built). The replay
+        # stores the raw launch, so the critic learns the true no-op value of
+        # these; this tracks how big that correction is.
+        materialize_gap_sum = 0.0
+        materialize_raw_sum = 0.0
+        materialize_log_tick = 0
 
         while global_step < total_env_steps:
             warmup = global_step < sac.learning_starts
@@ -1351,7 +1552,12 @@ def train(cfg: RunConfig) -> None:
                 states[e][learner_seat[e]]["observation"] for e in range(num_envs)
             ]
             learner_enc = encode_raw_observations(learner_obs, device=device)
-            learner_out = run_sac_heads(heads_kernel, learner_enc, device=device)
+            learner_time = _time_feat_from_obs(
+                learner_obs, cfg.game.episode_steps, device
+            )
+            learner_out = run_sac_heads(
+                heads_kernel, learner_enc, device=device, time_feat=learner_time
+            )
             if warmup:
                 learner_out = flatten_policy_output(learner_out)
             learner_actions, learner_records = sample_batch_with_records_raw(
@@ -1359,13 +1565,36 @@ def train(cfg: RunConfig) -> None:
             )
             learner_records = [record_to_cpu(r) for r in learner_records]
 
+            if not warmup:
+                materialize_raw_sum += sum(
+                    float(r.raw_launch.sum()) for r in learner_records
+                )
+                materialize_gap_sum += sum(
+                    float(r.raw_launch.sum() - r.launch.sum())
+                    for r in learner_records
+                )
+                materialize_log_tick += 1
+                if materialize_log_tick >= sac.log_metrics_every:
+                    if materialize_raw_sum > 0.0:
+                        state.writer.add_scalar(
+                            "rollout/materialize_gap_frac",
+                            materialize_gap_sum / materialize_raw_sum,
+                            global_step,
+                        )
+                    materialize_gap_sum = 0.0
+                    materialize_raw_sum = 0.0
+                    materialize_log_tick = 0
+
             opp_obs = [
                 states[e][opp_seat[e]]["observation"] for e in range(num_envs)
             ]
             # The opponent forward covers every env (static batch for compile);
             # builtin-opponent seats are then overwritten with the Python agent.
             opp_enc = encode_raw_observations(opp_obs, device=device)
-            opp_out = run_sac_heads(heads_kernel, opp_enc, device=device)
+            opp_time = _time_feat_from_obs(opp_obs, cfg.game.episode_steps, device)
+            opp_out = run_sac_heads(
+                heads_kernel, opp_enc, device=device, time_feat=opp_time
+            )
             opp_actions = sample_batch_actions_raw(
                 opp_out, opp_obs, deterministic=False
             )
@@ -1399,7 +1628,12 @@ def train(cfg: RunConfig) -> None:
                 for e in range(num_envs)
             ]
             next_learner_enc = encode_raw_observations(next_learner_obs, device=device)
-            next_out = run_sac_heads(heads_kernel, next_learner_enc, device=device)
+            next_learner_time = _time_feat_from_obs(
+                next_learner_obs, cfg.game.episode_steps, device
+            )
+            next_out = run_sac_heads(
+                heads_kernel, next_learner_enc, device=device, time_feat=next_learner_time
+            )
             _next_actions, next_records = sample_batch_with_records_raw(
                 next_out, next_learner_obs, deterministic=False
             )
@@ -1407,11 +1641,19 @@ def train(cfg: RunConfig) -> None:
 
             # ---- reward, terminal flag, replay insert, episode logging ----
             for e in range(num_envs):
-                cur_pot = potential(next_learner_obs[e], learner_seat[e])
-                step_reward = cfg.reward.potential_weight * (
-                    cur_pot - previous_potential[e]
+                # Reward = DELTA of the production margin: the agent is rewarded
+                # the step it grows its own production (a capture) and penalized
+                # the step the enemy grows theirs. r = pw·(Φ(s') − Φ(s)) with
+                # Φ = own_production − max_opponent_production — non-zero exactly
+                # on capture/loss events, so credit lands on the action that
+                # caused the swing. See `_obs_production_margin`.
+                cur_prod_margin = production_margin(
+                    next_learner_obs[e], learner_seat[e]
                 )
-                previous_potential[e] = cur_pot
+                step_reward = cfg.reward.potential_weight * (
+                    cur_prod_margin - previous_prod_margin[e]
+                )
+                previous_prod_margin[e] = cur_prod_margin
                 # Only a true absorbing terminal (elimination) zeroes the
                 # bootstrap; the step-`episode_steps` timeout is a truncation and
                 # must still bootstrap from s'.
@@ -1478,7 +1720,14 @@ def train(cfg: RunConfig) -> None:
 
                 replay.add(
                     _encoded_row(learner_enc, e),
-                    learner_records[e].launch,
+                    # The MDP action is the policy's RAW launch (masked only for
+                    # unowned / no-legal sources), NOT the materialized launch:
+                    # the actor optimizes launch_p and the critic conditions on
+                    # the taken launch, so both must see the same action. The
+                    # env no-ops launches that can't build a move; that shows up
+                    # as the realized reward + next state, which is exactly the
+                    # value the critic should learn for the raw action.
+                    learner_records[e].raw_launch,
                     learner_records[e].target_idx,
                     learner_records[e].fraction,
                     learner_records[e].target_legal_mask,
@@ -1486,6 +1735,8 @@ def train(cfg: RunConfig) -> None:
                     step_reward,
                     terminal,
                     _encoded_row(next_learner_enc, e),
+                    float(learner_time[e].item()),
+                    float(next_learner_time[e].item()),
                 )
                 episode_return[e] += step_reward
 
@@ -1504,16 +1755,18 @@ def train(cfg: RunConfig) -> None:
                     learner_seat[e] = (learner_seat[e] + 1) % num_players  # flip seat
                     opp_seat[e] = (learner_seat[e] + 1) % num_players
                     opponents[e] = _select_opponent_for_episode(state)
-                    previous_potential[e] = potential(
+                    previous_prod_margin[e] = production_margin(
                         states[e][learner_seat[e]]["observation"], learner_seat[e]
                     )
                     episode_return[e] = 0.0
 
             # ---- learn ----
             if global_step >= sac.learning_starts and len(replay) >= sac.batch_size:
+                if prefetcher is None:
+                    prefetcher = _ReplayPrefetcher(replay, sac.batch_size, device)
                 learn_step = _run_updates(
                     state,
-                    replay,
+                    prefetcher,
                     sac,
                     device,
                     num_envs=num_envs,
@@ -1557,6 +1810,7 @@ def _log_metrics(
     writer.add_scalar("losses/qf2_loss", m.qf2_loss, step)
     writer.add_scalar("losses/qf1_value", m.qf1_value, step)
     writer.add_scalar("losses/qf2_value", m.qf2_value, step)
+    writer.add_scalar("losses/explained_variance", m.explained_var, step)
     writer.add_scalar("losses/qf_grad_norm", m.qf_grad_norm, step)
     writer.add_scalar("losses/alpha_disc", m.alpha_disc, step)
     writer.add_scalar("losses/alpha_cont", m.alpha_cont, step)

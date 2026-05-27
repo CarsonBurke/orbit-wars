@@ -230,13 +230,12 @@ class SACCfg:
     # training runs. 0 disables. Distinct from the labeled snapshot archive.
     latest_ckpt_every: int = 2_000
 
-    # Opponent slate. SAC snapshots can't load through the PPO `LearnedAgent`
-    # path, so the snapshot pool isn't populated on this branch; matchmaking
-    # is therefore self-play vs. the builtin Python baselines. Per episode,
-    # with probability `builtin_prob` the opponent seat is one of
-    # `builtin_opponents` (chosen uniformly); otherwise it's self-play. Mixing
-    # in fixed baselines is the standard guard against self-play strategy
-    # collapse (see AGENTS.md "Self-play strategy collapse").
+    # Opponent slate. Self-play uses the LIVE model only — just the active actor
+    # and its replay buffer, no frozen snapshot copies. Per episode, with
+    # probability `builtin_prob` the opponent seat is one of `builtin_opponents`
+    # (chosen uniformly); otherwise it's self-play against the current learner.
+    # Mixing in fixed baselines is the guard against self-play strategy collapse
+    # (see AGENTS.md "Self-play strategy collapse").
     builtin_opponents: list[str] = field(
         default_factory=lambda: ["random", "sniper", "heuristic"]
     )

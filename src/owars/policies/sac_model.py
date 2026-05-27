@@ -181,6 +181,24 @@ class SACEncoder(nn.Module):
             ]
         )
         self.final_norm = nn.RMSNorm(cfg.dim, elementwise_affine=False)
+        # Global time FiLM. The reward is a production-margin LEVEL, so the
+        # value-to-go = Σ_{k≥t} γ^{k−t}·prod_margin shrinks as the remaining
+        # horizon shortens — a dependence on the game clock that is NOT in the
+        # per-planet/fleet tokens. Without it the critic sees identical
+        # encodings for boards at t=50 vs t=450 and can only fit the
+        # step-averaged value. We condition the post-encoder reps on a scalar
+        # time feature ∈ [0,1] via FiLM (γ,β per channel). Last layer is
+        # zero-init so γ=β=0 at start ⇒ identity (no perturbation to the
+        # carefully-tuned head inits); the optimizer grows it as the endgame
+        # signal demands. A multiplicative γ(t) is exactly the right form to
+        # represent value ≈ horizon_factor(t) · production_margin(s).
+        self.time_film = nn.Sequential(
+            CastedLinear(1, cfg.dim, bias=True),
+            SquaredReLU(),
+            CastedLinear(cfg.dim, 2 * cfg.dim, bias=True),
+        )
+        nn.init.zeros_(self.time_film[-1].weight)
+        nn.init.zeros_(self.time_film[-1].bias)
 
     def _embed(
         self,
@@ -241,6 +259,7 @@ class SACEncoder(nn.Module):
         feats: EncodedObs,
         *,
         action_feats: torch.Tensor | None = None,
+        time_feat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         h, full_mask, planet_mask, fleet_mask, planet_slice, p, _f, rope_cache = (
             self._embed(feats, action_feats)
@@ -258,6 +277,14 @@ class SACEncoder(nn.Module):
         h = self.final_norm(h)
         summary_h = h[:, 0]
         planet_h = h[:, 1 : 1 + p]
+        if time_feat is not None:
+            # FiLM-condition the post-encoder reps on the game clock (identity
+            # at init via the zero-init head). γ,β are per-channel; broadcast γ
+            # over the planet axis. `x·(1+γ)+β` so γ=0 ⇒ no change.
+            tf = time_feat.reshape(-1, 1).to(dtype=summary_h.dtype, device=summary_h.device)
+            gamma, beta = self.time_film(tf).chunk(2, dim=-1)  # each [B, d]
+            summary_h = summary_h * (1.0 + gamma) + beta
+            planet_h = planet_h * (1.0 + gamma).unsqueeze(1) + beta.unsqueeze(1)
         return planet_h, summary_h
 
 
@@ -356,7 +383,7 @@ class SACActor(nn.Module):
         )
 
     def _heads(
-        self, feats: EncodedObs
+        self, feats: EncodedObs, *, time_feat: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Return `(launch_logits, target_logits, fraction_mean,
         fraction_log_std, p)` before any legality masking is applied.
@@ -366,7 +393,7 @@ class SACActor(nn.Module):
         `OrbitPolicy.forward`. External callers apply the lead-intercept legal
         mask via `sampling`-style helpers.
         """
-        planet_h, summary_h = self.encoder(feats)
+        planet_h, summary_h = self.encoder(feats, time_feat=time_feat)
         b, p, d = planet_h.shape
         actor_ctx = summary_h.unsqueeze(1).expand(-1, p, -1)
         planet_with_ctx = torch.cat([planet_h, actor_ctx], dim=-1)  # [B, P, 2d]
@@ -414,6 +441,7 @@ class SACActor(nn.Module):
         legal_mask: torch.Tensor,
         *,
         deterministic: bool = False,
+        time_feat: torch.Tensor | None = None,
     ) -> SACAction:
         """Sample the factored action under the provided legal-target mask and
         compute the closed-form differentiable quantities the trainer needs.
@@ -424,7 +452,7 @@ class SACActor(nn.Module):
         log-prob / entropy.
         """
         launch_logits, target_logits, fraction_mean, fraction_log_std, p = self._heads(
-            feats
+            feats, time_feat=time_feat
         )
         # Finite guard: a divergent update can NaN outputs and tanh(NaN) flows
         # into the C++ env (which aborts with no Python traceback). Sanitize so
@@ -665,9 +693,11 @@ class SACSoftQ(nn.Module):
             persistent=False,
         )
 
-    def encode(self, feats: EncodedObs) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        self, feats: EncodedObs, *, time_feat: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """State-only encode → (planet_h [B,P,d], summary_h [B,d])."""
-        return self.encoder(feats)
+        return self.encoder(feats, time_feat=time_feat)
 
     def value(self, summary_h: torch.Tensor) -> torch.Tensor:
         """Dueling state-value distribution logits nV [B, num_bins]."""
@@ -708,7 +738,11 @@ class SACSoftQ(nn.Module):
         return nAL.float()
 
     def components(
-        self, feats: EncodedObs, fraction: torch.Tensor
+        self,
+        feats: EncodedObs,
+        fraction: torch.Tensor,
+        *,
+        time_feat: torch.Tensor | None = None,
     ) -> QComponents:
         """Factored components at the supplied per-source `fraction`: value
         distribution logits + scalar advantages.
@@ -717,7 +751,7 @@ class SACSoftQ(nn.Module):
         in the policy probs ⇒ closed-form expectation). No symexp — the heads now
         produce a distribution (value) and raw scalar advantages.
         """
-        planet_h, summary_h = self.encode(feats)
+        planet_h, summary_h = self.encode(feats, time_feat=time_feat)
         if fraction.dim() == 1:
             fraction = fraction.unsqueeze(0)
         return QComponents(

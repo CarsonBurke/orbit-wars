@@ -126,7 +126,8 @@ class SampleRecord:
     pre-squash latent with atanh.
     """
 
-    launch: torch.Tensor       # [P] float 0/1 Bernoulli sample
+    launch: torch.Tensor       # [P] float 0/1 — the MATERIALIZED launch (a move was actually built); PPO recomputes the executed action's log-prob at this value
+    raw_launch: torch.Tensor   # [P] float 0/1 — the raw Bernoulli sample (masked only for unowned / no-legal-target sources); the MDP action SAC's actor optimizes and critic conditions on
     target_idx: torch.Tensor   # [P] long, in [0, P)
     fraction: torch.Tensor     # [P] float in (eps, 1-eps) — executed squashed fraction
     log_prob: torch.Tensor     # [P] float — Bernoulli + launch*(Categorical + fraction)
@@ -142,7 +143,8 @@ class SampleBatchRecord:
     the rollout hot path.
     """
 
-    launch: torch.Tensor
+    launch: torch.Tensor       # [B, P] materialized launch (PPO)
+    raw_launch: torch.Tensor   # [B, P] raw masked Bernoulli sample (SAC)
     target_idx: torch.Tensor
     fraction: torch.Tensor
     log_prob: torch.Tensor
@@ -1458,7 +1460,13 @@ def _record_from_materialized_launch(
     fraction_log_std: torch.Tensor,
     materialized: list[bool],
 ) -> SampleRecord:
-    del launch
+    # `launch` is the raw Bernoulli sample (already masked to 0 on unowned /
+    # no-legal-target sources by `_mask_impossible_launches`); `materialized`
+    # additionally zeroes sources whose move could not be built (garrison too
+    # small / send rounds to 0). PPO trains on the executed (materialized)
+    # action; SAC trains its actor/critic on the raw policy action, so we keep
+    # both — see `SampleRecord`.
+    raw_launch = launch.to(dtype=fraction_mean.dtype)
     actual_launch = torch.as_tensor(
         materialized,
         device=target_idx.device,
@@ -1483,6 +1491,7 @@ def _record_from_materialized_launch(
     log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
     return SampleRecord(
         launch=actual_launch,
+        raw_launch=raw_launch,
         target_idx=target_idx,
         fraction=frac,
         log_prob=log_prob,
@@ -1502,6 +1511,7 @@ def _batch_record_from_materialized_launch(
     rows: Sequence[int],
 ) -> SampleBatchRecord:
     row_idx = torch.as_tensor(rows, device=launch.device, dtype=torch.long)
+    raw_launch_r = launch.index_select(0, row_idx)
     if len(rows) == 0:
         actual_launch = launch.new_zeros((0, launch.shape[1]))
     else:
@@ -1537,6 +1547,7 @@ def _batch_record_from_materialized_launch(
     log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
     return SampleBatchRecord(
         launch=actual_launch,
+        raw_launch=raw_launch_r,
         target_idx=target_idx_r,
         fraction=frac_r,
         log_prob=log_prob,

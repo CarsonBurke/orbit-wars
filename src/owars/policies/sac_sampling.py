@@ -9,8 +9,11 @@ adapts the actor's heads into a `PolicyOutput` so the `sampling` helpers can do
 the geometry.
 
 `sac_sample_with_record` returns the legal Kaggle action list plus a
-`SampleRecord` whose `(launch, target_idx, fraction, target_legal_mask)` is
-exactly what the SAC replay buffer stores. The returned actions carry the
+`SampleRecord` whose `(raw_launch, target_idx, fraction, target_legal_mask)`
+is what the SAC replay buffer stores — `raw_launch` (the masked Bernoulli
+sample), not the materialized launch, because the actor optimizes that raw
+launch and the critic must condition on the same action. The returned actions
+carry the
 7-element tracker payload (`[id, angle, ships, target_id, eta, x, y]`), so the
 caller's `_FleetTargetTracker.record` keeps encoded fleet features in sync the
 same way the PPO rollout does. `sac_sample_actions` is the moves-only
@@ -76,9 +79,11 @@ def _heads_to_policy_output(
     )
 
 
-def _actor_policy_output(actor: SACActor, feats: EncodedObs) -> PolicyOutput:
+def _actor_policy_output(
+    actor: SACActor, feats: EncodedObs, *, time_feat: torch.Tensor | None = None
+) -> PolicyOutput:
     launch_logits, target_logits, fraction_mean, fraction_log_std, _p = (
-        actor._heads(feats)
+        actor._heads(feats, time_feat=time_feat)
     )
     return _heads_to_policy_output(
         launch_logits, target_logits, fraction_mean, fraction_log_std, feats
@@ -91,6 +96,7 @@ def sac_sample_with_record(
     raw_obs: Any,
     *,
     deterministic: bool = False,
+    time_feat: torch.Tensor | None = None,
 ) -> tuple[list[list], SampleRecord]:
     """Stochastic rollout for one env: legal Kaggle actions + the buffer record.
 
@@ -99,7 +105,7 @@ def sac_sample_with_record(
     `SampleRecord(launch, target_idx, fraction, target_legal_mask)` the SAC
     buffer stores.
     """
-    out = _actor_policy_output(actor, feats)
+    out = _actor_policy_output(actor, feats, time_feat=time_feat)
     actions_list, records = sample_batch_with_records_raw(
         out, [raw_obs], deterministic=deterministic
     )
@@ -112,14 +118,18 @@ def sac_sample_actions(
     raw_obs: Any,
     *,
     deterministic: bool = True,
+    time_feat: torch.Tensor | None = None,
 ) -> list[list]:
     """Moves-only path for inference / opponent self-play.
+
+    `time_feat` is the game-clock scalar the encoder FiLM conditions on; pass
+    `step/episode_steps` at play time so the policy is endgame-aware.
 
     Reuses `sampling.sample_batch_actions_raw` (batch-1), which applies the
     deterministic launch-if-idle fallback so a confident-but-sub-0.5 launch
     still acts at play time.
     """
-    out = _actor_policy_output(actor, feats)
+    out = _actor_policy_output(actor, feats, time_feat=time_feat)
     return sample_batch_actions_raw(out, [raw_obs], deterministic=deterministic)[0]
 
 
@@ -127,6 +137,8 @@ def uniform_random_factored_actions(
     actor: SACActor,
     feats: EncodedObs,
     raw_obs: Any,
+    *,
+    time_feat: torch.Tensor | None = None,
 ) -> tuple[list[list], SampleRecord]:
     """Uniform-random factored warmup action for the `learning_starts` window.
 
@@ -138,7 +150,7 @@ def uniform_random_factored_actions(
     transitions are legal and on-distribution with learned rollouts.
     """
     launch_logits, target_logits, fraction_mean, fraction_log_std, _p = (
-        actor._heads(feats)
+        actor._heads(feats, time_feat=time_feat)
     )
     # Uniform launch (logit 0 → p=0.5), uniform target (flat logits over the
     # legal support `sampling` masks in — keep -inf on padded/self targets so
@@ -191,6 +203,7 @@ class _SACHeadsKernel(torch.nn.Module):
         planet_garrison: torch.Tensor,
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
+        time_feat: torch.Tensor,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -205,7 +218,7 @@ class _SACHeadsKernel(torch.nn.Module):
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
             launch_logits, target_logits, fraction_mean, fraction_log_std, _p = (
-                self.actor._heads(feats)
+                self.actor._heads(feats, time_feat=time_feat)
             )
         return _heads_to_policy_output(
             launch_logits, target_logits, fraction_mean, fraction_log_std, feats
@@ -240,13 +253,18 @@ def get_sac_heads_kernel(
 
 
 def run_sac_heads(
-    kernel: torch.nn.Module, feats: EncodedObs, *, device: torch.device
+    kernel: torch.nn.Module,
+    feats: EncodedObs,
+    *,
+    device: torch.device,
+    time_feat: torch.Tensor,
 ) -> PolicyOutput:
     """Batched, no-grad actor-heads forward (marks the cudagraph step first).
 
-    The returned `PolicyOutput` may alias cudagraph static buffers under
-    `reduce-overhead`, so the caller must consume it (sample + materialize any
-    kept tensors to CPU) before the next `run_sac_heads` call.
+    `time_feat` is the per-env game-clock scalar ([B] in [0,1]) the encoder's
+    FiLM conditions on. The returned `PolicyOutput` may alias cudagraph static
+    buffers under `reduce-overhead`, so the caller must consume it (sample +
+    materialize any kept tensors to CPU) before the next `run_sac_heads` call.
     """
     _mark_cuda_graph_step(device)
     with torch.no_grad():
@@ -258,6 +276,7 @@ def run_sac_heads(
             feats.planet_garrison,
             feats.fleet_feats,
             feats.fleet_mask,
+            time_feat,
         )
 
 
@@ -295,6 +314,7 @@ def record_to_cpu(record: SampleRecord) -> SampleRecord:
     """
     return SampleRecord(
         launch=record.launch.detach().cpu(),
+        raw_launch=record.raw_launch.detach().cpu(),
         target_idx=record.target_idx.detach().cpu(),
         fraction=record.fraction.detach().cpu(),
         log_prob=record.log_prob.detach().cpu(),

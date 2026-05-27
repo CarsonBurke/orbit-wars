@@ -65,8 +65,18 @@ model:
   # `value_num_bins` symlog-spaced bins in [value_min, value_max]. The advantages
   # tilt this distribution; the decoded scalar is clamped to the range, which
   # bounds the bootstrap (see sac_model.SACSoftQ).
-  value_min: -100000.0
-  value_max: 100000.0
+  # Value support sized to the DELTA production-margin reward (see `reward`).
+  # The reward is Φ(s')−Φ(s) with Φ=production margin, so the discounted return
+  # ≈ the net/total margin *change* over the remaining game, O(±10²) production
+  # units — NOT margin/(1−γ). A ±1000 symlog support keeps the operating range
+  # off the saturating bins while symlog packs fine resolution near 0 (where
+  # most near-balanced states sit). Watch losses/qf1_value: if it pins near
+  # ±1000 widen; if it stays ≪100 tighten for resolution. Watch
+  # losses/explained_variance: it should climb well above ~0 once the critic
+  # tracks state value rather than the marginal (the old ±1e5 support made the
+  # bins ~4500 ships wide — the critic could not resolve action differences).
+  value_min: -1000.0
+  value_max: 1000.0
   value_num_bins: 153
   value_symlog: true
 
@@ -115,8 +125,13 @@ sac:
   no_op_fraction: 0.02
   log_std_min: -5.0
   log_std_max: 2.0
+  # CPU-resident buffer (standard SAC); the sampled minibatch is moved to the
+  # GPU per update via a pinned, async, prefetched transfer that overlaps the
+  # H2D with compute (see ReplayBuffer.sample / _ReplayPrefetcher).
   buffer_size: 50000
-  batch_size: 256
+  # Large minibatch: the model is tiny (dim 96, depth 2) and the GPU is
+  # underutilized at 256, so 2048 buys a much lower-variance critic gradient.
+  batch_size: 2048
   learning_starts: 5000
   # Cadence counts CRITIC UPDATES (not ticks), continuous across ticks, exactly
   # like cleanrl: an actor+alpha step every policy_frequency-th critic update
@@ -145,13 +160,18 @@ sac:
   log_metrics_every: 100
   snapshot_every: 25000
   # Opponent slate: per episode, P(builtin)=builtin_prob (uniform over the
-  # list), else self-play. Mixing fixed baselines guards against self-play
-  # strategy collapse — the SAC snapshot pool isn't populated on this branch.
+  # list), else self-play against the LIVE model (active actor only — no frozen
+  # snapshot copies). Mixing fixed baselines in guards against self-play
+  # strategy collapse.
   builtin_opponents: [random, sniper, heuristic]
   builtin_prob: 0.5
 
 rollout:
-  num_envs: 8
+  # One subprocess per env; step_subset dispatches then gathers, so envs step in
+  # parallel — 16 ~doubles transitions/sec over 8 given ≥16 spare cores. The
+  # kaggle Python simulator is the per-tick wall-clock floor (env stepping >
+  # the tiny-model forward/update), so scaling envs is the main throughput lever.
+  num_envs: 16
   num_workers: 0
   env_backend: kaggle
 
@@ -163,17 +183,19 @@ opponents:
   initial_rating: 1500.0
   k_factor: 32.0
 
-# Reward = potential-based shaping only (win/loss/draw_value and margin_scale
-# stay 0). Φ = own_projected − enemy_projected, projected = ships +
-# production_weight·turns_left·production — a forward-looking estimate of the
-# final ship margin, so the per-step potential_weight·(Φ(s') − Φ(s)) rewards
-# improving the projected win-margin every step (production share is ~zero-sum
-# past the neutral land-grab and compounds into the ship margin). The forward
-# projection is why a standard γ<1 still values the endgame.
-# NOTE: Φ rides at O(10³–10⁴) (production·turns_left), so the critic value is
-# large and the symlog/tilt critic may be poorly conditioned at that scale; if
-# learning stalls, lower production_weight to bring Φ (and V) into a
-# better-conditioned range.
+# Reward = DELTA of the production margin (a per-event credit signal):
+#   r_t = potential_weight · (Φ(s') − Φ(s)),  Φ = own_production − max_opp_production.
+# The agent is rewarded the step it grows its own production (captures a planet)
+# and penalized the step the enemy grows theirs, so credit lands on the action
+# that caused the swing — non-zero exactly on capture/loss events. Φ is fully
+# observable (production + ownership are per-planet features) and O(±10²); the
+# discounted return is the net/total margin change over the remaining game
+# (NOT margin/(1−γ)), so the critic value is O(±10²) — small enough to resolve
+# action-level differences. The value-to-go still depends on the remaining
+# horizon (less time/territory left to swing), so the SAC encoder is
+# FiLM-conditioned on a global time feature to keep the endgame value learnable.
+#   potential_weight scales the reward (kept at raw production units = 1.0).
+#   production_weight / win/loss/draw / margin_scale are unused by this reward.
 reward:
   potential_weight: 1.0
   production_weight: 1.0

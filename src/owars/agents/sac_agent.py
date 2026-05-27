@@ -35,6 +35,7 @@ class SACAgent:
         ckpt_path: str | Path,
         device: str = "cpu",
         deterministic: bool = True,
+        episode_steps: int = 500,
     ):
         state = torch.load(ckpt_path, map_location=device, weights_only=False)
         if "actor" not in state or "actor_cfg" not in state:
@@ -52,14 +53,31 @@ class SACAgent:
         self.model.eval()
         self.device = device
         self.deterministic = deterministic
+        # The checkpoint records the training horizon (the encoder FiLM is
+        # conditioned on step/episode_steps); prefer it so play-time time_feat
+        # matches training, falling back to the arg for legacy checkpoints.
+        self.episode_steps = int(state.get("episode_steps", episode_steps))
         self._tracker = _FleetTargetTracker()
 
     @torch.inference_mode()
     def __call__(self, obs: Any) -> list[list]:
         annotated = self._tracker.annotate(obs)
         feats = encode_raw_observations([annotated], device=self.device)
+        # Game-clock scalar ∈ [0,1] for the encoder FiLM — must match training so
+        # the policy reproduces its endgame behavior.
+        get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+        step = float(get("step", 0) or 0)
+        time_feat = torch.tensor(
+            [min(1.0, max(0.0, step / float(self.episode_steps)))],
+            dtype=torch.float32,
+            device=self.device,
+        )
         actions = sac_sample_actions(
-            self.model, feats, annotated, deterministic=self.deterministic
+            self.model,
+            feats,
+            annotated,
+            deterministic=self.deterministic,
+            time_feat=time_feat,
         )
         self._tracker.record(obs, actions)
         return [move[:3] for move in actions]
