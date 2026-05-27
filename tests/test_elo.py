@@ -65,3 +65,37 @@ def test_all_same_identity_noop():
     before = elo.get("learner")
     elo.update_from_game([("learner", 1.0), ("learner", 0.0)])
     assert elo.get("learner") == before  # no distinct opponent → no update
+
+
+def test_ffa_uses_pregame_ratings():
+    """Regression: every pair in a >2-identity game must score against the
+    PRE-game ratings. Updating in place would let a later pair read a rating an
+    earlier pair already moved this game. Only visible when the starting ratings
+    differ (equal ratings give E=0.5 everywhere, hiding the bug — which is why
+    `test_multi_player_pairwise` at equal ratings doesn't catch it).
+    """
+    k = 32.0
+    pre = {"a": 1600.0, "b": 1500.0, "c": 1400.0}
+    scores = {"a": 3.0, "b": 2.0, "c": 1.0}
+    elo = EloTracker(initial_rating=1500.0, k_factor=k)
+    for name, rating in pre.items():
+        elo.set(name, rating)
+    elo.update_from_game([(n, scores[n]) for n in pre])
+
+    # Reference: every pair scored from the FROZEN pre-game ratings, deltas
+    # accumulated and applied after — what an order-independent update yields.
+    per_pair_k = k / (len(pre) - 1)  # K / (M − 1)
+    expected = dict(pre)
+    names = list(pre)
+    for i, x in enumerate(names):
+        for y in names[i + 1 :]:
+            sx = 1.0 if scores[x] > scores[y] else (0.0 if scores[x] < scores[y] else 0.5)
+            d = per_pair_k * (sx - expected_score(pre[x], pre[y]))
+            expected[x] += d
+            expected[y] -= d
+
+    for n in names:
+        assert abs(elo.get(n) - expected[n]) < 1e-9, (n, elo.get(n), expected[n])
+    assert abs(sum(elo.get(n) for n in names) - sum(pre.values())) < 1e-6  # zero-sum
+    # Each identity played M−1 pairs, so games_played reflects every pairing.
+    assert all(elo.games_played[n] == len(pre) - 1 for n in names)

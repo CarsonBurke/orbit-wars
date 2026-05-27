@@ -91,6 +91,13 @@ class EloTracker:
 
         K per pair is scaled to `K / (M − 1)` where M is the number of
         distinct identities, so any one rating moves at most ~K per game.
+
+        Every pair's expected score is computed against the *pre-game* ratings
+        and the deltas applied only after all pairs are scored. Updating in
+        place mid-loop (the obvious `update_pair` call) would let a later pair
+        read a rating already moved by an earlier pair in the same game —
+        invisible for 2 players (one pair) and when all ratings are equal
+        (E = 0.5 throughout), but it skews the per-player deltas in FFA.
         """
         if len(seats) < 2:
             return
@@ -102,6 +109,10 @@ class EloTracker:
             return  # everyone was the same identity (e.g., all self)
         avg = {n: sum(s) / len(s) for n, s in by_identity.items()}
         per_pair_k = self.k_factor / max(1, len(identities) - 1)
+        for name in identities:
+            self.ensure(name)
+        pre = {name: self.ratings[name] for name in identities}
+        deltas: dict[str, float] = defaultdict(float)
         for i, a in enumerate(identities):
             for b in identities[i + 1 :]:
                 if avg[a] > avg[b]:
@@ -110,7 +121,13 @@ class EloTracker:
                     sa = 0.0
                 else:
                     sa = 0.5
-                self.update_pair(a, b, sa, k=per_pair_k)
+                delta = per_pair_k * (sa - expected_score(pre[a], pre[b]))
+                deltas[a] += delta
+                deltas[b] -= delta
+                self.games_played[a] += 1
+                self.games_played[b] += 1
+        for name, delta in deltas.items():
+            self.ratings[name] += delta
 
     def snapshot_dict(self) -> dict[str, float]:
         """Plain dict for logging / persistence."""
