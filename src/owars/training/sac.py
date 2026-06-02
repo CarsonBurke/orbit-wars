@@ -17,13 +17,15 @@ gradient (no REINFORCE / no (Q−b) variance), and the fraction uses the
 pathwise/reparam gradient. Two entropy temperatures are tuned independently:
 `alpha_discrete` (launch+target) and `alpha_continuous` (fraction).
 
-Value scale: the factored critic is **distributional**. The state value is an
-HL-Gauss two-hot distribution over symlog-spaced bins; the scalar advantages tilt
-it in logit space (Q_logits = nV + adv·value_shift) and the TD loss is
-cross-entropy against the two-hot encoding of the real soft Bellman target.
-Decoding clamps to `[value_min, value_max]`, bounding the bootstrap — this
-replaces the earlier scalar symlog-MSE critic, whose loss gradient vanished at
-large |Q| and let the deadly triad run the value away. The reward is the
+Value scale: the factored critic is dueling in REAL ship-margin units,
+`Q(s,a) = V(s) + adv(s,a)`. The state value `V = bins_to_scalar(nV)` is decoded
+from an HL-Gauss two-hot distribution over symlog-spaced bins (clamped to
+`[value_min, value_max]`, bounding the bootstrap — this replaces the earlier
+scalar symlog-MSE critic, whose loss gradient vanished at large |Q| and let the
+deadly triad run the value away). The per-planet advantages are tanh-bounded
+(±`adv_scale`), so `adv = Σ_i A_i` is bounded and linear in the policy probs. The
+TD loss splits the heads: V learns the full target via HL-Gauss CE, adv the
+residual `(y − V)` (V detached) via Huber. The reward is the
 per-step production-margin delta (O(±10²); see `RewardCfg` and
 `rollout._obs_production_margin`), and the encoder is FiLM-conditioned on a
 global time feature so the value-to-go can depend on the remaining horizon.
@@ -67,11 +69,10 @@ from ..policies.sac_model import (
     QComponents,
     SACActor,
     SACSoftQ,
-    assemble_expected,
-    assemble_taken,
     expected_advantage,
     make_targets,
     polyak_update,
+    taken_advantage,
 )
 from ..policies.sac_sampling import (
     flatten_policy_output,
@@ -592,16 +593,18 @@ def _mark_cuda_graph_step(device: torch.device) -> None:
 
 
 class _SACQKernel(torch.nn.Module):
-    """Twin-Q soft-Bellman loss as one compiled graph.
+    """Twin-Q soft-Bellman loss as one compiled graph (REAL ship-margin units).
 
-    Resamples a'~π(·|s') (no grad), assembles the per-twin closed-form expected
-    target Q DISTRIBUTION, decodes the bounded scalar `bins_to_scalar`, forms the
-    soft value and the bootstrapped REAL target `y`; then trains each twin's
-    `Q_taken(s, a_buffer)` DISTRIBUTION with the HL-Gauss cross-entropy loss
-    (`−Σ target_probs(y)·log_softmax(Q_logits)`). The decoded value is clamped to
-    `[value_min, value_max]`, so the bootstrap is structurally bounded — the
-    deadly-triad runaway the old symlog-MSE scalar critic suffered cannot occur.
-    Returns `(q_loss, qf1_loss, qf2_loss, q1_scalar, q2_scalar)` (q scalars REAL).
+    Resamples a'~π(·|s') (no grad), forms the per-twin real Q' = V'(s') + E_a[adv'],
+    takes the pessimistic twin-min, adds the real-units entropy bonus
+    `α_d·H' + α_c·H'`, and bootstraps the REAL target `y = r + γ(1−done)·V_soft'`.
+    Then each twin's heads are trained with a SPLIT loss: the value head learns the
+    full target `y` via HL-Gauss cross-entropy (`−Σ target_probs(y)·log_softmax(nV)`,
+    decoded V clamped to `[value_min, value_max]` ⇒ bounded bootstrap), and the
+    advantage heads learn the residual `(y − V)` (V detached) via a Huber loss —
+    orthogonal heads, the tanh bound anchoring the V/A split (no centering). One α
+    in real units balances entropy in both the actor and this bootstrap. Returns
+    `(q_loss, qf1_loss, qf2_loss, q1_scalar, q2_scalar, …)` (q scalars REAL).
     """
 
     def __init__(
@@ -664,46 +667,35 @@ class _SACQKernel(torch.nn.Module):
                 next_action = self.actor.get_action(
                     next_feats, next_legal, deterministic=False, time_feat=next_time
                 )
-                # Entropy term enters in TILT space, the SAME coordinate the actor
-                # optimizes (`adv + α·H`) and where α is tuned. We tilt the
-                # next-state value distribution by the SOFT advantage `adv + α·H`
-                # (add α·H along value_shift, on top of the advantage tilt already
-                # in `logits_next`) THEN decode. So α is consistently "value-per-nat
-                # in tilt space" in both the actor and this bootstrap — a single,
-                # well-scaled α. The decode maps the tilt-space term to a
-                # state-aware real-units contribution (≈ Var_Q·(1+|Q|)·α·H); adding
-                # α·H directly to the real-units decoded value instead (tilt-tuned α
-                # ~O(1) vs real value O(10³)) makes it negligible — a near-hard
-                # critic. The contribution is SIGNED: H_disc ≥ 0 but H_cont is a
-                # differential entropy that can be negative (a confident, low-spread
-                # fraction), so a sharply-tuned continuous policy can make ent_tilt
-                # slightly negative — the standard max-ent semantics, matching the
-                # actor's identical `+α·H` term. Reward adds OUTSIDE the decode
-                # (real units), so y = r + γ·V_soft(s') is still a valid contraction.
-                ent_tilt = (
-                    alpha_d * next_action.H_disc + alpha_c * next_action.H_cont
-                ).unsqueeze(-1)  # [B, 1]
-                soft_v_next_twin = []
-                hard_v_next_twin = []  # entropy-free decode, diagnostic only
-                v_only_next_twin = []  # nV decode (no advantage tilt), diagnostic only
+                # Per-twin REAL next-state Q' = V'(s') + E_a[adv'](s'): decode the
+                # value distribution to real ship-margin units, add the closed-form
+                # expected advantage (bounded ±n_owned·adv_scale, same units). The
+                # twin-min is taken on the real Q'.
+                q_next_twin = []
+                v_only_next_twin = []  # V' alone (no advantage), diagnostic only
                 for qt in (self.qf1_target, self.qf2_target):
                     comp = qt.components(
                         next_feats, next_action.fraction, time_feat=next_time
                     )
-                    logits_next = assemble_expected(
+                    v_next = qt.bins_to_scalar(comp.nV)
+                    adv_next = expected_advantage(
                         comp,
                         next_action.launch_p,
                         next_action.target_probs,
                         next_gate,
-                        qt.value_shift,
                     )
-                    soft_logits = logits_next + ent_tilt * qt.value_shift
-                    soft_v_next_twin.append(qt.bins_to_scalar(soft_logits))
-                    hard_v_next_twin.append(qt.bins_to_scalar(logits_next))
-                    v_only_next_twin.append(qt.bins_to_scalar(comp.nV))
-            soft_v_next = torch.minimum(soft_v_next_twin[0], soft_v_next_twin[1])
-            hard_v_next = torch.minimum(hard_v_next_twin[0], hard_v_next_twin[1])
-            v_only_next = torch.minimum(v_only_next_twin[0], v_only_next_twin[1])
+                    q_next_twin.append(v_next + adv_next)
+                    v_only_next_twin.append(v_next)
+                hard_v_next = torch.minimum(q_next_twin[0], q_next_twin[1])
+                v_only_next = torch.minimum(v_only_next_twin[0], v_only_next_twin[1])
+            # Entropy bonus is now ADDED IN REAL UNITS (cleanrl's `min_q − α·log π`,
+            # sign-flipped to +α·H), the SAME real-units coordinate the actor's
+            # `adv + α·H` lives in and where α is tuned — one α, no symlog-Jacobian
+            # decoupling. SIGNED: H_disc ≥ 0 but the continuous differential H_cont
+            # can be negative for a confident low-spread fraction, so a sharply-tuned
+            # policy can make the bonus slightly negative — standard max-ent.
+            ent_bonus = alpha_d * next_action.H_disc + alpha_c * next_action.H_cont
+            soft_v_next = hard_v_next + ent_bonus
             y = reward + (1.0 - done) * self.gamma * soft_v_next
 
         with torch.autocast(
@@ -711,25 +703,36 @@ class _SACQKernel(torch.nn.Module):
         ):
             comp1 = self.qf1.components(feats, fraction, time_feat=time)
             comp2 = self.qf2.components(feats, fraction, time_feat=time)
-        logits1 = assemble_taken(comp1, launch, target_idx, gate, self.qf1.value_shift)
-        logits2 = assemble_taken(comp2, launch, target_idx, gate, self.qf2.value_shift)
-        # HL-Gauss distributional loss: cross-entropy of each twin's assembled Q
-        # distribution against the Gaussian-smoothed two-hot encoding of the REAL
-        # bootstrap target `y` (`target_probs` applies symlog + clamps to the
-        # support internally). Run in fp32 — the CE over symlog-spaced bins is
-        # precision-sensitive and the encoder forces fp32 buffers anyway. The
-        # twins share an identical HL-Gauss config, so `target_probs(y)` is the
-        # same for both; compute it once.
-        tp = self.qf1.hlgauss.target_probs(y.float())  # [B, num_bins]
-        qf1_loss = -(tp * F.log_softmax(logits1.float(), dim=-1)).sum(-1).mean()
-        qf2_loss = -(tp * F.log_softmax(logits2.float(), dim=-1)).sum(-1).mean()
+        # Split per-twin loss against the SAME real target `y`:
+        #   value head → HL-Gauss CE on the full target (decoded V bounded to the
+        #     support; `target_probs` applies symlog + clamps internally), and
+        #   advantage heads → Huber on the residual `(y − V)` with V DETACHED.
+        # These are orthogonal projections of the same target onto V and adv (not
+        # an alternating two-target drift): V owns the state baseline, the bounded
+        # adv owns the action-dependent residual. The Huber tail gradient does not
+        # vanish (unlike a CE through a tilt), so the tanh-bounded adv keeps a live
+        # signal. Run in fp32 — the CE over symlog-spaced bins is precision-
+        # sensitive and the encoder forces fp32 buffers anyway. The twins share an
+        # identical HL-Gauss config, so `target_probs(y)` is the same; compute once.
+        y_f = y.float()
+        tp = self.qf1.hlgauss.target_probs(y_f)  # [B, num_bins]
+        v1 = self.qf1.bins_to_scalar(comp1.nV).float()
+        v2 = self.qf2.bins_to_scalar(comp2.nV).float()
+        adv1 = taken_advantage(comp1, launch, target_idx, gate).float()
+        adv2 = taken_advantage(comp2, launch, target_idx, gate).float()
+        v_ce_1 = -(tp * F.log_softmax(comp1.nV.float(), dim=-1)).sum(-1).mean()
+        v_ce_2 = -(tp * F.log_softmax(comp2.nV.float(), dim=-1)).sum(-1).mean()
+        adv_hub_1 = F.smooth_l1_loss(adv1, (y_f - v1).detach(), beta=1.0)
+        adv_hub_2 = F.smooth_l1_loss(adv2, (y_f - v2).detach(), beta=1.0)
+        qf1_loss = v_ce_1 + adv_hub_1
+        qf2_loss = v_ce_2 + adv_hub_2
         q_loss = qf1_loss + qf2_loss
-        # Bootstrap diagnostics (real units): the hard value and the SIGNED entropy
-        # contribution the soft tilt actually injects into y (usually positive;
-        # can be slightly negative when the continuous differential entropy is).
-        # In tilt space the contribution is state-aware and non-negligible; watch
-        # bootstrap/entropy_bonus_frac to confirm it didn't collapse to ~0 (which
-        # would mean a near-hard critic — the bug this fixes).
+        # Bootstrap diagnostics (real units): the hard (entropy-free) twin-min value
+        # and the SIGNED entropy bonus actually injected into y (usually positive;
+        # slightly negative when the continuous differential entropy is). Now that
+        # the bonus is added in real units it is literally `α_d·H + α_c·H` —
+        # bootstrap/entropy_bonus_frac confirms α·H is a meaningful fraction of the
+        # value, not collapsed to ~0 (the near-hard critic this refactor fixes).
         boot_value = hard_v_next.mean().detach()
         boot_entropy_bonus = (soft_v_next - hard_v_next).mean().detach()
         # Explained variance of the taken-action Q vs the bootstrap target across
@@ -737,25 +740,23 @@ class _SACQKernel(torch.nn.Module):
         # the marginal (the failure mode at the old value scale) sits at ev≈0; a
         # critic that tracks state-conditional value approaches 1. This is the
         # decisive health check for the value-scale / observability fix.
-        q1_full = self.qf1.bins_to_scalar(logits1).float()
-        y_f = y.float()
+        q1_full = v1 + adv1
         explained_var = (
             1.0 - (y_f - q1_full).var() / y_f.var().clamp_min(1e-8)
         ).detach()
         # Advantage EV: does the critic's ACTION-DEPENDENT part explain the
         # action-relevant residual of the target, or is `explained_var` above just
-        # the critic predicting its own (action-independent) state value? Decompose
-        # Q_taken = V(s) + adv_contrib with V = decode(nV) (the dueling baseline,
-        # zero policy gradient); strip the discounted next-state V baseline from y
-        # to isolate the residual the advantage SHOULD predict (reward + value
-        # change + the next-state entropy tilt). If the advantages are inert (the
-        # suspected failure — Q≈V, entropy_bonus_frac≈0), adv_contrib≈const ⇒
-        # adv_explained_var≈0 AND adv_spread≈0 even while explained_var≈1, proving
-        # the headline EV is vacuous self-prediction. adv_spread (real-units std of
-        # adv_contrib) disambiguates inert (≈0) from noisy-but-uncorrelated (large
-        # spread, low EV) — the two ways adv_explained_var can sit near 0.
-        v_only = self.qf1.bins_to_scalar(comp1.nV).float()
-        adv_contrib = q1_full - v_only
+        # the critic predicting its own (action-independent) state value? adv_contrib
+        # is the taken-action advantage directly (= Q_taken − V, the dueling
+        # baseline carries zero policy gradient); strip the discounted next-state V
+        # baseline from y to isolate the residual the advantage SHOULD predict
+        # (reward + value change + the next-state entropy bonus). If the advantages
+        # are inert (the suspected failure — Q≈V, entropy_bonus_frac≈0),
+        # adv_contrib≈const ⇒ adv_explained_var≈0 AND adv_spread≈0 even while
+        # explained_var≈1, proving the headline EV is vacuous self-prediction.
+        # adv_spread (real-units std of adv_contrib) disambiguates inert (≈0) from
+        # noisy-but-uncorrelated (large spread, low EV).
+        adv_contrib = adv1
         y_resid = y_f - self.gamma * (1.0 - done.float()) * v_only_next.float()
         adv_explained_var = (
             1.0 - (y_resid - adv_contrib).var() / y_resid.var().clamp_min(1e-8)
@@ -766,7 +767,7 @@ class _SACQKernel(torch.nn.Module):
             qf1_loss.detach(),
             qf2_loss.detach(),
             q1_full.mean().detach(),  # REAL value units
-            self.qf2.bins_to_scalar(logits2).mean().detach(),
+            (v2 + adv2).mean().detach(),
             boot_value,
             boot_entropy_bonus,
             explained_var,
@@ -782,13 +783,12 @@ class _SACActorKernel(torch.nn.Module):
     advantage `E_a[adv_j]` (A0 detached as a baseline, AL live for the pathwise
     fraction grad, launch_p/target_probs live for the discrete grad); the loss is
     `-(min_j E_a[adv_j] + α_d·H_disc + α_c·H_cont)`. The actor ascends the scalar
-    advantage DIRECTLY — not the value distribution it tilts — because the state
-    value V is action-independent (zero policy gradient) and routing the advantage
-    through the value softmax would make the value/entropy trade-off
-    state-dependent (the symlog Jacobian varies by state). The raw advantage is
-    linear, well-conditioned, and naturally O(1-10) (tilt-space), so a single
-    global α balances it everywhere. Returns the actor loss plus the detached
-    entropy bookkeeping the eager dual-alpha step consumes.
+    advantage DIRECTLY — the state value V is action-independent (zero policy
+    gradient), so only adv carries the gradient. adv is now in REAL ship-margin
+    units (the heads are tanh-bounded), the SAME units as the entropy bonus and the
+    bootstrap, so a single global α (per discrete/continuous) balances value vs
+    entropy identically in the actor and the critic target. Returns the actor loss
+    plus the detached entropy bookkeeping the eager dual-alpha step consumes.
     """
 
     def __init__(
@@ -833,7 +833,7 @@ class _SACActorKernel(torch.nn.Module):
                 comp = qf.components(feats, action.fraction, time_feat=time)
                 # nA0 detached (no-launch baseline), nAL live (pathwise fraction
                 # grad). nV is unused by the scalar advantage — the actor ascends
-                # `adv`, not the value distribution it would tilt.
+                # `adv`, the action-dependent part of Q; V is the fixed baseline.
                 comp_actor = QComponents(
                     nV=comp.nV.detach(), nA0=comp.nA0.detach(), nAL=comp.nAL
                 )
@@ -843,10 +843,9 @@ class _SACActorKernel(torch.nn.Module):
                     )
                 )
         # Pessimistic over twins on the SCALAR advantage (the action-dependent part
-        # of Q; the V baseline contributes no policy gradient). adv is linear and
-        # state-independent, so `adv + α·H` has a state-invariant value/entropy
-        # trade-off — a single global α balances it everywhere (unlike routing adv
-        # through the value softmax, whose slope varies by state).
+        # of Q; the V baseline contributes no policy gradient). adv is in real
+        # ship-margin units (tanh-bounded heads), the same units as α·H, so a single
+        # global α balances the value/entropy trade-off everywhere.
         adv_min = torch.minimum(adv_per_twin[0], adv_per_twin[1])
         soft_v = adv_min + alpha_d * action.H_disc + alpha_c * action.H_cont
         actor_loss = -soft_v.mean()
@@ -923,18 +922,20 @@ def _q_step(
 ) -> _QStats:
     """Twin-Q TD update against the soft Bellman target (factored critic).
 
-      soft_V' = min_j bins_to_scalar[ nV_j(s') + (adv_j + α_d·H'+α_c·H')·vs_j ]
-      y       = r + (1-d)·γ·soft_V'                           # REAL soft target
-      loss    = Σ_twin CE( target_probs(y), Q_logits_j(s, a_buffer) )
+      Q'_j    = bins_to_scalar(nV_j(s')) + E_a[adv_j](s')      # REAL units
+      soft_V' = min_j Q'_j + α_d·H' + α_c·H'                   # real-units bonus
+      y       = r + (1-d)·γ·soft_V'                            # REAL soft target
+      loss_j  = CE( target_probs(y), nV_j(s) )                 # value head
+              + Huber( adv_j(s, a_buffer), sg[y − V_j(s)] )    # advantage head
 
-    The entropy bonus enters in TILT space (added to the advantage before the
-    Esscher tilt + decode), so α is "value-per-nat in tilt space" consistently in
-    both the critic bootstrap and the actor objective — a single, well-scaled α.
-    The forward+loss runs inside the compiled `q_kernel` (autocast → FA-2); the
-    gradient clip and optimizer step stay eager. The critic is DISTRIBUTIONAL
-    (HL-Gauss two-hot over symlog bins): `y` is the standard real soft Bellman
-    target, encoded to bin probabilities and fit by cross-entropy. The decoded Q
-    is clamped to `[value_min, value_max]`, structurally bounding the bootstrap.
+    The entropy bonus enters in REAL units (cleanrl's `min_q + α·H`), the same
+    units as the actor's `adv + α·H`, so α is "value-per-nat" consistently in both
+    the critic bootstrap and the actor objective — a single, well-scaled α. The
+    forward+loss runs inside the compiled `q_kernel` (autocast → FA-2); the
+    gradient clip and optimizer step stay eager. The value head is DISTRIBUTIONAL
+    (HL-Gauss two-hot over symlog bins, decoded V clamped to
+    `[value_min, value_max]` ⇒ bounded bootstrap); the advantage heads are scalar,
+    tanh-bounded, and fit the residual `(y − V)` with V detached.
     """
     alpha_d = log_alpha_disc.exp().detach()
     alpha_c = log_alpha_cont.exp().detach()
@@ -1203,6 +1204,7 @@ def _build_policy_cfg(cfg: RunConfig) -> OrbitPolicyConfig:
         value_min=m.value_min,
         value_max=m.value_max,
         value_symlog=m.value_symlog,
+        adv_scale=m.adv_scale,
     )
     return pcfg
 
@@ -1837,10 +1839,10 @@ def _log_metrics(
     writer.add_scalar("losses/qf_grad_norm", m.qf_grad_norm, step)
     writer.add_scalar("losses/alpha_disc", m.alpha_disc, step)
     writer.add_scalar("losses/alpha_cont", m.alpha_cont, step)
-    # Soft-value scale consistency: the real-units entropy bonus the tilt-space
-    # α·H actually injects into the bootstrap target, vs the hard value it rides
-    # on. entropy_bonus_frac near 0 ⇒ a near-hard critic (the failure the
-    # tilt-space soft value fixes); a healthy fraction confirms the soft target.
+    # Soft-value scale consistency: the real-units entropy bonus α·H injected into
+    # the bootstrap target, vs the hard value it rides on. entropy_bonus_frac near
+    # 0 ⇒ a near-hard critic (the failure the real-units soft value fixes); a
+    # healthy fraction confirms the soft target carries meaningful entropy.
     writer.add_scalar("bootstrap/value", m.boot_value, step)
     writer.add_scalar("bootstrap/entropy_bonus", m.boot_entropy_bonus, step)
     writer.add_scalar(

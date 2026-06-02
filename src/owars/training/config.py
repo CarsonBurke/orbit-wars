@@ -42,6 +42,9 @@ class ModelCfg:
     value_min: float = -100_000.0
     value_max: float = 100_000.0
     value_symlog: bool = True
+    # Real-units bound on the per-planet SAC advantage heads (see
+    # OrbitPolicyConfig.adv_scale): each head emits adv_scale·tanh(raw/adv_scale).
+    adv_scale: float = 40.0
 
 
 @dataclass
@@ -159,15 +162,15 @@ class SACCfg:
 
     SAC treatment: discrete-SAC (closed-form Bernoulli+categorical entropy) for
     launch+target; cleanrl reparameterized tanh-Normal for the fraction. The
-    critic is FACTORED (dueling) and DISTRIBUTIONAL: the state value V is an
-    HL-Gauss two-hot distribution over symlog-spaced bins, and per-planet scalar
-    advantages A_i(s, a_i) TILT that distribution in logit space
-    (Q_logits = n·V + adv·value_shift). Because the scalar adv = Σ_i A_i is
+    critic is FACTORED (dueling) in REAL ship-margin units,
+    `Q(s, a) = V(s) + Σ_i A_i(s, a_i)`: V = bins_to_scalar of an HL-Gauss two-hot
+    distribution over symlog-spaced bins, and the per-planet advantages A_i are
+    scalar and tanh-bounded (±`adv_scale`). Because the scalar adv = Σ_i A_i is
     LINEAR in the policy probs, the soft-value expectation E_a[Q] stays
     closed-form — so the launch/target gradient is EXACT (no REINFORCE / no
     score-function baseline); only the fraction uses the pathwise/reparam
-    gradient. The actor ascends the scalar advantage (which is monotone in the
-    decoded Q), treating V as an action-independent baseline.
+    gradient. The actor ascends the scalar advantage directly, treating V as an
+    action-independent baseline.
 
     Two entropy temperatures are tuned independently: `alpha_discrete` for the
     launch+target factors and `alpha_continuous` for the fraction.
@@ -373,6 +376,8 @@ class RunConfig:
             raise ValueError(f"model.{exc}") from exc
         if cfg.model.value_min >= cfg.model.value_max:
             raise ValueError("model.value_min must be less than model.value_max")
+        if cfg.model.adv_scale <= 0.0:
+            raise ValueError("model.adv_scale must be positive")
         if cfg.reward.production_weight < 0.0:
             raise ValueError("reward.production_weight must be non-negative")
         if not 0.0 <= cfg.sac.builtin_prob <= 1.0:

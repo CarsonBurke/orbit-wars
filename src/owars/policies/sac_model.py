@@ -36,13 +36,15 @@ planets, with each planet's per-option advantage enumerable:
     optimal fraction exists; a monotone AL would collapse f→0/1).
 This makes the soft-V expectation `Σ_a π(a)·Q(s,a)` tractable in closed form
 (no REINFORCE): the discrete policy gradient is exact and baseline-free, the
-fraction uses the pathwise/reparam gradient. The state value is **distributional**
-(HL-Gauss two-hot over symlog bins); the per-planet advantages stay scalar and
-tilt the value distribution in logit space (`Q_logits = nV + adv·value_shift`,
-`adv` linear in the policy probs so the closed-form expectation survives). The
-decoded `bins_to_scalar(Q_logits)` is clamped to `[value_min, value_max]`, which
-structurally bounds Q — the scalar+symlog-MSE critic it replaces had a loss whose
-gradient vanished at large |Q|, letting the deadly-triad bootstrap run away.
+fraction uses the pathwise/reparam gradient. The split is in REAL ship-margin
+units: `Q(s,a) = V(s) + adv(s,a)`. `V(s) = bins_to_scalar(nV)` is decoded from a
+**distributional** HL-Gauss two-hot head over symlog bins (clamped to
+`[value_min, value_max]`, which structurally bounds the bootstrap — the
+scalar+symlog-MSE critic it replaces had a loss whose gradient vanished at large
+|Q|, letting the deadly-triad bootstrap run away). The per-planet advantages are
+scalar and tanh-bounded to ±`adv_scale`, so `adv = Σ_i A_i` is bounded and linear
+in the policy probs (the closed-form expectation survives). The tanh bound — not
+a logit-space tilt — is what anchors the dueling V/A split.
 
 `get_action` returns the differentiable closed-form quantities the trainer
 needs: `launch_p`, `target_probs`, the reparam `fraction` + its per-planet
@@ -586,16 +588,14 @@ class QComponents:
     """Per-twin factored critic outputs for the distributional dueling critic.
 
     `nV` is the dueling state-value DISTRIBUTION as bin logits; `nA0` the
-    per-planet no-launch advantage (scalar); `nAL` the per-(source, target)
-    launch advantage (scalar) at the supplied fraction. `assemble_*` combines
-    them in LOGIT space: the scalar advantage `adv(s,a) = Σ_i g_i[…]` is linear
-    in the policy probs (that linearity is the closed-form `E_a[Q]`), and the
-    assembled Q distribution is `softmax(nV + adv · value_shift)` — an Esscher
-    tilt of the value distribution along the FIXED `value_shift` template (∝ bin
-    centers), which guarantees the decoded Q is monotone in adv. The decoded
-    scalar `bins_to_scalar(logits)` is structurally bounded to
-    `[value_min, value_max]`, which is what stops the bootstrap from diverging.
-    The `n` prefix is historical (not normalized).
+    per-planet no-launch advantage (scalar, tanh-bounded); `nAL` the
+    per-(source, target) launch advantage (scalar, tanh-bounded) at the supplied
+    fraction. `taken_advantage`/`expected_advantage` reduce them to the real-units
+    scalar `adv(s,a) = Σ_i g_i[…]`, linear in the policy probs (that linearity is
+    the closed-form `E_a[adv]`). The real-units Q is `bins_to_scalar(nV) + adv`:
+    the decoded V is structurally bounded to `[value_min, value_max]` and adv to
+    ±n_owned·adv_scale, so the bootstrap cannot diverge. The `n` prefix is
+    historical (not normalized).
     """
 
     nV: torch.Tensor    # [B, num_bins]  value-distribution logits
@@ -609,24 +609,21 @@ class SACSoftQ(nn.Module):
     State-only set-transformer encoder (no action conditioning at the input) →
     per-planet reps + summary. The dueling state value is DISTRIBUTIONAL — an
     HL-Gauss head emits logits over `value_num_bins` symlog-spaced bins (Dreamer
-    two-hot encoding); the advantages stay scalar:
+    two-hot encoding); the advantages are scalar and tanh-bounded:
       - `value_head(summary)` → nV  [B, num_bins]  (value-distribution logits)
-      - `noop_head(planet_h)` → nA0 [B, P]         (scalar no-launch advantage)
-      - K-basis fraction target attention → nAL [B, P, P] (scalar launch advantage)
+      - `noop_head(planet_h)` → nA0 [B, P]   (scalar no-launch adv, ±adv_scale)
+      - K-basis fraction target attention → nAL [B, P, P] (launch adv, ±adv_scale)
 
-    `assemble_*` combines them in LOGIT space: the scalar advantage
-    `adv(s, a) = Σ_i g_i[(1-l_i)nA0_i + l_i nAL_i[t_i]]` is linear in the policy
-    probs (the closed-form `E_a[Q]`, no REINFORCE), and the assembled Q
-    distribution is `softmax(nV + adv · value_shift)` — an Esscher (exponential)
-    tilt of the value distribution along the FIXED `value_shift` ∝ bin centers.
-    Because value_shift is a positive multiple of the centers c, `dE_Q[c]/d(adv) =
-    Var_Q[c] ≥ 0`, so the decoded Q is provably monotone in adv (keeping the actor,
-    which ascends adv, aligned with this decode). The decoded scalar
-    `bins_to_scalar(logits)` is structurally bounded to `[value_min, value_max]`,
-    so the bootstrap cannot diverge (this replaces the old symlog-MSE scalar Q,
-    whose loss vanished at large |Q| and let the deadly triad run away). The bare
-    `nV` head is NOT `E_π[Q]` (no V/A identifiability constraint) — read value
-    only off the assembled Q, never off `value()` alone.
+    `taken_advantage`/`expected_advantage` reduce them to the real-units scalar
+    `adv(s, a) = Σ_i g_i[(1-l_i)nA0_i + l_i nAL_i[t_i]]`, linear in the policy
+    probs (the closed-form `E_a[adv]`, no REINFORCE). The real-units Q is
+    `V(s) + adv` with `V(s) = bins_to_scalar(nV)`: V learns the full TD target via
+    HL-Gauss CE, adv learns the residual `(y − V)` (V detached) via a Huber loss,
+    and the tanh bound on the per-planet heads anchors the V/A split (no
+    centering). Decoded V is clamped to `[value_min, value_max]` and adv to
+    ±n_owned·adv_scale, so the bootstrap cannot diverge (this replaces the old
+    symlog-MSE scalar Q, whose loss vanished at large |Q| and let the deadly triad
+    run away).
 
     The launch advantage is `nAL_i[t] = Σ_k S_k(i, t)·φ_k(f_i)` with
     `φ(f) = [1, f, f², f³]` (cubic in the fraction so an interior optimal
@@ -640,6 +637,8 @@ class SACSoftQ(nn.Module):
         self.encoder = SACEncoder(cfg)
         d = cfg.dim
         self.k_basis = _FRAC_BASIS_K
+        # Real-units bound on each per-planet advantage head (tanh saturation).
+        self.adv_scale = float(cfg.adv_scale)
 
         # Distributional value support (symlog two-hot bins over the raw range).
         self.hlgauss = HLGaussLoss(
@@ -675,24 +674,6 @@ class SACSoftQ(nn.Module):
         nn.init.zeros_(self.adv_query.weight)
         nn.init.orthogonal_(self.adv_key.weight, gain=0.05)
 
-        # Advantage→logit tilt template, FIXED to the normalized symlog bin
-        # centers (a positive multiple of `centers`). The scalar advantage tilts
-        # the value distribution along this direction: P_Q(i) ∝ P_V(i)·exp(adv·
-        # value_shift_i) — the Esscher / exponential tilt. With value_shift ∝
-        # centers c, `dE_Q[c]/d(adv) = Var_Q[c]/κ ≥ 0`, so the decoded Q is
-        # GUARANTEED monotone increasing in adv (the actor ascends adv, so this
-        # keeps the actor aligned with the critic's own decoded bootstrap). A
-        # *learned* template would give `Cov_Q[c, w]`, which can flip sign and
-        # silently decouple the two — so it is a non-learned buffer. (One unit of
-        # adv is a *relative* raw-value shift ≈ (1+|Q|)·Var_Q[c]/κ, not additive
-        # ships — symlog-space tilt; don't read adv as an absolute ship count.)
-        centers = self.hlgauss.encoder.centers.float()
-        self.register_buffer(
-            "value_shift",
-            (centers / centers.abs().max().clamp_min(1e-8)).clone(),
-            persistent=False,
-        )
-
     def encode(
         self, feats: EncodedObs, *, time_feat: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -704,8 +685,13 @@ class SACSoftQ(nn.Module):
         return self.value_head(summary_h).float()
 
     def noop_adv(self, planet_h: torch.Tensor) -> torch.Tensor:
-        """Scalar no-launch advantage nA0 [B, P]."""
-        return self.noop_head(planet_h).squeeze(-1).float()
+        """Scalar no-launch advantage nA0 [B, P], tanh-bounded to ±adv_scale
+        (real ship-margin units). Bounding the PER-PLANET head (not the summed
+        advantage) preserves the linear-in-probs closed form, so the summed
+        advantage stays exactly enumerable while confined to ±n_owned·adv_scale.
+        """
+        a = self.noop_head(planet_h).squeeze(-1).float()
+        return self.adv_scale * torch.tanh(a / self.adv_scale)
 
     def bins_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
         """Decode value-distribution logits → REAL value, clamped to the support
@@ -734,8 +720,10 @@ class SACSoftQ(nn.Module):
         # S[b,i,t,k] = (q[b,i,k]·k[b,t,k]) / sqrt(d)
         scores = torch.einsum("bikd,btkd->bitk", q, k) / (d**0.5)  # [B,P,P,K]
         phi = _fraction_basis(fraction)  # [B,P,K]
-        nAL = torch.einsum("bitk,bik->bit", scores, phi)  # [B,P,P]
-        return nAL.float()
+        nAL = torch.einsum("bitk,bik->bit", scores, phi).float()  # [B,P,P]
+        # Same tanh bound as noop_adv: per-(source,target) head confined to
+        # ±adv_scale, so the launch advantage shares the no-launch head's units.
+        return self.adv_scale * torch.tanh(nAL / self.adv_scale)
 
     def components(
         self,
@@ -745,11 +733,11 @@ class SACSoftQ(nn.Module):
         time_feat: torch.Tensor | None = None,
     ) -> QComponents:
         """Factored components at the supplied per-source `fraction`: value
-        distribution logits + scalar advantages.
+        distribution logits + tanh-bounded scalar advantages.
 
-        `assemble_*` tilt the value distribution by the scalar advantage (linear
-        in the policy probs ⇒ closed-form expectation). No symexp — the heads now
-        produce a distribution (value) and raw scalar advantages.
+        `taken_advantage` / `expected_advantage` reduce these to the real-units
+        scalar advantage `adv = Σ_i A_i` (linear in the policy probs ⇒ closed-form
+        expectation). The real-units Q is `bins_to_scalar(nV) + adv`.
         """
         planet_h, summary_h = self.encode(feats, time_feat=time_feat)
         if fraction.dim() == 1:
@@ -759,18 +747,6 @@ class SACSoftQ(nn.Module):
             nA0=self.noop_adv(planet_h),
             nAL=self.launch_adv(planet_h, summary_h, fraction),
         )
-
-
-def _tilt_logits(
-    nV: torch.Tensor, adv: torch.Tensor, value_shift: torch.Tensor
-) -> torch.Tensor:
-    """Assembled Q-distribution logits = nV + adv·value_shift.
-
-    `nV` is [B, num_bins], `adv` the [B] scalar advantage, `value_shift` the
-    [num_bins] tilt template. The scalar advantage slides the value distribution
-    along `value_shift`; the decoded scalar stays bounded to the support.
-    """
-    return nV + adv.unsqueeze(-1) * value_shift
 
 
 def taken_advantage(
@@ -804,12 +780,12 @@ def expected_advantage(
 ) -> torch.Tensor:
     """Scalar expected advantage `adv = Σ_i g_i[(1-p_i)nA0_i + p_i·Σ_t π_t(i)·
     nAL_i[t]]` [B], LINEAR in the policy probs (the closed-form `E_a[adv]`, no
-    REINFORCE). This is the action-dependent part of Q the actor ascends directly
-    — well-conditioned and state-independent, unlike routing it through the value
-    distribution's softmax. `comp.nAL` must be built at the policy's reparam
-    fraction; the caller controls detachment (nA0 detached as a baseline, nAL live
-    for the pathwise fraction grad, launch_p/target_probs live for the discrete
-    grad).
+    REINFORCE). In real ship-margin units (the heads are tanh-bounded), this is the
+    action-dependent part of Q the actor ascends directly: `Q = V(s) + adv`, so a
+    single real-units α balances the value and entropy terms. `comp.nAL` must be
+    built at the policy's reparam fraction; the caller controls detachment (nA0
+    detached as a baseline, nAL live for the pathwise fraction grad,
+    launch_p/target_probs live for the discrete grad).
     """
     if launch_p.dim() == 1:
         launch_p = launch_p.unsqueeze(0)
@@ -820,47 +796,13 @@ def expected_advantage(
     return (g * ((1.0 - launch_p) * comp.nA0 + launch_p * al_exp)).sum(-1)  # [B]
 
 
-def assemble_taken(
-    comp: QComponents,
-    launch: torch.Tensor,
-    target_idx: torch.Tensor,
-    owned_mask: torch.Tensor,
-    value_shift: torch.Tensor,
-) -> torch.Tensor:
-    """Q-distribution logits [B, num_bins] for the taken action: tilt the value
-    distribution by the scalar advantage, `logits = nV + adv·value_shift`. Decode
-    with `bins_to_scalar` for a bounded real Q, or CE against `target_probs(y)`
-    for the TD loss. (The actor uses `taken_advantage`/`expected_advantage`
-    directly — it ascends the scalar advantage, not the tilted distribution.)
-    """
-    adv = taken_advantage(comp, launch, target_idx, owned_mask)
-    return _tilt_logits(comp.nV, adv, value_shift)
-
-
-def assemble_expected(
-    comp: QComponents,
-    launch_p: torch.Tensor,
-    target_probs: torch.Tensor,
-    owned_mask: torch.Tensor,
-    value_shift: torch.Tensor,
-) -> torch.Tensor:
-    """Expected Q-distribution logits [B, num_bins] under the factored policy:
-    `logits = nV + E_a[adv]·value_shift`, the tilt used by the critic's TD target
-    (decode with `bins_to_scalar`). The closed-form expectation lives in the
-    scalar `expected_advantage`.
-    """
-    adv = expected_advantage(comp, launch_p, target_probs, owned_mask)
-    return _tilt_logits(comp.nV, adv, value_shift)
-
-
 def make_targets(qf: SACSoftQ) -> SACSoftQ:
     """Build an EMA target network that mirrors `qf`'s parameters exactly.
 
-    `SACSoftQ(qf.cfg)` reconstructs the non-persistent buffers (HLGauss support
-    and `value_shift`) identically by config, so they need no copying;
-    `load_state_dict` copies the learned parameters. `value_shift` is a fixed
-    buffer (not a parameter), so `polyak_update` correctly leaves it untouched —
-    it is the same constant in the online and target nets.
+    `SACSoftQ(qf.cfg)` reconstructs the non-persistent HLGauss support buffer
+    identically by config, so it needs no copying; `load_state_dict` copies the
+    learned parameters. `polyak_update` walks only parameters, so that buffer (the
+    same constant in online and target nets) is correctly left untouched.
     """
     target = SACSoftQ(qf.cfg)
     target.load_state_dict(qf.state_dict())
@@ -883,8 +825,6 @@ __all__ = [
     "SACActor",
     "SACEncoder",
     "SACSoftQ",
-    "assemble_expected",
-    "assemble_taken",
     "expected_advantage",
     "make_targets",
     "polyak_update",

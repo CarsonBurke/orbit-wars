@@ -75,6 +75,15 @@ class OrbitPolicyConfig:
     value_min: float = -100_000.0
     value_max: float = 100_000.0
     value_symlog: bool = True
+    # Real-units bound on the per-planet SAC advantage heads: each head emits
+    # `adv_scale·tanh(raw/adv_scale)`, so a single planet's launch/no-launch
+    # advantage is confined to ±adv_scale ship-margin units and the summed
+    # advantage to ±n_owned·adv_scale. The tanh bound (rather than logit-space
+    # tilt) is what anchors the dueling V/A split: V carries the state baseline,
+    # adv the bounded action-dependent residual. Sized for headroom over the
+    # per-capture margin tail (~30 ships); raise toward 60 if `adv_spread`
+    # saturates near the bound.
+    adv_scale: float = 40.0
 
     def to_dict(self) -> dict:
         return asdict(self)

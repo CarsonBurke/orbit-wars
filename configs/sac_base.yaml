@@ -9,20 +9,22 @@
 #     closed-form launch+target policy gradient (no REINFORCE), reparam
 #     tanh-Normal for the fraction, with two independently-tuned temperatures
 #     (alpha_discrete, alpha_continuous).
-#   - The critic is FACTORED (dueling) and DISTRIBUTIONAL: the state value is an
-#     HL-Gauss two-hot distribution over symlog-spaced bins; the per-planet
-#     advantages A_i(s, a_i) are scalar and TILT that distribution in logit space
-#     (Q_logits = nV + adv·value_shift). The scalar adv = Σ_i A_i is linear in the
-#     policy probs, so the soft-value expectation stays tractable in closed form
-#     (no REINFORCE). The TD loss is cross-entropy against the two-hot encoding of
-#     the REAL soft Bellman target y, decoded (and bootstrapped) via bins_to_scalar
-#     clamped to [value_min, value_max] — so the heavy-tailed potential (Φ spikes
-#     by production·turns_left, O(10³)) cannot make the bootstrap diverge (the
-#     scalar symlog-MSE critic this replaces had a loss whose gradient vanished at
-#     large |Q|, letting the deadly triad run Q away to ~1e12). The ACTOR ascends
-#     the scalar advantage directly (min_j E[adv_j] + α·H), not the value
-#     distribution it tilts: V is an action-independent baseline, and adv is
-#     linear/state-independent so a single global α balances value vs entropy.
+#   - The critic is FACTORED (dueling) in REAL ship-margin units:
+#     Q(s,a) = V(s) + adv(s,a). V(s) = bins_to_scalar(nV) is decoded from an
+#     HL-Gauss two-hot distribution over symlog-spaced bins (clamped to
+#     [value_min, value_max], so the bootstrap cannot diverge — the scalar
+#     symlog-MSE critic this replaces had a loss whose gradient vanished at large
+#     |Q|, letting the deadly triad run Q away to ~1e12). adv = Σ_i A_i is the
+#     summed per-planet advantage, each head tanh-bounded to ±adv_scale (so adv is
+#     bounded ±n_owned·adv_scale) and LINEAR in the policy probs, so the soft-value
+#     expectation stays closed-form (no REINFORCE). The TD loss is split: V learns
+#     the full target y via cross-entropy against its two-hot encoding; adv learns
+#     the residual (y − V), V detached, via a Huber loss — orthogonal heads, the
+#     tanh bound alone anchoring the V/A split (no centering). The ACTOR ascends
+#     the real-units advantage directly (min_j E[adv_j] + α·H): V is an
+#     action-independent baseline, and adv is now in the SAME units as the reward,
+#     so a single real-units α balances value vs entropy in actor and bootstrap
+#     alike (no symlog-Jacobian state dependence to decouple them).
 #   - Three independent set-transformer networks (actor, qf1, qf2) plus
 #     EMA target copies of qf1/qf2. cleanrl convention; no shared trunk.
 #   - Adam everywhere (Muon is not applied for SAC in this branch — the
@@ -79,6 +81,11 @@ model:
   value_max: 1000.0
   value_num_bins: 153
   value_symlog: true
+  # Real-units bound on the per-planet advantage heads: each emits
+  # adv_scale·tanh(raw/adv_scale), so the summed advantage is ±n_owned·adv_scale
+  # ship-margin units. 40 gives headroom over the per-capture margin tail
+  # (~30 ships); watch losses/adv_spread — raise toward 60 if it saturates.
+  adv_scale: 40.0
 
 optim:
   # SAC uses Adam for everything; muon_* / head_lr / control_lr in this section
