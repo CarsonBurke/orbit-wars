@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import copy
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -164,3 +164,33 @@ class OpponentPool:
             return OpponentSlot(name=LEARNER_NAME, agent=None)
         name = self.rng.choice(self.snapshot_names())
         return OpponentSlot(name=name, agent=self._frozen[name])
+
+
+class FixedOpponentPool:
+    """Static builtin-opponent sampler with the `OpponentPool` rollout API."""
+
+    def __init__(
+        self,
+        opponent_names: Sequence[str],
+        rng: random.Random | None = None,
+    ):
+        unknown = set(opponent_names) - set(BUILTIN)
+        if unknown:
+            raise ValueError(
+                f"unknown fixed opponents {sorted(unknown)}; "
+                f"valid: {sorted(BUILTIN)}"
+            )
+        if not opponent_names:
+            raise ValueError("fixed opponent mode requires at least one opponent")
+        self.opponent_names = list(opponent_names)
+        self.rng = rng or random.Random()
+
+    def sample(self, k: int) -> list[OpponentSlot]:
+        return [self._sample_one() for _ in range(k)]
+
+    def _sample_one(self) -> OpponentSlot:
+        name = self.rng.choice(self.opponent_names)
+        return OpponentSlot(name=name, agent=BUILTIN[name])
+
+    def snapshot_names(self) -> list[str]:
+        return []

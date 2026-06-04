@@ -79,6 +79,7 @@ struct RustCoreVecEnv {
     episode_steps: i32,
     ship_speed: f64,
     random_seed: u32,
+    reset_counts: Vec<u32>,
 }
 
 #[pymethods]
@@ -99,8 +100,9 @@ impl RustCoreVecEnv {
             episode_steps,
             ship_speed,
             random_seed,
+            reset_counts: vec![0; num_envs],
         };
-        env.reset_core();
+        env.reset_core(false);
         env
     }
 
@@ -110,7 +112,26 @@ impl RustCoreVecEnv {
     }
 
     fn reset(&mut self) {
-        self.reset_core();
+        self.reset_core(true);
+    }
+
+    fn reset_subset(&mut self, indices: Vec<usize>) -> PyResult<()> {
+        for env_idx in indices {
+            if env_idx >= self.games.len() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "env index out of range",
+                ));
+            }
+            self.games[env_idx] = Game::new(
+                GameConfig::new(self.num_players, self.episode_steps, self.ship_speed),
+                self.random_seed
+                    + env_idx as u32
+                    + self.reset_counts[env_idx] * self.num_envs as u32,
+            );
+            self.reset_counts[env_idx] += 1;
+            self.legal_mask_cache[env_idx] = None;
+        }
+        Ok(())
     }
 
     fn step_subset_fast<'py>(
@@ -584,15 +605,20 @@ impl RustCoreVecEnv {
         Ok(out.into_pyarray(py))
     }
 
-    fn reset_core(&mut self) {
-        self.games = (0..self.num_envs)
-            .map(|idx| {
-                Game::new(
-                    GameConfig::new(self.num_players, self.episode_steps, self.ship_speed),
-                    self.random_seed + idx as u32,
-                )
-            })
-            .collect();
+    fn reset_core(&mut self, advance_counts: bool) {
+        let mut games = Vec::with_capacity(self.num_envs);
+        for idx in 0..self.num_envs {
+            let seed =
+                self.random_seed + idx as u32 + self.reset_counts[idx] * self.num_envs as u32;
+            if advance_counts {
+                self.reset_counts[idx] += 1;
+            }
+            games.push(Game::new(
+                GameConfig::new(self.num_players, self.episode_steps, self.ship_speed),
+                seed,
+            ));
+        }
+        self.games = games;
         self.legal_mask_cache = vec![None; self.games.len()];
     }
 

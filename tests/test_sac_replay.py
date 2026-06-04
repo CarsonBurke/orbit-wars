@@ -11,7 +11,8 @@ from __future__ import annotations
 import torch
 
 from owars.policies.features import MAX_FLEETS, MAX_PLANETS, EncodedObs
-from owars.training.sac import ReplayBuffer, _ReplayPrefetcher
+from owars.training.config import RunConfig
+from owars.training.sac import ReplayBuffer, _ReplayPrefetcher, _builtin_opponent_slate
 
 PLANET_FEATURES = 19
 FLEET_FEATURES = 20
@@ -111,3 +112,22 @@ def test_prefetcher_cpu_fallback_yields_independent_batches() -> None:
     assert b2.reward.shape == (8,)
     # Two independent uniform draws should (almost surely) differ.
     assert not torch.equal(b1.reward, b2.reward)
+
+
+def test_fixed_mode_overrides_sac_builtin_slate() -> None:
+    cfg = RunConfig.from_dict(
+        {
+            "opponents": {
+                "mode": "fixed",
+                "fixed_opponents": ["sniper"],
+            },
+            "sac": {
+                "builtin_opponents": ["random", "heuristic"],
+                "builtin_prob": 0.25,
+            },
+        }
+    )
+
+    names, prob = _builtin_opponent_slate(cfg)
+    assert names == ["sniper"]
+    assert prob == 1.0

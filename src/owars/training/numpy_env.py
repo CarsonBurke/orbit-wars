@@ -1054,6 +1054,8 @@ class NumpyVecEnv:
         self.episode_steps = episode_steps
         self.ship_speed = ship_speed
         self.comet_speed = comet_speed
+        self.random_seed = random_seed
+        self.reset_count = np.zeros(num_envs, dtype=np.int64)
         self.envs = [
             NumpyOrbitWarsEnv(
                 num_players=num_players,
@@ -1084,9 +1086,17 @@ class NumpyVecEnv:
         self._planet_slot_cache: list[dict[int, int] | None] = [None] * num_envs
         self._initial_planet_slot_cache: list[dict[int, int] | None] = [None] * num_envs
 
+    def _reset_seed(self, idx: int) -> int | None:
+        if self.random_seed is None:
+            return None
+        return int(self.random_seed + idx + self.reset_count[idx] * self.num_envs)
+
     def reset(self) -> list[list[dict[str, Any]]]:
         self.last_replay_html = None
-        states = [env.reset() for env in self.envs]
+        states = []
+        for idx, env in enumerate(self.envs):
+            states.append(env.reset(seed=self._reset_seed(idx)))
+            self.reset_count[idx] += 1
         self.planet_mask.fill(False)
         self.initial_planet_mask.fill(False)
         self.initial_orbit_radius.fill(0.0)
@@ -1104,6 +1114,21 @@ class NumpyVecEnv:
             self._store_env(i, env)
         self.last_states = states
         return states
+
+    def reset_subset(self, indices: list[int]) -> dict[int, list[dict[str, Any]]]:
+        self.last_replay_html = None
+        out: dict[int, list[dict[str, Any]]] = {}
+        for idx in indices:
+            state = self.envs[idx].reset(seed=self._reset_seed(idx))
+            self.reset_count[idx] += 1
+            self._store_env(idx, self.envs[idx])
+            if idx >= len(self.last_states):
+                self.last_states.extend(
+                    [[] for _ in range(idx + 1 - len(self.last_states))]
+                )
+            self.last_states[idx] = state
+            out[idx] = state
+        return out
 
     def step_subset(
         self, indices: list[int], actions: list[Any]
@@ -1386,6 +1411,9 @@ class NumpyVecEnv:
     def observation(self, idx: int, player: int) -> dict[str, Any]:
         """Materialize one player observation for non-learner Python agents."""
         return self._observation(idx, player, self._observation_base(idx))
+
+    def observations(self, rows: list[tuple[int, int]]) -> list[dict[str, Any]]:
+        return [self.observation(int(idx), int(player)) for idx, player in rows]
 
     def reward_potentials(
         self,

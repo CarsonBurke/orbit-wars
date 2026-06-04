@@ -38,10 +38,12 @@ Orbit Wars-specific adaptations vs cleanrl `sac_continuous_action.py`:
   actor optimizes and the critic conditions on, NOT the env-materialized
   launch — `target_idx[P]`, `fraction[P]`) plus the legal-target masks for s
   and s' (the q-step samples a'~π(·|s') and must mask to s' legal support).
-* Self-play uses the LIVE model only: per episode the opponent seat is either a
-  builtin baseline (prob `builtin_prob`) or the current learner itself — no
-  frozen snapshot copies are kept. `league.py` is used only for Elo
-  bookkeeping. Only learner-seat transitions are pushed to replay.
+* Self-play uses the LIVE model only: in league mode the opponent seat is
+  either a builtin baseline (prob `builtin_prob`) or the current learner
+  itself. In fixed mode every opponent is sampled from
+  `opponents.fixed_opponents`. No frozen snapshot copies are kept. `league.py`
+  is used only for Elo bookkeeping. Only learner-seat transitions are pushed to
+  replay.
 """
 
 from __future__ import annotations
@@ -82,10 +84,17 @@ from ..policies.sac_sampling import (
     sample_batch_actions_raw,
     sample_batch_with_records_raw,
 )
+from ..policies.sampling import (
+    SampleBatchRecord,
+    SampleRecord,
+    sample_batch_with_records_context,
+)
 from .config import RunConfig
 from .elo import EloTracker
 from .league import BUILTIN, LEARNER_NAME, OpponentPool
+from .numpy_env import NumpyVecEnv
 from .rollout import _obs_production_margin
+from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
 
 
@@ -1209,6 +1218,136 @@ def _build_policy_cfg(cfg: RunConfig) -> OrbitPolicyConfig:
     return pcfg
 
 
+def _builtin_opponent_slate(cfg: RunConfig) -> tuple[list[str], float]:
+    """Return SAC builtin opponent names and sampling probability."""
+    if cfg.opponents.mode == "fixed":
+        return list(cfg.opponents.fixed_opponents), 1.0
+    return list(cfg.sac.builtin_opponents), cfg.sac.builtin_prob
+
+
+def _make_vec_env(cfg: RunConfig) -> Any:
+    vec_kwargs = dict(
+        num_envs=max(1, cfg.rollout.num_envs),
+        num_players=cfg.game.num_players,
+        episode_steps=cfg.game.episode_steps,
+        ship_speed=cfg.game.ship_speed,
+    )
+    backend = cfg.rollout.env_backend
+    if backend == "numpy":
+        return NumpyVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
+            random_seed=cfg.run.seed,
+        )
+    if backend == "numpy_mp":
+        return ShardedNumpyVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
+            num_workers=cfg.rollout.num_workers,
+            random_seed=cfg.run.seed,
+        )
+    if backend == "rust":
+        from .rust_env import RustVecEnv
+
+        return RustVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
+            random_seed=cfg.run.seed,
+        )
+    if backend == "kaggle":
+        return VecEnv(**vec_kwargs, replay_env_idx=None)
+    raise ValueError(f"unknown rollout.env_backend: {backend!r}")
+
+
+def _observations_for_rows(
+    vec: Any,
+    states: list[Any],
+    rows: list[tuple[int, int]],
+) -> list[Any]:
+    observations = getattr(vec, "observations", None)
+    if callable(observations):
+        return observations(rows)
+    return [states[env_idx][seat]["observation"] for env_idx, seat in rows]
+
+
+def _encoded_to(feats: EncodedObs, device: torch.device | str) -> EncodedObs:
+    return EncodedObs(
+        planet_feats=feats.planet_feats.to(device),
+        planet_mask=feats.planet_mask.to(device),
+        planet_owned_mask=feats.planet_owned_mask.to(device),
+        planet_ids=feats.planet_ids.to(device),
+        planet_garrison=feats.planet_garrison.to(device),
+        fleet_feats=feats.fleet_feats.to(device),
+        fleet_mask=feats.fleet_mask.to(device),
+    )
+
+
+def _policy_inputs_for_rows(
+    vec: Any,
+    states: list[Any],
+    rows: list[tuple[int, int]],
+    *,
+    episode_steps: int,
+    device: torch.device,
+) -> tuple[list[Any], EncodedObs, list[Any] | None, torch.Tensor]:
+    obs = _observations_for_rows(vec, states, rows)
+    policy_batch = getattr(vec, "policy_batch", None)
+    if callable(policy_batch):
+        enc, contexts = policy_batch(rows, device=str(device), pin_memory=True)
+        enc = _encoded_to(enc, device)
+        return obs, enc, contexts, _time_feat_from_obs(obs, episode_steps, device)
+    enc = encode_raw_observations(obs, device=device)
+    return obs, enc, None, _time_feat_from_obs(obs, episode_steps, device)
+
+
+def _record_batch_to_list(records: SampleBatchRecord) -> list[SampleRecord]:
+    out: list[SampleRecord] = []
+    for i in range(records.launch.shape[0]):
+        out.append(
+            SampleRecord(
+                launch=records.launch[i],
+                raw_launch=records.raw_launch[i],
+                target_idx=records.target_idx[i],
+                fraction=records.fraction[i],
+                log_prob=records.log_prob[i],
+                target_legal_mask=records.target_legal_mask[i],
+            )
+        )
+    return out
+
+
+def _records_to_cpu_list(
+    records: list[SampleRecord] | SampleBatchRecord,
+) -> list[SampleRecord]:
+    if isinstance(records, SampleBatchRecord):
+        records = _record_batch_to_list(records)
+    return [record_to_cpu(r) for r in records]
+
+
+def _sample_actions_with_records(
+    vec: Any,
+    out: Any,
+    rows: list[tuple[int, int]],
+    obs: list[Any],
+    contexts: list[Any] | None,
+    *,
+    deterministic: bool = False,
+) -> tuple[list[Any], list[SampleRecord]]:
+    native_sampler = getattr(vec, "sample_batch_with_records", None)
+    if callable(native_sampler):
+        actions, records = native_sampler(out, rows, deterministic=deterministic)
+        return actions, _records_to_cpu_list(records)
+    if contexts is not None:
+        actions, records = sample_batch_with_records_context(
+            out, contexts, deterministic=deterministic
+        )
+        return actions, _records_to_cpu_list(records)
+    actions, records = sample_batch_with_records_raw(
+        out, obs, deterministic=deterministic
+    )
+    return actions, _records_to_cpu_list(records)
+
+
 def _build_state(cfg: RunConfig, device: torch.device) -> SACState:
     pcfg = _build_policy_cfg(cfg)
     sac = cfg.sac
@@ -1292,7 +1431,8 @@ def _build_state(cfg: RunConfig, device: torch.device) -> SACState:
         k_factor=cfg.opponents.k_factor,
     )
     elo.set(LEARNER_NAME, cfg.opponents.initial_rating)
-    builtin_agents = {name: BUILTIN[name] for name in sac.builtin_opponents}
+    builtin_names, builtin_prob = _builtin_opponent_slate(cfg)
+    builtin_agents = {name: BUILTIN[name] for name in builtin_names}
     for name in builtin_agents:
         elo.set(name, cfg.opponents.initial_rating)
     pool_device = (
@@ -1300,10 +1440,10 @@ def _build_state(cfg: RunConfig, device: torch.device) -> SACState:
         if cfg.opponents.snapshot_device == "train"
         else cfg.opponents.snapshot_device
     )
-    # Self-play uses the LIVE model only (no frozen snapshot copies): the
-    # opponent seat is driven by the current actor, and diversity comes from the
-    # builtin baselines mixed in by `_select_opponent_for_episode`. The pool is
-    # kept purely for Elo bookkeeping symmetry with the PPO trainer.
+    # SAC keeps no frozen opponent snapshots. In league mode the opponent seat
+    # is either the current actor or a mixed-in builtin; in fixed mode
+    # `builtin_prob=1.0` forces every rematch to use a static builtin. The pool
+    # is kept purely for Elo bookkeeping symmetry with the PPO trainer.
     pool = OpponentPool(
         elo=elo,
         top_k=cfg.opponents.top_k,
@@ -1334,7 +1474,7 @@ def _build_state(cfg: RunConfig, device: torch.device) -> SACState:
         disc_target_entropy_ratio=sac.disc_target_entropy_ratio,
         target_entropy_per_dim=sac.target_entropy_per_dim,
         builtin_agents=builtin_agents,
-        builtin_prob=sac.builtin_prob,
+        builtin_prob=builtin_prob,
         episode_steps=cfg.game.episode_steps,
     )
 
@@ -1368,8 +1508,7 @@ def _select_opponent_for_episode(state: SACState) -> tuple[str, Any]:
     With probability `builtin_prob` (and when any builtins are configured) the
     seat is a uniformly-chosen builtin baseline; otherwise it's self-play
     (`(LEARNER_NAME, None)`, the loop drives the live learner actor on that
-    seat). Mixing fixed baselines in is the guard against self-play strategy
-    collapse.
+    seat). Fixed-opponent mode is represented by `builtin_prob=1.0`.
     """
     if state.builtin_agents and state.rng.random() < state.builtin_prob:
         name = state.rng.choice(list(state.builtin_agents.keys()))
@@ -1388,6 +1527,7 @@ def _run_updates(
     tick: int,
     global_step: int,
     start_time: float,
+    critic_updates: int | None = None,
 ) -> int:
     """One learning phase, interleaved exactly like cleanrl SAC.
 
@@ -1414,7 +1554,11 @@ def _run_updates(
     q_stats: _QStats | None = None
     a_stats: _ActorStats | None = None
 
-    n_critic = num_envs * sac.gradient_steps
+    n_critic = (
+        max(0, int(critic_updates))
+        if critic_updates is not None
+        else max(0, int(round(num_envs * float(sac.gradient_steps))))
+    )
     for _ in range(n_critic):
         # One CUDA-graph step per learner iteration: brackets the critic update,
         # the actor burst, and the polyak as a single step so the shared qf1/qf2
@@ -1519,7 +1663,9 @@ def train(cfg: RunConfig) -> None:
 
     # Per-env episode bookkeeping. Seats start alternated across envs so the
     # learner sees both initial conditions from step 0 (symmetry paranoia).
-    vec = VecEnv(num_envs, num_players, cfg.game.episode_steps, cfg.game.ship_speed)
+    vec = _make_vec_env(cfg)
+    fast_step_subset = getattr(vec, "step_subset_fast", None)
+    step_subset = fast_step_subset if callable(fast_step_subset) else vec.step_subset
     start_time = time.time()
     games_vs: dict[str, int] = defaultdict(int)
     wins_vs: dict[str, float] = defaultdict(float)
@@ -1530,15 +1676,18 @@ def train(cfg: RunConfig) -> None:
         learner_seat = [e % num_players for e in range(num_envs)]
         opp_seat = [(s + 1) % num_players for s in learner_seat]
         opponents = [_select_opponent_for_episode(state) for _ in range(num_envs)]
+        learner_rows = [(e, learner_seat[e]) for e in range(num_envs)]
+        learner_obs = _observations_for_rows(vec, states, learner_rows)
         previous_prod_margin = [
-            production_margin(states[e][learner_seat[e]]["observation"], learner_seat[e])
-            for e in range(num_envs)
+            production_margin(obs, seat)
+            for obs, (_env_idx, seat) in zip(learner_obs, learner_rows, strict=True)
         ]
         episode_return = [0.0] * num_envs
 
         global_step = 0
         tick = 0
         learn_step = 0  # persistent critic-update counter (drives cleanrl cadence)
+        update_credit = 0.0
         last_snapshot_step = 0
         last_latest_step = 0
         # Async minibatch prefetcher (pinned, side-stream, overlapped H2D). Built
@@ -1562,22 +1711,29 @@ def train(cfg: RunConfig) -> None:
             # warmup and learned paths share `sampling.py`'s lead-solved geometry
             # so stored (launch, target_idx, fraction, mask) and executed moves
             # always agree.
-            learner_obs = [
-                states[e][learner_seat[e]]["observation"] for e in range(num_envs)
-            ]
-            learner_enc = encode_raw_observations(learner_obs, device=device)
-            learner_time = _time_feat_from_obs(
-                learner_obs, cfg.game.episode_steps, device
+            learner_rows = [(e, learner_seat[e]) for e in range(num_envs)]
+            learner_obs, learner_enc, learner_contexts, learner_time = (
+                _policy_inputs_for_rows(
+                    vec,
+                    states,
+                    learner_rows,
+                    episode_steps=cfg.game.episode_steps,
+                    device=device,
+                )
             )
             learner_out = run_sac_heads(
                 heads_kernel, learner_enc, device=device, time_feat=learner_time
             )
             if warmup:
                 learner_out = flatten_policy_output(learner_out)
-            learner_actions, learner_records = sample_batch_with_records_raw(
-                learner_out, learner_obs, deterministic=False
+            learner_actions, learner_records = _sample_actions_with_records(
+                vec,
+                learner_out,
+                learner_rows,
+                learner_obs,
+                learner_contexts,
+                deterministic=False,
             )
-            learner_records = [record_to_cpu(r) for r in learner_records]
 
             if not warmup:
                 materialize_raw_sum += sum(
@@ -1599,23 +1755,45 @@ def train(cfg: RunConfig) -> None:
                     materialize_raw_sum = 0.0
                     materialize_log_tick = 0
 
-            opp_obs = [
-                states[e][opp_seat[e]]["observation"] for e in range(num_envs)
+            opp_actions: list[Any] = [None] * num_envs
+            builtin_rows = [
+                (e, opp_seat[e]) for e in range(num_envs) if opponents[e][1] is not None
             ]
-            # The opponent forward covers every env (static batch for compile);
-            # builtin-opponent seats are then overwritten with the Python agent.
-            opp_enc = encode_raw_observations(opp_obs, device=device)
-            opp_time = _time_feat_from_obs(opp_obs, cfg.game.episode_steps, device)
-            opp_out = run_sac_heads(
-                heads_kernel, opp_enc, device=device, time_feat=opp_time
-            )
-            opp_actions = sample_batch_actions_raw(
-                opp_out, opp_obs, deterministic=False
-            )
-            for e in range(num_envs):
+            builtin_obs = _observations_for_rows(vec, states, builtin_rows)
+            for obs, (e, _seat) in zip(builtin_obs, builtin_rows, strict=True):
                 _name, agent = opponents[e]
-                if agent is not None:
-                    opp_actions[e] = agent(opp_obs[e])
+                if agent is None:
+                    raise RuntimeError("builtin row resolved to self-play opponent")
+                opp_actions[e] = agent(obs)
+
+            self_play_envs = [e for e in range(num_envs) if opponents[e][1] is None]
+            if self_play_envs:
+                opp_rows = [(e, opp_seat[e]) for e in self_play_envs]
+                opp_obs, opp_enc, opp_contexts, opp_time = _policy_inputs_for_rows(
+                    vec,
+                    states,
+                    opp_rows,
+                    episode_steps=cfg.game.episode_steps,
+                    device=device,
+                )
+                opp_out = run_sac_heads(
+                    heads_kernel, opp_enc, device=device, time_feat=opp_time
+                )
+                if opp_contexts is not None:
+                    sampled_opp_actions, _opp_records = (
+                        sample_batch_with_records_context(
+                            opp_out, opp_contexts, deterministic=False, record_rows=[]
+                        )
+                    )
+                else:
+                    sampled_opp_actions = sample_batch_actions_raw(
+                        opp_out, opp_obs, deterministic=False
+                    )
+                for e, acts in zip(self_play_envs, sampled_opp_actions, strict=True):
+                    opp_actions[e] = acts
+            for e in range(num_envs):
+                if opp_actions[e] is None:
+                    raise RuntimeError(f"missing opponent action for env {e}")
 
             # ---- step every env in parallel ----
             # 7-element learner/self-play actions carry the tracker payload the
@@ -1627,7 +1805,7 @@ def train(cfg: RunConfig) -> None:
                 acts[learner_seat[e]] = learner_actions[e]
                 acts[opp_seat[e]] = opp_actions[e]
                 actions_list.append(acts)
-            results = vec.step_subset(list(range(num_envs)), actions_list)
+            results = step_subset(list(range(num_envs)), actions_list)
             next_states: list[Any] = [None] * num_envs
             dones = [False] * num_envs
             finals: list[Any] = [None] * num_envs
@@ -1637,21 +1815,26 @@ def train(cfg: RunConfig) -> None:
                 finals[e] = fn
 
             # ---- s' legal-target support for the q-step's a'~π(·|s') resample ----
-            next_learner_obs = [
-                next_states[e][learner_seat[e]]["observation"]
-                for e in range(num_envs)
-            ]
-            next_learner_enc = encode_raw_observations(next_learner_obs, device=device)
-            next_learner_time = _time_feat_from_obs(
-                next_learner_obs, cfg.game.episode_steps, device
+            next_learner_obs, next_learner_enc, next_contexts, next_learner_time = (
+                _policy_inputs_for_rows(
+                    vec,
+                    next_states,
+                    learner_rows,
+                    episode_steps=cfg.game.episode_steps,
+                    device=device,
+                )
             )
             next_out = run_sac_heads(
                 heads_kernel, next_learner_enc, device=device, time_feat=next_learner_time
             )
-            _next_actions, next_records = sample_batch_with_records_raw(
-                next_out, next_learner_obs, deterministic=False
+            _next_actions, next_records = _sample_actions_with_records(
+                vec,
+                next_out,
+                learner_rows,
+                next_learner_obs,
+                next_contexts,
+                deterministic=False,
             )
-            next_records = [record_to_cpu(r) for r in next_records]
 
             # ---- reward, terminal flag, replay insert, episode logging ----
             for e in range(num_envs):
@@ -1769,31 +1952,38 @@ def train(cfg: RunConfig) -> None:
             done_envs = [e for e in range(num_envs) if dones[e]]
             if done_envs:
                 reset_states = vec.reset_subset(done_envs)
+                reset_rows: list[tuple[int, int]] = []
                 for e in done_envs:
                     states[e] = reset_states[e]
                     learner_seat[e] = (learner_seat[e] + 1) % num_players  # flip seat
                     opp_seat[e] = (learner_seat[e] + 1) % num_players
                     opponents[e] = _select_opponent_for_episode(state)
-                    previous_prod_margin[e] = production_margin(
-                        states[e][learner_seat[e]]["observation"], learner_seat[e]
-                    )
+                    reset_rows.append((e, learner_seat[e]))
                     episode_return[e] = 0.0
+                reset_obs = _observations_for_rows(vec, states, reset_rows)
+                for obs, (e, seat) in zip(reset_obs, reset_rows, strict=True):
+                    previous_prod_margin[e] = production_margin(obs, seat)
 
             # ---- learn ----
             if global_step >= sac.learning_starts and len(replay) >= sac.batch_size:
-                if prefetcher is None:
-                    prefetcher = _ReplayPrefetcher(replay, sac.batch_size, device)
-                learn_step = _run_updates(
-                    state,
-                    prefetcher,
-                    sac,
-                    device,
-                    num_envs=num_envs,
-                    learn_step=learn_step,
-                    tick=tick,
-                    global_step=global_step,
-                    start_time=start_time,
-                )
+                update_credit += num_envs * float(sac.gradient_steps)
+                critic_updates = int(update_credit)
+                update_credit -= critic_updates
+                if critic_updates > 0:
+                    if prefetcher is None:
+                        prefetcher = _ReplayPrefetcher(replay, sac.batch_size, device)
+                    learn_step = _run_updates(
+                        state,
+                        prefetcher,
+                        sac,
+                        device,
+                        num_envs=num_envs,
+                        learn_step=learn_step,
+                        tick=tick,
+                        global_step=global_step,
+                        start_time=start_time,
+                        critic_updates=critic_updates,
+                    )
 
             # ---- snapshot / rolling-latest (threshold-based: global_step jumps
             # by num_envs per tick, so exact modulo is unreliable) ----

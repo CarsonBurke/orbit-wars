@@ -194,13 +194,17 @@ def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
     return PolicyOutput(
         launch_logits=out.launch_logits[:rows],
         target_logits=out.target_logits[:rows],
-        fraction_mean=out.fraction_mean[:rows],
-        fraction_log_std=out.fraction_log_std[:rows],
         value=out.value[:rows],
         value_logits=out.value_logits[:rows],
         planet_owned_mask=out.planet_owned_mask[:rows],
         planet_mask=out.planet_mask[:rows],
         planet_ids=out.planet_ids[:rows],
+        fraction_alpha=None if out.fraction_alpha is None else out.fraction_alpha[:rows],
+        fraction_beta=None if out.fraction_beta is None else out.fraction_beta[:rows],
+        fraction_mean=None if out.fraction_mean is None else out.fraction_mean[:rows],
+        fraction_log_std=(
+            None if out.fraction_log_std is None else out.fraction_log_std[:rows]
+        ),
     )
 
 

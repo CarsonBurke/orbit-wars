@@ -28,6 +28,33 @@ def test_invalid_gamma_raises():
         RunConfig.from_dict({"ppo": {"gamma": 1.01}})
 
 
+def test_invalid_advantage_transform_raises():
+    with pytest.raises(ValueError):
+        RunConfig.from_dict({"ppo": {"advantage_transform": "zscoreish"}})
+
+
+def test_fixed_opponent_mode_loads():
+    cfg = RunConfig.from_dict(
+        {"opponents": {"mode": "fixed", "fixed_opponents": ["sniper"]}}
+    )
+    assert cfg.opponents.mode == "fixed"
+    assert cfg.opponents.fixed_opponents == ["sniper"]
+
+
+def test_fixed_opponent_mode_requires_known_builtin():
+    with pytest.raises(ValueError, match="opponents.fixed_opponents"):
+        RunConfig.from_dict(
+            {"opponents": {"mode": "fixed", "fixed_opponents": ["not_real"]}}
+        )
+
+
+def test_fixed_opponent_mode_requires_non_empty_opponents():
+    with pytest.raises(ValueError, match="requires non-empty"):
+        RunConfig.from_dict(
+            {"opponents": {"mode": "fixed", "fixed_opponents": []}}
+        )
+
+
 @pytest.mark.parametrize(
     "ppo_cfg",
     [
@@ -100,6 +127,14 @@ def test_learned_configs_use_conventional_gae():
             cfg = RunConfig.from_dict(yaml.safe_load(f))
         assert cfg.ppo.gamma == 0.997
         assert cfg.ppo.gae_lambda == 0.95
+
+
+def test_sniper_training_configs_load():
+    for path in ("configs/ppo_vs_sniper.yaml", "configs/sac_vs_sniper.yaml"):
+        with open(path) as f:
+            cfg = RunConfig.from_dict(yaml.safe_load(f))
+        assert cfg.opponents.mode == "fixed"
+        assert cfg.opponents.fixed_opponents == ["sniper"]
 
 
 def test_ablation_yaml_keys_load():

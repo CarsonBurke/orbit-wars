@@ -120,6 +120,10 @@ class PPOCfg:
 
     gamma: float = 0.997
     gae_lambda: float = 0.95
+    # CleanRL IterThink v24 policy-advantage shaping. "rankgauss" maps the
+    # full rollout's raw GAE advantages to empirical Gaussian quantiles before
+    # minibatching; "none" keeps raw GAE.
+    advantage_transform: Literal["rankgauss", "none"] = "rankgauss"
     norm_advantage: bool = True
     # CleanRL SPO asym: quadratic ratio penalty with a looser bound when
     # ratio drift agrees with the advantage sign.
@@ -223,7 +227,7 @@ class SACCfg:
     # target polyak every target_network_frequency-th critic update.
     policy_frequency: int = 2
     target_network_frequency: int = 1
-    gradient_steps: int = 1           # UTD: critic updates per collected transition
+    gradient_steps: float = 1.0       # UTD: critic updates per collected transition
 
     q_lr: float = 1.0e-3
     policy_lr: float = 3.0e-4
@@ -270,14 +274,20 @@ class RolloutCfg:
 
 @dataclass
 class OpponentsCfg:
-    """Self-play matchmaking + Elo-pruned snapshot pool.
+    """Opponent matchmaking.
 
-    Per opponent slot, with probability `self_play_prob` we play "self" (a
-    no-grad copy of the current learner); otherwise we pick uniformly from
-    the live snapshot pool. The pool keeps the top-K snapshots by Elo —
-    weak snapshots get evicted instead of aging out by FIFO.
+    ``mode="league"`` is the normal self-play league: per opponent slot, with
+    probability `self_play_prob` we play "self" (a no-grad copy of the current
+    learner); otherwise we pick uniformly from the live snapshot pool. The pool
+    keeps the top-K snapshots by Elo.
+
+    ``mode="fixed"`` samples static builtin opponents from `fixed_opponents`
+    and never uses self-play or snapshots. This is the low-noise training mode
+    for measuring learner progress against a stationary baseline.
     """
 
+    mode: Literal["league", "fixed"] = "league"
+    fixed_opponents: list[str] = field(default_factory=lambda: ["sniper"])
     snapshot_every: int = 25      # save a frozen snapshot for the pool every N updates
     top_k: int = 10               # max live snapshots; lowest-Elo evicted past this
     self_play_prob: float = 0.8   # P(opponent slot = current learner) per slot
@@ -362,6 +372,8 @@ class RunConfig:
             raise ValueError("ppo.spo_eps_low/high must be positive")
         if cfg.ppo.spo_eps_high < cfg.ppo.spo_eps_low:
             raise ValueError("ppo.spo_eps_high must be >= ppo.spo_eps_low")
+        if cfg.ppo.advantage_transform not in {"rankgauss", "none"}:
+            raise ValueError("ppo.advantage_transform must be 'rankgauss' or 'none'")
         if not 0.0 <= cfg.model.planet_rope_fraction <= 1.0:
             raise ValueError("model.planet_rope_fraction must be in [0, 1]")
         if cfg.model.planet_rope_base <= 0.0:
@@ -390,13 +402,36 @@ class RunConfig:
             raise ValueError("sac.alpha_discrete_lr/continuous_lr must be positive")
         from .league import BUILTIN
 
+        if cfg.opponents.mode not in {"league", "fixed"}:
+            raise ValueError("opponents.mode must be 'league' or 'fixed'")
+        if not 0.0 <= cfg.opponents.self_play_prob <= 1.0:
+            raise ValueError("opponents.self_play_prob must be in [0, 1]")
+        if cfg.opponents.top_k <= 0:
+            raise ValueError("opponents.top_k must be positive")
+        if cfg.opponents.snapshot_every <= 0:
+            raise ValueError("opponents.snapshot_every must be positive")
+        unknown_fixed = set(cfg.opponents.fixed_opponents) - set(BUILTIN)
+        if unknown_fixed:
+            raise ValueError(
+                f"opponents.fixed_opponents has unknown agents "
+                f"{sorted(unknown_fixed)}; valid: {sorted(BUILTIN)}"
+            )
+        if cfg.opponents.mode == "fixed" and not cfg.opponents.fixed_opponents:
+            raise ValueError(
+                "opponents.mode='fixed' requires non-empty opponents.fixed_opponents"
+            )
+
         unknown = set(cfg.sac.builtin_opponents) - set(BUILTIN)
         if unknown:
             raise ValueError(
                 f"sac.builtin_opponents has unknown agents {sorted(unknown)}; "
                 f"valid: {sorted(BUILTIN)}"
             )
-        if cfg.sac.builtin_prob > 0.0 and not cfg.sac.builtin_opponents:
+        if (
+            cfg.opponents.mode == "league"
+            and cfg.sac.builtin_prob > 0.0
+            and not cfg.sac.builtin_opponents
+        ):
             raise ValueError(
                 "sac.builtin_prob > 0 requires a non-empty sac.builtin_opponents"
             )

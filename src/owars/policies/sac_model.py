@@ -63,7 +63,6 @@ import torch.nn.functional as F  # noqa: N812
 from .config import OrbitPolicyConfig
 from .features import EncodedObs, MAX_PLANETS
 from .model import (
-    FRACTION_LOG_STD_INIT,
     CastedLinear,
     FleetLatentTokenizer,
     HLGaussLoss,
@@ -74,6 +73,7 @@ from .model import (
 
 _PLANET_XY_SCALE: float = 100.0
 _PLANET_XY_OFFSET: float = 50.0
+FRACTION_LOG_STD_INIT: float = 0.0
 
 # Numerical floors mirrored from `sampling.py` so train-time log-probs match
 # the rollout-time squashed-Normal log-probs the buffer was filled with.

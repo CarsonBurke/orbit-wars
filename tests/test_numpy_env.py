@@ -200,13 +200,13 @@ def test_numpy_vec_fast_policy_batch_matches_raw_observations():
     out = PolicyOutput(
         launch_logits=launch_logits,
         target_logits=logits,
-        fraction_mean=torch.full((b, p), 3.0),
-        fraction_log_std=torch.zeros((b, p)),
         value=torch.zeros(b),
         value_logits=torch.zeros(b, 51),
         planet_owned_mask=fast.planet_owned_mask,
         planet_mask=fast.planet_mask,
         planet_ids=fast.planet_ids,
+        fraction_alpha=torch.full((b, p), 20.0),
+        fraction_beta=torch.full((b, p), 2.0),
     )
     assert sample_batch_actions_context(out, contexts, deterministic=True) == (
         sample_batch_actions_raw(out, raw, deterministic=True)
@@ -318,6 +318,25 @@ def test_numpy_vec_fast_step_matches_materialized_step():
                     normal_states[env_idx][seat]["observation"],
                 )
             assert fast_results[env_idx][1] == normal_results[env_idx][1]
+
+
+def test_numpy_vec_reset_subset_advances_seed():
+    vec = NumpyVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    vec.reset()
+    vec.step_subset_fast([0], [[[], []]])
+    first = vec.observation(0, 0)
+
+    vec.reset_subset([0])
+    vec.step_subset_fast([0], [[[], []]])
+    second = vec.observation(0, 0)
+
+    assert first["planets"] != second["planets"]
 
 
 def test_numpy_vec_env_matches_scalar_fallback_with_launches():

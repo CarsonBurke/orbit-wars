@@ -21,14 +21,14 @@ target/fraction heads see "what's the joint plan look like" without us
 having to go autoregressive.
 
 We deliberately do **not** down-project after the actor concat: target_query
-and fraction_head take 2d-wide inputs and project to their natural output
-dim (d for query/key, 1 for the squashed-Gaussian mean head). Down-projecting
+and the Beta fraction heads take 2d-wide inputs and project to their natural
+output dim (d for query/key, 1 for each concentration head). Down-projecting
 `[planet_h || h_actor]` back to d would discard exactly the global-context
 capacity the extra token was added to provide.
 
 **Action factorization.** Per source planet, the actor emits a Bernoulli
 launch decision, a masked categorical target distribution conditional on
-launching, and a tanh-squashed Gaussian fraction distribution conditional on launching. This
+launching, and a unimodal Beta fraction distribution conditional on launching. This
 keeps "should this planet act?" independent of the number of legal target
 planets; target count should affect *where* probability mass goes, not whether
 the source launches at all.
@@ -36,11 +36,12 @@ the source launches at all.
 **No angle head.** The launch angle is computed exactly via an iterative
 lead-intercept solver in `sampling.py`.
 
-**Fraction head is a tanh-squashed Gaussian** mapped from pre-squash
-z ∈ ℝ to fraction ∈ [0, 1]. The network predicts the pre-squash mean per
-source planet and uses one direct learned log std parameter expanded over
-planets. PPO stores the post-squash fraction that the simulator executes, and
-log-prob recomputation inverts it with atanh plus the tanh Jacobian correction.
+**Fraction head is a unimodal Beta** on native fraction support `(0, 1)`,
+following the CleanRL IterThink v24 / Dreamer4 path:
+`alpha = 1 + softplus(raw_alpha)`, `beta = 1 + softplus(raw_beta)`.
+PPO stores the native Beta sample that the simulator executes, so log-prob
+recomputation evaluates the same bounded-support sample directly; no tanh
+squash, inverse, or Jacobian correction is involved.
 
 **Distributional value head (HL-Gauss).** dreamer4 (`dreamer4.py:722–805`)
 predicts a categorical over a fixed bin support and trains it with
@@ -677,10 +678,9 @@ class FleetLatentTokenizer(nn.Module):
         return self.final_norm(latents)
 
 
-# Direct log std for the tanh-squashed Gaussian fraction head. A scalar
-# parameter is expanded over source planets, CleanRL-style, so the readout only
-# predicts the state-dependent pre-squash mean.
-FRACTION_LOG_STD_INIT: float = 0.0
+# Beta samples live on an open interval. Clamp sampled fractions off exactly
+# 0/1 before log-prob evaluation or simulator action materialization.
+BETA_SAMPLE_EPS: float = 1e-6
 
 
 class HLGaussLoss(nn.Module):
@@ -768,13 +768,17 @@ def _symexp(x: torch.Tensor) -> torch.Tensor:
 class PolicyOutput:
     launch_logits: torch.Tensor       # [B, P] Bernoulli logits
     target_logits: torch.Tensor       # [B, P, P] masked target categorical logits
-    fraction_mean: torch.Tensor       # [B, P] pre-squash Normal mean
-    fraction_log_std: torch.Tensor    # [B, P] direct learned Normal log std
     value: torch.Tensor               # [B] — scalar value E[V] recovered from value_logits
     value_logits: torch.Tensor        # [B, num_bins] — distributional value head logits
     planet_owned_mask: torch.Tensor   # [B, P] bool
     planet_mask: torch.Tensor         # [B, P] bool
     planet_ids: torch.Tensor          # [B, P] long
+    fraction_alpha: torch.Tensor | None = None  # [B, P] Beta concentration α
+    fraction_beta: torch.Tensor | None = None   # [B, P] Beta concentration β
+    # SAC's actor still adapts through this shared sampler as a squashed
+    # Normal. PPO OrbitPolicy leaves these as None and uses the Beta fields.
+    fraction_mean: torch.Tensor | None = None       # [B, P] Normal mean
+    fraction_log_std: torch.Tensor | None = None    # [B, P] Normal log std
 
 
 def _match_feature_width(x: torch.Tensor, expected: int) -> torch.Tensor:
@@ -887,15 +891,19 @@ class OrbitPolicy(nn.Module):
         self.launch_head = CastedLinear(2 * cfg.dim, 1)
         nn.init.zeros_(self.launch_head.weight)
         nn.init.constant_(self.launch_head.bias, -1.5)
-        # 2·dim input for the same reason as target_query. Outputs the
-        # pre-squash Normal mean for the tanh-squashed fraction distribution.
-        self.fraction_head = CastedLinear(2 * cfg.dim, 1)
-        self.fraction_log_std = nn.Parameter(torch.tensor(FRACTION_LOG_STD_INIT))
-        # gain=0.01 — cleanrl PPO's canonical actor-readout init
-        # (`ppo_continuous_action.py:127`). Zero bias starts the deterministic
-        # fraction at 0.5 via tanh(0).
-        nn.init.orthogonal_(self.fraction_head.weight, gain=0.01)
-        nn.init.zeros_(self.fraction_head.bias)
+        # 2·dim input for the same reason as target_query. Two independent
+        # readouts parameterize a native-support Beta fraction distribution:
+        # alpha,beta = 1 + softplus(raw). The +1 enforces the Dreamer4
+        # unimodal path and avoids boundary-seeking exploration.
+        self.fraction_alpha_head = CastedLinear(2 * cfg.dim, 1)
+        self.fraction_beta_head = CastedLinear(2 * cfg.dim, 1)
+        # gain=0.01 — CleanRL PPO's canonical actor-readout init
+        # (`ppo_continuous_action.py:127`). Zero biases make alpha == beta at
+        # init, so the deterministic fraction starts at 0.5.
+        nn.init.orthogonal_(self.fraction_alpha_head.weight, gain=0.01)
+        nn.init.orthogonal_(self.fraction_beta_head.weight, gain=0.01)
+        nn.init.zeros_(self.fraction_alpha_head.bias)
+        nn.init.zeros_(self.fraction_beta_head.bias)
         # Distributional value head — emits logits over `value_num_bins`
         # bins. Scalar V is recovered from these via `HLGaussLoss.bins_to_scalar`.
         # The default uses Dreamer4-style symlog buckets over a wide raw
@@ -1120,10 +1128,14 @@ class OrbitPolicy(nn.Module):
         launch_logits = launch_logits.masked_fill(valid_target_count <= 0, -20.0)
         target_logits = logits  # [B, P, P]
 
-        # Fraction head: pre-squash Normal mean plus a direct learned log std
-        # expanded over planets, matching the CleanRL squashed-Gaussian idiom.
-        fraction_mean = self.fraction_head(planet_with_ctx).squeeze(-1).float()
-        fraction_log_std = self.fraction_log_std.float().expand_as(fraction_mean)
+        # Fraction head: native-support unimodal Beta, matching the CleanRL
+        # IterThink v24 / Dreamer4 beta path.
+        fraction_alpha = 1.0 + F.softplus(
+            self.fraction_alpha_head(planet_with_ctx).squeeze(-1).float()
+        )
+        fraction_beta = 1.0 + F.softplus(
+            self.fraction_beta_head(planet_with_ctx).squeeze(-1).float()
+        )
 
         if include_value:
             # Value: distributional head over the dedicated critic token.
@@ -1138,11 +1150,11 @@ class OrbitPolicy(nn.Module):
         return PolicyOutput(
             launch_logits=launch_logits,
             target_logits=target_logits,
-            fraction_mean=fraction_mean,
-            fraction_log_std=fraction_log_std,
             value=value,
             value_logits=value_logits,
             planet_owned_mask=planet_owned,
             planet_mask=planet_mask,
             planet_ids=planet_ids,
+            fraction_alpha=fraction_alpha,
+            fraction_beta=fraction_beta,
         )

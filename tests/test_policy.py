@@ -43,8 +43,8 @@ def test_policy_forward_shapes():
     # batch dim was added implicitly by the encoder fast path.
     assert out.launch_logits.shape == (1, 64)
     assert out.target_logits.shape == (1, 64, 64)
-    assert out.fraction_mean.shape == (1, 64)
-    assert out.fraction_log_std.shape == (1, 64)
+    assert out.fraction_alpha.shape == (1, 64)
+    assert out.fraction_beta.shape == (1, 64)
     assert out.value.shape == (1,)
     # Distributional value head: per-bin logits over the configured support.
     assert out.value_logits.shape == (1, cfg.value_num_bins)
@@ -172,23 +172,24 @@ def test_launch_prior_is_stable_across_planet_counts():
     assert torch.allclose(large.sigmoid()[0, 0], expected, atol=1e-5)
 
 
-def test_fraction_log_std_is_direct_parameter_expanded_over_planets():
+def test_fraction_beta_concentrations_are_unimodal():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
     model = OrbitPolicy(cfg)
     out = model(encode_observation(parse_observation(_obs())))
 
-    assert "fraction_log_std" in dict(model.named_parameters())
-    expected = model.fraction_log_std.detach().expand_as(out.fraction_log_std)
-    assert torch.allclose(out.fraction_log_std, expected)
+    assert "fraction_alpha_head.weight" in dict(model.named_parameters())
+    assert "fraction_beta_head.weight" in dict(model.named_parameters())
+    assert torch.all(out.fraction_alpha >= 1.0)
+    assert torch.all(out.fraction_beta >= 1.0)
 
 
-def test_deterministic_fraction_uses_squashed_mean():
-    fraction = torch.tensor([0.1, 0.9])
-    mean = torch.atanh(2.0 * fraction - 1.0)
+def test_deterministic_fraction_uses_beta_mean():
+    alpha = torch.tensor([1.0, 9.0])
+    beta = torch.tensor([9.0, 1.0])
 
-    got = _deterministic_fraction(mean)
+    got = _deterministic_fraction(alpha, beta)
 
-    assert torch.allclose(got, fraction, atol=1e-6)
+    assert torch.allclose(got, torch.tensor([0.1, 0.9]), atol=1e-6)
 
 
 def test_policy_accepts_legacy_fleet_feature_width():
@@ -221,8 +222,12 @@ def test_policy_ignores_padded_token_features():
     valid_cols = feats.planet_mask.unsqueeze(0)
     assert torch.allclose(clean_out.value, noisy_out.value)
     assert torch.allclose(
-        clean_out.fraction_mean[valid_planets],
-        noisy_out.fraction_mean[valid_planets],
+        clean_out.fraction_alpha[valid_planets],
+        noisy_out.fraction_alpha[valid_planets],
+    )
+    assert torch.allclose(
+        clean_out.fraction_beta[valid_planets],
+        noisy_out.fraction_beta[valid_planets],
     )
     assert torch.allclose(
         clean_out.launch_logits[valid_planets],

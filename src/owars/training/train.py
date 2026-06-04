@@ -7,10 +7,9 @@ Loop:
      value function so the actor's advantage isn't garbage at step 0.
      This is the single highest-leverage knob from VAPO/VC-PPO.
   1. For each PPO update:
-     a. Sample N episodes against opponents from the pool. Per opponent
-        slot, with probability `self_play_prob` (default 0.8) the seat is
-        filled by the live learner; otherwise by a uniformly-chosen
-        snapshot from the top-K by Elo.
+     a. Sample N episodes against opponents. The normal league mode fills each
+        opponent seat from live self-play or a top-K frozen snapshot. Fixed mode
+        instead samples static builtins such as `sniper`.
      b. **Decoupled GAE**: critic target uses λ_critic=1 (Monte-Carlo,
         unbiased); actor advantage uses λ_policy < 1 (variance-reduced,
         optionally length-adaptive).
@@ -41,7 +40,13 @@ from ..policies.model import OrbitPolicy, restore_fp32_params
 from ..utils import TBLogger, set_seed
 from .config import OptimCfg, RunConfig, load_config
 from .elo import EloTracker
-from .league import BUILTIN, LEARNER_NAME, OpponentPool, OpponentSlot
+from .league import (
+    BUILTIN,
+    LEARNER_NAME,
+    FixedOpponentPool,
+    OpponentPool,
+    OpponentSlot,
+)
 from .muon import MultiOptimizer, Muon
 from .numpy_env import NumpyVecEnv
 from .ppo import (
@@ -83,8 +88,8 @@ _MUON_BLOCK_PREFIXES: tuple[str, ...] = (
 _HEAD_LR_PATTERNS: tuple[str, ...] = (
     "target_query",
     "target_key",
-    "fraction_head",
-    "fraction_log_std",
+    "fraction_alpha_head",
+    "fraction_beta_head",
     "launch_head",
     "value_head",
 )
@@ -105,7 +110,7 @@ def _split_params(
     parameter-golf's optimizee split.
 
     AdamW (head-lr): task readout matrices — `target_query`, `target_key`,
-    `fraction_head`, `launch_head`, and `value_head`.
+    Beta fraction heads, `launch_head`, and `value_head`.
 
     AdamW (control-lr): per-channel residual scales and `q_gain`s — need
     update magnitudes comparable to Muon's matrix updates, see
@@ -421,7 +426,7 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     Includes the encoder (shared backbone), both summary tokens (actor_token
     feeds the encoder self-attention so h_critic depends on it; critic_token
     feeds the value head directly), and the value head. Excludes the actor
-    heads (target_query/key, launch_head, fraction_head) — they receive zero
+    heads (target_query/key, launch_head, fraction alpha/beta heads) — they receive zero
     gradient from the value loss, and including them would let AdamW's
     weight-decay pull them toward zero with no learning signal, leaving PPO
     to start from a worse-than-init policy.
@@ -487,13 +492,21 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
         str(device) if cfg.opponents.snapshot_device == "train"
         else cfg.opponents.snapshot_device
     )
-    pool = OpponentPool(
-        elo=elo,
-        top_k=cfg.opponents.top_k,
-        self_play_prob=cfg.opponents.self_play_prob,
-        device=snapshot_device,
-        rng=random.Random(cfg.run.seed),
-    )
+    if cfg.opponents.mode == "fixed":
+        for name in cfg.opponents.fixed_opponents:
+            elo.set(name, cfg.opponents.initial_rating)
+        pool = FixedOpponentPool(
+            cfg.opponents.fixed_opponents,
+            rng=random.Random(cfg.run.seed),
+        )
+    else:
+        pool = OpponentPool(
+            elo=elo,
+            top_k=cfg.opponents.top_k,
+            self_play_prob=cfg.opponents.self_play_prob,
+            device=snapshot_device,
+            rng=random.Random(cfg.run.seed),
+        )
     logger = TBLogger(cfg.run.name, root=cfg.run.log_root)
 
     # One subprocess pool reused across pretraining + every PPO update.
@@ -546,7 +559,7 @@ def _ppo_loop(
     model: OrbitPolicy,
     optimizer: torch.optim.Optimizer,
     elo: EloTracker,
-    pool: OpponentPool,
+    pool: OpponentPool | FixedOpponentPool,
     logger: TBLogger,
     device: torch.device,
     vec: VecEnv,
@@ -557,14 +570,15 @@ def _ppo_loop(
     cumulative_loss_margin = 0.0
     cumulative_games = 0
 
-    # Seed the pool with a snapshot of the random-init model. Without this,
-    # `_sample_one` returns LEARNER_NAME for every slot until the first
-    # snapshot lands at `snapshot_every`, every game is learner-vs-learner,
-    # `update_from_game` early-returns on a single identity, and Elo stays
-    # frozen. The init snapshot is *not* pinned — if it's bad it'll lose
-    # rating and UCB-eviction will cull it like any other weak snapshot.
-    init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
-    pool.add_snapshot("init", model, init_ckpt)
+    if cfg.opponents.mode == "league":
+        # Seed the pool with a snapshot of the random-init model. Without this,
+        # `_sample_one` returns LEARNER_NAME for every slot until the first
+        # snapshot lands at `snapshot_every`, every game is learner-vs-learner,
+        # `update_from_game` early-returns on a single identity, and Elo stays
+        # frozen. The init snapshot is *not* pinned — if it's bad it'll lose
+        # rating and UCB-eviction will cull it like any other weak snapshot.
+        init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
+        pool.add_snapshot("init", model, init_ckpt)
 
     # `ppo_update` owns minibatch-level compile/capture. Keeping compilation
     # there lets Inductor see the policy forward, PPO loss, metrics, and
@@ -639,6 +653,7 @@ def _ppo_loop(
             target_entropy_coef=cfg.ppo.target_entropy_coef,
             fraction_entropy_coef=cfg.ppo.fraction_entropy_coef,
             norm_advantage=cfg.ppo.norm_advantage,
+            advantage_transform=cfg.ppo.advantage_transform,
             spo_eps_low=cfg.ppo.spo_eps_low,
             spo_eps_high=cfg.ppo.spo_eps_high,
             epochs=cfg.optim.epochs_per_update,
@@ -697,11 +712,11 @@ def _ppo_loop(
         logger.scalars(
             "fraction",
             {
-                "mean_mean": log.fraction_mean_mean,
-                "mean_abs_max": log.fraction_mean_abs_max,
-                "log_std_mean": log.fraction_log_std_mean,
-                "log_std_min": log.fraction_log_std_min,
-                "log_std_max": log.fraction_log_std_max,
+                "alpha_mean": log.fraction_alpha_mean,
+                "beta_mean": log.fraction_beta_mean,
+                "concentration_mean": log.fraction_concentration_mean,
+                "concentration_max": log.fraction_concentration_max,
+                "skew_abs_mean": log.fraction_skew_abs_mean,
                 "deterministic_mean": log.deterministic_fraction_mean,
             },
             update,
@@ -742,7 +757,10 @@ def _ppo_loop(
             }
         )
 
-        if (update + 1) % cfg.opponents.snapshot_every == 0:
+        if (
+            cfg.opponents.mode == "league"
+            and (update + 1) % cfg.opponents.snapshot_every == 0
+        ):
             ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / f"snapshot_{update:04d}.pt"
             pool.add_snapshot(f"{update:04d}", model, ckpt)
         snapshot_s = perf_counter() - phase_t0

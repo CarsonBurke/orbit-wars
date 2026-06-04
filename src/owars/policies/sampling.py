@@ -3,7 +3,7 @@
 The policy emits, per owned planet:
   - a Bernoulli launch decision
   - a masked Categorical over target planets, conditional on launch
-  - a tanh-squashed Gaussian on [0, 1] for the fraction-of-garrison to send,
+  - a Beta distribution on (0, 1) for the fraction-of-garrison to send,
     conditional on launch
 
 The simulator's action format is `[from_planet_id, angle_radians, num_ships]`.
@@ -17,9 +17,10 @@ For PPO we need, *per owned planet*, the Bernoulli + conditional
 Categorical/fraction log-prob of the actually-sampled action.
 `sample_with_record` returns those alongside the moves; `sample_actions` is
 the thin moves-only wrapper used by inference paths that don't care about
-log-probs. The recorded fraction is the post-squash action executed by the
-simulator; log-prob recomputation recovers the pre-squash latent with atanh
-and applies the tanh Jacobian correction.
+log-probs. The recorded PPO fraction is the native Beta sample executed by
+the simulator; log-prob recomputation evaluates that same bounded-support
+value directly. The SAC adapter still uses the legacy squashed-Normal path
+through the same helpers, selected by the populated fraction parameter fields.
 """
 
 from __future__ import annotations
@@ -39,13 +40,14 @@ from ..game.physics import fleet_speed
 from ..game.types import BOARD_SIZE, CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS, Move
 from .model import PolicyOutput
 
-# Numerical floors for Gumbel sampling and atanh/log-Jacobian inversion.
+# Numerical floors for Gumbel sampling, Beta endpoints, and atanh inversion.
 SAMPLE_EPS: float = 1e-7
 SQUASH_EPS: float = 1e-6
+BETA_SAMPLE_EPS: float = 1e-6
 DETERMINISTIC_LAUNCH_FALLBACK_LOGIT: float = -3.0
 
 
-def _deterministic_fraction(
+def _deterministic_squashed_normal_fraction(
     fraction_mean: torch.Tensor,
     fraction_log_std: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -56,6 +58,55 @@ def _deterministic_fraction(
     del fraction_log_std
     return (0.5 * (torch.tanh(fraction_mean.float()) + 1.0)).clamp(
         SQUASH_EPS, 1.0 - SQUASH_EPS
+    )
+
+
+def _deterministic_beta_fraction(
+    fraction_alpha: torch.Tensor,
+    fraction_beta: torch.Tensor,
+) -> torch.Tensor:
+    return (
+        fraction_alpha.float() / (fraction_alpha.float() + fraction_beta.float())
+    ).clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
+
+
+def _deterministic_fraction(
+    fraction_param1: torch.Tensor,
+    fraction_param2: torch.Tensor | None = None,
+    *,
+    fraction_dist: str = "beta",
+) -> torch.Tensor:
+    if fraction_dist == "beta":
+        if fraction_param2 is None:
+            raise ValueError("Beta fraction requires alpha and beta tensors")
+        return _deterministic_beta_fraction(fraction_param1, fraction_param2)
+    if fraction_dist == "squashed_normal":
+        return _deterministic_squashed_normal_fraction(fraction_param1, fraction_param2)
+    raise ValueError(f"unknown fraction_dist={fraction_dist!r}")
+
+
+def _beta_log_prob(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    fraction: torch.Tensor,
+) -> torch.Tensor:
+    x = fraction.float().clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
+    alpha = alpha.float()
+    beta = beta.float()
+    log_norm = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
+    return (alpha - 1.0) * torch.log(x) + (beta - 1.0) * torch.log1p(-x) - log_norm
+
+
+def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    alpha = alpha.float()
+    beta = beta.float()
+    total = alpha + beta
+    log_norm = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(total)
+    return (
+        log_norm
+        - (alpha - 1.0) * torch.digamma(alpha)
+        - (beta - 1.0) * torch.digamma(beta)
+        + (total - 2.0) * torch.digamma(total)
     )
 
 
@@ -88,6 +139,39 @@ def _squashed_normal_log_prob(
 def _squashed_normal_entropy(log_std: torch.Tensor) -> torch.Tensor:
     """Approximate squashed entropy with the unsquashed Normal entropy."""
     return log_std.float() + 0.5 * (1.0 + math.log(2.0 * math.pi))
+
+
+def _fraction_log_prob(
+    fraction_param1: torch.Tensor,
+    fraction_param2: torch.Tensor,
+    fraction: torch.Tensor,
+    fraction_dist: str,
+) -> torch.Tensor:
+    if fraction_dist == "beta":
+        return _beta_log_prob(fraction_param1, fraction_param2, fraction)
+    if fraction_dist == "squashed_normal":
+        return _squashed_normal_log_prob(fraction_param1, fraction_param2, fraction)
+    raise ValueError(f"unknown fraction_dist={fraction_dist!r}")
+
+
+def _fraction_entropy(
+    fraction_param1: torch.Tensor,
+    fraction_param2: torch.Tensor,
+    fraction_dist: str,
+) -> torch.Tensor:
+    if fraction_dist == "beta":
+        return _beta_entropy(fraction_param1, fraction_param2)
+    if fraction_dist == "squashed_normal":
+        return _squashed_normal_entropy(fraction_param2)
+    raise ValueError(f"unknown fraction_dist={fraction_dist!r}")
+
+
+def _policy_fraction_params(out: PolicyOutput) -> tuple[torch.Tensor, torch.Tensor, str]:
+    if out.fraction_alpha is not None and out.fraction_beta is not None:
+        return out.fraction_alpha, out.fraction_beta, "beta"
+    if out.fraction_mean is not None and out.fraction_log_std is not None:
+        return out.fraction_mean, out.fraction_log_std, "squashed_normal"
+    raise ValueError("PolicyOutput requires either Beta or squashed-Normal fraction params")
 
 
 # Lead-intercept solver. The intercept condition for a fleet leaving source
@@ -1034,28 +1118,40 @@ def _ensure_deterministic_launch_if_idle(
 
 def _sample_launch_fraction(
     launch_logits: torch.Tensor,
-    fraction_mean: torch.Tensor,
-    fraction_log_std: torch.Tensor,
+    fraction_param1: torch.Tensor,
+    fraction_param2: torch.Tensor,
     deterministic: bool,
+    fraction_dist: str = "beta",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     launch_logits = launch_logits.float()
-    fraction_mean = fraction_mean.float()
-    fraction_log_std = fraction_log_std.float()
+    fraction_param1 = fraction_param1.float()
+    fraction_param2 = fraction_param2.float()
     if deterministic:
-        launch = (launch_logits > 0.0).to(fraction_mean.dtype)
-        frac = _deterministic_fraction(fraction_mean, fraction_log_std)
+        launch = (launch_logits > 0.0).to(fraction_param1.dtype)
+        frac = _deterministic_fraction(
+            fraction_param1,
+            fraction_param2,
+            fraction_dist=fraction_dist,
+        )
         return launch, frac
     launch = (torch.rand_like(launch_logits) < launch_logits.sigmoid()).to(
-        fraction_mean.dtype
+        fraction_param1.dtype
     )
-    with torch.no_grad():
-        z = fraction_mean + torch.exp(fraction_log_std) * torch.randn_like(
-            fraction_mean
+    if fraction_dist == "beta":
+        with torch.no_grad():
+            dist = torch.distributions.Beta(fraction_param1, fraction_param2)
+            frac = dist.sample().clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
+        return launch, frac
+    if fraction_dist == "squashed_normal":
+        with torch.no_grad():
+            z = fraction_param1 + torch.exp(fraction_param2) * torch.randn_like(
+                fraction_param1
+            )
+        frac = (0.5 * (torch.tanh(z) + 1.0)).clamp(
+            SQUASH_EPS, 1.0 - SQUASH_EPS
         )
-    frac = (0.5 * (torch.tanh(z) + 1.0)).clamp(
-        SQUASH_EPS, 1.0 - SQUASH_EPS
-    )
-    return launch, frac
+        return launch, frac
+    raise ValueError(f"unknown fraction_dist={fraction_dist!r}")
 
 
 def _sample_target(
@@ -1464,8 +1560,9 @@ def _record_from_materialized_launch(
     frac: torch.Tensor,
     launch_logits: torch.Tensor,
     target_logits: torch.Tensor,
-    fraction_mean: torch.Tensor,
-    fraction_log_std: torch.Tensor,
+    fraction_param1: torch.Tensor,
+    fraction_param2: torch.Tensor,
+    fraction_dist: str,
     materialized: list[bool],
 ) -> SampleRecord:
     # `launch` is the raw Bernoulli sample (already masked to 0 on unowned /
@@ -1474,11 +1571,11 @@ def _record_from_materialized_launch(
     # small / send rounds to 0). PPO trains on the executed (materialized)
     # action; SAC trains its actor/critic on the raw policy action, so we keep
     # both — see `SampleRecord`.
-    raw_launch = launch.to(dtype=fraction_mean.dtype)
+    raw_launch = launch.to(dtype=fraction_param1.dtype)
     actual_launch = torch.as_tensor(
         materialized,
         device=target_idx.device,
-        dtype=fraction_mean.dtype,
+        dtype=fraction_param1.dtype,
     )
     safe_target_logits = _safe_target_logits(target_logits.float())
     launch_lp = -nn_functional.binary_cross_entropy_with_logits(
@@ -1491,10 +1588,11 @@ def _record_from_materialized_launch(
         -1,
         target_idx.clamp(0, safe_target_logits.shape[-1] - 1).unsqueeze(-1),
     ).squeeze(-1)
-    frac_lp = _squashed_normal_log_prob(
-        fraction_mean.detach().float(),
-        fraction_log_std.detach().float(),
+    frac_lp = _fraction_log_prob(
+        fraction_param1.detach().float(),
+        fraction_param2.detach().float(),
         frac.detach().float(),
+        fraction_dist,
     )
     log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
     return SampleRecord(
@@ -1513,8 +1611,9 @@ def _batch_record_from_materialized_launch(
     frac: torch.Tensor,
     launch_logits: torch.Tensor,
     target_logits: torch.Tensor,
-    fraction_mean: torch.Tensor,
-    fraction_log_std: torch.Tensor,
+    fraction_param1: torch.Tensor,
+    fraction_param2: torch.Tensor,
+    fraction_dist: str,
     materialized: Any,
     rows: Sequence[int],
 ) -> SampleBatchRecord:
@@ -1533,8 +1632,8 @@ def _batch_record_from_materialized_launch(
     target_idx_r = target_idx.index_select(0, row_idx)
     frac_r = frac.index_select(0, row_idx)
     target_logits_r = target_logits.index_select(0, row_idx)
-    fraction_mean_r = fraction_mean.index_select(0, row_idx)
-    fraction_log_std_r = fraction_log_std.index_select(0, row_idx)
+    fraction_param1_r = fraction_param1.index_select(0, row_idx)
+    fraction_param2_r = fraction_param2.index_select(0, row_idx)
 
     safe_target_logits = _safe_target_logits(target_logits_r.float())
     launch_lp = -nn_functional.binary_cross_entropy_with_logits(
@@ -1547,10 +1646,11 @@ def _batch_record_from_materialized_launch(
         -1,
         target_idx_r.clamp(0, safe_target_logits.shape[-1] - 1).unsqueeze(-1),
     ).squeeze(-1)
-    frac_lp = _squashed_normal_log_prob(
-        fraction_mean_r.detach().float(),
-        fraction_log_std_r.detach().float(),
+    frac_lp = _fraction_log_prob(
+        fraction_param1_r.detach().float(),
+        fraction_param2_r.detach().float(),
         frac_r.detach().float(),
+        fraction_dist,
     )
     log_prob = launch_lp + actual_launch.float() * (target_lp + frac_lp)
     return SampleBatchRecord(
@@ -1574,14 +1674,19 @@ def sample_with_record(
     """
     launch_logits = out.launch_logits[0]
     target_logits = out.target_logits[0]  # [P, P]
-    fraction_mean = out.fraction_mean[0]
-    fraction_log_std = out.fraction_log_std[0]
+    fraction_param1_b, fraction_param2_b, fraction_dist = _policy_fraction_params(out)
+    fraction_param1 = fraction_param1_b[0]
+    fraction_param2 = fraction_param2_b[0]
     owned = out.planet_owned_mask[0]
     pmask = out.planet_mask[0]
     ids = out.planet_ids[0]
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_mean, fraction_log_std, deterministic
+        launch_logits,
+        fraction_param1,
+        fraction_param2,
+        deterministic,
+        fraction_dist,
     )
     target_legal_mask = _target_legal_mask_from_observation(
         frac, launch, owned, pmask, ids, o
@@ -1603,8 +1708,9 @@ def sample_with_record(
         frac,
         launch_logits,
         target_logits,
-        fraction_mean,
-        fraction_log_std,
+        fraction_param1,
+        fraction_param2,
+        fraction_dist,
         materialized,
     )
     return moves, record
@@ -1618,13 +1724,18 @@ def sample_actions(
     """Moves-only wrapper for inference paths (eval, agent submission)."""
     launch_logits = out.launch_logits[0]
     target_logits = out.target_logits[0]
-    fraction_mean = out.fraction_mean[0]
-    fraction_log_std = out.fraction_log_std[0]
+    fraction_param1_b, fraction_param2_b, fraction_dist = _policy_fraction_params(out)
+    fraction_param1 = fraction_param1_b[0]
+    fraction_param2 = fraction_param2_b[0]
     owned = out.planet_owned_mask[0]
     pmask = out.planet_mask[0]
     ids = out.planet_ids[0]
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_mean, fraction_log_std, deterministic
+        launch_logits,
+        fraction_param1,
+        fraction_param2,
+        deterministic,
+        fraction_dist,
     )
     target_legal_mask = _target_legal_mask_from_observation(
         frac, launch, owned, pmask, ids, o
@@ -1670,13 +1781,12 @@ def sample_batch_with_records(
     """
     launch_logits = out.launch_logits      # [B, P]
     target_logits = out.target_logits      # [B, P, P]
-    fraction_mean = out.fraction_mean      # [B, P]
-    fraction_log_std = out.fraction_log_std  # [B, P]
+    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_mean, fraction_log_std, deterministic
+        launch_logits, fraction_param1, fraction_param2, deterministic, fraction_dist
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -1732,8 +1842,9 @@ def sample_batch_with_records(
                     frac[k],
                     launch_logits[k],
                     target_logits[k],
-                    fraction_mean[k],
-                    fraction_log_std[k],
+                    fraction_param1[k],
+                    fraction_param2[k],
+                    fraction_dist,
                     materialized,
                 )
             )
@@ -1746,8 +1857,9 @@ def sample_batch_with_records(
             frac,
             launch_logits,
             target_logits,
-            fraction_mean,
-            fraction_log_std,
+            fraction_param1,
+            fraction_param2,
+            fraction_dist,
             [row for row in materialized_rows if row is not None],
             record_rows,
         )
@@ -1763,13 +1875,12 @@ def sample_batch_with_records_raw(
     """Batched sampler that builds Kaggle action lists from raw obs dicts."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_mean = out.fraction_mean
-    fraction_log_std = out.fraction_log_std
+    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
     b_dim, p, _ = target_logits.shape
     assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_mean, fraction_log_std, deterministic
+        launch_logits, fraction_param1, fraction_param2, deterministic, fraction_dist
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -1833,8 +1944,9 @@ def sample_batch_with_records_raw(
                     frac[k],
                     launch_logits[k],
                     target_logits[k],
-                    fraction_mean[k],
-                    fraction_log_std[k],
+                    fraction_param1[k],
+                    fraction_param2[k],
+                    fraction_dist,
                     materialized,
                 )
             )
@@ -1847,8 +1959,9 @@ def sample_batch_with_records_raw(
             frac,
             launch_logits,
             target_logits,
-            fraction_mean,
-            fraction_log_std,
+            fraction_param1,
+            fraction_param2,
+            fraction_dist,
             [row for row in materialized_rows if row is not None],
             record_rows,
         )
@@ -1864,13 +1977,12 @@ def sample_batch_with_records_context(
     """Batched sampler that builds action lists from fast env contexts."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_mean = out.fraction_mean
-    fraction_log_std = out.fraction_log_std
+    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
     b_dim, p, _ = target_logits.shape
     assert len(contexts) == b_dim, (len(contexts), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_mean, fraction_log_std, deterministic
+        launch_logits, fraction_param1, fraction_param2, deterministic, fraction_dist
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -1925,8 +2037,9 @@ def sample_batch_with_records_context(
                     frac[k],
                     launch_logits[k],
                     target_logits[k],
-                    fraction_mean[k],
-                    fraction_log_std[k],
+                    fraction_param1[k],
+                    fraction_param2[k],
+                    fraction_dist,
                     materialized,
                 )
             )
@@ -1939,8 +2052,9 @@ def sample_batch_with_records_context(
             frac,
             launch_logits,
             target_logits,
-            fraction_mean,
-            fraction_log_std,
+            fraction_param1,
+            fraction_param2,
+            fraction_dist,
             [row for row in materialized_rows if row is not None],
             record_rows,
         )
@@ -1955,13 +2069,12 @@ def sample_batch_actions(
     """Batched moves-only sampler for eval and opponent inference paths."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_mean = out.fraction_mean
-    fraction_log_std = out.fraction_log_std
+    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
     b_dim, p, _ = target_logits.shape
     assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_mean, fraction_log_std, deterministic
+        launch_logits, fraction_param1, fraction_param2, deterministic, fraction_dist
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -2017,13 +2130,12 @@ def sample_batch_actions_raw(
     """Batched moves-only sampler for raw Kaggle-style observations."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_mean = out.fraction_mean
-    fraction_log_std = out.fraction_log_std
+    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
     b_dim, p, _ = target_logits.shape
     assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_mean, fraction_log_std, deterministic
+        launch_logits, fraction_param1, fraction_param2, deterministic, fraction_dist
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids
@@ -2089,13 +2201,12 @@ def sample_batch_actions_context(
     """Batched moves-only sampler for fast env action contexts."""
     launch_logits = out.launch_logits
     target_logits = out.target_logits
-    fraction_mean = out.fraction_mean
-    fraction_log_std = out.fraction_log_std
+    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
     b_dim, p, _ = target_logits.shape
     assert len(contexts) == b_dim, (len(contexts), b_dim)
 
     launch, frac = _sample_launch_fraction(
-        launch_logits, fraction_mean, fraction_log_std, deterministic
+        launch_logits, fraction_param1, fraction_param2, deterministic, fraction_dist
     )
     legality_fields_l = _packed_legality_fields(
         launch, frac, out.planet_owned_mask, out.planet_mask, out.planet_ids

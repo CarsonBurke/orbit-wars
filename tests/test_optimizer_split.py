@@ -46,9 +46,10 @@ def test_optimizer_split_matches_parameter_golf_boundary():
         "target_key.weight",
         "launch_head.weight",
         "launch_head.bias",
-        "fraction_head.weight",
-        "fraction_head.bias",
-        "fraction_log_std",
+        "fraction_alpha_head.weight",
+        "fraction_alpha_head.bias",
+        "fraction_beta_head.weight",
+        "fraction_beta_head.bias",
         "value_head.0.weight",
         "value_head.2.weight",
     ):
@@ -103,9 +104,10 @@ def test_grad_clip_groups_match_real_policy_roles():
         "target_q_gain",
         "launch_head.weight",
         "launch_head.bias",
-        "fraction_head.weight",
-        "fraction_head.bias",
-        "fraction_log_std",
+        "fraction_alpha_head.weight",
+        "fraction_alpha_head.bias",
+        "fraction_beta_head.weight",
+        "fraction_beta_head.bias",
     ):
         assert groups[name] == "actor"
 

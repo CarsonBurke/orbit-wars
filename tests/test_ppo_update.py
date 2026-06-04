@@ -19,11 +19,12 @@ from owars.policies.features import MAX_FLEETS, MAX_PLANETS, EncodedObs
 from owars.policies.model import HLGaussLoss, OrbitPolicy
 from owars.policies.sampling import sample_batch_with_records
 from owars.training.ppo import (
+    _beta_log_prob,
     _conditional_action_entropy,
     _fixed_minibatches,
     _backward_actor_critic_with_separate_clips,
     _minibatch_loss_scale,
-    _squashed_normal_log_prob,
+    _rank_gaussian_advantage,
     ppo_update,
     value_only_update,
 )
@@ -113,6 +114,7 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         target_entropy_coef=0.01,
         fraction_entropy_coef=0.0,
         norm_advantage=True,
+        advantage_transform="rankgauss",
         spo_eps_low=0.2,
         spo_eps_high=0.28,
         epochs=2, minibatch_size=4, grad_clip=0.5,
@@ -129,11 +131,11 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         "fraction_entropy",
         "move_prob",
         "target_confidence",
-        "fraction_mean_mean",
-        "fraction_mean_abs_max",
-        "fraction_log_std_mean",
-        "fraction_log_std_min",
-        "fraction_log_std_max",
+        "fraction_alpha_mean",
+        "fraction_beta_mean",
+        "fraction_concentration_mean",
+        "fraction_concentration_max",
+        "fraction_skew_abs_mean",
         "deterministic_fraction_mean",
     ):
         v = getattr(log, name)
@@ -173,9 +175,7 @@ def test_log_prob_recompute_matches_sample_time():
     launch_logits = out.launch_logits.masked_fill(~target_legal_mask.any(dim=-1), -20.0)
     target_log_probs = torch.log_softmax(target_logits, dim=-1)
     target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-    frac_lp = _squashed_normal_log_prob(
-        out.fraction_mean, out.fraction_log_std, batch["fraction"]
-    )
+    frac_lp = _beta_log_prob(out.fraction_alpha, out.fraction_beta, batch["fraction"])
     launch_lp = -nn_functional.binary_cross_entropy_with_logits(
         launch_logits, launch, reduction="none"
     )
@@ -235,6 +235,16 @@ def test_minibatch_loss_scale_downweights_padded_tail_step():
     assert torch.allclose(_minibatch_loss_scale(weight), torch.tensor(0.4))
 
 
+def test_rank_gaussian_advantage_maps_full_batch_ranks_to_normal_quantiles():
+    adv = torch.tensor([10.0, -1.0, 3.0, 0.0])
+    got = _rank_gaussian_advantage(adv)
+    ranks = adv.argsort().argsort().float()
+    expected = math.sqrt(2.0) * torch.erfinv(2.0 * ((ranks + 0.5) / 4.0) - 1.0)
+
+    assert torch.allclose(got, expected)
+    assert torch.equal(got.argsort(), adv.argsort())
+
+
 def test_policy_value_grad_clip_separates_shared_actor_and_critic_grads():
     class Toy(torch.nn.Module):
         def __init__(self):
@@ -270,8 +280,8 @@ class _FixedPolicy(torch.nn.Module):
         self.new_target_logits = torch.log(
             torch.tensor([[[0.20, 0.80], [0.50, 0.50]]])
         )
-        self.new_fraction_mean = torch.tensor([[0.0, 0.0]])
-        self.new_fraction_log_std = torch.tensor([[-0.25, -0.25]])
+        self.new_fraction_alpha = torch.tensor([[2.0, 2.0]])
+        self.new_fraction_beta = torch.tensor([[2.0, 2.0]])
 
     def forward(self, feats, *, detach_actor: bool = False):
         b = feats.planet_feats.shape[0]
@@ -284,12 +294,12 @@ class _FixedPolicy(torch.nn.Module):
                 self.new_launch_logits.expand(b, -1).to(feats.planet_feats.device)
                 + self.dummy * 0.0
             ),
-            fraction_mean=(
-                self.new_fraction_mean.expand(b, -1).to(feats.planet_feats.device)
+            fraction_alpha=(
+                self.new_fraction_alpha.expand(b, -1).to(feats.planet_feats.device)
                 + self.dummy * 0.0
             ),
-            fraction_log_std=(
-                self.new_fraction_log_std.expand(b, -1).to(feats.planet_feats.device)
+            fraction_beta=(
+                self.new_fraction_beta.expand(b, -1).to(feats.planet_feats.device)
                 + self.dummy * 0.0
             ),
             value_logits=(
@@ -334,9 +344,9 @@ def test_spo_asym_policy_loss_uses_high_eps_when_drift_agrees_with_advantage():
     model = _FixedPolicy()
     launch_lp = torch.log(model.new_launch_logits.sigmoid()[0, 0])
     target_lp = torch.log(model.new_target_logits.exp()[0, 0, 1])
-    frac_lp = _squashed_normal_log_prob(
-        model.new_fraction_mean[0, 0],
-        model.new_fraction_log_std[0, 0],
+    frac_lp = _beta_log_prob(
+        model.new_fraction_alpha[0, 0],
+        model.new_fraction_beta[0, 0],
         torch.tensor(0.5),
     )
     new_log_prob = (launch_lp + target_lp + frac_lp).reshape(1, 1)
@@ -354,6 +364,7 @@ def test_spo_asym_policy_loss_uses_high_eps_when_drift_agrees_with_advantage():
         target_entropy_coef=0.0,
         fraction_entropy_coef=0.0,
         norm_advantage=False,
+        advantage_transform="none",
         spo_eps_low=0.2,
         spo_eps_high=0.28,
         epochs=1, minibatch_size=1, grad_clip=1.0,
@@ -371,9 +382,9 @@ def test_approx_kl_sums_owned_planet_log_probs_cleanrl_style():
     model = _FixedPolicy()
     launch_lp = torch.log(model.new_launch_logits.sigmoid())
     target_lp = torch.log(torch.tensor([[0.80, 0.50]]))
-    frac_lp = _squashed_normal_log_prob(
-        model.new_fraction_mean,
-        model.new_fraction_log_std,
+    frac_lp = _beta_log_prob(
+        model.new_fraction_alpha,
+        model.new_fraction_beta,
         torch.full((1, 2), 0.5),
     )
     new_log_prob = launch_lp + target_lp + frac_lp
@@ -392,6 +403,7 @@ def test_approx_kl_sums_owned_planet_log_probs_cleanrl_style():
         target_entropy_coef=0.0,
         fraction_entropy_coef=0.0,
         norm_advantage=False,
+        advantage_transform="none",
         spo_eps_low=0.2,
         spo_eps_high=0.28,
         epochs=1, minibatch_size=1, grad_clip=1.0,
@@ -406,9 +418,9 @@ def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
     model = _FixedPolicy()
     launch_lp = torch.log(model.new_launch_logits.sigmoid()[0, 0])
     target_lp = torch.log(model.new_target_logits.exp()[0, 0, 1])
-    frac_lp = _squashed_normal_log_prob(
-        model.new_fraction_mean[0, 0],
-        model.new_fraction_log_std[0, 0],
+    frac_lp = _beta_log_prob(
+        model.new_fraction_alpha[0, 0],
+        model.new_fraction_beta[0, 0],
         torch.tensor(0.5),
     )
     new_log_prob = launch_lp + target_lp + frac_lp
@@ -447,6 +459,7 @@ def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
         target_entropy_coef=0.0,
         fraction_entropy_coef=0.0,
         norm_advantage=False,
+        advantage_transform="none",
         spo_eps_low=0.2,
         spo_eps_high=0.28,
         epochs=1, minibatch_size=1, grad_clip=1.0,
@@ -462,9 +475,9 @@ def test_spo_asym_policy_loss_uses_low_eps_when_drift_opposes_advantage():
     model = _FixedPolicy()
     launch_lp = torch.log(model.new_launch_logits.sigmoid()[0, 0])
     target_lp = torch.log(model.new_target_logits.exp()[0, 0, 1])
-    frac_lp = _squashed_normal_log_prob(
-        model.new_fraction_mean[0, 0],
-        model.new_fraction_log_std[0, 0],
+    frac_lp = _beta_log_prob(
+        model.new_fraction_alpha[0, 0],
+        model.new_fraction_beta[0, 0],
         torch.tensor(0.5),
     )
     new_log_prob = (launch_lp + target_lp + frac_lp).reshape(1, 1)
@@ -482,6 +495,7 @@ def test_spo_asym_policy_loss_uses_low_eps_when_drift_opposes_advantage():
         target_entropy_coef=0.0,
         fraction_entropy_coef=0.0,
         norm_advantage=False,
+        advantage_transform="none",
         spo_eps_low=0.2,
         spo_eps_high=0.28,
         epochs=1, minibatch_size=1, grad_clip=1.0,

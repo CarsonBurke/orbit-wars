@@ -344,6 +344,29 @@ def test_rust_vec_env_step_subset_fast_rejects_duplicate_indices():
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_reset_subset_advances_seed():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust.reset()
+    rust.step_subset_fast([0], [[[], []]])
+    first = rust.observation(0, 0)
+
+    rust.reset_subset([0])
+    rust.step_subset_fast([0], [[[], []]])
+    second = rust.observation(0, 0)
+
+    assert first["planets"] != second["planets"]
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
 def test_rust_vec_env_policy_batch_no_context_matches_features():
     _build_rust_extension()
     from owars.training.rust_env import RustVecEnv
@@ -592,13 +615,13 @@ def test_rust_vec_env_native_sampler_matches_context_sampler():
     out = PolicyOutput(
         launch_logits=launch_logits,
         target_logits=target_logits,
-        fraction_mean=torch.full((b, p), 3.0),
-        fraction_log_std=torch.zeros((b, p)),
         value=torch.zeros(b),
         value_logits=torch.zeros(b, 51),
         planet_owned_mask=fast.planet_owned_mask,
         planet_mask=fast.planet_mask,
         planet_ids=fast.planet_ids,
+        fraction_alpha=torch.full((b, p), 20.0),
+        fraction_beta=torch.full((b, p), 2.0),
     )
 
     expected_actions, expected_records = sample_batch_with_records_context(

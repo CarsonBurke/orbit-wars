@@ -10,7 +10,8 @@ import torch
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
 from owars.training.elo import EloTracker
-from owars.training.league import LEARNER_NAME, OpponentPool
+from owars.agents.sniper import sniper_agent
+from owars.training.league import FixedOpponentPool, LEARNER_NAME, OpponentPool
 
 
 def _tiny_model() -> OrbitPolicy:
@@ -100,3 +101,20 @@ def test_new_snapshot_inherits_learner_rating(tmp_path: Path):
     pool = OpponentPool(elo=elo, top_k=4, self_play_prob=0.0, rng=random.Random(0))
     pool.add_snapshot("a", _tiny_model(), tmp_path / "a.pt")
     assert elo.get("frozen:a") == 1700.0
+
+
+def test_fixed_opponent_pool_samples_static_builtin():
+    pool = FixedOpponentPool(["sniper"], rng=random.Random(0))
+    slots = pool.sample(8)
+    assert all(s.name == "sniper" for s in slots)
+    assert all(s.agent is sniper_agent for s in slots)
+    assert pool.snapshot_names() == []
+
+
+def test_fixed_opponent_pool_rejects_unknown_builtin():
+    try:
+        FixedOpponentPool(["not_real"], rng=random.Random(0))
+    except ValueError as exc:
+        assert "unknown fixed opponents" in str(exc)
+    else:
+        raise AssertionError("unknown fixed opponent should raise")

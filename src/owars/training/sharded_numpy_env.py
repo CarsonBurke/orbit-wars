@@ -18,6 +18,7 @@ from ..policies.sampling import ActionContext
 from .numpy_env import NumpyVecEnv
 
 _RESET = "reset"
+_RESET_SUBSET = "reset_subset"
 _STEP = "step"
 _STEP_FAST = "step_fast"
 _OBSERVATION = "observation"
@@ -78,6 +79,9 @@ def _numpy_shard_worker(
                 remote.send(("ok", None))
             elif cmd == _RESET:
                 remote.send(("ok", vec.reset()))
+            elif cmd == _RESET_SUBSET:
+                indices = [int(idx) for idx in payload]
+                remote.send(("ok", vec.reset_subset(indices)))
             elif cmd == _STEP:
                 indices, actions = payload
                 remote.send(("ok", vec.step_subset(indices, actions)))
@@ -191,6 +195,32 @@ class ShardedNumpyVecEnv:
             start, _size = self.shards[shard_idx]
             for local_idx, state in enumerate(payload):
                 states[start + local_idx] = state
+        return states
+
+    def reset_subset(self, indices: list[int]) -> dict[int, Any]:
+        self.last_replay_html = None
+        grouped_indices: list[list[int]] = [[] for _ in self.shards]
+        for env_idx in indices:
+            shard_idx, local_idx = self._env_to_shard[env_idx]
+            grouped_indices[shard_idx].append(local_idx)
+
+        active_shards: list[int] = []
+        for shard_idx, local_indices in enumerate(grouped_indices):
+            if not local_indices:
+                continue
+            self._remotes[shard_idx].send((_RESET_SUBSET, local_indices))
+            active_shards.append(shard_idx)
+
+        states: dict[int, Any] = {}
+        for shard_idx in active_shards:
+            tag, payload = self._remotes[shard_idx].recv()
+            if tag != "ok":
+                raise RuntimeError(
+                    f"numpy shard {shard_idx} reset_subset failed: {payload}"
+                )
+            start, _size = self.shards[shard_idx]
+            for local_idx, state in payload.items():
+                states[start + int(local_idx)] = state
         return states
 
     def step_subset(

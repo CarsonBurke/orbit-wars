@@ -47,6 +47,7 @@ optim:
 ppo:
   gamma: 0.997
   gae_lambda: 0.95
+  advantage_transform: rankgauss
   norm_advantage: true
   spo_eps_low: 0.4
   spo_eps_high: 0.56

@@ -83,8 +83,8 @@ def _model() -> OrbitPolicy:
 def _forced_move_output(feats) -> PolicyOutput:
     """PolicyOutput that deterministically launches from planet 0 to planet 1.
 
-    A large pre-squash mean on planet 0 sends most of the garrison. All other
-    planets use mean 0, whose deterministic fraction is 0.5.
+    A high-alpha Beta on planet 0 sends most of the garrison. All other
+    planets use symmetric Beta parameters, whose deterministic fraction is 0.5.
     """
     batched = feats.planet_ids.dim() == 2
     b = int(feats.planet_ids.shape[0]) if batched else 1
@@ -94,14 +94,14 @@ def _forced_move_output(feats) -> PolicyOutput:
     target_logits = torch.full((b, p, p), -100.0)
     target_logits[:, 0, :] = -100.0
     target_logits[:, 0, 1] = 100.0
-    fraction_mean = torch.zeros((b, p))
-    fraction_mean[:, 0] = 3.0
-    fraction_log_std = torch.zeros((b, p))
+    fraction_alpha = torch.full((b, p), 2.0)
+    fraction_beta = torch.full((b, p), 2.0)
+    fraction_alpha[:, 0] = 20.0
     if not batched:
         launch_logits = launch_logits[:1]
         target_logits = target_logits[:1]
-        fraction_mean = fraction_mean[:1]
-        fraction_log_std = fraction_log_std[:1]
+        fraction_alpha = fraction_alpha[:1]
+        fraction_beta = fraction_beta[:1]
         planet_owned_mask = feats.planet_owned_mask.unsqueeze(0)
         planet_mask = feats.planet_mask.unsqueeze(0)
         planet_ids = feats.planet_ids.unsqueeze(0)
@@ -112,13 +112,13 @@ def _forced_move_output(feats) -> PolicyOutput:
     return PolicyOutput(
         launch_logits=launch_logits,
         target_logits=target_logits,
-        fraction_mean=fraction_mean,
-        fraction_log_std=fraction_log_std,
         value=torch.zeros(b),
         value_logits=torch.zeros(b, 51),
         planet_owned_mask=planet_owned_mask,
         planet_mask=planet_mask,
         planet_ids=planet_ids,
+        fraction_alpha=fraction_alpha,
+        fraction_beta=fraction_beta,
     )
 
 
@@ -131,9 +131,9 @@ def _forced_source_output(feats, target_scores: dict[int, float]) -> PolicyOutpu
     target_logits = torch.full((b, p, p), -100.0)
     for target, score in target_scores.items():
         target_logits[:, 0, target] = score
-    fraction_mean = torch.zeros((b, p))
-    fraction_mean[:, 0] = 3.0
-    fraction_log_std = torch.zeros((b, p))
+    fraction_alpha = torch.full((b, p), 2.0)
+    fraction_beta = torch.full((b, p), 2.0)
+    fraction_alpha[:, 0] = 20.0
     if not batched:
         planet_owned_mask = feats.planet_owned_mask.unsqueeze(0)
         planet_mask = feats.planet_mask.unsqueeze(0)
@@ -145,13 +145,13 @@ def _forced_source_output(feats, target_scores: dict[int, float]) -> PolicyOutpu
     return PolicyOutput(
         launch_logits=launch_logits,
         target_logits=target_logits,
-        fraction_mean=fraction_mean,
-        fraction_log_std=fraction_log_std,
         value=torch.zeros(b),
         value_logits=torch.zeros(b, 51),
         planet_owned_mask=planet_owned_mask,
         planet_mask=planet_mask,
         planet_ids=planet_ids,
+        fraction_alpha=fraction_alpha,
+        fraction_beta=fraction_beta,
     )
 
 
@@ -167,13 +167,13 @@ def _duplicate_source_output() -> PolicyOutput:
     return PolicyOutput(
         launch_logits=launch_logits,
         target_logits=target_logits,
-        fraction_mean=torch.full((1, 3), 1.5),
-        fraction_log_std=torch.zeros((1, 3)),
         value=torch.zeros(1),
         value_logits=torch.zeros(1, 51),
         planet_owned_mask=torch.tensor([[True, True, False]]),
         planet_mask=torch.tensor([[True, True, True]]),
         planet_ids=torch.tensor([[0, 0, 1]]),
+        fraction_alpha=torch.full((1, 3), 19.0),
+        fraction_beta=torch.full((1, 3), 1.0),
     )
 
 
@@ -344,13 +344,13 @@ def test_deterministic_moves_only_fallback_allows_multiple_sources():
     out = PolicyOutput(
         launch_logits=torch.full((1, p), -100.0),
         target_logits=torch.full((1, p, p), -100.0),
-        fraction_mean=torch.zeros((1, p)),
-        fraction_log_std=torch.zeros((1, p)),
         value=torch.zeros(1),
         value_logits=torch.zeros(1, 51),
         planet_owned_mask=feats.planet_owned_mask.unsqueeze(0),
         planet_mask=feats.planet_mask.unsqueeze(0),
         planet_ids=feats.planet_ids.unsqueeze(0),
+        fraction_alpha=torch.full((1, p), 2.0),
+        fraction_beta=torch.full((1, p), 2.0),
     )
     out.launch_logits[:, 0] = -1.0
     out.launch_logits[:, 2] = -1.2

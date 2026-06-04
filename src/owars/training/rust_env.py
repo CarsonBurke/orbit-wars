@@ -24,6 +24,7 @@ from ..policies.sampling import (
     _batch_record_from_materialized_launch,
     _ensure_deterministic_launch_if_idle,
     _mask_impossible_launches,
+    _policy_fraction_params,
     _sample_launch_fraction,
     _sample_target,
 )
@@ -32,7 +33,7 @@ from ..policies.sampling import (
 def _load_native() -> Any:
     try:
         return importlib.import_module("_owars_env")
-    except ModuleNotFoundError:
+    except (ImportError, ModuleNotFoundError):
         root = Path(__file__).resolve().parents[3]
         candidates = [
             root / "rust" / "owars_env_py" / "target" / "release" / "lib_owars_env.so",
@@ -44,11 +45,23 @@ def _load_native() -> Any:
             spec = importlib.util.spec_from_file_location("_owars_env", path)
             if spec is None or spec.loader is None:
                 continue
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            try:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except ImportError:
+                # The extension is tied to the Python ABI. A checked-in or
+                # previously-built .so from another venv can exist but fail to
+                # load; fall through and rebuild for the active interpreter.
+                continue
             return module
         manifest = root / "rust" / "owars_env_py" / "Cargo.toml"
         if manifest.exists():
+            subprocess.run(
+                ["cargo", "clean"],
+                cwd=manifest.parent,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
             subprocess.run(
                 ["cargo", "build", "--release"],
                 cwd=manifest.parent,
@@ -118,6 +131,10 @@ class RustVecEnv:
         self._core.reset()
         return [None] * self.num_envs
 
+    def reset_subset(self, indices: list[int]) -> dict[int, Any]:
+        self._core.reset_subset([int(idx) for idx in indices])
+        return {int(idx): None for idx in indices}
+
     def step_subset_fast(
         self, indices: list[int], actions: list[Any]
     ) -> dict[int, tuple[Any, bool, Any]]:
@@ -183,10 +200,13 @@ class RustVecEnv:
             record_rows = list(range(len(rows)))
         launch_logits = out.launch_logits
         target_logits = out.target_logits
-        fraction_mean = out.fraction_mean
-        fraction_log_std = out.fraction_log_std
+        fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
         launch, frac = _sample_launch_fraction(
-            launch_logits, fraction_mean, fraction_log_std, deterministic
+            launch_logits,
+            fraction_param1,
+            fraction_param2,
+            deterministic,
+            fraction_dist,
         )
         active_fields_masker = getattr(
             self._core,
@@ -291,8 +311,9 @@ class RustVecEnv:
             frac,
             launch_logits,
             target_logits,
-            fraction_mean,
-            fraction_log_std,
+            fraction_param1,
+            fraction_param2,
+            fraction_dist,
             materialized_rows,
             record_rows,
         )

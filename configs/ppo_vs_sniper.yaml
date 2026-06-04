@@ -1,4 +1,4 @@
-# Main PPO config — the "primary" learned model.
+# PPO fixed-opponent config: train only against the static sniper bot.
 #
 # 2-player PPO config.
 #
@@ -11,10 +11,10 @@
 #   - Distributional value head (symlog HL-Gauss CE on ±100k raw margin / 153 bins), unclipped.
 
 run:
-  name: ppo_base
+  name: ppo_vs_sniper
   seed: 0
   device: cuda
-  compile_mode: reduce-overhead
+  compile_mode: ""
   log_root: runs
   ckpt_root: checkpoints
   total_updates: 1000
@@ -62,7 +62,7 @@ optim:
   weight_decay: 1.0e-4
   grad_clip: 0.5   # actor and critic gradients are clipped separately, including
                    # their shared-trunk components, then summed before step.
-  minibatch_size: 4096
+  minibatch_size: 1024
   epochs_per_update: 4
 
 ppo:
@@ -91,14 +91,11 @@ rollout:
   env_backend: rust
 
 opponents:
+  mode: fixed
+  fixed_opponents: [sniper]
   snapshot_device: train
-  snapshot_every: 1   # one snapshot per PPO update — weights only move once
-                      # per update, so this is the finest meaningful cadence.
-                      # UCB-based eviction in `OpponentPool._trim_to_top_k`
-                      # handles prioritization toward strong+well-measured
-                      # snapshots and culls the rest.
-  top_k: 10           # ~10 updates of historical diversity before eviction
-                      # kicks in — compact enough to keep the league focused.
+  snapshot_every: 1   # ignored in fixed mode
+  top_k: 10           # ignored in fixed mode
   self_play_prob: 0.8
   initial_rating: 1500.0
   k_factor: 32.0

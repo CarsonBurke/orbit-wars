@@ -153,31 +153,67 @@ def _conditional_action_entropy(
     )
 
 
-SQUASH_EPS: float = 1e-6
+BETA_SAMPLE_EPS: float = 1e-6
+RANK_GAUSS_CLAMP: float = 0.999
 
 
-def _squashed_normal_log_prob(
-    mean: torch.Tensor,
-    log_std: torch.Tensor,
+def _beta_log_prob(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
     fraction: torch.Tensor,
 ) -> torch.Tensor:
-    u = (2.0 * fraction.float() - 1.0).clamp(
-        -1.0 + SQUASH_EPS, 1.0 - SQUASH_EPS
-    )
-    z = torch.atanh(u)
-    log_std = log_std.float()
-    inv_std = torch.exp(-log_std)
-    log_prob_z = (
-        -0.5 * ((z - mean.float()) * inv_std).square()
-        - log_std
-        - 0.5 * math.log(2.0 * math.pi)
-    )
-    squash_correction = torch.log(1.0 - u.square() + SQUASH_EPS)
-    return log_prob_z - squash_correction
+    x = fraction.float().clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
+    alpha = alpha.float()
+    beta = beta.float()
+    log_norm = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta)
+    return (alpha - 1.0) * torch.log(x) + (beta - 1.0) * torch.log1p(-x) - log_norm
 
 
-def _squashed_normal_entropy(log_std: torch.Tensor) -> torch.Tensor:
-    return log_std.float() + 0.5 * (1.0 + math.log(2.0 * math.pi))
+def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    alpha = alpha.float()
+    beta = beta.float()
+    total = alpha + beta
+    log_norm = torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(total)
+    return (
+        log_norm
+        - (alpha - 1.0) * torch.digamma(alpha)
+        - (beta - 1.0) * torch.digamma(beta)
+        + (total - 2.0) * torch.digamma(total)
+    )
+
+
+def _deterministic_beta_fraction(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    return (alpha.float() / (alpha.float() + beta.float())).clamp(
+        BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS
+    )
+
+
+def _rank_gaussian_advantage(
+    advantage: torch.Tensor,
+    *,
+    clamp: float = RANK_GAUSS_CLAMP,
+) -> torch.Tensor:
+    """Map raw advantages to empirical Gaussian quantiles over the full batch."""
+    flat = advantage.float().flatten()
+    if flat.numel() == 0:
+        return advantage.float()
+    ranks = flat.argsort().argsort().to(torch.float32)
+    quantile = (ranks + 0.5) / float(flat.numel())
+    centered = (2.0 * quantile - 1.0).clamp(-float(clamp), float(clamp))
+    shaped = math.sqrt(2.0) * torch.erfinv(centered)
+    return shaped.reshape_as(advantage.float()).to(device=advantage.device)
+
+
+def _shape_policy_advantage(
+    advantage: torch.Tensor,
+    *,
+    transform: str,
+) -> torch.Tensor:
+    if transform == "rankgauss":
+        return _rank_gaussian_advantage(advantage)
+    if transform == "none":
+        return advantage.float()
+    raise ValueError(f"unknown PPO advantage_transform={transform!r}")
 
 
 def _module_device(model: torch.nn.Module) -> torch.device:
@@ -192,8 +228,8 @@ _ACTOR_CLIP_PATTERNS: tuple[str, ...] = (
     "target_key",
     "target_q_gain",
     "launch_head",
-    "fraction_head",
-    "fraction_log_std",
+    "fraction_alpha_head",
+    "fraction_beta_head",
 )
 
 _CRITIC_CLIP_PATTERNS: tuple[str, ...] = ("value_head",)
@@ -355,8 +391,10 @@ class _PPOMinibatchKernel(torch.nn.Module):
         launch_logits = out.launch_logits.float().masked_fill(~has_legal_target, -20.0)
         target_logits = out.target_logits.float().masked_fill(~target_legal_mask, float("-inf"))
         target_logits = _safe_target_logits(target_logits)
-        fraction_mean = out.fraction_mean.float()
-        fraction_log_std = out.fraction_log_std.float()
+        if out.fraction_alpha is None or out.fraction_beta is None:
+            raise ValueError("PPO OrbitPolicy output must include Beta fraction params")
+        fraction_alpha = out.fraction_alpha.float()
+        fraction_beta = out.fraction_beta.float()
         value_logits = out.value_logits.float()
 
         owned_f = owned_mask.float()
@@ -369,9 +407,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         target_log_probs = F.log_softmax(target_logits, dim=-1)
         target_dist_probs = target_log_probs.exp()
         target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-        frac_lp = _squashed_normal_log_prob(
-            fraction_mean, fraction_log_std, fraction.float()
-        )
+        frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
         chosen = launch_lp + launch_f * (target_lp + frac_lp)
 
         adv_b = advantage.float().unsqueeze(-1).expand_as(chosen)
@@ -403,7 +439,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         value_ce = -(target_probs * log_v_probs).sum(dim=-1)
         value_loss = _weighted_mean(value_ce, row_w)
 
-        frac_entropy_per_planet = _squashed_normal_entropy(fraction_log_std)
+        frac_entropy_per_planet = _beta_entropy(fraction_alpha, fraction_beta)
         p_move_current = launch_logits.sigmoid()
         planet_entropy = _conditional_action_entropy(
             launch_logits, target_log_probs, frac_entropy_per_planet
@@ -419,12 +455,17 @@ class _PPOMinibatchKernel(torch.nn.Module):
         fraction_entropy = ((p_move_current * frac_entropy_per_planet) * owned_w).sum() / denom
         move_prob = (p_move_current * owned_w).sum() / denom
         target_confidence = (target_dist_probs.amax(dim=-1) * owned_w).sum() / denom
-        fraction_mean_mean = (fraction_mean * owned_w).sum() / denom
-        fraction_mean_abs_max = _weighted_max(fraction_mean.abs(), owned_w)
-        fraction_log_std_mean = (fraction_log_std * owned_w).sum() / denom
-        fraction_log_std_min = -_weighted_max(-fraction_log_std, owned_w)
-        fraction_log_std_max = _weighted_max(fraction_log_std, owned_w)
-        deterministic_fraction = 0.5 * (torch.tanh(fraction_mean) + 1.0)
+        fraction_alpha_mean = (fraction_alpha * owned_w).sum() / denom
+        fraction_beta_mean = (fraction_beta * owned_w).sum() / denom
+        concentration = fraction_alpha + fraction_beta
+        fraction_concentration_mean = (concentration * owned_w).sum() / denom
+        fraction_concentration_max = _weighted_max(concentration, owned_w)
+        fraction_skew_abs_mean = (
+            ((fraction_alpha - fraction_beta).abs() * owned_w).sum() / denom
+        )
+        deterministic_fraction = _deterministic_beta_fraction(
+            fraction_alpha, fraction_beta
+        )
         deterministic_fraction_mean = (deterministic_fraction * owned_w).sum() / denom
         entropy_bonus = (
             self.target_entropy_coef * (launch_entropy + target_entropy)
@@ -458,11 +499,11 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 fraction_entropy.detach(),
                 move_prob.detach(),
                 target_confidence.detach(),
-                fraction_mean_mean.detach(),
-                fraction_mean_abs_max.detach(),
-                fraction_log_std_mean.detach(),
-                fraction_log_std_min.detach(),
-                fraction_log_std_max.detach(),
+                fraction_alpha_mean.detach(),
+                fraction_beta_mean.detach(),
+                fraction_concentration_mean.detach(),
+                fraction_concentration_max.detach(),
+                fraction_skew_abs_mean.detach(),
                 deterministic_fraction_mean.detach(),
             ]
         ).float()
@@ -607,11 +648,11 @@ class PPOLog:
     fraction_entropy: float = 0.0
     move_prob: float = 0.0
     target_confidence: float = 0.0
-    fraction_mean_mean: float = 0.0
-    fraction_mean_abs_max: float = 0.0
-    fraction_log_std_mean: float = 0.0
-    fraction_log_std_min: float = 0.0
-    fraction_log_std_max: float = 0.0
+    fraction_alpha_mean: float = 0.0
+    fraction_beta_mean: float = 0.0
+    fraction_concentration_mean: float = 0.0
+    fraction_concentration_max: float = 0.0
+    fraction_skew_abs_mean: float = 0.0
     deterministic_fraction_mean: float = 0.0
 
 
@@ -662,6 +703,7 @@ def ppo_update(
     target_entropy_coef: float,
     fraction_entropy_coef: float,
     norm_advantage: bool,
+    advantage_transform: str,
     spo_eps_low: float,
     spo_eps_high: float,
     epochs: int,
@@ -686,6 +728,10 @@ def ppo_update(
     """
     n = batch["planet_feats"].shape[0]
     device = batch["planet_feats"].device
+    policy_advantage = _shape_policy_advantage(
+        batch["advantage"],
+        transform=advantage_transform,
+    )
 
     metric_sum: torch.Tensor | None = None
     last_metrics: torch.Tensor | None = None
@@ -718,7 +764,7 @@ def ppo_update(
                 batch["target_idx"][mb],
                 batch["fraction"][mb],
                 batch["old_log_prob"][mb],
-                batch["advantage"][mb],
+                policy_advantage[mb],
                 batch["return"][mb],
                 batch["owned_mask"][mb],
                 batch["target_legal_mask"][mb],
@@ -766,11 +812,11 @@ def ppo_update(
         fraction_entropy=float(mean_logs[7]),
         move_prob=float(mean_logs[8]),
         target_confidence=float(mean_logs[9]),
-        fraction_mean_mean=float(mean_logs[10]),
-        fraction_mean_abs_max=float(mean_logs[11]),
-        fraction_log_std_mean=float(mean_logs[12]),
-        fraction_log_std_min=float(mean_logs[13]),
-        fraction_log_std_max=float(mean_logs[14]),
+        fraction_alpha_mean=float(mean_logs[10]),
+        fraction_beta_mean=float(mean_logs[11]),
+        fraction_concentration_mean=float(mean_logs[12]),
+        fraction_concentration_max=float(mean_logs[13]),
+        fraction_skew_abs_mean=float(mean_logs[14]),
         deterministic_fraction_mean=float(mean_logs[15]),
     )
 
