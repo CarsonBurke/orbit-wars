@@ -231,6 +231,30 @@ impl RustCoreVecEnv {
         Array1::from_vec(values).into_pyarray(py)
     }
 
+    fn production_margins<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<f32>>> {
+        for &(idx, player) in &rows {
+            if idx >= self.games.len() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "env index out of range",
+                ));
+            }
+            if player >= self.num_players {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "player index out of range",
+                ));
+            }
+        }
+        let values = rows
+            .into_iter()
+            .map(|(idx, player)| production_margin(&self.games[idx], player))
+            .collect::<Vec<_>>();
+        Ok(Array1::from_vec(values).into_pyarray(py))
+    }
+
     fn legal_target_mask<'py>(
         &self,
         py: Python<'py>,
@@ -525,6 +549,60 @@ impl RustCoreVecEnv {
     ) -> PyResult<Bound<'py, PyDict>> {
         policy_batch_dict(py, &self.games, rows, false)
     }
+
+    fn builtin_actions<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        rows: Vec<(usize, usize)>,
+        native: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        if name != "sniper" {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported native builtin opponent: {name}"
+            )));
+        }
+        for &(env_idx, player) in &rows {
+            if env_idx >= self.games.len() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "env index out of range",
+                ));
+            }
+            if player >= self.num_players {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "player index out of range",
+                ));
+            }
+        }
+        let games = &self.games;
+        let actions = py.detach(|| {
+            rows.into_par_iter()
+                .map(|(env_idx, player)| sniper_actions(&games[env_idx], player))
+                .collect::<Vec<_>>()
+        });
+        let out = PyList::empty(py);
+        for row_actions in actions {
+            if native {
+                out.append(Py::new(
+                    py,
+                    NativeActionList {
+                        actions: row_actions,
+                    },
+                )?)?;
+            } else {
+                let py_actions = PyList::empty(py);
+                for action in row_actions {
+                    let item = PyList::empty(py);
+                    item.append(action.from_planet_id)?;
+                    item.append(action.angle)?;
+                    item.append(action.ships)?;
+                    py_actions.append(item)?;
+                }
+                out.append(py_actions)?;
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl RustCoreVecEnv {
@@ -752,6 +830,57 @@ fn parse_env_actions(obj: &Bound<'_, PyAny>, num_players: usize) -> PyResult<Vec
         }
     }
     Ok(out)
+}
+
+fn sniper_actions(game: &Game, player: usize) -> PlayerAction {
+    let player = player as i32;
+    let targets = game
+        .planets
+        .iter()
+        .filter(|planet| planet.owner != player)
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let mut moves = Vec::new();
+    for mine in game.planets.iter().filter(|planet| planet.owner == player) {
+        let Some(target) = targets.iter().min_by(|a, b| {
+            distance_sq(mine, a)
+                .partial_cmp(&distance_sq(mine, b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
+            continue;
+        };
+        let ships_needed = target.ships + 1;
+        if mine.ships >= ships_needed {
+            let angle = (target.y - mine.y).atan2(target.x - mine.x);
+            moves.push(Action::launch(mine.id, angle, ships_needed));
+        }
+    }
+    moves
+}
+
+fn production_margin(game: &Game, player: usize) -> f32 {
+    let mut production = vec![0.0_f64; game.num_players];
+    for planet in &game.planets {
+        if planet.owner != -1 {
+            production[planet.owner as usize] += planet.production as f64;
+        }
+    }
+    let own = production[player];
+    let enemy = production
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, value)| (idx != player).then_some(*value))
+        .fold(0.0_f64, f64::max);
+    (own - enemy) as f32
+}
+
+fn distance_sq(a: &Planet, b: &Planet) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    dx * dx + dy * dy
 }
 
 fn get_or<T>(row: &Bound<'_, PyList>, idx: usize, default: T) -> PyResult<T>
@@ -1064,9 +1193,6 @@ fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
             if i == j || !mask_at(j) {
                 continue;
             }
-            if is_comet_col[j] {
-                continue;
-            }
             let Some(target) = target_motions[j].as_ref() else {
                 continue;
             };
@@ -1178,9 +1304,7 @@ fn legal_mask_state(game: &Game, planets_len: usize) -> LegalMaskState {
             ))
         })
         .collect::<Vec<_>>();
-    let target_cols = (0..planet_limit)
-        .filter(|&idx| !is_comet_col[idx])
-        .collect::<Vec<_>>();
+    let target_cols = (0..planet_limit).collect::<Vec<_>>();
     let mut source_cols_by_player = vec![Vec::new(); game.num_players];
     for (idx, planet) in game.planets.iter().take(planet_limit).enumerate() {
         if planet.owner < 0 || planet.ships < 2 {
@@ -1354,7 +1478,7 @@ where
             continue;
         }
         let target_id = id_at(ti);
-        if target_id < 0 || comet_ids.contains(&target_id) {
+        if target_id < 0 {
             continue;
         }
         let source_id = id_at(i);
@@ -1452,9 +1576,6 @@ where
         }
         let target = game.planets[ti];
         let target_id = target.id;
-        if is_comet_planet(game, target_id) {
-            continue;
-        }
         let send = ships_to_send(source_ships, frac_at(i));
         if send <= 0 {
             continue;
@@ -1553,9 +1674,6 @@ where
         }
         let target = game.planets[ti];
         let target_id = target.id;
-        if is_comet_planet(game, target_id) {
-            continue;
-        }
         let send = ships_to_send(source_ships, frac_at(i));
         if send <= 0 {
             continue;

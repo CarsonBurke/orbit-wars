@@ -14,7 +14,6 @@ per bin.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -23,6 +22,12 @@ import torch.nn.functional as F  # noqa: N812
 
 from ..policies.features import EncodedObs
 from ..policies.model import OrbitPolicy
+from ..policies.sampling import (
+    _categorical_action_log_probs,
+    _threshold_normal_launch_entropy,
+    _threshold_normal_launch_log_prob,
+    _threshold_normal_launch_prob,
+)
 
 
 def _slice_feats(batch: dict[str, torch.Tensor], mb) -> EncodedObs:
@@ -91,6 +96,44 @@ def _fixed_minibatches(
         weight = torch.ones(real, device=device, dtype=torch.float32)
         if mb.shape[0] < size:
             mb = torch.cat((mb, idx[: size - mb.shape[0]]), dim=0)
+            weight = torch.cat(
+                (
+                    weight,
+                    torch.zeros(size - real, device=device, dtype=torch.float32),
+                ),
+                dim=0,
+            )
+        batches.append((mb, weight))
+    return batches
+
+
+def _fixed_minibatches_by_count(
+    n: int,
+    minibatch_count: int,
+    device: torch.device,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Return exactly `minibatch_count` shuffled equal-shape minibatches.
+
+    The final logical minibatch is padded with repeated rows and zero weights
+    when `n` is not divisible by `minibatch_count`, so every real rollout row
+    contributes once per epoch and every optimizer step sees the same leading
+    dimension.
+    """
+    if n <= 0:
+        return []
+    count = max(1, int(minibatch_count))
+    size = math.ceil(n / count)
+    idx = torch.randperm(n, device=device)
+    batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    cursor = 0
+    for _ in range(count):
+        real = max(0, min(size, n - cursor))
+        mb = idx[cursor : cursor + real]
+        cursor += real
+        weight = torch.ones(real, device=device, dtype=torch.float32)
+        if real < size:
+            extra = idx[torch.randint(n, (size - real,), device=device)]
+            mb = torch.cat((mb, extra), dim=0)
             weight = torch.cat(
                 (
                     weight,
@@ -226,8 +269,8 @@ def _module_device(model: torch.nn.Module) -> torch.device:
 _ACTOR_CLIP_PATTERNS: tuple[str, ...] = (
     "target_query",
     "target_key",
+    "target_noop_key",
     "target_q_gain",
-    "launch_head",
     "fraction_alpha_head",
     "fraction_beta_head",
 )
@@ -266,60 +309,29 @@ def _clip_grad_norm(
     return torch.nn.utils.clip_grad_norm_(params, max_norm)
 
 
-def _clone_grads(
-    params: list[torch.nn.Parameter],
-) -> list[tuple[torch.nn.Parameter, torch.Tensor]]:
-    return [
-        (param, param.grad.detach().clone())
-        for param in params
-        if param.grad is not None
-    ]
-
-
-def _clear_grads(params: Iterable[torch.nn.Parameter]) -> None:
-    for param in params:
-        param.grad = None
-
-
-def _add_grads(saved: list[tuple[torch.nn.Parameter, torch.Tensor]]) -> None:
-    for param, grad in saved:
-        if param.grad is None:
-            param.grad = grad
-        else:
-            param.grad.add_(grad)
-
-
-def _backward_actor_critic_with_separate_clips(
+def _backward_actor_critic_with_group_clips(
     model: torch.nn.Module,
     actor_loss: torch.Tensor,
     critic_loss: torch.Tensor,
     max_norm: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Backprop actor and critic losses with independent clipping.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backprop once, then clip actor heads, critic head, and trunk separately.
 
-    The shared encoder receives both policy and value gradients, but the two
-    norms are clipped before they are added together. This prevents value CE
-    from setting the policy step size through a single combined norm.
+    Actor-only heads receive gradients only from `actor_loss`, and the critic
+    head receives gradients only from `critic_loss`. The shared encoder sees the
+    true combined gradient from both losses. This avoids the retained-graph
+    double-backward memory spike while still preventing a large head gradient
+    from setting the step scale for unrelated parameter groups.
     """
     actor, critic, shared = _grad_clip_groups(model)
     device = _module_device(model)
-    if max_norm <= 0.0:
-        (actor_loss + critic_loss).backward()
-        zero = torch.zeros((), device=device)
-        return zero, zero
+    clip_norm = max_norm if max_norm > 0.0 else float("inf")
 
-    actor_params = actor + shared
-    critic_params = critic + shared
-
-    actor_loss.backward(retain_graph=True)
-    actor_norm = _clip_grad_norm(actor_params, max_norm, device)
-    actor_grads = _clone_grads(actor_params)
-    _clear_grads(model.parameters())
-
-    critic_loss.backward()
-    critic_norm = _clip_grad_norm(critic_params, max_norm, device)
-    _add_grads(actor_grads)
-    return actor_norm, critic_norm
+    (actor_loss + critic_loss).backward()
+    actor_norm = _clip_grad_norm(actor, clip_norm, device)
+    critic_norm = _clip_grad_norm(critic, clip_norm, device)
+    shared_norm = _clip_grad_norm(shared, clip_norm, device)
+    return actor_norm, critic_norm, shared_norm
 
 
 class _PPOMinibatchKernel(torch.nn.Module):
@@ -388,9 +400,19 @@ class _PPOMinibatchKernel(torch.nn.Module):
 
         target_legal_mask = target_legal_mask.bool()
         has_legal_target = target_legal_mask.any(dim=-1)
-        launch_logits = out.launch_logits.float().masked_fill(~has_legal_target, -20.0)
+        launch_logits = out.launch_logits.float()
+        out_action_logit_softcap = getattr(out, "action_logit_softcap", None)
+        action_logit_softcap = (
+            None if out_action_logit_softcap is None else float(out_action_logit_softcap)
+        )
+        if action_logit_softcap is None:
+            launch_logits = launch_logits.masked_fill(~has_legal_target, -20.0)
+        out_launch_log_std = getattr(out, "launch_log_std", None)
+        launch_log_std = (
+            None if out_launch_log_std is None else out_launch_log_std.float()
+        )
+        launch_prob_floor = float(getattr(out, "launch_prob_floor", 0.0))
         target_logits = out.target_logits.float().masked_fill(~target_legal_mask, float("-inf"))
-        target_logits = _safe_target_logits(target_logits)
         if out.fraction_alpha is None or out.fraction_beta is None:
             raise ValueError("PPO OrbitPolicy output must include Beta fraction params")
         fraction_alpha = out.fraction_alpha.float()
@@ -401,14 +423,35 @@ class _PPOMinibatchKernel(torch.nn.Module):
         p = target_logits.shape[1]
         launch_f = launch.float().clamp(0.0, 1.0)
         target = target_idx.clamp(0, p - 1)
-        launch_lp = -F.binary_cross_entropy_with_logits(
-            launch_logits, launch_f, reduction="none"
-        )
-        target_log_probs = F.log_softmax(target_logits, dim=-1)
-        target_dist_probs = target_log_probs.exp()
-        target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+        if action_logit_softcap is None:
+            target_logits = _safe_target_logits(target_logits)
+            launch_lp = _threshold_normal_launch_log_prob(
+                launch_logits,
+                launch_log_std,
+                launch_f,
+                launch_prob_floor,
+            )
+            target_log_probs = F.log_softmax(target_logits, dim=-1)
+            target_dist_probs = target_log_probs.exp()
+            target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            action_lp = launch_lp + launch_f * target_lp
+        else:
+            action_log_probs = _categorical_action_log_probs(
+                launch_logits,
+                target_logits,
+                action_logit_softcap,
+            )
+            action_probs = action_log_probs.exp()
+            action_idx = torch.where(
+                launch_f > 0.5,
+                target + 1,
+                torch.zeros_like(target),
+            )
+            action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
+            target_log_probs = action_log_probs[..., 1:]
+            target_dist_probs = action_probs[..., 1:]
         frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
-        chosen = launch_lp + launch_f * (target_lp + frac_lp)
+        chosen = action_lp + launch_f * frac_lp
 
         adv_b = advantage.float().unsqueeze(-1).expand_as(chosen)
         row_w = row_weight.to(device=owned_f.device, dtype=owned_f.dtype)
@@ -416,7 +459,11 @@ class _PPOMinibatchKernel(torch.nn.Module):
         owned_w = owned_f * row_w_b
         denom = owned_w.sum().clamp_min(1.0)
 
-        log_ratio = chosen - old_log_prob.float()
+        log_ratio = torch.where(
+            owned_f > 0.0,
+            chosen - old_log_prob.float(),
+            torch.zeros_like(chosen),
+        )
         ratio = log_ratio.exp()
         adv_actor = adv_b
         if self.norm_advantage:
@@ -440,20 +487,76 @@ class _PPOMinibatchKernel(torch.nn.Module):
         value_loss = _weighted_mean(value_ce, row_w)
 
         frac_entropy_per_planet = _beta_entropy(fraction_alpha, fraction_beta)
-        p_move_current = launch_logits.sigmoid()
-        planet_entropy = _conditional_action_entropy(
-            launch_logits, target_log_probs, frac_entropy_per_planet
-        )
+        if action_logit_softcap is None:
+            p_move_current = _threshold_normal_launch_prob(
+                launch_logits,
+                launch_log_std,
+                launch_prob_floor,
+            )
+            planet_entropy = _conditional_action_entropy(
+                torch.logit(p_move_current.clamp(1e-7, 1.0 - 1e-7)),
+                target_log_probs,
+                frac_entropy_per_planet,
+            )
+            launch_entropy = (
+                _threshold_normal_launch_entropy(
+                    launch_logits,
+                    launch_log_std,
+                    launch_prob_floor,
+                )
+                * owned_w
+            ).sum() / denom
+            min_real = torch.finfo(target_log_probs.dtype).min
+            target_entropy_per_planet = -(
+                target_dist_probs * target_log_probs.clamp_min(min_real)
+            ).sum(dim=-1)
+            target_entropy = (
+                (p_move_current * target_entropy_per_planet) * owned_w
+            ).sum() / denom
+        else:
+            safe_action_log_probs = torch.where(
+                torch.isfinite(action_log_probs),
+                action_log_probs,
+                torch.zeros_like(action_log_probs),
+            )
+            action_entropy = -(
+                action_probs * safe_action_log_probs
+            ).sum(dim=-1)
+            p_move_current = target_dist_probs.sum(dim=-1)
+            planet_entropy = action_entropy + p_move_current * frac_entropy_per_planet
+            target_entropy = (action_entropy * owned_w).sum() / denom
+            launch_entropy = target_entropy * 0.0
         entropy = (planet_entropy * owned_w).sum() / denom
-        launch_entropy = (_bernoulli_entropy(launch_logits) * owned_w).sum() / denom
-        target_entropy_per_planet = -(
-            target_dist_probs
-            * target_log_probs.clamp_min(torch.finfo(target_log_probs.dtype).min)
-        ).sum(dim=-1)
-        target_entropy = ((p_move_current * target_entropy_per_planet) * owned_w).sum()
-        target_entropy = target_entropy / denom
         fraction_entropy = ((p_move_current * frac_entropy_per_planet) * owned_w).sum() / denom
         move_prob = (p_move_current * owned_w).sum() / denom
+        legal_target_count = target_legal_mask.to(dtype=owned_f.dtype).sum(dim=-1)
+        legal_target_count_mean = (legal_target_count * owned_w).sum() / denom
+        uniform_move_prior = (
+            (legal_target_count > 0.0).to(dtype=owned_f.dtype) * 0.5
+            * owned_w
+        ).sum() / denom
+        launch_mean = (launch_logits * owned_w).sum() / denom
+        if action_logit_softcap is not None:
+            launch_log_std_mean = launch_logits.sum() * 0.0
+            action_logit_softcap_metric = launch_logits.new_tensor(
+                float(action_logit_softcap)
+            )
+            target_best = target_logits.amax(dim=-1)
+            target_best = torch.where(has_legal_target, target_best, launch_logits)
+            launch_score_mean = (
+                ((launch_logits - target_best) * owned_w).sum()
+                / denom
+            )
+        elif launch_log_std is None:
+            launch_log_std_mean = launch_logits.sum() * 0.0
+            action_logit_softcap_metric = launch_logits.sum() * 0.0
+            launch_score_mean = launch_logits.sum() * 0.0
+        else:
+            launch_log_std_f = launch_log_std.float()
+            launch_log_std_mean = (launch_log_std_f * owned_w).sum() / denom
+            action_logit_softcap_metric = launch_logits.sum() * 0.0
+            launch_score = launch_logits * torch.exp(-launch_log_std_f)
+            launch_score_mean = (launch_score * owned_w).sum() / denom
         target_confidence = (target_dist_probs.amax(dim=-1) * owned_w).sum() / denom
         fraction_alpha_mean = (fraction_alpha * owned_w).sum() / denom
         fraction_beta_mean = (fraction_beta * owned_w).sum() / denom
@@ -479,11 +582,25 @@ class _PPOMinibatchKernel(torch.nn.Module):
         # log-probs into one joint action log-prob per rollout row, then apply
         # Joschu's k3 approximation `E[(r - 1) - log r]`. The policy surrogate
         # above remains per-source-planet; this is only the reported KL scale.
+        per_planet_kl = (((ratio - 1.0) - log_ratio) * owned_w).sum() / denom
+        per_planet_old_kl = ((-log_ratio) * owned_w).sum() / denom
+        log_ratio_abs_mean = (log_ratio.abs() * owned_w).sum() / denom
+        log_ratio_abs_max = _weighted_max(log_ratio.abs(), owned_w)
+        spo_clip_frac = ((ratio_diff.abs() > eps).to(owned_f.dtype) * owned_w).sum() / denom
+        executed_launch_frac = (launch_f * owned_w).sum() / denom
+
         row_log_ratio = (log_ratio * owned_f).sum(dim=-1)
         row_log_ratio = torch.where(row_w > 0.0, row_log_ratio, row_log_ratio * 0.0)
         row_ratio = row_log_ratio.exp()
         row_denom = row_w.sum().clamp_min(1.0)
+        row_launch_count = (launch_f * owned_w).sum(dim=-1)
+        turn_no_action_frac = (
+            ((row_launch_count <= 0.0).to(row_w.dtype) * row_w).sum() / row_denom
+        )
         kl = (((row_ratio - 1.0) - row_log_ratio) * row_w).sum() / row_denom
+        old_kl = ((-row_log_ratio) * row_w).sum() / row_denom
+        row_log_ratio_abs_mean = (row_log_ratio.abs() * row_w).sum() / row_denom
+        owned_planets_mean = owned_w.sum() / row_denom
         pos_count = (owned_w * (adv_b >= 0.0).to(owned_f.dtype)).sum()
         total_owned = owned_w.sum().clamp_min(1.0)
         pos_frac = pos_count / total_owned
@@ -505,6 +622,22 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 fraction_concentration_max.detach(),
                 fraction_skew_abs_mean.detach(),
                 deterministic_fraction_mean.detach(),
+                old_kl.detach(),
+                per_planet_kl.detach(),
+                per_planet_old_kl.detach(),
+                log_ratio_abs_mean.detach(),
+                log_ratio_abs_max.detach(),
+                spo_clip_frac.detach(),
+                owned_planets_mean.detach(),
+                executed_launch_frac.detach(),
+                row_log_ratio_abs_mean.detach(),
+                launch_mean.detach(),
+                launch_log_std_mean.detach(),
+                launch_score_mean.detach(),
+                action_logit_softcap_metric.detach(),
+                turn_no_action_frac.detach(),
+                legal_target_count_mean.detach(),
+                uniform_move_prior.detach(),
             ]
         ).float()
         return actor_loss, critic_loss, metrics
@@ -644,6 +777,9 @@ class PPOLog:
     approx_kl: float
     spo_penalty: float
     pos_frac: float
+    actor_grad_norm: float = 0.0
+    critic_grad_norm: float = 0.0
+    shared_grad_norm: float = 0.0
     target_entropy: float = 0.0
     fraction_entropy: float = 0.0
     move_prob: float = 0.0
@@ -654,6 +790,23 @@ class PPOLog:
     fraction_concentration_max: float = 0.0
     fraction_skew_abs_mean: float = 0.0
     deterministic_fraction_mean: float = 0.0
+    old_approx_kl: float = 0.0
+    per_planet_approx_kl: float = 0.0
+    per_planet_old_approx_kl: float = 0.0
+    log_ratio_abs_mean: float = 0.0
+    log_ratio_abs_max: float = 0.0
+    spo_clip_frac: float = 0.0
+    owned_planets_mean: float = 0.0
+    executed_launch_frac: float = 0.0
+    source_non_action_frac: float = 0.0
+    turn_no_action_frac: float = 0.0
+    row_log_ratio_abs_mean: float = 0.0
+    launch_mean: float = 0.0
+    launch_log_std_mean: float = 0.0
+    launch_score_mean: float = 0.0
+    action_logit_softcap: float = 0.0
+    legal_target_count_mean: float = 0.0
+    uniform_move_prior: float = 0.0
 
 
 def compute_gae(
@@ -709,9 +862,13 @@ def ppo_update(
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
+    minibatch_count: int | None = None,
     compile_mode: str | None = None,
 ) -> PPOLog:
-    """Run `epochs × ⌈N/B⌉` minibatch updates on `batch`.
+    """Run PPO minibatch updates on `batch`.
+
+    If `minibatch_count` is set, each epoch runs exactly that many equal-shape
+    minibatches. Otherwise each epoch runs `ceil(N / minibatch_size)` batches.
 
     Expected keys:
       `planet_feats`, `planet_mask`, `planet_owned_mask`, `planet_ids`,
@@ -735,6 +892,9 @@ def ppo_update(
 
     metric_sum: torch.Tensor | None = None
     last_metrics: torch.Tensor | None = None
+    actor_grad_norm_sum = torch.zeros((), device=device)
+    critic_grad_norm_sum = torch.zeros((), device=device)
+    shared_grad_norm_sum = torch.zeros((), device=device)
     n_steps = 0
 
     kernel = _get_ppo_kernel(
@@ -748,7 +908,12 @@ def ppo_update(
         compile_mode=compile_mode,
     )
     for _ in range(epochs):
-        for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
+        minibatches = (
+            _fixed_minibatches_by_count(n, minibatch_count, device)
+            if minibatch_count is not None
+            else _fixed_minibatches(n, minibatch_size, device)
+        )
+        for mb, row_weight in minibatches:
             if compile_mode is not None:
                 _mark_cuda_graph_step(device)
             actor_loss, critic_loss, metrics = kernel(
@@ -772,13 +937,18 @@ def ppo_update(
 
             optimizer.zero_grad(set_to_none=True)
             loss_scale = _minibatch_loss_scale(row_weight)
-            _backward_actor_critic_with_separate_clips(
-                model,
-                actor_loss * loss_scale,
-                critic_loss * loss_scale,
-                grad_clip,
+            actor_grad_norm, critic_grad_norm, shared_grad_norm = (
+                _backward_actor_critic_with_group_clips(
+                    model,
+                    actor_loss * loss_scale,
+                    critic_loss * loss_scale,
+                    grad_clip,
+                )
             )
             optimizer.step()
+            actor_grad_norm_sum += actor_grad_norm.detach()
+            critic_grad_norm_sum += critic_grad_norm.detach()
+            shared_grad_norm_sum += shared_grad_norm.detach()
 
             if metric_sum is None:
                 metric_sum = torch.zeros_like(metrics)
@@ -788,7 +958,7 @@ def ppo_update(
 
     n_steps = max(1, n_steps)
     mean_logs = (
-        [0.0] * 16
+        [0.0] * 32
         if metric_sum is None
         else (metric_sum / n_steps).detach().cpu().tolist()
     )
@@ -797,10 +967,14 @@ def ppo_update(
     # diagnostics stay averaged to preserve their lower-noise TensorBoard
     # behavior.
     kl_logs = (
-        [0.0] * 16
+        [0.0] * 32
         if last_metrics is None
         else last_metrics.detach().cpu().tolist()
     )
+    grad_logs = (
+        torch.stack([actor_grad_norm_sum, critic_grad_norm_sum, shared_grad_norm_sum])
+        / n_steps
+    ).detach().cpu().tolist()
     return PPOLog(
         policy_loss=float(mean_logs[0]),
         value_loss=float(mean_logs[1]),
@@ -808,6 +982,9 @@ def ppo_update(
         approx_kl=float(kl_logs[3]),
         spo_penalty=float(mean_logs[4]),
         pos_frac=float(mean_logs[5]),
+        actor_grad_norm=float(grad_logs[0]),
+        critic_grad_norm=float(grad_logs[1]),
+        shared_grad_norm=float(grad_logs[2]),
         target_entropy=float(mean_logs[6]),
         fraction_entropy=float(mean_logs[7]),
         move_prob=float(mean_logs[8]),
@@ -818,6 +995,23 @@ def ppo_update(
         fraction_concentration_max=float(mean_logs[13]),
         fraction_skew_abs_mean=float(mean_logs[14]),
         deterministic_fraction_mean=float(mean_logs[15]),
+        old_approx_kl=float(kl_logs[16]),
+        per_planet_approx_kl=float(kl_logs[17]),
+        per_planet_old_approx_kl=float(kl_logs[18]),
+        log_ratio_abs_mean=float(mean_logs[19]),
+        log_ratio_abs_max=float(mean_logs[20]),
+        spo_clip_frac=float(mean_logs[21]),
+        owned_planets_mean=float(mean_logs[22]),
+        executed_launch_frac=float(mean_logs[23]),
+        source_non_action_frac=float(1.0 - mean_logs[23]),
+        turn_no_action_frac=float(mean_logs[29]),
+        row_log_ratio_abs_mean=float(mean_logs[24]),
+        launch_mean=float(mean_logs[25]),
+        launch_log_std_mean=float(mean_logs[26]),
+        launch_score_mean=float(mean_logs[27]),
+        action_logit_softcap=float(mean_logs[28]),
+        legal_target_count_mean=float(mean_logs[30]),
+        uniform_move_prior=float(mean_logs[31]),
     )
 
 

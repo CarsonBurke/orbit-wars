@@ -10,6 +10,7 @@ the submission shell can lazy-load weights only once per process.
 from __future__ import annotations
 
 import math
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,11 @@ from ..policies.model import (
     restore_fp32_params,
 )
 from ..policies.sampling import sample_batch_actions_raw
+
+
+def _policy_config_from_checkpoint(raw: dict[str, Any]) -> OrbitPolicyConfig:
+    allowed = {field.name for field in fields(OrbitPolicyConfig)}
+    return OrbitPolicyConfig(**{k: v for k, v in raw.items() if k in allowed})
 
 
 def _angle_delta(a: float, b: float) -> float:
@@ -235,6 +241,9 @@ def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
         planet_owned_mask=out.planet_owned_mask[:rows],
         planet_mask=out.planet_mask[:rows],
         planet_ids=out.planet_ids[:rows],
+        action_logit_softcap=out.action_logit_softcap,
+        launch_log_std=None if out.launch_log_std is None else out.launch_log_std[:rows],
+        launch_prob_floor=out.launch_prob_floor,
         fraction_alpha=None if out.fraction_alpha is None else out.fraction_alpha[:rows],
         fraction_beta=None if out.fraction_beta is None else out.fraction_beta[:rows],
         fraction_mean=None if out.fraction_mean is None else out.fraction_mean[:rows],
@@ -254,7 +263,7 @@ class LearnedAgent:
         compile_graph_rows: int | None = None,
     ):
         state = torch.load(ckpt_path, map_location=device)
-        cfg = OrbitPolicyConfig(**state["config"])
+        cfg = _policy_config_from_checkpoint(state["config"])
         self.model = OrbitPolicy(cfg).to(device)
         # Match the training-time fp32-master pattern so loaded checkpoints
         # cast cleanly under autocast on CUDA. CPU load (kaggle submission
@@ -262,7 +271,7 @@ class LearnedAgent:
         if torch.device(device).type == "cuda":
             self.model.bfloat16()
             restore_fp32_params(self.model)
-        self.model.load_state_dict(state["model"])
+        self.model.load_state_dict(state["model"], strict=True)
         self.model.eval()
         self.device = device
         self.deterministic = deterministic

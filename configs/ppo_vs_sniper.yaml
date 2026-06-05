@@ -47,6 +47,7 @@ model:
   value_max: 100000.0
   value_num_bins: 153
   value_symlog: true
+  action_logit_softcap: 8.0
 
 optim:
   # Muon (transformer block matrix params). Matches parameter-golf
@@ -60,8 +61,9 @@ optim:
   lr: 3.0e-4
   head_lr: 3.0e-4
   weight_decay: 1.0e-4
-  grad_clip: 0.5   # actor and critic gradients are clipped separately, including
-                   # their shared-trunk components, then summed before step.
+  grad_clip: 0.5   # actor heads, critic head, and shared trunk are clipped as
+                   # separate gradient groups after one combined backward pass.
+  minibatch_count: 16
   minibatch_size: 1024
   epochs_per_update: 4
 
@@ -74,8 +76,8 @@ ppo:
   spo_eps_high: 0.56
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
 
-  target_entropy_coef: 0.01     # categorical target distribution has no structural floor, so keep it from collapsing
-  fraction_entropy_coef: 0.0    # native Beta entropy; keep off by default
+  target_entropy_coef: 0.0      # no explicit entropy bonus; exploration comes from stochastic sampling
+  fraction_entropy_coef: 0.0
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`
                         # warms V on a state distribution PPO immediately
@@ -86,7 +88,8 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 128             # parallel envs (= episodes per update)
+  num_envs: 128             # parallel envs
+  games_per_env_per_update: 1  # 128 full games per PPO update
   num_workers: 0            # only used by numpy_mp
   env_backend: rust
 
@@ -101,6 +104,7 @@ opponents:
   k_factor: 32.0
 
 reward:
+  signal: projected_margin
   potential_weight: 1.0
   production_weight: 1.0
   win_value: 0.0

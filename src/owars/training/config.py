@@ -42,6 +42,7 @@ class ModelCfg:
     value_min: float = -100_000.0
     value_max: float = 100_000.0
     value_symlog: bool = True
+    action_logit_softcap: float = 8.0
     # Real-units bound on the per-planet SAC advantage heads (see
     # OrbitPolicyConfig.adv_scale): each head emits adv_scale·tanh(raw/adv_scale).
     adv_scale: float = 40.0
@@ -105,6 +106,10 @@ class OptimCfg:
     control_lr: float = 0.02
     weight_decay: float = 1e-4
     grad_clip: float = 0.5
+    # If set, PPO divides the full rollout batch into exactly this many
+    # shuffled minibatches per epoch, padding the tail with zero-weight rows so
+    # every optimizer step has one stable shape.
+    minibatch_count: int | None = None
     minibatch_size: int = 4096
     epochs_per_update: int = 4
 
@@ -258,9 +263,9 @@ class SACCfg:
 class RolloutCfg:
     """Per-update rollout settings.
 
-    `num_envs` is the total rollout parallelism: each PPO update plays
-    exactly this many episodes and batches policy forwards across all alive
-    envs each step.
+    `num_envs` is the rollout parallelism. Each PPO update plays
+    `num_envs * games_per_env_per_update` episodes and batches policy forwards
+    across all alive envs each step.
     `rust` is the default fast training backend. `numpy` uses the in-process
     Python/NumPy parity path. `numpy_mp` shards that path across CPU worker
     processes. `num_workers` is only used by `numpy_mp`; the official Kaggle
@@ -268,6 +273,7 @@ class RolloutCfg:
     """
 
     num_envs: int = 128
+    games_per_env_per_update: int = 1
     num_workers: int = 0  # 0 => backend default; set to physical cores for rollout-heavy runs
     env_backend: str = "rust"  # "rust", "numpy", "numpy_mp", or "kaggle"
 
@@ -300,13 +306,13 @@ class OpponentsCfg:
 class RewardCfg:
     """Dense per-step potential reward: `potential_weight * (Phi(s') - Phi(s))`.
 
-    The two trainers use DIFFERENT potentials Phi (both own-minus-strongest-enemy):
+    `signal` selects the potential Phi (both own-minus-strongest-enemy):
 
-      - PPO (`rollout._obs_reward_potential`): PROJECTED population margin —
+      - `projected_margin`: PROJECTED population margin —
         current ships on owned planets + ships in owned fleets, plus production
         converted to projected future ships by `production_weight * turns_left`.
         O(±10^3).
-      - SAC (`rollout._obs_production_margin`): PRODUCTION-RATE margin only —
+      - `production_margin`: PRODUCTION-RATE margin only —
         Σ production over owned planets (comets included), NO ship counts and NO
         turns_left projection. O(±10^2), which keeps the distributional critic's
         value bounded (see configs/sac_base.yaml). `production_weight` is unused
@@ -319,6 +325,7 @@ class RewardCfg:
     lever — the dense potential carries the signal.
     """
 
+    signal: Literal["projected_margin", "production_margin"] = "projected_margin"
     potential_weight: float = 1.0
     production_weight: float = 1.0
     win_value: float = 0.0
@@ -374,6 +381,16 @@ class RunConfig:
             raise ValueError("ppo.spo_eps_high must be >= ppo.spo_eps_low")
         if cfg.ppo.advantage_transform not in {"rankgauss", "none"}:
             raise ValueError("ppo.advantage_transform must be 'rankgauss' or 'none'")
+        if cfg.optim.minibatch_count is not None and cfg.optim.minibatch_count <= 0:
+            raise ValueError("optim.minibatch_count must be positive when set")
+        if cfg.optim.minibatch_size <= 0:
+            raise ValueError("optim.minibatch_size must be positive")
+        if cfg.optim.epochs_per_update <= 0:
+            raise ValueError("optim.epochs_per_update must be positive")
+        if cfg.rollout.num_envs <= 0:
+            raise ValueError("rollout.num_envs must be positive")
+        if cfg.rollout.games_per_env_per_update <= 0:
+            raise ValueError("rollout.games_per_env_per_update must be positive")
         if not 0.0 <= cfg.model.planet_rope_fraction <= 1.0:
             raise ValueError("model.planet_rope_fraction must be in [0, 1]")
         if cfg.model.planet_rope_base <= 0.0:
@@ -390,8 +407,14 @@ class RunConfig:
             raise ValueError("model.value_min must be less than model.value_max")
         if cfg.model.adv_scale <= 0.0:
             raise ValueError("model.adv_scale must be positive")
+        if cfg.model.action_logit_softcap <= 0.0:
+            raise ValueError("model.action_logit_softcap must be positive")
         if cfg.reward.production_weight < 0.0:
             raise ValueError("reward.production_weight must be non-negative")
+        if cfg.reward.signal not in {"projected_margin", "production_margin"}:
+            raise ValueError(
+                "reward.signal must be 'projected_margin' or 'production_margin'"
+            )
         if not 0.0 <= cfg.sac.builtin_prob <= 1.0:
             raise ValueError("sac.builtin_prob must be in [0, 1]")
         if not 0.0 <= cfg.sac.disc_target_entropy_ratio <= 1.0:

@@ -1428,6 +1428,26 @@ class NumpyVecEnv:
             )
         return values
 
+    def production_margins(self, rows: list[tuple[int, int]]) -> np.ndarray:
+        values = np.empty(len(rows), dtype=np.float32)
+        for row, (idx, player) in enumerate(rows):
+            production = np.zeros(self.num_players, dtype=np.float64)
+            for planet in self.planets[int(idx), self.planet_mask[int(idx)]]:
+                owner = int(planet[P_OWNER])
+                if owner != -1:
+                    production[owner] += float(planet[P_PROD])
+            own = float(production[int(player)])
+            enemy = max(
+                (
+                    float(production[p])
+                    for p in range(self.num_players)
+                    if p != int(player)
+                ),
+                default=0.0,
+            )
+            values[row] = own - enemy
+        return values
+
     def _reward_potential(
         self,
         idx: int,

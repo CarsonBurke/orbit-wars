@@ -27,6 +27,7 @@ opponent pool — see `STRATEGY.md`.
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from contextlib import suppress
 from pathlib import Path
@@ -70,6 +71,7 @@ from .vec_rollout import alternating_learner_seats, rollout_episodes_batched
 _CONTROL_LR_PATTERNS: tuple[str, ...] = (
     "attn_scale",
     "ff_scale",
+    "cross_scale",
     "resid_mix",
     "q_gain",  # also matches `target_q_gain` via substring
 )
@@ -88,9 +90,9 @@ _MUON_BLOCK_PREFIXES: tuple[str, ...] = (
 _HEAD_LR_PATTERNS: tuple[str, ...] = (
     "target_query",
     "target_key",
+    "target_noop_key",
     "fraction_alpha_head",
     "fraction_beta_head",
-    "launch_head",
     "value_head",
 )
 
@@ -110,7 +112,7 @@ def _split_params(
     parameter-golf's optimizee split.
 
     AdamW (head-lr): task readout matrices — `target_query`, `target_key`,
-    Beta fraction heads, `launch_head`, and `value_head`.
+    Beta fraction heads, categorical action heads, and `value_head`.
 
     AdamW (control-lr): per-channel residual scales and `q_gain`s — need
     update magnitudes comparable to Muon's matrix updates, see
@@ -207,6 +209,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         value_min=cfg.model.value_min,
         value_max=cfg.model.value_max,
         value_symlog=cfg.model.value_symlog,
+        action_logit_softcap=cfg.model.action_logit_softcap,
     )
     return OrbitPolicy(pcfg)
 
@@ -289,13 +292,31 @@ def _stack_trajectories(
 
     advs = torch.from_numpy(np.concatenate(advs_all)).float()
     rets = torch.from_numpy(np.concatenate(rets_all)).float()
+    values = torch.from_numpy(all_values).float()
+    if values.numel() != rets.numel():
+        values = torch.zeros_like(rets)
     batch["advantage"] = advs
     batch["return"] = rets
+    batch["value"] = values
     batch["raw_advantage_abs_mean"] = torch.tensor(
         float(advs.abs().mean()) if advs.numel() else 0.0,
         dtype=torch.float32,
     )
     return batch
+
+
+def _explained_variance(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """CleanRL-style EV: 1 - Var[target - pred] / Var[target]."""
+    with torch.no_grad():
+        pred_f = pred.detach().float().flatten()
+        target_f = target.detach().float().flatten()
+        if target_f.numel() == 0:
+            return float("nan")
+        var_y = torch.var(target_f, unbiased=False)
+        if var_y <= 0:
+            return float("nan")
+        ev = 1.0 - torch.var(target_f - pred_f, unbiased=False) / var_y
+        return float(ev.cpu())
 
 
 def _pretrain_value_batch(trajs: list[Trajectory], gamma: float) -> dict[str, torch.Tensor]:
@@ -420,13 +441,18 @@ def _seat_names(learner_seat: int, slots: list[OpponentSlot]) -> list[str]:
     return names
 
 
+def _save_ppo_checkpoint(model: OrbitPolicy, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model": model.state_dict(), "config": model.cfg.to_dict()}, path)
+
+
 def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     """Params that *actually* get gradient from value-only loss.
 
     Includes the encoder (shared backbone), both summary tokens (actor_token
     feeds the encoder self-attention so h_critic depends on it; critic_token
     feeds the value head directly), and the value head. Excludes the actor
-    heads (target_query/key, launch_head, fraction alpha/beta heads) — they receive zero
+    heads (target_query/key, categorical action heads, fraction alpha/beta heads) — they receive zero
     gradient from the value loss, and including them would let AdamW's
     weight-decay pull them toward zero with no learning signal, leaving PPO
     to start from a worse-than-init policy.
@@ -474,7 +500,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
         # whose weights no longer match the current architecture.
         ckpt = torch.load(load_weights, map_location=device, weights_only=False)
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-        model.load_state_dict(state)
+        model.load_state_dict(state, strict=True)
         print(f"loaded weights from {load_weights}")
     pretrain_opt = torch.optim.AdamW(
         _value_pretrain_params(model),
@@ -569,6 +595,9 @@ def _ppo_loop(
     cumulative_win_margin = 0.0
     cumulative_loss_margin = 0.0
     cumulative_games = 0
+    best_win_rate = float("-inf")
+    best_margin = float("-inf")
+    best_update = -1
 
     if cfg.opponents.mode == "league":
         # Seed the pool with a snapshot of the random-init model. Without this,
@@ -596,41 +625,55 @@ def _ppo_loop(
     replays_dir.mkdir(parents=True, exist_ok=True)
 
     for update in range(cfg.run.total_updates):
-        # Sample opponents once per env, then play all envs in parallel.
-        # Each env's seat assignment is fixed for the episode; the rollout
-        # batches the *policy forward* across envs each step.
-        opponents_per_env = [
-            pool.sample(cfg.game.num_players - 1)
-            for _ in range(cfg.rollout.num_envs)
-        ]
-        learner_seats = alternating_learner_seats(
-            cfg.rollout.num_envs, cfg.game.num_players, offset=update
-        )
         update_t0 = perf_counter()
         phase_t0 = update_t0
-        trajs = rollout_episodes_batched(
-            model,
-            vec,
-            opponents_per_env,
-            num_players=cfg.game.num_players,
-            learner_seat=learner_seats,
-            device=str(device),
-            reward_cfg=cfg.reward,
-            compile_mode=_compile_mode_for_model(model, cfg),
-        )
-        rollout_s = perf_counter() - phase_t0
-
-        phase_t0 = perf_counter()
-        if vec.last_replay_html is not None:
-            (replays_dir / f"update_{update:04d}.html").write_text(
-                vec.last_replay_html
+        trajs = []
+        rollout_s = 0.0
+        bookkeeping_s = 0.0
+        for game_batch in range(cfg.rollout.games_per_env_per_update):
+            # Sample opponents once per env for this wave, then play all envs
+            # in parallel. Each env's seat assignment is fixed for the episode;
+            # the rollout batches the policy forward across all alive envs.
+            opponents_per_env = [
+                pool.sample(cfg.game.num_players - 1)
+                for _ in range(cfg.rollout.num_envs)
+            ]
+            seat_offset = update * cfg.rollout.games_per_env_per_update + game_batch
+            learner_seats = alternating_learner_seats(
+                cfg.rollout.num_envs, cfg.game.num_players, offset=seat_offset
             )
+            phase_t0 = perf_counter()
+            batch_trajs = rollout_episodes_batched(
+                model,
+                vec,
+                opponents_per_env,
+                num_players=cfg.game.num_players,
+                learner_seat=learner_seats,
+                device=str(device),
+                reward_cfg=cfg.reward,
+                compile_mode=_compile_mode_for_model(model, cfg),
+            )
+            rollout_s += perf_counter() - phase_t0
 
-        for env_idx, traj in enumerate(trajs):
-            slots = opponents_per_env[env_idx]
-            seat_names = _seat_names(traj.learner_seat, slots)
-            elo.update_from_game(list(zip(seat_names, traj.seat_rewards, strict=True)))
-        bookkeeping_s = perf_counter() - phase_t0
+            phase_t0 = perf_counter()
+            if vec.last_replay_html is not None:
+                suffix = (
+                    ""
+                    if cfg.rollout.games_per_env_per_update == 1
+                    else f"_gamebatch_{game_batch:02d}"
+                )
+                (replays_dir / f"update_{update:04d}{suffix}.html").write_text(
+                    vec.last_replay_html
+                )
+
+            for env_idx, traj in enumerate(batch_trajs):
+                slots = opponents_per_env[env_idx]
+                seat_names = _seat_names(traj.learner_seat, slots)
+                elo.update_from_game(
+                    list(zip(seat_names, traj.seat_rewards, strict=True))
+                )
+            trajs.extend(batch_trajs)
+            bookkeeping_s += perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
         batch = _stack_trajectories(
@@ -659,14 +702,20 @@ def _ppo_loop(
             epochs=cfg.optim.epochs_per_update,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
+            minibatch_count=cfg.optim.minibatch_count,
             compile_mode=_compile_mode_for_model(model, cfg),
         )
         ppo_s = perf_counter() - phase_t0
+        value_ev = _explained_variance(batch["value"], batch["return"])
 
         phase_t0 = perf_counter()
         margins = [float(t.final_score) for t in trajs]
+        episode_returns = [float(sum(t.reward)) for t in trajs]
+        episode_lengths = [float(len(t.reward)) for t in trajs]
         win_rate = float(np.mean([t.won for t in trajs]))
         margin = float(np.mean(margins))
+        episodic_return = float(np.mean(episode_returns)) if episode_returns else 0.0
+        episodic_length = float(np.mean(episode_lengths)) if episode_lengths else 0.0
         update_win_margin = sum(m for t, m in zip(trajs, margins, strict=True) if t.won)
         update_loss_margin = sum(
             m for t, m in zip(trajs, margins, strict=True) if not t.won and not t.drawn
@@ -689,10 +738,40 @@ def _ppo_loop(
             update,
         )
         logger.scalars(
+            "losses",
+            {
+                "policy_loss": log.policy_loss,
+                "value_loss": log.value_loss,
+                "entropy": log.entropy,
+                "approx_kl": log.approx_kl,
+                "old_approx_kl": log.old_approx_kl,
+                "per_planet_approx_kl": log.per_planet_approx_kl,
+                "per_planet_old_approx_kl": log.per_planet_old_approx_kl,
+                "spo_penalty": log.spo_penalty,
+                "spo_clip_frac": log.spo_clip_frac,
+                "explained_variance": value_ev,
+                "actor_grad_norm": log.actor_grad_norm,
+                "critic_grad_norm": log.critic_grad_norm,
+                "shared_grad_norm": log.shared_grad_norm,
+                "log_ratio_abs_mean": log.log_ratio_abs_mean,
+                "log_ratio_abs_max": log.log_ratio_abs_max,
+                "row_log_ratio_abs_mean": log.row_log_ratio_abs_mean,
+                "raw_advantage_abs_mean": float(batch["raw_advantage_abs_mean"]),
+            },
+            update,
+        )
+        logger.scalars(
             "kl",
             {
                 "approx": log.approx_kl,
+                "old_approx": log.old_approx_kl,
+                "per_planet_approx": log.per_planet_approx_kl,
+                "per_planet_old_approx": log.per_planet_old_approx_kl,
                 "spo_penalty": log.spo_penalty,
+                "spo_clip_frac": log.spo_clip_frac,
+                "log_ratio_abs_mean": log.log_ratio_abs_mean,
+                "log_ratio_abs_max": log.log_ratio_abs_max,
+                "row_log_ratio_abs_mean": log.row_log_ratio_abs_mean,
             },
             update,
         )
@@ -700,11 +779,22 @@ def _ppo_loop(
             "policy",
             {
                 "entropy": log.entropy,
+                "action_entropy": log.target_entropy,
                 "target_entropy": log.target_entropy,
                 "fraction_entropy": log.fraction_entropy,
                 "target_confidence": log.target_confidence,
                 "move_prob": log.move_prob,
+                "executed_launch_frac": log.executed_launch_frac,
+                "source_non_action_frac": log.source_non_action_frac,
+                "turn_no_action_frac": log.turn_no_action_frac,
+                "legal_target_count_mean": log.legal_target_count_mean,
+                "uniform_move_prior": log.uniform_move_prior,
+                "owned_planets_mean": log.owned_planets_mean,
                 "pos_advantage_frac": log.pos_frac,
+                "launch_mean": log.launch_mean,
+                "launch_log_std_mean": log.launch_log_std_mean,
+                "launch_score_mean": log.launch_score_mean,
+                "action_logit_softcap": log.action_logit_softcap,
                 "raw_advantage_abs_mean": float(batch["raw_advantage_abs_mean"]),
             },
             update,
@@ -730,6 +820,13 @@ def _ppo_loop(
                 "cumulative_win_margin": cumulative_win_margin,
                 "cumulative_loss_margin": cumulative_loss_margin,
                 "cumulative_mean_margin": cumulative_mean_margin,
+                "episodic_return_mean": episodic_return,
+                "episodic_return_std": (
+                    float(np.std(episode_returns)) if episode_returns else 0.0
+                ),
+                "episodic_return_min": min(episode_returns) if episode_returns else 0.0,
+                "episodic_return_max": max(episode_returns) if episode_returns else 0.0,
+                "episodic_length_mean": episodic_length,
             },
             update,
         )
@@ -751,11 +848,34 @@ def _ppo_loop(
                 "update": update,
                 "win_rate": win_rate,
                 "margin": margin,
+                "episodic_return": episodic_return,
+                "episodic_length": episodic_length,
                 "cumulative_margin": cumulative_margin,
                 "cumulative_mean_margin": cumulative_mean_margin,
                 "elo_learner": elo.get(LEARNER_NAME),
             }
         )
+
+        is_best = (win_rate > best_win_rate) or (
+            win_rate == best_win_rate and margin > best_margin
+        )
+        if cfg.opponents.mode == "fixed" and is_best:
+            best_win_rate = win_rate
+            best_margin = margin
+            best_update = update
+            best_path = Path(cfg.run.ckpt_root) / cfg.run.name / "best.pt"
+            _save_ppo_checkpoint(model, best_path)
+            best_meta = {
+                "update": best_update,
+                "win_rate": best_win_rate,
+                "margin": best_margin,
+                "episodic_return": episodic_return,
+                "episodic_length": episodic_length,
+                "run_dir": str(logger.path),
+            }
+            best_path.with_name("best.json").write_text(
+                json.dumps(best_meta, indent=2, sort_keys=True)
+            )
 
         if (
             cfg.opponents.mode == "league"
@@ -763,8 +883,20 @@ def _ppo_loop(
         ):
             ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / f"snapshot_{update:04d}.pt"
             pool.add_snapshot(f"{update:04d}", model, ckpt)
+        elif (
+            cfg.opponents.mode == "fixed"
+            and (update + 1) % cfg.opponents.snapshot_every == 0
+        ):
+            _save_ppo_checkpoint(
+                model,
+                Path(cfg.run.ckpt_root) / cfg.run.name / "latest.pt",
+            )
         snapshot_s = perf_counter() - phase_t0
         update_s = perf_counter() - update_t0
+        learner_steps = sum(len(t.reward) for t in trajs)
+        learner_steps_per_s = learner_steps / max(rollout_s, 1e-9)
+        end_to_end_steps_per_s = learner_steps / max(update_s, 1e-9)
+        games_per_minute = len(trajs) * 60.0 / max(update_s, 1e-9)
 
         logger.scalars(
             "timing",
@@ -778,18 +910,26 @@ def _ppo_loop(
                 "metrics_s": metrics_s,
                 "logging_s": logging_s,
                 "snapshot_s": snapshot_s,
-                "learner_steps_per_s": (
-                    sum(len(t.reward) for t in trajs) / max(rollout_s, 1e-9)
-                ),
+                "learner_steps_per_s": learner_steps_per_s,
+                "end_to_end_steps_per_s": end_to_end_steps_per_s,
+            },
+            update,
+        )
+        logger.scalars(
+            "charts",
+            {
+                "SPS": end_to_end_steps_per_s,
+                "episodic_return": episodic_return,
+                "episodic_length": episodic_length,
+                "rollout_SPS": learner_steps_per_s,
+                "games_per_minute": games_per_minute,
+                "rollout_games_per_minute": len(trajs) * 60.0 / max(rollout_s, 1e-9),
             },
             update,
         )
 
     final_path = Path(cfg.run.ckpt_root) / cfg.run.name / "final.pt"
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict(), "config": model.cfg.to_dict()}, final_path)
-
-    import json
+    _save_ppo_checkpoint(model, final_path)
 
     elo_path = final_path.with_name("elo.json")
     elo_path.write_text(json.dumps(elo.snapshot_dict(), indent=2, sort_keys=True))

@@ -1213,6 +1213,7 @@ def _build_policy_cfg(cfg: RunConfig) -> OrbitPolicyConfig:
         value_min=m.value_min,
         value_max=m.value_max,
         value_symlog=m.value_symlog,
+        action_logit_softcap=m.action_logit_softcap,
         adv_scale=m.adv_scale,
     )
     return pcfg
@@ -1683,6 +1684,7 @@ def train(cfg: RunConfig) -> None:
             for obs, (_env_idx, seat) in zip(learner_obs, learner_rows, strict=True)
         ]
         episode_return = [0.0] * num_envs
+        episode_length = [0] * num_envs
 
         global_step = 0
         tick = 0
@@ -1813,6 +1815,7 @@ def train(cfg: RunConfig) -> None:
                 next_states[e] = st
                 dones[e] = dn
                 finals[e] = fn
+                episode_length[e] += 1
 
             # ---- s' legal-target support for the q-step's a'~π(·|s') resample ----
             next_learner_obs, next_learner_enc, next_contexts, next_learner_time = (
@@ -1890,8 +1893,15 @@ def train(cfg: RunConfig) -> None:
 
                     # Distinct x per finishing env within this tick's step range.
                     log_step = global_step + e
+                    return_total = episode_return[e] + step_reward
                     state.writer.add_scalar(
-                        "episode/return", episode_return[e] + step_reward, log_step
+                        "episode/return", return_total, log_step
+                    )
+                    state.writer.add_scalar(
+                        "charts/episodic_return", return_total, log_step
+                    )
+                    state.writer.add_scalar(
+                        "charts/episodic_length", episode_length[e], log_step
                     )
                     state.writer.add_scalar("episode/win_rate", float(won), log_step)
                     state.writer.add_scalar("episode/margin", margin, log_step)
@@ -1960,6 +1970,7 @@ def train(cfg: RunConfig) -> None:
                     opponents[e] = _select_opponent_for_episode(state)
                     reset_rows.append((e, learner_seat[e]))
                     episode_return[e] = 0.0
+                    episode_length[e] = 0
                 reset_obs = _observations_for_rows(vec, states, reset_rows)
                 for obs, (e, seat) in zip(reset_obs, reset_rows, strict=True):
                     previous_prod_margin[e] = production_margin(obs, seat)

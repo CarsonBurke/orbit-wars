@@ -344,6 +344,33 @@ def test_rust_vec_env_step_subset_fast_rejects_duplicate_indices():
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_native_sniper_matches_python_sniper():
+    _build_rust_extension()
+    from owars.agents.sniper import sniper_agent
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust.reset()
+    rust.step_subset_fast([0, 1], [[[], []], [[], []]])
+    rows = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    native = rust.builtin_actions("sniper", rows, native_actions=False)
+
+    for row_actions, (env_idx, player) in zip(native, rows, strict=True):
+        expected = sniper_agent(rust.observation(env_idx, player))
+        assert len(row_actions) == len(expected)
+        for got, want in zip(row_actions, expected, strict=True):
+            assert int(got[0]) == int(want[0])
+            assert math.isclose(float(got[1]), float(want[1]), rel_tol=0.0, abs_tol=1e-12)
+            assert int(got[2]) == int(want[2])
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
 def test_rust_vec_env_reset_subset_advances_seed():
     _build_rust_extension()
     from owars.training.rust_env import RustVecEnv
@@ -585,6 +612,52 @@ def test_rust_fast_rollout_uses_policy_batch_no_context(monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fast_rollout_uses_native_sniper_without_observations(monkeypatch):
+    _build_rust_extension()
+    from owars.agents.sniper import sniper_agent
+    from owars.policies.config import OrbitPolicyConfig
+    from owars.policies.model import OrbitPolicy
+    from owars.training.league import OpponentSlot
+    from owars.training.rust_env import RustVecEnv
+    from owars.training.vec_rollout import rollout_episodes_batched
+
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=8,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+
+    def fail_observation(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("native sniper rollout should not materialize observations")
+
+    calls = {"builtin_actions": 0}
+    original_builtin_actions = rust.builtin_actions
+
+    def count_builtin_actions(*args: Any, **kwargs: Any) -> Any:
+        calls["builtin_actions"] += 1
+        return original_builtin_actions(*args, **kwargs)
+
+    monkeypatch.setattr(rust, "observation", fail_observation)
+    monkeypatch.setattr(rust, "observations", fail_observation)
+    monkeypatch.setattr(rust, "builtin_actions", count_builtin_actions)
+
+    model = OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
+    opponent = OpponentSlot("sniper", agent=sniper_agent)
+    trajs = rollout_episodes_batched(
+        model,
+        rust,
+        [[opponent], [opponent]],
+        num_players=2,
+        device="cpu",
+    )
+
+    assert len(trajs) == 2
+    assert calls["builtin_actions"] > 0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
 def test_rust_vec_env_native_sampler_matches_context_sampler():
     _build_rust_extension()
     from owars.policies.model import PolicyOutput
@@ -620,6 +693,7 @@ def test_rust_vec_env_native_sampler_matches_context_sampler():
         planet_owned_mask=fast.planet_owned_mask,
         planet_mask=fast.planet_mask,
         planet_ids=fast.planet_ids,
+        action_logit_softcap=8.0,
         fraction_alpha=torch.full((b, p), 20.0),
         fraction_beta=torch.full((b, p), 2.0),
     )
@@ -749,3 +823,7 @@ def test_rust_vec_env_reward_potentials_match_numpy():
     rust_potentials = rust.reward_potentials(rows, production_weight=1.0)
     numpy_potentials = numpy.reward_potentials(rows, production_weight=1.0)
     assert rust_potentials.tolist() == pytest.approx(numpy_potentials.tolist())
+
+    rust_production = rust.production_margins(rows)
+    numpy_production = numpy.production_margins(rows)
+    assert rust_production.tolist() == pytest.approx(numpy_production.tolist())

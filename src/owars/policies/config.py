@@ -57,11 +57,12 @@ class OrbitPolicyConfig:
     fleet_tokenizer_depth: int = 1
 
     # Action factorization. For each owned planet we emit:
-    #   - a Bernoulli launch logit
-    #   - masked categorical target logits, conditional on launching
+    #   - one masked categorical over [noop, target_0, ..., target_P]
+    #   - pg-style softcapped logits for the categorical distribution
     #   - a unimodal Beta fraction, conditional on launching.
     # Launch angle is derived from the chosen target via an iterative
     # lead-intercept solver in `sampling.py` — no learned angle component.
+    action_logit_softcap: float = 8.0
 
     # Distributional value head — predicts a categorical over `value_num_bins`
     # bins, trained with Dreamer4-style symlog HL-Gauss CE. `value_min/max`

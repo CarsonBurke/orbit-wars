@@ -39,6 +39,7 @@ from ..policies.sampling import (
 )
 from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
+from .rollout import _obs_production_margin
 from .rollout import Trajectory
 from .vec_env import VecEnv
 
@@ -199,6 +200,9 @@ def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
         planet_owned_mask=out.planet_owned_mask[:rows],
         planet_mask=out.planet_mask[:rows],
         planet_ids=out.planet_ids[:rows],
+        action_logit_softcap=out.action_logit_softcap,
+        launch_log_std=None if out.launch_log_std is None else out.launch_log_std[:rows],
+        launch_prob_floor=out.launch_prob_floor,
         fraction_alpha=None if out.fraction_alpha is None else out.fraction_alpha[:rows],
         fraction_beta=None if out.fraction_beta is None else out.fraction_beta[:rows],
         fraction_mean=None if out.fraction_mean is None else out.fraction_mean[:rows],
@@ -341,6 +345,16 @@ def _state_reward_potential(
     )
 
 
+def _state_production_margin(
+    state: Any,
+    player: int,
+    num_players: int,
+) -> float:
+    slot = state[player]
+    obs = slot["observation"] if isinstance(slot, dict) else slot.observation
+    return _obs_production_margin(obs, player, num_players)
+
+
 def _reward_potentials(
     vec: Any,
     states: Sequence[Any],
@@ -351,6 +365,19 @@ def _reward_potentials(
 ) -> list[float]:
     if not rows:
         return []
+    if reward_cfg.signal == "production_margin":
+        native_production = getattr(vec, "production_margins", None)
+        if callable(native_production):
+            values = native_production(rows)
+            return [float(v) for v in values]
+        return [
+            _state_production_margin(
+                states[env_idx],
+                player,
+                num_players,
+            )
+            for env_idx, player in rows
+        ]
     native = getattr(vec, "reward_potentials", None)
     if callable(native):
         values = native(rows, production_weight=reward_cfg.production_weight)
@@ -425,6 +452,8 @@ def rollout_episodes_batched(
     fast_observation = getattr(vec, "observation", None)
     fast_observations = getattr(vec, "observations", None)
     fast_step_subset = getattr(vec, "step_subset_fast", None)
+    fast_builtin_actions = getattr(vec, "builtin_actions", None)
+    native_builtin_opponents = set(getattr(vec, "native_builtin_opponents", ()))
     use_fast_numpy_path = (
         bool(getattr(vec, "fast_rollout", False))
         and callable(fast_policy_batch)
@@ -458,6 +487,12 @@ def rollout_episodes_batched(
                         and getattr(slot.agent, "model", None) is not None
                     )
                     if can_fast_snapshot:
+                        opp_buckets[slot.name].append((env_idx, seat, None, slot))
+                    elif (
+                        use_fast_numpy_path
+                        and callable(fast_builtin_actions)
+                        and slot.name in native_builtin_opponents
+                    ):
                         opp_buckets[slot.name].append((env_idx, seat, None, slot))
                     elif use_fast_numpy_path:
                         pending_opp_obs.append((env_idx, seat))
@@ -507,6 +542,22 @@ def rollout_episodes_batched(
         # builtin Python baselines stay on the scalar callable path.
         for _name, bucket in opp_buckets.items():
             agent = bucket[0][3].agent
+            if (
+                use_fast_numpy_path
+                and callable(fast_builtin_actions)
+                and _name in native_builtin_opponents
+            ):
+                rows = [(env_idx, seat) for env_idx, seat, _obs, _slot in bucket]
+                batched_actions = fast_builtin_actions(
+                    _name,
+                    rows,
+                    native_actions=True,
+                )
+                for (env_idx, seat, _obs, _slot), acts in zip(
+                    bucket, batched_actions, strict=True
+                ):
+                    actions_per_env[env_idx][seat] = acts
+                continue
             agent_model = getattr(agent, "model", None)
             if (
                 use_fast_numpy_path

@@ -26,12 +26,9 @@ output dim (d for query/key, 1 for each concentration head). Down-projecting
 `[planet_h || h_actor]` back to d would discard exactly the global-context
 capacity the extra token was added to provide.
 
-**Action factorization.** Per source planet, the actor emits a Bernoulli
-launch decision, a masked categorical target distribution conditional on
-launching, and a unimodal Beta fraction distribution conditional on launching. This
-keeps "should this planet act?" independent of the number of legal target
-planets; target count should affect *where* probability mass goes, not whether
-the source launches at all.
+**Action factorization.** Per source planet, the actor emits one masked
+categorical over `[noop, target_0, ..., target_P]` with pg-style softcapped
+logits, plus a unimodal Beta fraction distribution conditional on launching.
 
 **No angle head.** The launch angle is computed exactly via an iterative
 lead-intercept solver in `sampling.py`.
@@ -766,13 +763,16 @@ def _symexp(x: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class PolicyOutput:
-    launch_logits: torch.Tensor       # [B, P] Bernoulli logits
+    launch_logits: torch.Tensor       # [B, P] noop column logits for PPO / legacy launch logits for SAC adapters
     target_logits: torch.Tensor       # [B, P, P] masked target categorical logits
     value: torch.Tensor               # [B] — scalar value E[V] recovered from value_logits
     value_logits: torch.Tensor        # [B, num_bins] — distributional value head logits
     planet_owned_mask: torch.Tensor   # [B, P] bool
     planet_mask: torch.Tensor         # [B, P] bool
     planet_ids: torch.Tensor          # [B, P] long
+    action_logit_softcap: float | None = None
+    launch_log_std: torch.Tensor | None = None  # [B, P] state-dependent Normal log std
+    launch_prob_floor: float = 0.0
     fraction_alpha: torch.Tensor | None = None  # [B, P] Beta concentration α
     fraction_beta: torch.Tensor | None = None   # [B, P] Beta concentration β
     # SAC's actor still adapts through this shared sampler as a squashed
@@ -856,6 +856,7 @@ class OrbitPolicy(nn.Module):
         # query side only is what gives the actor token bite.
         self.target_query = CastedLinear(2 * cfg.dim, cfg.dim, bias=False)
         self.target_key = CastedLinear(cfg.dim, cfg.dim, bias=False)
+        self.target_noop_key = nn.Parameter(torch.zeros(cfg.dim))
         # Target attention temperature (per parameter-golf `q_gain` pattern,
         # `sota_train_gpt.py:101,104`). We RMS-norm Q & K below, then scale
         # by this learnable scalar before the softmax. Pins the target-logit
@@ -884,13 +885,7 @@ class OrbitPolicy(nn.Module):
         # weight magnitude on these doesn't translate to logit magnitude.
         nn.init.orthogonal_(self.target_query.weight, gain=0.05)
         nn.init.orthogonal_(self.target_key.weight, gain=0.05)
-        # Per-planet launch Bernoulli. It sees the same local+global context
-        # as the fraction head, but is independent of target count; target
-        # selection is a separate conditional categorical below. Bias negative
-        # so cold-start prefers not launching until advantage says otherwise.
-        self.launch_head = CastedLinear(2 * cfg.dim, 1)
-        nn.init.zeros_(self.launch_head.weight)
-        nn.init.constant_(self.launch_head.bias, -1.5)
+        nn.init.trunc_normal_(self.target_noop_key, std=0.02)
         # 2·dim input for the same reason as target_query. Two independent
         # readouts parameterize a native-support Beta fraction distribution:
         # alpha,beta = 1 + softplus(raw). The +1 enforces the Dreamer4
@@ -1106,6 +1101,11 @@ class OrbitPolicy(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         q = q * self.target_q_gain.to(q.dtype)
+        noop_k = F.rms_norm(
+            self.target_noop_key.to(dtype=k.dtype, device=k.device),
+            (k.size(-1),),
+        )
+        noop_logits = torch.einsum("bid,d->bi", q, noop_k) / (d**0.5)
         # [B, P, P] — keep the canonical 1/√d divisor; `target_q_gain`
         # multiplies on top, mirroring how trunk SDPA's auto-scale plus
         # `q_gain` compose.
@@ -1119,13 +1119,6 @@ class OrbitPolicy(nn.Module):
         logits = logits.masked_fill(
             self._self_target_mask[:p, :p].unsqueeze(0), float("-inf")
         )
-        # Per-planet launch logits are a Bernoulli sibling of target/fraction,
-        # not an extra target slot. Rows with no legal target get a very low
-        # launch logit; the target categorical is still sanitized downstream
-        # for distribution APIs, but such rows are behaviorally no-launch.
-        valid_target_count = (planet_mask.sum(dim=-1, keepdim=True) - 1).clamp_min(0)
-        launch_logits = self.launch_head(planet_with_ctx).squeeze(-1)
-        launch_logits = launch_logits.masked_fill(valid_target_count <= 0, -20.0)
         target_logits = logits  # [B, P, P]
 
         # Fraction head: native-support unimodal Beta, matching the CleanRL
@@ -1148,13 +1141,14 @@ class OrbitPolicy(nn.Module):
             value_logits = h_critic.new_empty((b, 0), dtype=torch.float32)
 
         return PolicyOutput(
-            launch_logits=launch_logits,
+            launch_logits=noop_logits,
             target_logits=target_logits,
             value=value,
             value_logits=value_logits,
             planet_owned_mask=planet_owned,
             planet_mask=planet_mask,
             planet_ids=planet_ids,
+            action_logit_softcap=float(self.cfg.action_logit_softcap),
             fraction_alpha=fraction_alpha,
             fraction_beta=fraction_beta,
         )

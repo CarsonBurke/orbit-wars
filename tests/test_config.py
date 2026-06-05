@@ -33,6 +33,11 @@ def test_invalid_advantage_transform_raises():
         RunConfig.from_dict({"ppo": {"advantage_transform": "zscoreish"}})
 
 
+def test_invalid_reward_signal_raises():
+    with pytest.raises(ValueError, match="reward.signal"):
+        RunConfig.from_dict({"reward": {"signal": "not_a_signal"}})
+
+
 def test_fixed_opponent_mode_loads():
     cfg = RunConfig.from_dict(
         {"opponents": {"mode": "fixed", "fixed_opponents": ["sniper"]}}

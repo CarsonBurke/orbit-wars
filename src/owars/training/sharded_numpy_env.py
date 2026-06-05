@@ -25,6 +25,7 @@ _OBSERVATION = "observation"
 _OBSERVATIONS = "observations"
 _POLICY_BATCH = "policy_batch"
 _REWARD_POTENTIALS = "reward_potentials"
+_PRODUCTION_MARGINS = "production_margins"
 _CLOSE = "close"
 _SET_RECORDING = "set_recording"
 
@@ -112,6 +113,9 @@ def _numpy_shard_worker(
                         ),
                     )
                 )
+            elif cmd == _PRODUCTION_MARGINS:
+                rows = [(int(idx), int(player)) for idx, player in payload]
+                remote.send(("ok", vec.production_margins(rows)))
             else:
                 remote.send(("err", f"unknown cmd: {cmd!r}"))
     except Exception as exc:
@@ -394,6 +398,39 @@ class ShardedNumpyVecEnv:
         values = [value for value in out if value is not None]
         if len(values) != len(rows):
             raise RuntimeError("incomplete sharded reward potentials")
+        return values
+
+    def production_margins(self, rows: list[tuple[int, int]]) -> Any:
+        if not rows:
+            return []
+
+        grouped_rows: list[list[tuple[int, int]]] = [[] for _ in self.shards]
+        grouped_positions: list[list[int]] = [[] for _ in self.shards]
+        for pos, (env_idx, player) in enumerate(rows):
+            shard_idx, local_idx = self._env_to_shard[env_idx]
+            grouped_rows[shard_idx].append((local_idx, player))
+            grouped_positions[shard_idx].append(pos)
+
+        active_shards: list[int] = []
+        for shard_idx, local_rows in enumerate(grouped_rows):
+            if not local_rows:
+                continue
+            self._remotes[shard_idx].send((_PRODUCTION_MARGINS, local_rows))
+            active_shards.append(shard_idx)
+
+        out: list[float | None] = [None] * len(rows)
+        for shard_idx in active_shards:
+            tag, payload = self._remotes[shard_idx].recv()
+            if tag != "ok":
+                raise RuntimeError(
+                    f"numpy shard {shard_idx} production_margins failed: {payload}"
+                )
+            for value, pos in zip(payload, grouped_positions[shard_idx], strict=True):
+                out[pos] = float(value)
+
+        values = [value for value in out if value is not None]
+        if len(values) != len(rows):
+            raise RuntimeError("incomplete sharded production margins")
         return values
 
     def set_recording(self, enabled: bool) -> None:

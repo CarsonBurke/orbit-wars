@@ -7,6 +7,7 @@ from owars.policies.features import EncodedObs
 from owars.agents.learned import _FleetTargetTracker
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
+from owars.training.config import RewardCfg
 from owars.training.league import LEARNER_NAME, OpponentSlot
 from owars.training.numpy_env import NumpyVecEnv
 from owars.training.sharded_numpy_env import ShardedNumpyVecEnv
@@ -18,6 +19,7 @@ from owars.training.vec_env import (
 from owars.training.vec_rollout import (
     _normalize_learner_seats,
     _obs_reward_potential,
+    _reward_potentials,
     _resolve_seat_agents,
     _trim_fleets_for_forward,
     _state_reward_potential,
@@ -116,6 +118,34 @@ def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():
         done_state, player=0, num_players=3, episode_steps=100, production_weight=1.0
     )
     assert early_finish_phi == pytest.approx(phi)
+
+
+def test_reward_potentials_can_use_production_margin_signal():
+    obs = {
+        "player": 0,
+        "step": 10,
+        "planets": [
+            [0, 0, 0.0, 0.0, 1.0, 10, 2],
+            [1, 1, 0.0, 0.0, 1.0, 20, 1],
+            [2, 2, 0.0, 0.0, 1.0, 5, 4],
+        ],
+        "fleets": [[10, 0, 0.0, 0.0, 0.0, 0, 999]],
+    }
+    state = [
+        {"status": "ACTIVE", "observation": obs},
+        {"status": "ACTIVE", "observation": {**obs, "player": 1}},
+        {"status": "ACTIVE", "observation": {**obs, "player": 2}},
+    ]
+    values = _reward_potentials(
+        vec=object(),
+        states=[state],
+        rows=[(0, 0)],
+        num_players=3,
+        episode_steps=100,
+        reward_cfg=RewardCfg(signal="production_margin"),
+    )
+
+    assert values == pytest.approx([2 - 4])
 
 
 def test_kaggle_vecenv_helpers_preserve_policy_target_sidecars():

@@ -149,7 +149,7 @@ def test_fleet_latent_encoder_compresses_fleet_tokens():
     assert f == cfg.num_fleet_latents
 
 
-def test_launch_prior_is_stable_across_planet_counts():
+def test_noop_column_is_stable_across_planet_counts():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
     model = OrbitPolicy(cfg).eval()
     with torch.no_grad():
@@ -167,9 +167,8 @@ def test_launch_prior_is_stable_across_planet_counts():
         small = model(encode_observation(parse_observation(obs_small))).launch_logits
         large = model(encode_observation(parse_observation(obs_large))).launch_logits
 
-    expected = torch.sigmoid(torch.tensor(-1.5))
-    assert torch.allclose(small.sigmoid()[0, 0], expected, atol=1e-5)
-    assert torch.allclose(large.sigmoid()[0, 0], expected, atol=1e-5)
+    assert torch.allclose(small[0, 0], torch.zeros(()), atol=1e-5)
+    assert torch.allclose(large[0, 0], torch.zeros(()), atol=1e-5)
 
 
 def test_fraction_beta_concentrations_are_unimodal():

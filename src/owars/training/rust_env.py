@@ -24,58 +24,72 @@ from ..policies.sampling import (
     _batch_record_from_materialized_launch,
     _ensure_deterministic_launch_if_idle,
     _mask_impossible_launches,
+    _categorical_support_launch_fraction,
     _policy_fraction_params,
+    _sample_categorical_action,
+    _sample_fraction,
     _sample_launch_fraction,
     _sample_target,
 )
 
 
-def _load_native() -> Any:
+def _native_has_required_api(module: Any) -> bool:
+    core = getattr(module, "RustCoreVecEnv", None)
+    return core is not None and hasattr(core, "builtin_actions")
+
+
+def _load_native_path(path: Path) -> Any | None:
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("_owars_env", path)
+    if spec is None or spec.loader is None:
+        return None
     try:
-        return importlib.import_module("_owars_env")
-    except (ImportError, ModuleNotFoundError):
-        root = Path(__file__).resolve().parents[3]
-        candidates = [
-            root / "rust" / "owars_env_py" / "target" / "release" / "lib_owars_env.so",
-            root / "rust" / "owars_env_py" / "target" / "debug" / "lib_owars_env.so",
-        ]
-        for path in candidates:
-            if not path.exists():
-                continue
-            spec = importlib.util.spec_from_file_location("_owars_env", path)
-            if spec is None or spec.loader is None:
-                continue
-            try:
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-            except ImportError:
-                # The extension is tied to the Python ABI. A checked-in or
-                # previously-built .so from another venv can exist but fail to
-                # load; fall through and rebuild for the active interpreter.
-                continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except ImportError:
+        # The extension is tied to the Python ABI. A checked-in or
+        # previously-built .so from another venv can exist but fail to load.
+        return None
+    if not _native_has_required_api(module):
+        return None
+    return module
+
+
+def _source_is_newer(artifact: Path, sources: list[Path]) -> bool:
+    if not artifact.exists():
+        return True
+    artifact_mtime = artifact.stat().st_mtime
+    return any(path.exists() and path.stat().st_mtime > artifact_mtime for path in sources)
+
+
+def _load_native() -> Any:
+    root = Path(__file__).resolve().parents[3]
+    crate = root / "rust" / "owars_env_py"
+    release = crate / "target" / "release" / "lib_owars_env.so"
+    debug = crate / "target" / "debug" / "lib_owars_env.so"
+    sources = [
+        crate / "Cargo.toml",
+        crate / "src" / "lib.rs",
+        root / "rust" / "owars_env" / "Cargo.toml",
+        root / "rust" / "owars_env" / "src" / "core.rs",
+        root / "rust" / "owars_env" / "src" / "lib.rs",
+    ]
+    if (crate / "Cargo.toml").exists() and _source_is_newer(release, sources):
+        subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=crate,
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+    for path in (release, debug):
+        module = _load_native_path(path)
+        if module is not None:
             return module
-        manifest = root / "rust" / "owars_env_py" / "Cargo.toml"
-        if manifest.exists():
-            subprocess.run(
-                ["cargo", "clean"],
-                cwd=manifest.parent,
-                check=True,
-                stdout=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["cargo", "build", "--release"],
-                cwd=manifest.parent,
-                check=True,
-                stdout=subprocess.DEVNULL,
-            )
-            path = root / "rust" / "owars_env_py" / "target" / "release" / "lib_owars_env.so"
-            if path.exists():
-                spec = importlib.util.spec_from_file_location("_owars_env", path)
-                if spec is not None and spec.loader is not None:
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-                    return module
-        raise
+    module = importlib.import_module("_owars_env")
+    if not _native_has_required_api(module):
+        raise ImportError("_owars_env is missing required RustCoreVecEnv.builtin_actions API")
+    return module
 
 
 _native = _load_native()
@@ -101,6 +115,7 @@ def _numpy_from_tensor(tensor: torch.Tensor) -> np.ndarray:
 class RustVecEnv:
     fast_rollout = True
     supports_replay = False
+    native_builtin_opponents = frozenset({"sniper"})
 
     def __init__(
         self,
@@ -184,6 +199,11 @@ class RustVecEnv:
             float(production_weight),
         )
 
+    def production_margins(self, rows: list[tuple[int, int]]) -> np.ndarray:
+        return self._core.production_margins(
+            [(int(idx), int(player)) for idx, player in rows]
+        )
+
     def sample_batch_with_records(
         self,
         out: Any,
@@ -199,15 +219,36 @@ class RustVecEnv:
         if record_rows is None:
             record_rows = list(range(len(rows)))
         launch_logits = out.launch_logits
+        launch_log_std = out.launch_log_std
+        action_logit_softcap = out.action_logit_softcap
         target_logits = out.target_logits
         fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
-        launch, frac = _sample_launch_fraction(
-            launch_logits,
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-        )
+        if action_logit_softcap is None:
+            launch, frac = _sample_launch_fraction(
+                launch_logits,
+                fraction_param1,
+                fraction_param2,
+                deterministic,
+                fraction_dist,
+                launch_log_std=launch_log_std,
+                launch_prob_floor=out.launch_prob_floor,
+            )
+        else:
+            frac = _sample_fraction(
+                fraction_param1,
+                fraction_param2,
+                deterministic,
+                fraction_dist,
+            )
+            support_launch, _support_frac = _categorical_support_launch_fraction(
+                fraction_param1,
+                fraction_param2,
+                out.planet_owned_mask,
+                out.planet_mask,
+                fraction_dist,
+            )
+        mask_launch = launch if action_logit_softcap is None else support_launch
+        mask_frac = frac
         active_fields_masker = getattr(
             self._core,
             "legal_target_mask_from_state_active_fields",
@@ -217,21 +258,23 @@ class RustVecEnv:
         has_active_fields_masker = callable(active_fields_masker)
         if has_active_fields_masker:
             active_fields_np = _numpy_from_tensor(
-                torch.stack((frac.float(), launch.float()), dim=-1)
+                torch.stack((mask_frac.float(), mask_launch.float()), dim=-1)
             )
             if deterministic_fallback:
                 active_fields_np[:, :, 1] = 1.0
-            elif record_rows:
+            elif record_rows and action_logit_softcap is None:
                 active_fields_np[record_rows, :, 1] = 1.0
             frac_np = active_fields_np[:, :, 0]
+            materialize_frac_np = _numpy_from_tensor(frac.float())
             target_legal_mask_np = active_fields_masker(row_pairs, active_fields_np)
         else:
-            frac_np = _numpy_from_tensor(frac.float())
+            frac_np = _numpy_from_tensor(mask_frac.float())
+            materialize_frac_np = _numpy_from_tensor(frac.float())
         if not has_active_fields_masker and callable(active_masker):
-            active_source = launch.to(dtype=torch.bool)
+            active_source = mask_launch.to(dtype=torch.bool)
             if deterministic_fallback:
                 active_source = torch.ones_like(active_source, dtype=torch.bool)
-            elif record_rows:
+            elif record_rows and action_logit_softcap is None:
                 active_source = active_source.clone()
                 record_idx = torch.as_tensor(
                     record_rows,
@@ -255,26 +298,36 @@ class RustVecEnv:
         target_logits = _apply_target_legal_mask(
             target_logits,
             target_legal_mask,
-            launch,
+            mask_launch,
             out.planet_owned_mask,
             out.planet_mask,
         )
-        launch_logits, launch = _mask_impossible_launches(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-        )
-        launch = _ensure_deterministic_launch_if_idle(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic_fallback,
-        )
-        target_idx = _sample_target(target_logits, deterministic)
+        if action_logit_softcap is None:
+            launch_logits, launch = _mask_impossible_launches(
+                launch_logits,
+                launch,
+                target_legal_mask,
+                out.planet_owned_mask,
+                out.planet_mask,
+            )
+            launch = _ensure_deterministic_launch_if_idle(
+                launch_logits,
+                launch,
+                target_legal_mask,
+                out.planet_owned_mask,
+                out.planet_mask,
+                deterministic_fallback,
+            )
+            target_idx = _sample_target(target_logits, deterministic)
+        else:
+            launch, target_idx = _sample_categorical_action(
+                launch_logits,
+                target_logits,
+                action_logit_softcap,
+                out.planet_owned_mask,
+                out.planet_mask,
+                deterministic,
+            )
         materialize_fields = getattr(
             self._core,
             "materialize_masked_action_fields_from_state",
@@ -300,7 +353,7 @@ class RustVecEnv:
                 row_pairs,
                 _numpy_from_tensor(launch.float()),
                 _numpy_from_tensor(target_idx.to(torch.int64)),
-                frac_np,
+                materialize_frac_np,
                 bool(native_actions),
             )
         actions_list = materialized["actions"]
@@ -310,12 +363,15 @@ class RustVecEnv:
             target_idx,
             frac,
             launch_logits,
+            launch_log_std,
+            action_logit_softcap,
             target_logits,
             fraction_param1,
             fraction_param2,
             fraction_dist,
             materialized_rows,
             record_rows,
+            launch_prob_floor=out.launch_prob_floor,
         )
         record_target_legal = np.ascontiguousarray(target_legal_mask_np[record_rows])
         if len(record_rows) > 0:
@@ -357,6 +413,19 @@ class RustVecEnv:
             native_actions=native_actions,
         )
         return actions
+
+    def builtin_actions(
+        self,
+        name: str,
+        rows: list[tuple[int, int]],
+        *,
+        native_actions: bool = False,
+    ) -> list[Any]:
+        return self._core.builtin_actions(
+            str(name),
+            [(int(idx), int(player)) for idx, player in rows],
+            bool(native_actions),
+        )
 
     def policy_batch(
         self,
