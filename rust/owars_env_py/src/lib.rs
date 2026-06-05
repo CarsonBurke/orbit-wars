@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{IntoPyArray, PyReadonlyArray2, PyReadonlyArray3, PyUntypedArrayMethods};
@@ -38,7 +41,11 @@ struct TargetMotion {
     radius: f64,
     radius_sq: f64,
     is_orbiting: bool,
-    positions: Vec<(f64, f64)>,
+    theta0: f64,
+    orbit_radius: f64,
+    angular_velocity: f64,
+    max_turns: usize,
+    positions: Option<Vec<(f64, f64)>>,
 }
 
 #[derive(Clone)]
@@ -834,28 +841,72 @@ fn parse_env_actions(obj: &Bound<'_, PyAny>, num_players: usize) -> PyResult<Vec
 
 fn sniper_actions(game: &Game, player: usize) -> PlayerAction {
     let player = player as i32;
-    let targets = game
+    let mut targets = game
         .planets
         .iter()
-        .filter(|planet| planet.owner != player)
+        .enumerate()
+        .filter_map(|(idx, planet)| (planet.owner != player).then_some(idx))
         .collect::<Vec<_>>();
     if targets.is_empty() {
         return Vec::new();
     }
+    let comet_ids = comet_id_set(game);
+    let mut blockers = Vec::with_capacity(game.planets.len());
+    let mut static_cols = Vec::new();
+    let mut moving_cols = Vec::new();
+    for (idx, planet) in game.planets.iter().enumerate() {
+        let motion = target_motion(
+            planet,
+            game.angular_velocity,
+            comet_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&planet.id)),
+        );
+        if motion.is_orbiting {
+            moving_cols.push(idx);
+        } else {
+            static_cols.push(idx);
+        }
+        blockers.push(Some(motion));
+    }
 
     let mut moves = Vec::new();
     for mine in game.planets.iter().filter(|planet| planet.owner == player) {
-        let Some(target) = targets.iter().min_by(|a, b| {
-            distance_sq(mine, a)
-                .partial_cmp(&distance_sq(mine, b))
+        targets.sort_by(|a, b| {
+            distance_sq(mine, &game.planets[*a])
+                .partial_cmp(&distance_sq(mine, &game.planets[*b]))
                 .unwrap_or(std::cmp::Ordering::Equal)
-        }) else {
-            continue;
-        };
-        let ships_needed = target.ships + 1;
-        if mine.ships >= ships_needed {
-            let angle = (target.y - mine.y).atan2(target.x - mine.x);
-            moves.push(Action::launch(mine.id, angle, ships_needed));
+        });
+        for &target_idx in &targets {
+            let target = &game.planets[target_idx];
+            let ships_needed = target.ships + 1;
+            if mine.ships < ships_needed {
+                continue;
+            }
+            let speed = fleet_speed_local(ships_needed, game.ship_speed);
+            let Some(target_motion) = blockers.get(target_idx).and_then(|motion| motion.as_ref())
+            else {
+                continue;
+            };
+            let Some(solution) = lead_solution_cached_with_speed(mine, target_motion, speed) else {
+                continue;
+            };
+            if !route_clear_to_solution_with_cols(
+                mine.id,
+                target.id,
+                mine.x,
+                mine.y,
+                mine.radius,
+                &solution,
+                speed,
+                &blockers,
+                &static_cols,
+                &moving_cols,
+            ) {
+                continue;
+            }
+            moves.push(Action::launch(mine.id, solution.angle, ships_needed));
+            break;
         }
     }
     moves
@@ -1151,10 +1202,14 @@ fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
     FIds: Fn(usize) -> i32,
 {
     let planets_by_col = planets_by_col(game, planets_len, &id_at, &mask_at);
+    let comet_ids = comet_id_set(game);
     let is_comet_col = (0..planets_len)
         .map(|col| {
             let target_id = id_at(col);
-            target_id >= 0 && is_comet_planet(game, target_id)
+            target_id >= 0
+                && comet_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&target_id))
         })
         .collect::<Vec<_>>();
     let target_motions = planets_by_col
@@ -1162,12 +1217,7 @@ fn fill_legal_mask_row<FFrac, FOwned, FMask, FIds>(
         .enumerate()
         .map(|(col, planet)| {
             planet.map(|target| {
-                target_motion(
-                    &target,
-                    game.angular_velocity,
-                    game.ship_speed,
-                    is_comet_col[col],
-                )
+                cached_target_motion(&target, game.angular_velocity, is_comet_col[col])
             })
         })
         .collect::<Vec<_>>();
@@ -1284,11 +1334,16 @@ fn fill_legal_mask_row_from_state<FFrac, FActive>(
 
 fn legal_mask_state(game: &Game, planets_len: usize) -> LegalMaskState {
     let planet_limit = planets_len.min(game.planets.len());
+    let comet_ids = comet_id_set(game);
     let is_comet_col = game
         .planets
         .iter()
         .take(planet_limit)
-        .map(|target| is_comet_planet(game, target.id))
+        .map(|target| {
+            comet_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&target.id))
+        })
         .collect::<Vec<_>>();
     let target_motions = game
         .planets
@@ -1296,10 +1351,9 @@ fn legal_mask_state(game: &Game, planets_len: usize) -> LegalMaskState {
         .take(planet_limit)
         .enumerate()
         .map(|(idx, target)| {
-            Some(target_motion(
+            Some(cached_target_motion(
                 target,
                 game.angular_velocity,
-                game.ship_speed,
                 is_comet_col[idx],
             ))
         })
@@ -1414,10 +1468,13 @@ where
         .collect()
 }
 
-fn is_comet_planet(game: &Game, planet_id: i32) -> bool {
-    game.comets
-        .iter()
-        .any(|group| group.planet_ids.iter().any(|id| *id == planet_id))
+fn comet_id_set(game: &Game) -> Option<HashSet<i32>> {
+    (!game.comets.is_empty()).then(|| {
+        game.comets
+            .iter()
+            .flat_map(|group| group.planet_ids.iter().copied())
+            .collect()
+    })
 }
 
 fn materialize_action_row<FLaunch, FTarget, FFrac, FOwned, FMask, FIds>(
@@ -1443,11 +1500,7 @@ where
         .iter()
         .map(|p| (p.id, *p))
         .collect::<HashMap<_, _>>();
-    let comet_ids = game
-        .comets
-        .iter()
-        .flat_map(|group| group.planet_ids.iter().copied())
-        .collect::<std::collections::HashSet<_>>();
+    let comet_ids = comet_id_set(game);
     let mut remaining = game
         .planets
         .iter()
@@ -1460,8 +1513,9 @@ where
             Some(target_motion(
                 planet,
                 game.angular_velocity,
-                game.ship_speed,
-                comet_ids.contains(&planet.id),
+                comet_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&planet.id)),
             ))
         })
         .collect::<Vec<_>>();
@@ -1482,7 +1536,7 @@ where
             continue;
         }
         let source_id = id_at(i);
-        let (Some(source), Some(target)) = (
+        let (Some(source), Some(_target)) = (
             by_id.get(&source_id).copied(),
             by_id.get(&target_id).copied(),
         ) else {
@@ -1500,13 +1554,10 @@ where
         if speed <= 0.0 {
             continue;
         }
-        let Some(solution) = lead_solution(
-            &source,
-            &target,
-            game.angular_velocity,
-            send,
-            game.ship_speed,
-        ) else {
+        let Some(target_motion) = blockers.get(ti).and_then(|motion| motion.as_ref()) else {
+            continue;
+        };
+        let Some(solution) = lead_solution_cached_with_speed(&source, target_motion, speed) else {
             continue;
         };
         if !route_clear_to_solution(
@@ -1550,7 +1601,7 @@ where
     FFrac: Fn(usize) -> f64,
 {
     let planet_limit = planets_len.min(game.planets.len());
-    let mut blockers: Option<Vec<Option<TargetMotion>>> = None;
+    let mut target_motions: Option<Vec<Option<TargetMotion>>> = None;
     let mut result = RowActionResult {
         actions: Vec::new(),
         materialized: vec![false; planets_len],
@@ -1584,16 +1635,8 @@ where
         if speed <= 0.0 {
             continue;
         }
-        let Some(solution) = lead_solution(
-            &source,
-            &target,
-            game.angular_velocity,
-            send,
-            game.ship_speed,
-        ) else {
-            continue;
-        };
-        let blockers = blockers.get_or_insert_with(|| {
+        let target_motions = target_motions.get_or_insert_with(|| {
+            let comet_ids = comet_id_set(game);
             game.planets
                 .iter()
                 .take(planet_limit)
@@ -1601,12 +1644,19 @@ where
                     Some(target_motion(
                         planet,
                         game.angular_velocity,
-                        game.ship_speed,
-                        is_comet_planet(game, planet.id),
+                        comet_ids
+                            .as_ref()
+                            .is_some_and(|ids| ids.contains(&planet.id)),
                     ))
                 })
                 .collect::<Vec<_>>()
         });
+        let Some(target_motion) = target_motions.get(ti).and_then(|motion| motion.as_ref()) else {
+            continue;
+        };
+        let Some(solution) = lead_solution_cached_with_speed(&source, target_motion, speed) else {
+            continue;
+        };
         if !route_clear_to_solution(
             source.id,
             target_id,
@@ -1615,7 +1665,7 @@ where
             source.radius,
             &solution,
             speed,
-            blockers,
+            target_motions,
         ) {
             continue;
         }
@@ -1648,7 +1698,7 @@ where
     FFrac: Fn(usize) -> f64,
 {
     let planet_limit = planets_len.min(game.planets.len());
-    let mut blockers: Option<Vec<Option<TargetMotion>>> = None;
+    let mut target_motions: Option<Vec<Option<TargetMotion>>> = None;
     let mut result = RowActionResult {
         actions: Vec::new(),
         materialized: vec![false; planets_len],
@@ -1682,16 +1732,8 @@ where
         if speed <= 0.0 {
             continue;
         }
-        let Some(solution) = lead_solution(
-            &source,
-            &target,
-            game.angular_velocity,
-            send,
-            game.ship_speed,
-        ) else {
-            continue;
-        };
-        let blockers = blockers.get_or_insert_with(|| {
+        let target_motions = target_motions.get_or_insert_with(|| {
+            let comet_ids = comet_id_set(game);
             game.planets
                 .iter()
                 .take(planet_limit)
@@ -1699,12 +1741,19 @@ where
                     Some(target_motion(
                         planet,
                         game.angular_velocity,
-                        game.ship_speed,
-                        is_comet_planet(game, planet.id),
+                        comet_ids
+                            .as_ref()
+                            .is_some_and(|ids| ids.contains(&planet.id)),
                     ))
                 })
                 .collect::<Vec<_>>()
         });
+        let Some(target_motion) = target_motions.get(ti).and_then(|motion| motion.as_ref()) else {
+            continue;
+        };
+        let Some(solution) = lead_solution_cached_with_speed(&source, target_motion, speed) else {
+            continue;
+        };
         if !route_clear_to_solution(
             source.id,
             target_id,
@@ -1713,7 +1762,7 @@ where
             source.radius,
             &solution,
             speed,
-            blockers,
+            target_motions,
         ) {
             continue;
         }
@@ -1748,11 +1797,19 @@ fn fleet_speed_local(ships: i32, max_speed: f64) -> f64 {
     (1.0 + (max_speed - 1.0) * frac.powf(1.5)).min(max_speed)
 }
 
-fn target_motion(
+fn target_motion(target: &Planet, angular_velocity: f64, is_comet: bool) -> TargetMotion {
+    target_motion_with_cache(target, angular_velocity, is_comet, false)
+}
+
+fn cached_target_motion(target: &Planet, angular_velocity: f64, is_comet: bool) -> TargetMotion {
+    target_motion_with_cache(target, angular_velocity, is_comet, true)
+}
+
+fn target_motion_with_cache(
     target: &Planet,
     angular_velocity: f64,
-    max_speed: f64,
     is_comet: bool,
+    cache_positions: bool,
 ) -> TargetMotion {
     let orbit_radius = ((target.x - CENTER).powi(2) + (target.y - CENTER).powi(2)).sqrt();
     let is_orbiting = !is_comet
@@ -1767,21 +1824,26 @@ fn target_motion(
             radius: target.radius,
             radius_sq: target.radius * target.radius,
             is_orbiting: false,
-            positions: Vec::new(),
+            theta0: 0.0,
+            orbit_radius: 0.0,
+            angular_velocity: 0.0,
+            max_turns: 0,
+            positions: None,
         };
     }
     let theta0 = (target.y - CENTER).atan2(target.x - CENTER);
-    let speed_floor = fleet_speed_local(1, max_speed).max(1e-9);
-    let max_turns = bounded_lead_scan_turns(speed_floor, target.radius);
-    let positions = (1..=max_turns)
-        .map(|k| {
-            let theta = theta0 + angular_velocity * (k - 1) as f64;
-            (
-                CENTER + orbit_radius * theta.cos(),
-                CENTER + orbit_radius * theta.sin(),
-            )
-        })
-        .collect();
+    let max_turns = bounded_lead_scan_turns(1.0, target.radius) as usize;
+    let positions = cache_positions.then(|| {
+        (0..max_turns)
+            .map(|step| {
+                let theta = theta0 + angular_velocity * step as f64;
+                (
+                    CENTER + orbit_radius * theta.cos(),
+                    CENTER + orbit_radius * theta.sin(),
+                )
+            })
+            .collect()
+    });
     TargetMotion {
         id: target.id,
         x: target.x,
@@ -1789,6 +1851,10 @@ fn target_motion(
         radius: target.radius,
         radius_sq: target.radius * target.radius,
         is_orbiting: true,
+        theta0,
+        orbit_radius,
+        angular_velocity,
+        max_turns,
         positions,
     }
 }
@@ -1843,7 +1909,8 @@ fn lead_solution_from_point_cached_with_speed(
     }
     let max_turns = bounded_lead_scan_turns(speed, target.radius) as usize;
     let mut previous_error: Option<f64> = None;
-    for (idx, &(tx, ty)) in target.positions.iter().take(max_turns).enumerate() {
+    for idx in 0..max_turns.min(target.max_turns) {
+        let (tx, ty) = motion_position_at(target, idx);
         let k = (idx + 1) as i32;
         let distance = ((tx - source_x).powi(2) + (ty - source_y).powi(2)).sqrt();
         let error = distance - k as f64 * speed;
@@ -1873,6 +1940,7 @@ fn bounded_lead_scan_turns(speed: f64, target_radius: f64) -> i32 {
         .min((((LEAD_MAX_SCAN_DISTANCE + target_radius) / speed).ceil() as i32 + 1).max(1))
 }
 
+#[cfg(test)]
 fn lead_solution(
     source: &Planet,
     target: &Planet,
@@ -1917,6 +1985,7 @@ fn lead_solution(
     Some(solution)
 }
 
+#[cfg(test)]
 fn lead_solution_from_point(
     source_x: f64,
     source_y: f64,
@@ -1983,11 +2052,18 @@ fn motion_position_at(motion: &TargetMotion, steps: usize) -> (f64, f64) {
     if !motion.is_orbiting || steps == 0 {
         return (motion.x, motion.y);
     }
-    motion
-        .positions
-        .get(steps)
-        .copied()
-        .unwrap_or_else(|| *motion.positions.last().unwrap_or(&(motion.x, motion.y)))
+    if let Some(positions) = motion.positions.as_ref() {
+        return positions
+            .get(steps)
+            .copied()
+            .unwrap_or_else(|| positions.last().copied().unwrap_or((motion.x, motion.y)));
+    }
+    let bounded_steps = steps.min(motion.max_turns.saturating_sub(1));
+    let theta = motion.theta0 + motion.angular_velocity * bounded_steps as f64;
+    (
+        CENTER + motion.orbit_radius * theta.cos(),
+        CENTER + motion.orbit_radius * theta.sin(),
+    )
 }
 
 fn route_clear_to_solution(
@@ -2185,6 +2261,156 @@ fn point_to_segment_distance_sq_local(
 
 fn angle_delta(a: f64, b: f64) -> f64 {
     (a - b).sin().atan2((a - b).cos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use owars_env::{CometGroup, GameState, Point};
+
+    #[test]
+    fn comet_legal_mask_and_materializer_use_same_motion_model() {
+        let planets = vec![
+            Planet {
+                id: 13,
+                owner: 0,
+                x: 30.230528337169282,
+                y: 37.113714576315715,
+                radius: 1.0,
+                ships: 2,
+                production: 1,
+            },
+            Planet {
+                id: 18,
+                owner: 1,
+                x: 70.0,
+                y: 75.0,
+                radius: 1.0,
+                ships: 20,
+                production: 1,
+            },
+            Planet {
+                id: 29,
+                owner: -1,
+                x: 47.52883413524248,
+                y: 97.05854540070332,
+                radius: 1.0,
+                ships: 7,
+                production: 1,
+            },
+        ];
+        let game = Game::from_state(
+            GameConfig::new(2, 500, 6.0),
+            GameState::new(
+                50,
+                0.03,
+                planets.clone(),
+                planets,
+                vec![],
+                vec![CometGroup {
+                    planet_ids: vec![29],
+                    paths: vec![vec![
+                        Point::new(47.52883413524248, 97.05854540070332),
+                        Point::new(47.0, 95.0),
+                    ]],
+                    path_index: 0,
+                }],
+                0,
+            ),
+        );
+        let planets_len = 3;
+        let frac = 0.16880422830581665;
+        let legal_state = legal_mask_state(&game, planets_len);
+        let mut legal = vec![false; planets_len * planets_len];
+        fill_legal_mask_row_from_state(
+            &game,
+            &legal_state,
+            0,
+            planets_len,
+            |col| if col == 0 { frac } else { 0.5 },
+            |_| true,
+            &mut legal,
+        );
+        assert!(legal[2], "source 0 should be allowed to target comet col 2");
+
+        let result = materialize_masked_action_row_from_state(
+            &game,
+            0,
+            planets_len,
+            |col| if col == 0 { 1.0 } else { 0.0 },
+            |col| if col == 0 { 2 } else { 0 },
+            |col| if col == 0 { frac } else { 0.5 },
+        );
+        assert!(result.materialized[0]);
+        assert_eq!(result.actions.len(), 1);
+        assert_eq!(result.actions[0].from_planet_id, 13);
+        assert_eq!(result.actions[0].target_id, 29);
+    }
+
+    #[test]
+    fn native_sniper_treats_comet_target_as_non_orbiting() {
+        let planets = vec![
+            Planet {
+                id: 13,
+                owner: 0,
+                x: 30.230528337169282,
+                y: 37.113714576315715,
+                radius: 1.0,
+                ships: 20,
+                production: 1,
+            },
+            Planet {
+                id: 29,
+                owner: -1,
+                x: 47.52883413524248,
+                y: 97.05854540070332,
+                radius: 1.0,
+                ships: 7,
+                production: 1,
+            },
+        ];
+        let game = Game::from_state(
+            GameConfig::new(2, 500, 6.0),
+            GameState::new(
+                50,
+                0.04,
+                planets.clone(),
+                planets,
+                vec![],
+                vec![CometGroup {
+                    planet_ids: vec![29],
+                    paths: vec![vec![
+                        Point::new(47.52883413524248, 97.05854540070332),
+                        Point::new(47.0, 95.0),
+                    ]],
+                    path_index: 0,
+                }],
+                0,
+            ),
+        );
+        let source = game.planets[0];
+        let target = game.planets[1];
+        let ships_needed = target.ships + 1;
+        let speed = fleet_speed_local(ships_needed, game.ship_speed);
+        let comet_motion = target_motion(&target, game.angular_velocity, true);
+        let expected = lead_solution_cached_with_speed(&source, &comet_motion, speed).unwrap();
+        let old_orbit_inferred = lead_solution(
+            &source,
+            &target,
+            game.angular_velocity,
+            ships_needed,
+            game.ship_speed,
+        )
+        .unwrap();
+
+        let actions = sniper_actions(&game, 0);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].from_planet_id, 13);
+        assert_eq!(actions[0].ships, ships_needed);
+        assert!((actions[0].angle - expected.angle).abs() < 1e-12);
+        assert!(angle_delta(actions[0].angle, old_orbit_inferred.angle).abs() > 0.1);
+    }
 }
 
 #[pymodule]

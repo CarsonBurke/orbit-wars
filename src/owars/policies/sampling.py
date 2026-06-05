@@ -530,6 +530,8 @@ def _lead_solution_from_point(
     target_radius: float,
     angular_velocity: float,
     send: int,
+    *,
+    target_is_comet: bool = False,
 ) -> LeadSolution | None:
     """Closed-form first-intercept solution from an exact fleet start point.
 
@@ -552,7 +554,8 @@ def _lead_solution_from_point(
     # Static target (matches `geometry.predicted_position`'s rule) or zero
     # angular velocity → no orbital motion → aim direct, t = d/sp.
     is_orbiting = (
-        orbit_radius + target_radius < ROTATION_RADIUS_LIMIT
+        not target_is_comet
+        and orbit_radius + target_radius < ROTATION_RADIUS_LIMIT
         and abs(angular_velocity) > 1e-12
         and orbit_radius > 1e-9
     )
@@ -700,9 +703,18 @@ def _lead_angle_from_point(
     target_radius: float,
     angular_velocity: float,
     send: int,
+    *,
+    target_is_comet: bool = False,
 ) -> float | None:
     solution = _lead_solution_from_point(
-        mine_x, mine_y, target_x, target_y, target_radius, angular_velocity, send
+        mine_x,
+        mine_y,
+        target_x,
+        target_y,
+        target_radius,
+        angular_velocity,
+        send,
+        target_is_comet=target_is_comet,
     )
     return None if solution is None else solution.angle
 
@@ -716,6 +728,8 @@ def _lead_solution(
     target_radius: float,
     angular_velocity: float,
     send: int,
+    *,
+    target_is_comet: bool = False,
 ) -> LeadSolution | None:
     """First-intercept launch solution for the official action semantics.
 
@@ -726,7 +740,14 @@ def _lead_solution(
     missed by a centerline shot.
     """
     solution = _lead_solution_from_point(
-        mine_x, mine_y, target_x, target_y, target_radius, angular_velocity, send
+        mine_x,
+        mine_y,
+        target_x,
+        target_y,
+        target_radius,
+        angular_velocity,
+        send,
+        target_is_comet=target_is_comet,
     )
     if solution is None:
         return None
@@ -746,6 +767,7 @@ def _lead_solution(
             target_radius,
             angular_velocity,
             send,
+            target_is_comet=target_is_comet,
         )
         if refined is None:
             return None
@@ -765,6 +787,8 @@ def _lead_angle(
     target_radius: float,
     angular_velocity: float,
     send: int,
+    *,
+    target_is_comet: bool = False,
 ) -> float | None:
     solution = _lead_solution(
         mine_x,
@@ -775,6 +799,7 @@ def _lead_angle(
         target_radius,
         angular_velocity,
         send,
+        target_is_comet=target_is_comet,
     )
     return None if solution is None else solution.angle
 
@@ -843,6 +868,7 @@ def _build_moves_from_lists(
             target.radius,
             omega,
             send,
+            target_is_comet=int(target.id) in o.comet_planet_ids,
         )
         if solution is None:
             continue  # solver couldn't find a feasible intercept — silently no-op
@@ -970,6 +996,7 @@ def _target_legal_mask_from_planets(
                 target_radius,
                 omega,
                 send,
+                target_is_comet=int(ids_l[j]) in comet_ids,
             )
             if solution is None:
                 continue
@@ -1038,6 +1065,7 @@ def _target_legal_mask_from_packed_legality_fields(
                 target_radius,
                 omega,
                 send,
+                target_is_comet=int(ids[j]) in comet_ids,
             )
             if solution is None:
                 continue
@@ -1399,6 +1427,7 @@ def _build_moves_from_packed_fields_with_mask(
             target.radius,
             omega,
             send,
+            target_is_comet=int(target.id) in o.comet_planet_ids,
         )
         if solution is None:
             continue
@@ -1477,6 +1506,7 @@ def _build_action_lists_from_packed_fields_raw_with_mask(
             float(target[4]),
             omega,
             send,
+            target_is_comet=int(target_id) in comet_planet_ids,
         )
         if solution is None:
             continue
@@ -1571,6 +1601,7 @@ def _build_deterministic_action_lists_from_logits_raw(
                 float(target[4]),
                 omega,
                 send,
+                target_is_comet=int(target_id) in comet_planet_ids,
             )
             if solution is None:
                 continue
@@ -1653,6 +1684,7 @@ def _build_action_lists_from_packed_fields_context_with_mask(
             float(target[4]),
             omega,
             send,
+            target_is_comet=int(target_id) in comet_planet_ids,
         )
         if solution is None:
             continue

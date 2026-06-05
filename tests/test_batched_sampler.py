@@ -709,3 +709,45 @@ def test_sampler_allows_comet_target_when_route_is_legal():
         ],
         deterministic=True,
     )[0]
+
+
+def test_sampler_treats_orbit_threshold_comet_as_comet_not_orbiter():
+    obs = _obs()
+    obs["step"] = 50
+    obs["planets"] = [
+        [13, 0, 30.230528337169282, 37.113714576315715, 1.0, 20, 1],
+        [29, -1, 47.52883413524248, 97.05854540070332, 1.0, 7, 1],
+        [18, 1, 70.0, 75.0, 1.0, 20, 1],
+    ]
+    obs["initial_planets"] = [row.copy() for row in obs["planets"]]
+    obs["comet_planet_ids"] = [29]
+    obs["comets"] = [
+        {
+            "planet_ids": [29],
+            "paths": [[[47.52883413524248, 97.05854540070332], [47.0, 95.0]]],
+            "path_index": 0,
+        }
+    ]
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+
+    moves, record = sample_with_record(out, o, deterministic=True)
+    raw_actions = sample_batch_actions_raw(out, [obs], deterministic=True)
+    context_actions = sample_batch_actions_context(
+        out,
+        [
+            ActionContext(
+                planets=obs["planets"],
+                angular_velocity=obs["angular_velocity"],
+                comet_planet_ids=obs["comet_planet_ids"],
+            )
+        ],
+        deterministic=True,
+    )
+
+    assert moves
+    assert record.target_legal_mask[0, 1]
+    assert record.launch[0].item() == 1.0
+    assert raw_actions[0] and raw_actions[0][0][3] == 29
+    assert context_actions[0] and context_actions[0][0][3] == 29
