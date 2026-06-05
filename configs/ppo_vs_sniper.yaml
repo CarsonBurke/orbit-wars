@@ -46,6 +46,7 @@ model:
   value_min: -100000.0
   value_max: 100000.0
   value_num_bins: 153
+  critic_mtp_horizon: 6
   value_symlog: true
   action_logit_softcap: 8.0
 
@@ -61,8 +62,9 @@ optim:
   lr: 3.0e-4
   head_lr: 3.0e-4
   weight_decay: 1.0e-4
-  grad_clip: 0.5   # actor heads, critic head, and shared trunk are clipped as
-                   # separate gradient groups after one combined backward pass.
+  grad_clip: 0.5   # actor and critic losses are backpropagated separately;
+                   # each flow clips its task head plus shared trunk before
+                   # their shared gradients are summed.
   minibatch_count: 16
   minibatch_size: 1024
   epochs_per_update: 4

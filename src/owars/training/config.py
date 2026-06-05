@@ -39,6 +39,7 @@ class ModelCfg:
     fleet_tokenizer_depth: int = 1
     value_hidden: int = 64
     value_num_bins: int = 153
+    critic_mtp_horizon: int = 6
     value_min: float = -100_000.0
     value_max: float = 100_000.0
     value_symlog: bool = True
@@ -118,13 +119,15 @@ class OptimCfg:
 class PPOCfg:
     """SPO-asym policy objective + distributional critic.
 
-    Dense potential rewards make the per-step signal informative, so use the
-    conventional PPO GAE setup: discounted returns with one fixed lambda for
-    both actor advantages and critic targets.
+    Dense potential rewards make the per-step signal informative, so the
+    default is conventional PPO GAE with one lambda. Sparse terminal rewards
+    can decouple the critic target with `value_gae_lambda=1.0` while keeping
+    lower-variance policy advantages.
     """
 
     gamma: float = 0.997
     gae_lambda: float = 0.95
+    value_gae_lambda: float | None = None
     # CleanRL IterThink v24 policy-advantage shaping. "rankgauss" maps the
     # full rollout's raw GAE advantages to empirical Gaussian quantiles before
     # minibatching; "none" keeps raw GAE.
@@ -304,9 +307,9 @@ class OpponentsCfg:
 
 @dataclass
 class RewardCfg:
-    """Dense per-step potential reward: `potential_weight * (Phi(s') - Phi(s))`.
+    """Reward configuration.
 
-    `signal` selects the potential Phi (both own-minus-strongest-enemy):
+    `signal` selects the reward family:
 
       - `projected_margin`: PROJECTED population margin —
         current ships on owned planets + ships in owned fleets, plus production
@@ -317,6 +320,9 @@ class RewardCfg:
         turns_left projection. O(±10^2), which keeps the distributional critic's
         value bounded (see configs/sac_base.yaml). `production_weight` is unused
         by this one.
+      - `win_terminal`: terminal-only outcome reward. Dense potential deltas are
+        disabled; configs that specify only `signal: win_terminal` default to
+        `win_value=+1`, `loss_value=-1`, `draw_value=0`.
 
     The dense delta is the SOLE reward: the terminal outcome fields
     (win/loss/draw_value, margin_scale) default to zero. They stay configurable
@@ -325,13 +331,20 @@ class RewardCfg:
     lever — the dense potential carries the signal.
     """
 
-    signal: Literal["projected_margin", "production_margin"] = "projected_margin"
+    signal: Literal[
+        "projected_margin",
+        "production_margin",
+        "win_terminal",
+    ] = "projected_margin"
     potential_weight: float = 1.0
     production_weight: float = 1.0
     win_value: float = 0.0
     loss_value: float = 0.0
     draw_value: float = 0.0
     margin_scale: float = 0.0
+
+    def uses_dense_potential(self) -> bool:
+        return self.signal != "win_terminal" and self.potential_weight != 0.0
 
 
 @dataclass
@@ -363,6 +376,9 @@ class RunConfig:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> RunConfig:
         cfg = cls()
+        reward_section = d.get("reward") or {}
+        ppo_section = d.get("ppo") or {}
+        model_section = d.get("model") or {}
         for section, sub in d.items():
             if not hasattr(cfg, section):
                 raise KeyError(f"unknown config section: {section!r}")
@@ -371,12 +387,46 @@ class RunConfig:
                 if not hasattr(target, k):
                     raise KeyError(f"unknown {section}.{k}")
                 setattr(target, k, v)
+        if cfg.reward.signal == "win_terminal":
+            if "potential_weight" not in reward_section:
+                cfg.reward.potential_weight = 0.0
+            if "win_value" not in reward_section:
+                cfg.reward.win_value = 1.0
+            if "loss_value" not in reward_section:
+                cfg.reward.loss_value = -1.0
+            if "draw_value" not in reward_section:
+                cfg.reward.draw_value = 0.0
+            if "gamma" not in ppo_section:
+                cfg.ppo.gamma = 1.0
+            if "value_gae_lambda" not in ppo_section:
+                cfg.ppo.value_gae_lambda = 1.0
+            if "value_min" not in model_section:
+                cfg.model.value_min = -1.0
+            if "value_max" not in model_section:
+                cfg.model.value_max = 1.0
+            if "value_num_bins" not in model_section:
+                cfg.model.value_num_bins = 41
+            if "value_symlog" not in model_section:
+                cfg.model.value_symlog = False
         if not 0.0 <= cfg.ppo.gae_lambda <= 1.0:
             raise ValueError("ppo.gae_lambda must be in [0, 1]")
+        if cfg.ppo.value_gae_lambda is not None and not (
+            0.0 <= cfg.ppo.value_gae_lambda <= 1.0
+        ):
+            raise ValueError("ppo.value_gae_lambda must be in [0, 1]")
         if not 0.0 < cfg.ppo.gamma <= 1.0:
             raise ValueError("ppo.gamma must be in (0, 1]")
+        if cfg.reward.signal == "win_terminal" and cfg.ppo.gamma != 1.0:
+            raise ValueError("reward.signal='win_terminal' requires ppo.gamma=1.0")
         if cfg.ppo.spo_eps_low <= 0.0 or cfg.ppo.spo_eps_high <= 0.0:
             raise ValueError("ppo.spo_eps_low/high must be positive")
+        if (
+            cfg.reward.signal == "win_terminal"
+            and cfg.ppo.value_gae_lambda != 1.0
+        ):
+            raise ValueError(
+                "reward.signal='win_terminal' requires ppo.value_gae_lambda=1.0"
+            )
         if cfg.ppo.spo_eps_high < cfg.ppo.spo_eps_low:
             raise ValueError("ppo.spo_eps_high must be >= ppo.spo_eps_low")
         if cfg.ppo.advantage_transform not in {"rankgauss", "none"}:
@@ -405,15 +455,23 @@ class RunConfig:
             raise ValueError(f"model.{exc}") from exc
         if cfg.model.value_min >= cfg.model.value_max:
             raise ValueError("model.value_min must be less than model.value_max")
+        if cfg.model.critic_mtp_horizon <= 0:
+            raise ValueError("model.critic_mtp_horizon must be positive")
         if cfg.model.adv_scale <= 0.0:
             raise ValueError("model.adv_scale must be positive")
         if cfg.model.action_logit_softcap <= 0.0:
             raise ValueError("model.action_logit_softcap must be positive")
         if cfg.reward.production_weight < 0.0:
             raise ValueError("reward.production_weight must be non-negative")
-        if cfg.reward.signal not in {"projected_margin", "production_margin"}:
+        valid_reward_signals = {
+            "projected_margin",
+            "production_margin",
+            "win_terminal",
+        }
+        if cfg.reward.signal not in valid_reward_signals:
             raise ValueError(
-                "reward.signal must be 'projected_margin' or 'production_margin'"
+                "reward.signal must be one of "
+                f"{sorted(valid_reward_signals)}"
             )
         if not 0.0 <= cfg.sac.builtin_prob <= 1.0:
             raise ValueError("sac.builtin_prob must be in [0, 1]")

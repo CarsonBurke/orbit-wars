@@ -64,15 +64,12 @@ class OrbitPolicyConfig:
     # lead-intercept solver in `sampling.py` — no learned angle component.
     action_logit_softcap: float = 8.0
 
-    # Distributional value head — predicts a categorical over `value_num_bins`
-    # bins, trained with Dreamer4-style symlog HL-Gauss CE. `value_min/max`
-    # are raw return bounds; with `value_symlog=True`, the library transforms
-    # them to symlog support endpoints for bucket placement and decodes scalar
-    # predictions with symexp. For example, raw ±100k becomes symlog support
-    # ±log(100001) ≈ ±11.51. Targets outside the raw support are clipped to
-    # the boundary bin in `target_probs`.
+    # Distributional critic. The first horizon predicts V(s_t); additional
+    # MTP horizons predict future-row lambda returns from the same critic token
+    # and are masked at episode tails.
     value_hidden: int = 64
     value_num_bins: int = 153
+    critic_mtp_horizon: int = 6
     value_min: float = -100_000.0
     value_max: float = 100_000.0
     value_symlog: bool = True

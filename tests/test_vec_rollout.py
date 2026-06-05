@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -17,6 +19,8 @@ from owars.training.vec_env import (
     _strip_action_sidecars,
 )
 from owars.training.vec_rollout import (
+    _empty_traj,
+    _finalize_trajectory,
     _normalize_learner_seats,
     _obs_reward_potential,
     _reward_potentials,
@@ -146,6 +150,48 @@ def test_reward_potentials_can_use_production_margin_signal():
     )
 
     assert values == pytest.approx([2 - 4])
+
+
+def test_win_terminal_signal_has_no_dense_potential_and_applies_terminal_outcome():
+    state = [
+        {
+            "status": "ACTIVE",
+            "observation": {
+                "player": 0,
+                "step": 10,
+                "planets": [[0, 0, 0.0, 0.0, 1.0, 10, 2]],
+                "fleets": [],
+            },
+        }
+    ]
+    reward_cfg = RewardCfg(
+        signal="win_terminal",
+        win_value=1.0,
+        loss_value=-1.0,
+        draw_value=0.0,
+    )
+
+    assert _reward_potentials(
+        vec=object(),
+        states=[state],
+        rows=[(0, 0)],
+        num_players=2,
+        episode_steps=100,
+        reward_cfg=reward_cfg,
+    ) == [0.0]
+
+    traj = _empty_traj()
+    traj.reward.append(0.0)
+    _finalize_trajectory(
+        traj,
+        [SimpleNamespace(score=12.0, reward=12.0), SimpleNamespace(score=7.0, reward=7.0)],
+        learner_seat=0,
+        reward_cfg=reward_cfg,
+    )
+
+    assert traj.won is True
+    assert traj.final_score == pytest.approx(5.0)
+    assert traj.reward == pytest.approx([1.0])
 
 
 def test_kaggle_vecenv_helpers_preserve_policy_target_sidecars():

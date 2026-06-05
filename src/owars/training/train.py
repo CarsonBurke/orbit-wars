@@ -2,17 +2,16 @@
 
 Loop:
   0. (Optional) **Value pretraining** — roll N episodes against a frozen
-     behavior policy, compute MC returns (γ=1, λ=1 → trajectory outcome
-     for every state), fit the critic with MSE only. Gives PPO a warm
-     value function so the actor's advantage isn't garbage at step 0.
-     This is the single highest-leverage knob from VAPO/VC-PPO.
+     behavior policy and fit the critic to the configured bootstrapped
+     lambda-return target. Gives PPO a warm value function so the actor's
+     advantage is less noisy at step 0.
   1. For each PPO update:
      a. Sample N episodes against opponents. The normal league mode fills each
         opponent seat from live self-play or a top-K frozen snapshot. Fixed mode
         instead samples static builtins such as `sniper`.
-     b. **Decoupled GAE**: critic target uses λ_critic=1 (Monte-Carlo,
-        unbiased); actor advantage uses λ_policy < 1 (variance-reduced,
-        optionally length-adaptive).
+     b. Compute GAE advantages and lambda-return critic targets. Dense rewards
+        use `ppo.gae_lambda` for both by default; sparse terminal reward
+        ablations can set `ppo.value_gae_lambda=1.0` for MC critic targets.
      c. PPO update with token-level loss.
      d. Update Elo from each game's per-seat scores. The learner
         rating drives snapshot retention — when a snapshot's Elo
@@ -53,7 +52,6 @@ from .numpy_env import NumpyVecEnv
 from .ppo import (
     _slice_feats,
     compute_gae,
-    compute_mc_return,
     ppo_update,
     value_only_update,
 )
@@ -206,6 +204,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         fleet_tokenizer_depth=cfg.model.fleet_tokenizer_depth,
         value_hidden=cfg.model.value_hidden,
         value_num_bins=cfg.model.value_num_bins,
+        critic_mtp_horizon=cfg.model.critic_mtp_horizon,
         value_min=cfg.model.value_min,
         value_max=cfg.model.value_max,
         value_symlog=cfg.model.value_symlog,
@@ -252,8 +251,10 @@ def _stack_trajectories(
     trajs: list[Trajectory],
     gamma: float,
     gae_lambda: float,
+    value_gae_lambda: float | None = None,
+    critic_mtp_horizon: int = 1,
 ) -> dict[str, torch.Tensor]:
-    """Flatten per-step records into one PPO batch with conventional GAE."""
+    """Flatten per-step records into one PPO batch with optional decoupled GAE."""
     batch = _stack_encoded(trajs)
 
     launch, tidx, frac, lp, owned, target_legal = [], [], [], [], [], []
@@ -279,7 +280,9 @@ def _stack_trajectories(
     else:
         all_values = np.zeros(0, dtype=np.float32)
 
-    advs_all, rets_all = [], []
+    target_lam = gae_lambda if value_gae_lambda is None else value_gae_lambda
+    mtp_h = max(1, int(critic_mtp_horizon))
+    advs_all, rets_all, mtp_all, mtp_mask_all = [], [], [], []
     offset = 0
     for t in trajs:
         rewards = np.asarray(t.reward, dtype=np.float32)
@@ -287,8 +290,19 @@ def _stack_trajectories(
         values = all_values[offset : offset + horizon]
         offset += horizon
         adv, ret = compute_gae(rewards, values, gamma, gae_lambda)
+        if target_lam != gae_lambda:
+            _target_adv, ret = compute_gae(rewards, values, gamma, target_lam)
         advs_all.append(adv)
         rets_all.append(ret)
+        mtp = np.zeros((horizon, mtp_h), dtype=np.float32)
+        mtp_mask = np.zeros((horizon, mtp_h), dtype=np.bool_)
+        for h in range(mtp_h):
+            valid = max(0, horizon - h)
+            if valid:
+                mtp[:valid, h] = ret[h:]
+                mtp_mask[:valid, h] = True
+        mtp_all.append(mtp)
+        mtp_mask_all.append(mtp_mask)
 
     advs = torch.from_numpy(np.concatenate(advs_all)).float()
     rets = torch.from_numpy(np.concatenate(rets_all)).float()
@@ -297,6 +311,8 @@ def _stack_trajectories(
         values = torch.zeros_like(rets)
     batch["advantage"] = advs
     batch["return"] = rets
+    batch["return_mtp"] = torch.from_numpy(np.concatenate(mtp_all)).float()
+    batch["return_mtp_mask"] = torch.from_numpy(np.concatenate(mtp_mask_all)).bool()
     batch["value"] = values
     batch["raw_advantage_abs_mean"] = torch.tensor(
         float(advs.abs().mean()) if advs.numel() else 0.0,
@@ -319,22 +335,42 @@ def _explained_variance(pred: torch.Tensor, target: torch.Tensor) -> float:
         return float(ev.cpu())
 
 
-def _pretrain_value_batch(trajs: list[Trajectory], gamma: float) -> dict[str, torch.Tensor]:
-    """Critic-target = pure Monte-Carlo trajectory return (γ=1, λ=1).
-
-    For dense potential rewards this is the undiscounted accumulated change in
-    projected population margin. Pretraining is still behavior-policy value
-    regression, but it is no longer a constant win/loss label per trajectory.
+def _pretrain_value_batch(
+    trajs: list[Trajectory],
+    gamma: float,
+    gae_lambda: float,
+    critic_mtp_horizon: int = 1,
+) -> dict[str, torch.Tensor]:
+    """Critic-target = configured bootstrapped GAE/lambda return.
 
     Encoder fields only — `value_only_update` doesn't read the actor-side
     records, so we skip stacking and host→device-copying them.
     """
     batch = _stack_encoded(trajs)
-    rets_all = [
-        compute_mc_return(np.asarray(t.reward, dtype=np.float32), gamma=gamma)
-        for t in trajs
-    ]
+    mtp_h = max(1, int(critic_mtp_horizon))
+    rets_all, mtp_all, mtp_mask_all = [], [], []
+    for t in trajs:
+        rewards = np.asarray(t.reward, dtype=np.float32)
+        values = (
+            torch.stack(t.value).detach().to(torch.float32).cpu().numpy()
+            if t.value
+            else np.zeros_like(rewards, dtype=np.float32)
+        )
+        _adv, ret = compute_gae(rewards, values, gamma, gae_lambda)
+        rets_all.append(ret)
+        horizon = len(rewards)
+        mtp = np.zeros((horizon, mtp_h), dtype=np.float32)
+        mtp_mask = np.zeros((horizon, mtp_h), dtype=np.bool_)
+        for h in range(mtp_h):
+            valid = max(0, horizon - h)
+            if valid:
+                mtp[:valid, h] = ret[h:]
+                mtp_mask[:valid, h] = True
+        mtp_all.append(mtp)
+        mtp_mask_all.append(mtp_mask)
     batch["return"] = torch.from_numpy(np.concatenate(rets_all)).float()
+    batch["return_mtp"] = torch.from_numpy(np.concatenate(mtp_all)).float()
+    batch["return_mtp_mask"] = torch.from_numpy(np.concatenate(mtp_mask_all)).bool()
     return batch
 
 
@@ -387,7 +423,16 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
             ))
         batch = {
             k: v.to(device)
-            for k, v in _pretrain_value_batch(trajs, gamma=cfg.ppo.gamma).items()
+            for k, v in _pretrain_value_batch(
+                trajs,
+                gamma=cfg.ppo.gamma,
+                gae_lambda=(
+                    cfg.ppo.gae_lambda
+                    if cfg.ppo.value_gae_lambda is None
+                    else cfg.ppo.value_gae_lambda
+                ),
+                critic_mtp_horizon=cfg.model.critic_mtp_horizon,
+            ).items()
         }
         loss = value_only_update(
             model, optimizer, batch,
@@ -680,6 +725,8 @@ def _ppo_loop(
             trajs,
             gamma=cfg.ppo.gamma,
             gae_lambda=cfg.ppo.gae_lambda,
+            value_gae_lambda=cfg.ppo.value_gae_lambda,
+            critic_mtp_horizon=cfg.model.critic_mtp_horizon,
         )
         stack_s = perf_counter() - phase_t0
 
@@ -752,7 +799,10 @@ def _ppo_loop(
                 "explained_variance": value_ev,
                 "actor_grad_norm": log.actor_grad_norm,
                 "critic_grad_norm": log.critic_grad_norm,
+                "actor_shared_grad_norm": log.actor_shared_grad_norm,
+                "critic_shared_grad_norm": log.critic_shared_grad_norm,
                 "shared_grad_norm": log.shared_grad_norm,
+                "shared_merged_grad_norm": log.shared_grad_norm,
                 "log_ratio_abs_mean": log.log_ratio_abs_mean,
                 "log_ratio_abs_max": log.log_ratio_abs_max,
                 "row_log_ratio_abs_mean": log.row_log_ratio_abs_mean,

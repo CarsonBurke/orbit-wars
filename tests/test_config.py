@@ -38,6 +38,61 @@ def test_invalid_reward_signal_raises():
         RunConfig.from_dict({"reward": {"signal": "not_a_signal"}})
 
 
+def test_win_terminal_reward_normalizes_terminal_only_mc_defaults():
+    cfg = RunConfig.from_dict({"reward": {"signal": "win_terminal"}})
+
+    assert cfg.reward.potential_weight == 0.0
+    assert cfg.reward.win_value == 1.0
+    assert cfg.reward.loss_value == -1.0
+    assert cfg.reward.draw_value == 0.0
+    assert cfg.ppo.gamma == 1.0
+    assert cfg.ppo.gae_lambda == 0.95
+    assert cfg.ppo.value_gae_lambda == 1.0
+    assert cfg.model.value_min == -1.0
+    assert cfg.model.value_max == 1.0
+    assert cfg.model.value_num_bins == 41
+    assert cfg.model.value_symlog is False
+    assert not cfg.reward.uses_dense_potential()
+
+
+def test_win_terminal_reward_preserves_explicit_value_support():
+    cfg = RunConfig.from_dict(
+        {
+            "reward": {"signal": "win_terminal"},
+            "model": {
+                "value_min": -2.0,
+                "value_max": 2.0,
+                "value_num_bins": 81,
+                "value_symlog": True,
+            },
+        }
+    )
+
+    assert cfg.model.value_min == -2.0
+    assert cfg.model.value_max == 2.0
+    assert cfg.model.value_num_bins == 81
+    assert cfg.model.value_symlog is True
+
+
+def test_win_terminal_reward_rejects_discounted_ppo_returns():
+    with pytest.raises(ValueError, match="ppo.gamma=1.0"):
+        RunConfig.from_dict(
+            {"reward": {"signal": "win_terminal"}, "ppo": {"gamma": 0.997}}
+        )
+    with pytest.raises(ValueError, match="ppo.value_gae_lambda=1.0"):
+        RunConfig.from_dict(
+            {
+                "reward": {"signal": "win_terminal"},
+                "ppo": {"value_gae_lambda": 0.95},
+            }
+        )
+
+
+def test_invalid_value_gae_lambda_raises():
+    with pytest.raises(ValueError, match="ppo.value_gae_lambda"):
+        RunConfig.from_dict({"ppo": {"value_gae_lambda": 1.5}})
+
+
 def test_fixed_opponent_mode_loads():
     cfg = RunConfig.from_dict(
         {"opponents": {"mode": "fixed", "fixed_opponents": ["sniper"]}}
@@ -103,6 +158,11 @@ def test_invalid_attention_head_config_raises(model_cfg):
 def test_invalid_value_support_raises():
     with pytest.raises(ValueError):
         RunConfig.from_dict({"model": {"value_min": 1.0, "value_max": 1.0}})
+
+
+def test_invalid_critic_mtp_horizon_raises():
+    with pytest.raises(ValueError, match="critic_mtp_horizon"):
+        RunConfig.from_dict({"model": {"critic_mtp_horizon": 0}})
 
 
 def test_deep_override_merges():

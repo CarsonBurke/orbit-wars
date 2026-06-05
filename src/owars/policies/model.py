@@ -766,7 +766,7 @@ class PolicyOutput:
     launch_logits: torch.Tensor       # [B, P] noop column logits for PPO / legacy launch logits for SAC adapters
     target_logits: torch.Tensor       # [B, P, P] masked target categorical logits
     value: torch.Tensor               # [B] — scalar value E[V] recovered from value_logits
-    value_logits: torch.Tensor        # [B, num_bins] — distributional value head logits
+    value_logits: torch.Tensor        # [B,H,num_bins] — distributional critic logits; H=critic_mtp_horizon
     planet_owned_mask: torch.Tensor   # [B, P] bool
     planet_mask: torch.Tensor         # [B, P] bool
     planet_ids: torch.Tensor          # [B, P] long
@@ -912,7 +912,11 @@ class OrbitPolicy(nn.Module):
         self.value_head = nn.Sequential(
             CastedLinear(cfg.dim, cfg.value_hidden, bias=False),
             SquaredReLU(),
-            CastedLinear(cfg.value_hidden, cfg.value_num_bins, bias=False),
+            CastedLinear(
+                cfg.value_hidden,
+                cfg.critic_mtp_horizon * cfg.value_num_bins,
+                bias=False,
+            ),
         )
         # Orthogonal init for the value-head input projection (both dims
         # ≥64 if `value_hidden ≥ 64`).
@@ -1132,13 +1136,19 @@ class OrbitPolicy(nn.Module):
 
         if include_value:
             # Value: distributional head over the dedicated critic token.
-            # Logits are returned for distributional CE loss + value clipping;
-            # the scalar `value` is recovered via E[V] = Σ p_i · center_i.
-            value_logits = self.value_head(h_critic)  # [B, num_bins]
-            value = self.value_encoder.bins_to_scalar(value_logits)
+            # Horizon 0 is V(s_t); later horizons are critic-only MTP targets.
+            value_logits = self.value_head(h_critic).view(
+                b,
+                int(self.cfg.critic_mtp_horizon),
+                int(self.cfg.value_num_bins),
+            )
+            value = self.value_encoder.bins_to_scalar(value_logits[:, 0])
         else:
             value = h_critic.new_empty((b,), dtype=torch.float32)
-            value_logits = h_critic.new_empty((b, 0), dtype=torch.float32)
+            value_logits = h_critic.new_empty(
+                (b, int(self.cfg.critic_mtp_horizon), 0),
+                dtype=torch.float32,
+            )
 
         return PolicyOutput(
             launch_logits=noop_logits,

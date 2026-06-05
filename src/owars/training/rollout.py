@@ -92,6 +92,8 @@ def _obs_reward_signal(
     episode_steps: int,
     reward_cfg: RewardCfg,
 ) -> float:
+    if reward_cfg.signal == "win_terminal":
+        return 0.0
     if reward_cfg.signal == "production_margin":
         return _obs_production_margin(obs, player, num_players)
     return _obs_reward_potential(
@@ -236,7 +238,8 @@ def rollout_episode(
 
     state = env.reset(num_agents=num_players)
     previous_potential = 0.0
-    if reward_cfg.potential_weight != 0.0:
+    dense_potential = reward_cfg.uses_dense_potential()
+    if dense_potential:
         previous_potential = _obs_reward_signal(
             state[learner_ix]["observation"],
             learner_ix,
@@ -270,7 +273,7 @@ def rollout_episode(
                 obs = slot["observation"]
                 actions.append(agents[seat](obs))
         state = env.step(actions)
-        if reward_cfg.potential_weight != 0.0 and traj.reward:
+        if dense_potential and traj.reward:
             current_potential = _obs_reward_signal(
                 state[learner_ix]["observation"],
                 learner_ix,

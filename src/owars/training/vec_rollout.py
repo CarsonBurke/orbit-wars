@@ -365,6 +365,8 @@ def _reward_potentials(
 ) -> list[float]:
     if not rows:
         return []
+    if reward_cfg.signal == "win_terminal":
+        return [0.0] * len(rows)
     if reward_cfg.signal == "production_margin":
         native_production = getattr(vec, "production_margins", None)
         if callable(native_production):
@@ -436,7 +438,7 @@ def rollout_episodes_batched(
     states = vec.reset()
     dones = [False] * num_envs
     episode_steps = int(getattr(vec, "episode_steps", 500))
-    dense_potential = record_trajectories and reward_cfg.potential_weight != 0.0
+    dense_potential = record_trajectories and reward_cfg.uses_dense_potential()
     previous_potential = [0.0] * num_envs
     if dense_potential:
         previous_potential = _reward_potentials(

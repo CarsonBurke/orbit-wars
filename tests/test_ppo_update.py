@@ -9,6 +9,7 @@ Also keeps a regression guard on the log_prob recompute invariant
 from __future__ import annotations
 
 import math
+import numpy as np
 from types import SimpleNamespace
 
 import torch
@@ -31,11 +32,14 @@ from owars.training.ppo import (
     _fixed_minibatches,
     _fixed_minibatches_by_count,
     _backward_actor_critic_with_group_clips,
+    _distributional_value_loss,
     _minibatch_loss_scale,
     _rank_gaussian_advantage,
+    compute_gae,
     ppo_update,
     value_only_update,
 )
+from owars.training import train as train_mod
 
 
 # A non-degenerate 8-planet position. Player 0 owns the first three; the rest
@@ -156,6 +160,127 @@ def test_ppo_update_runs_and_returns_finite_metrics():
     assert log.value_loss >= 0.0, log.value_loss
 
 
+def test_pretrain_value_batch_uses_configured_lambda_return(monkeypatch):
+    monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
+    rewards = np.asarray([1.0, -0.5, 2.0], dtype=np.float32)
+    values = np.asarray([0.25, -0.1, 0.4], dtype=np.float32)
+    traj = SimpleNamespace(
+        reward=rewards.tolist(),
+        value=[torch.tensor(v) for v in values],
+    )
+
+    batch = train_mod._pretrain_value_batch(
+        [traj],
+        gamma=0.9,
+        gae_lambda=0.5,
+    )
+
+    _adv, expected = compute_gae(rewards, values, gamma=0.9, lam=0.5)
+    assert torch.allclose(batch["return"], torch.from_numpy(expected))
+
+
+def test_stack_trajectories_can_decouple_policy_and_value_lambdas(monkeypatch):
+    monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
+    rewards = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    values = np.asarray([0.2, 0.1, -0.3], dtype=np.float32)
+    traj = SimpleNamespace(
+        reward=rewards.tolist(),
+        value=[torch.tensor(v) for v in values],
+        launch=[torch.zeros(1) for _ in rewards],
+        target_idx=[torch.zeros(1, dtype=torch.long) for _ in rewards],
+        fraction=[torch.full((1,), 0.5) for _ in rewards],
+        log_prob=[torch.zeros(1) for _ in rewards],
+        owned_mask=[torch.ones(1, dtype=torch.bool) for _ in rewards],
+        target_legal_mask=[torch.ones(1, 1, dtype=torch.bool) for _ in rewards],
+    )
+
+    batch = train_mod._stack_trajectories(
+        [traj],
+        gamma=1.0,
+        gae_lambda=0.5,
+        value_gae_lambda=1.0,
+    )
+
+    expected_adv, _policy_return = compute_gae(rewards, values, gamma=1.0, lam=0.5)
+    _value_adv, expected_return = compute_gae(rewards, values, gamma=1.0, lam=1.0)
+    assert torch.allclose(batch["advantage"], torch.from_numpy(expected_adv))
+    assert torch.allclose(batch["return"], torch.from_numpy(expected_return))
+
+
+def test_stack_trajectories_builds_masked_critic_mtp_targets(monkeypatch):
+    monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
+    rewards = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+    values = np.zeros_like(rewards)
+    traj = SimpleNamespace(
+        reward=rewards.tolist(),
+        value=[torch.tensor(v) for v in values],
+        launch=[torch.zeros(1) for _ in rewards],
+        target_idx=[torch.zeros(1, dtype=torch.long) for _ in rewards],
+        fraction=[torch.full((1,), 0.5) for _ in rewards],
+        log_prob=[torch.zeros(1) for _ in rewards],
+        owned_mask=[torch.ones(1, dtype=torch.bool) for _ in rewards],
+        target_legal_mask=[torch.ones(1, 1, dtype=torch.bool) for _ in rewards],
+    )
+
+    batch = train_mod._stack_trajectories(
+        [traj],
+        gamma=1.0,
+        gae_lambda=1.0,
+        critic_mtp_horizon=4,
+    )
+
+    assert torch.equal(
+        batch["return_mtp_mask"],
+        torch.tensor(
+            [
+                [True, True, True, False],
+                [True, True, False, False],
+                [True, False, False, False],
+            ]
+        ),
+    )
+    assert torch.allclose(
+        batch["return_mtp"],
+        torch.tensor(
+            [
+                [6.0, 5.0, 3.0, 0.0],
+                [5.0, 3.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0, 0.0],
+            ]
+        ),
+    )
+
+
+def test_distributional_value_loss_sums_valid_mtp_horizons():
+    encoder = HLGaussLoss(min_value=-1.0, max_value=1.0, num_bins=5)
+    logits = torch.zeros(2, 3, 5)
+    returns = torch.tensor([[0.0, 0.5, 1.0], [-0.5, 0.25, 0.75]])
+    mask = torch.tensor([[True, True, False], [True, False, False]])
+    row_weight = torch.ones(2)
+
+    got = _distributional_value_loss(encoder, logits, returns, row_weight, mask)
+    target_probs = encoder.target_probs(returns)
+    ce = -(target_probs * nn_functional.log_softmax(logits, dim=-1)).sum(dim=-1)
+    expected = torch.tensor([(ce[0, :2].sum() + ce[1, 0]) / 2.0])
+
+    assert torch.allclose(got, expected.squeeze(0))
+
+
+def test_distributional_value_loss_legacy_logits_use_horizon_zero_only():
+    encoder = HLGaussLoss(min_value=-1.0, max_value=1.0, num_bins=5)
+    logits = torch.zeros(2, 5)
+    returns = torch.tensor([[0.0, 1.0], [0.5, -1.0]])
+    mask = torch.tensor([[True, True], [False, True]])
+    row_weight = torch.ones(2)
+
+    got = _distributional_value_loss(encoder, logits, returns, row_weight, mask)
+    target_probs = encoder.target_probs(returns[:, 0])
+    ce = -(target_probs * nn_functional.log_softmax(logits, dim=-1)).sum(dim=-1)
+    expected = ce[0]
+
+    assert torch.allclose(got, expected)
+
+
 def test_ppo_update_minibatch_count_runs_exact_count():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
     model = OrbitPolicy(cfg)
@@ -178,6 +303,8 @@ def test_ppo_update_minibatch_count_runs_exact_count():
     assert math.isfinite(log.value_loss)
     assert log.actor_grad_norm >= 0.0
     assert log.critic_grad_norm >= 0.0
+    assert log.actor_shared_grad_norm >= 0.0
+    assert log.critic_shared_grad_norm >= 0.0
     assert log.shared_grad_norm >= 0.0
 
 
@@ -375,7 +502,7 @@ def test_rank_gaussian_advantage_maps_full_batch_ranks_to_normal_quantiles():
     assert torch.equal(got.argsort(), adv.argsort())
 
 
-def test_policy_value_grad_clip_groups_heads_and_combined_shared_grads():
+def test_policy_value_grad_clip_uses_separate_backward_and_sums_shared_grads():
     class Toy(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -390,22 +517,60 @@ def test_policy_value_grad_clip_groups_heads_and_combined_shared_grads():
     )
     critic_loss = 30.0 * model.value_head.weight.sum() + 40.0 * model.shared.weight.sum()
 
-    actor_norm, critic_norm, shared_norm = _backward_actor_critic_with_group_clips(
-        model,
-        actor_loss,
-        critic_loss,
-        1.0,
-    )
+    (
+        actor_norm,
+        critic_norm,
+        actor_shared_norm,
+        critic_shared_norm,
+        shared_norm,
+    ) = _backward_actor_critic_with_group_clips(model, actor_loss, critic_loss, 1.0)
 
-    assert torch.allclose(actor_norm, torch.tensor(3.0))
-    assert torch.allclose(critic_norm, torch.tensor(30.0))
-    assert torch.allclose(shared_norm, torch.tensor(44.0))
+    assert torch.allclose(actor_norm, torch.tensor(5.0))
+    assert torch.allclose(critic_norm, torch.tensor(50.0))
+    assert torch.allclose(actor_shared_norm, torch.tensor(0.8))
+    assert torch.allclose(critic_shared_norm, torch.tensor(0.8))
+    assert torch.allclose(shared_norm, torch.tensor(1.6))
     assert torch.allclose(
         model.target_noop_key.weight.grad,
-        torch.tensor([[1.0]]),
+        torch.tensor([[0.6]]),
     )
-    assert torch.allclose(model.value_head.weight.grad, torch.tensor([[1.0]]))
-    assert torch.allclose(model.shared.weight.grad, torch.tensor([[1.0]]))
+    assert torch.allclose(model.value_head.weight.grad, torch.tensor([[0.6]]))
+    assert torch.allclose(model.shared.weight.grad, torch.tensor([[1.6]]))
+
+
+def test_policy_value_grad_clip_retains_shared_forward_graph():
+    class Toy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.trunk = torch.nn.Linear(1, 1, bias=False)
+            self.target_noop_key = torch.nn.Linear(1, 1, bias=False)
+            self.value_head = torch.nn.Linear(1, 1, bias=False)
+
+    model = Toy()
+    with torch.no_grad():
+        model.trunk.weight.fill_(1.0)
+        model.target_noop_key.weight.fill_(1.0)
+        model.value_head.weight.fill_(1.0)
+
+    h = model.trunk(torch.tensor([[2.0]]))
+    actor_loss = model.target_noop_key(h).sum()
+    critic_loss = 10.0 * model.value_head(h).sum()
+
+    (
+        actor_norm,
+        critic_norm,
+        actor_shared_norm,
+        critic_shared_norm,
+        shared_norm,
+    ) = _backward_actor_critic_with_group_clips(model, actor_loss, critic_loss, 1.0)
+
+    sqrt2 = math.sqrt(2.0)
+    assert torch.allclose(actor_norm, torch.tensor(2.0 * sqrt2))
+    assert torch.allclose(critic_norm, torch.tensor(20.0 * sqrt2))
+    assert torch.allclose(actor_shared_norm, torch.tensor(1.0 / sqrt2))
+    assert torch.allclose(critic_shared_norm, torch.tensor(1.0 / sqrt2))
+    assert torch.allclose(shared_norm, torch.tensor(sqrt2))
+    assert torch.allclose(model.trunk.weight.grad, torch.tensor([[sqrt2]]))
 
 
 class _FixedPolicy(torch.nn.Module):

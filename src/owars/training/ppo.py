@@ -162,6 +162,49 @@ def _minibatch_loss_scale(row_weight: torch.Tensor) -> torch.Tensor:
     return row_weight.sum().clamp_min(1.0) / max(1, row_weight.numel())
 
 
+def _distributional_value_loss(
+    value_encoder: torch.nn.Module,
+    value_logits: torch.Tensor,
+    returns: torch.Tensor,
+    row_weight: torch.Tensor,
+    return_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """HL-Gauss CE, summed over valid critic MTP horizons per row.
+
+    `value_logits` may be legacy `[B, bins]` or MTP `[B, H, bins]`.
+    For MTP, `returns` and `return_mask` are `[B, H]`; invalid episode-tail
+    horizons contribute zero. The horizon losses are summed per row, then
+    reduced with the usual minibatch row weights.
+    """
+    if value_logits.dim() == 2:
+        if returns.dim() == 2:
+            returns = returns[:, 0]
+            if return_mask is not None:
+                row_weight = row_weight * return_mask[:, 0].to(
+                    device=row_weight.device,
+                    dtype=row_weight.dtype,
+                )
+        target_probs = value_encoder.target_probs(returns.float())
+        log_probs = F.log_softmax(value_logits, dim=-1)
+        value_ce = -(target_probs * log_probs).sum(dim=-1)
+        return _weighted_mean(value_ce, row_weight.to(value_ce.device))
+
+    if returns.dim() == 1:
+        returns = returns.unsqueeze(-1)
+    mtp_h = returns.shape[-1]
+    value_logits = value_logits[:, :mtp_h]
+    if return_mask is None:
+        return_mask = torch.ones_like(returns, dtype=torch.bool)
+    else:
+        return_mask = return_mask[:, :mtp_h]
+    return_mask_f = return_mask.to(device=value_logits.device, dtype=value_logits.dtype)
+    target_probs = value_encoder.target_probs(returns.float())
+    log_probs = F.log_softmax(value_logits, dim=-1)
+    value_ce = -(target_probs * log_probs).sum(dim=-1)
+    value_ce = (value_ce * return_mask_f).sum(dim=-1)
+    return _weighted_mean(value_ce, row_weight.to(value_ce.device))
+
+
 def _safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
     finite = torch.isfinite(target_logits).any(dim=-1, keepdim=True)
     return torch.where(finite, target_logits, torch.zeros_like(target_logits))
@@ -309,29 +352,57 @@ def _clip_grad_norm(
     return torch.nn.utils.clip_grad_norm_(params, max_norm)
 
 
+def _clear_param_grads(params: list[torch.nn.Parameter]) -> None:
+    for param in params:
+        param.grad = None
+
+
 def _backward_actor_critic_with_group_clips(
     model: torch.nn.Module,
     actor_loss: torch.Tensor,
     critic_loss: torch.Tensor,
     max_norm: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backprop once, then clip actor heads, critic head, and trunk separately.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backprop actor and critic separately, clip each flow, then merge grads.
 
-    Actor-only heads receive gradients only from `actor_loss`, and the critic
-    head receives gradients only from `critic_loss`. The shared encoder sees the
-    true combined gradient from both losses. This avoids the retained-graph
-    double-backward memory spike while still preventing a large head gradient
-    from setting the step scale for unrelated parameter groups.
+    This mirrors the CleanRL dual-backward path: the critic loss is backpropagated
+    first, critic-head plus shared-trunk gradients are clipped and stashed, then
+    the actor loss is backpropagated and actor-head plus shared-trunk gradients
+    are clipped. The stashed critic gradients are finally added back, so shared
+    parameters receive a sum of separately clipped actor and critic signals.
     """
     actor, critic, shared = _grad_clip_groups(model)
     device = _module_device(model)
     clip_norm = max_norm if max_norm > 0.0 else float("inf")
+    actor_params = [*actor, *shared]
+    critic_params = [*critic, *shared]
+    all_params = [*actor, *critic, *shared]
 
-    (actor_loss + critic_loss).backward()
-    actor_norm = _clip_grad_norm(actor, clip_norm, device)
-    critic_norm = _clip_grad_norm(critic, clip_norm, device)
-    shared_norm = _clip_grad_norm(shared, clip_norm, device)
-    return actor_norm, critic_norm, shared_norm
+    _clear_param_grads(all_params)
+    critic_loss.backward(retain_graph=True)
+    critic_norm = _clip_grad_norm(critic_params, clip_norm, device)
+    critic_shared_norm = _clip_grad_norm(shared, float("inf"), device)
+    critic_grads = [
+        (param, param.grad.detach().clone())
+        for param in critic_params
+        if param.grad is not None
+    ]
+
+    _clear_param_grads(all_params)
+    actor_loss.backward()
+    actor_norm = _clip_grad_norm(actor_params, clip_norm, device)
+    actor_shared_norm = _clip_grad_norm(shared, float("inf"), device)
+    for param, grad in critic_grads:
+        param.grad = grad if param.grad is None else param.grad + grad
+
+    shared_norm = _clip_grad_norm(shared, float("inf"), device)
+    return (
+        actor_norm,
+        critic_norm,
+        actor_shared_norm,
+        critic_shared_norm,
+        shared_norm,
+    )
 
 
 class _PPOMinibatchKernel(torch.nn.Module):
@@ -380,7 +451,8 @@ class _PPOMinibatchKernel(torch.nn.Module):
         fraction: torch.Tensor,
         old_log_prob: torch.Tensor,
         advantage: torch.Tensor,
-        ret: torch.Tensor,
+        ret_mtp: torch.Tensor,
+        ret_mtp_mask: torch.Tensor,
         owned_mask: torch.Tensor,
         target_legal_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -480,11 +552,13 @@ class _PPOMinibatchKernel(torch.nn.Module):
         policy_loss = -_weighted_mean(adv_actor * ratio - spo_penalty, owned_w)
         spo_penalty_mean = _weighted_mean(spo_penalty, owned_w)
 
-        value_encoder = self.model.value_encoder
-        target_probs = value_encoder.target_probs(ret.float())
-        log_v_probs = F.log_softmax(value_logits, dim=-1)
-        value_ce = -(target_probs * log_v_probs).sum(dim=-1)
-        value_loss = _weighted_mean(value_ce, row_w)
+        value_loss = _distributional_value_loss(
+            self.model.value_encoder,
+            value_logits,
+            ret_mtp,
+            row_w,
+            ret_mtp_mask,
+        )
 
         frac_entropy_per_planet = _beta_entropy(fraction_alpha, fraction_beta)
         if action_logit_softcap is None:
@@ -659,7 +733,8 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
         row_weight: torch.Tensor,
-        ret: torch.Tensor,
+        ret_mtp: torch.Tensor,
+        ret_mtp_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -675,10 +750,13 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
         ):
             out = self.model(feats)
         value_logits = out.value_logits.float()
-        target_probs = self.model.value_encoder.target_probs(ret.float())
-        log_probs = F.log_softmax(value_logits, dim=-1)
-        value_ce = -(target_probs * log_probs).sum(dim=-1)
-        value_loss = _weighted_mean(value_ce, row_weight.to(value_ce.device))
+        value_loss = _distributional_value_loss(
+            self.model.value_encoder,
+            value_logits,
+            ret_mtp,
+            row_weight.to(value_logits.device),
+            ret_mtp_mask,
+        )
         return value_loss, value_loss.detach().float()
 
 
@@ -779,6 +857,8 @@ class PPOLog:
     pos_frac: float
     actor_grad_norm: float = 0.0
     critic_grad_norm: float = 0.0
+    actor_shared_grad_norm: float = 0.0
+    critic_shared_grad_norm: float = 0.0
     shared_grad_norm: float = 0.0
     target_entropy: float = 0.0
     fraction_entropy: float = 0.0
@@ -875,6 +955,7 @@ def ppo_update(
       `planet_garrison`, `fleet_feats`, `fleet_mask`,
       `launch` [B,P], `target_idx` [B,P], `fraction` [B,P],
       `old_log_prob` [B,P], `advantage` [B], `return` [B],
+      optional `return_mtp` [B,H], `return_mtp_mask` [B,H],
       `owned_mask` [B,P], `target_legal_mask` [B,P,P].
 
     The actor objective is SPO asym:
@@ -889,11 +970,18 @@ def ppo_update(
         batch["advantage"],
         transform=advantage_transform,
     )
+    return_mtp = batch.get("return_mtp", batch["return"].unsqueeze(-1))
+    return_mtp_mask = batch.get(
+        "return_mtp_mask",
+        torch.ones_like(return_mtp, dtype=torch.bool),
+    )
 
     metric_sum: torch.Tensor | None = None
     last_metrics: torch.Tensor | None = None
     actor_grad_norm_sum = torch.zeros((), device=device)
     critic_grad_norm_sum = torch.zeros((), device=device)
+    actor_shared_grad_norm_sum = torch.zeros((), device=device)
+    critic_shared_grad_norm_sum = torch.zeros((), device=device)
     shared_grad_norm_sum = torch.zeros((), device=device)
     n_steps = 0
 
@@ -930,14 +1018,21 @@ def ppo_update(
                 batch["fraction"][mb],
                 batch["old_log_prob"][mb],
                 policy_advantage[mb],
-                batch["return"][mb],
+                return_mtp[mb],
+                return_mtp_mask[mb],
                 batch["owned_mask"][mb],
                 batch["target_legal_mask"][mb],
             )
 
             optimizer.zero_grad(set_to_none=True)
             loss_scale = _minibatch_loss_scale(row_weight)
-            actor_grad_norm, critic_grad_norm, shared_grad_norm = (
+            (
+                actor_grad_norm,
+                critic_grad_norm,
+                actor_shared_grad_norm,
+                critic_shared_grad_norm,
+                shared_grad_norm,
+            ) = (
                 _backward_actor_critic_with_group_clips(
                     model,
                     actor_loss * loss_scale,
@@ -948,6 +1043,8 @@ def ppo_update(
             optimizer.step()
             actor_grad_norm_sum += actor_grad_norm.detach()
             critic_grad_norm_sum += critic_grad_norm.detach()
+            actor_shared_grad_norm_sum += actor_shared_grad_norm.detach()
+            critic_shared_grad_norm_sum += critic_shared_grad_norm.detach()
             shared_grad_norm_sum += shared_grad_norm.detach()
 
             if metric_sum is None:
@@ -972,7 +1069,15 @@ def ppo_update(
         else last_metrics.detach().cpu().tolist()
     )
     grad_logs = (
-        torch.stack([actor_grad_norm_sum, critic_grad_norm_sum, shared_grad_norm_sum])
+        torch.stack(
+            [
+                actor_grad_norm_sum,
+                critic_grad_norm_sum,
+                actor_shared_grad_norm_sum,
+                critic_shared_grad_norm_sum,
+                shared_grad_norm_sum,
+            ]
+        )
         / n_steps
     ).detach().cpu().tolist()
     return PPOLog(
@@ -984,7 +1089,9 @@ def ppo_update(
         pos_frac=float(mean_logs[5]),
         actor_grad_norm=float(grad_logs[0]),
         critic_grad_norm=float(grad_logs[1]),
-        shared_grad_norm=float(grad_logs[2]),
+        actor_shared_grad_norm=float(grad_logs[2]),
+        critic_shared_grad_norm=float(grad_logs[3]),
+        shared_grad_norm=float(grad_logs[4]),
         target_entropy=float(mean_logs[6]),
         fraction_entropy=float(mean_logs[7]),
         move_prob=float(mean_logs[8]),
@@ -1027,10 +1134,9 @@ def value_only_update(
 ) -> float:
     """Critic-only distributional CE update for the value-pretraining phase.
 
-    `batch["return"]` should be Monte-Carlo returns from the configured reward.
-    Run this for a few hundred steps against a frozen behavior policy before
-    turning on PPO. Mirrors the same HL-Gauss CE loss `ppo_update` uses, so the
-    cold-start critic sees the same target distribution it'll train against
+    `batch["return"]` should use the same configured lambda-return convention
+    as PPO. Mirrors the same HL-Gauss CE loss `ppo_update` uses, so the
+    cold-start critic sees the same target distribution it will train against
     later.
 
     Reports mean value loss over the pass.
@@ -1040,6 +1146,11 @@ def value_only_update(
     total: torch.Tensor | None = None
     n_steps = 0
     kernel = _get_value_only_kernel(model, compile_mode=compile_mode)
+    return_mtp = batch.get("return_mtp", batch["return"].unsqueeze(-1))
+    return_mtp_mask = batch.get(
+        "return_mtp_mask",
+        torch.ones_like(return_mtp, dtype=torch.bool),
+    )
     for _ in range(epochs):
         for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
             if compile_mode is not None:
@@ -1053,7 +1164,8 @@ def value_only_update(
                 batch["fleet_feats"][mb],
                 batch["fleet_mask"][mb],
                 row_weight,
-                batch["return"][mb],
+                return_mtp[mb],
+                return_mtp_mask[mb],
             )
 
             optimizer.zero_grad(set_to_none=True)
