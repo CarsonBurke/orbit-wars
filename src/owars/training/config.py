@@ -106,7 +106,10 @@ class OptimCfg:
     # actor drift, so KL accumulates. Match `muon_lr` to restore parity.
     control_lr: float = 0.02
     weight_decay: float = 1e-4
-    grad_clip: float = 0.5
+    # PPO clips actor and critic flows separately. Each flow includes its task
+    # readout head plus the shared trunk, then clipped shared gradients are
+    # summed before the optimizer step.
+    grad_clip: float = 1.0
     # If set, PPO divides the full rollout batch into exactly this many
     # shuffled minibatches per epoch, padding the tail with zero-weight rows so
     # every optimizer step has one stable shape.

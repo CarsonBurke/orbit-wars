@@ -1076,7 +1076,13 @@ class OrbitPolicy(nn.Module):
             f,
         )
 
-    def forward(self, feats: EncodedObs, *, include_value: bool = True) -> PolicyOutput:
+    def forward(
+        self,
+        feats: EncodedObs,
+        *,
+        include_value: bool = True,
+        include_actor: bool = True,
+    ) -> PolicyOutput:
         planet_h, _fleet_h, h_actor, h_critic, _token_mask = self.encode(feats)
         b, p, d = planet_h.shape
 
@@ -1088,51 +1094,57 @@ class OrbitPolicy(nn.Module):
         planet_mask = _b(feats.planet_mask)
         planet_ids = _b(feats.planet_ids)
 
-        # Concatenate the actor token onto each per-planet rep — global
-        # context for the action heads. Broadcast: [B,1,d] → [B,P,d].
-        actor_ctx = h_actor.unsqueeze(1).expand(-1, p, -1)
-        planet_with_ctx = torch.cat([planet_h, actor_ctx], dim=-1)  # [B, P, 2d]
+        if include_actor:
+            # Concatenate the actor token onto each per-planet rep — global
+            # context for the action heads. Broadcast: [B,1,d] → [B,P,d].
+            actor_ctx = h_actor.unsqueeze(1).expand(-1, p, -1)
+            planet_with_ctx = torch.cat([planet_h, actor_ctx], dim=-1)  # [B, P, 2d]
 
-        # Target attention: query carries actor context (2d→d), key stays
-        # plain (d→d). Putting the actor concat on the *key* side too would
-        # add a column-constant term to `q·k` that cancels in the softmax.
-        q = self.target_query(planet_with_ctx)
-        k = self.target_key(planet_h)
-        # QK-RMSNorm + learnable gain — same pattern as `SelfAttention`.
-        # `F.rms_norm` along the last dim pins ‖q‖ and ‖k‖ to √d regardless
-        # of weight magnitude, so the post-softmax target distribution has
-        # a magnitude bound that doesn't drift with the projection norms.
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        q = q * self.target_q_gain.to(q.dtype)
-        noop_k = F.rms_norm(
-            self.target_noop_key.to(dtype=k.dtype, device=k.device),
-            (k.size(-1),),
-        )
-        noop_logits = torch.einsum("bid,d->bi", q, noop_k) / (d**0.5)
-        # [B, P, P] — keep the canonical 1/√d divisor; `target_q_gain`
-        # multiplies on top, mirroring how trunk SDPA's auto-scale plus
-        # `q_gain` compose.
-        logits = torch.einsum("bid,bjd->bij", q, k) / (d**0.5)
-        # Mask out padded *targets*.
-        logits = logits.masked_fill(~planet_mask.unsqueeze(1), float("-inf"))
-        # Mask self-targets (diagonal). The simulator silently no-ops a
-        # send-to-self anyway; without this mask the policy can put
-        # probability mass on a meaningless action and the entropy term
-        # rewards it. Buffer is preallocated; slice for the actual P.
-        logits = logits.masked_fill(
-            self._self_target_mask[:p, :p].unsqueeze(0), float("-inf")
-        )
-        target_logits = logits  # [B, P, P]
+            # Target attention: query carries actor context (2d→d), key stays
+            # plain (d→d). Putting the actor concat on the *key* side too would
+            # add a column-constant term to `q·k` that cancels in the softmax.
+            q = self.target_query(planet_with_ctx)
+            k = self.target_key(planet_h)
+            # QK-RMSNorm + learnable gain — same pattern as `SelfAttention`.
+            # `F.rms_norm` along the last dim pins ‖q‖ and ‖k‖ to √d regardless
+            # of weight magnitude, so the post-softmax target distribution has
+            # a magnitude bound that doesn't drift with the projection norms.
+            q = F.rms_norm(q, (q.size(-1),))
+            k = F.rms_norm(k, (k.size(-1),))
+            q = q * self.target_q_gain.to(q.dtype)
+            noop_k = F.rms_norm(
+                self.target_noop_key.to(dtype=k.dtype, device=k.device),
+                (k.size(-1),),
+            )
+            noop_logits = torch.einsum("bid,d->bi", q, noop_k) / (d**0.5)
+            # [B, P, P] — keep the canonical 1/√d divisor; `target_q_gain`
+            # multiplies on top, mirroring how trunk SDPA's auto-scale plus
+            # `q_gain` compose.
+            logits = torch.einsum("bid,bjd->bij", q, k) / (d**0.5)
+            # Mask out padded *targets*.
+            logits = logits.masked_fill(~planet_mask.unsqueeze(1), float("-inf"))
+            # Mask self-targets (diagonal). The simulator silently no-ops a
+            # send-to-self anyway; without this mask the policy can put
+            # probability mass on a meaningless action and the entropy term
+            # rewards it. Buffer is preallocated; slice for the actual P.
+            logits = logits.masked_fill(
+                self._self_target_mask[:p, :p].unsqueeze(0), float("-inf")
+            )
+            target_logits = logits  # [B, P, P]
 
-        # Fraction head: native-support unimodal Beta, matching the CleanRL
-        # IterThink v24 / Dreamer4 beta path.
-        fraction_alpha = 1.0 + F.softplus(
-            self.fraction_alpha_head(planet_with_ctx).squeeze(-1).float()
-        )
-        fraction_beta = 1.0 + F.softplus(
-            self.fraction_beta_head(planet_with_ctx).squeeze(-1).float()
-        )
+            # Fraction head: native-support unimodal Beta, matching the CleanRL
+            # IterThink v24 / Dreamer4 beta path.
+            fraction_alpha = 1.0 + F.softplus(
+                self.fraction_alpha_head(planet_with_ctx).squeeze(-1).float()
+            )
+            fraction_beta = 1.0 + F.softplus(
+                self.fraction_beta_head(planet_with_ctx).squeeze(-1).float()
+            )
+        else:
+            noop_logits = h_actor.new_empty((b, p), dtype=torch.float32)
+            target_logits = h_actor.new_empty((b, p, 0), dtype=torch.float32)
+            fraction_alpha = None
+            fraction_beta = None
 
         if include_value:
             # Value: distributional head over the dedicated critic token.

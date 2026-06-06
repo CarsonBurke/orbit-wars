@@ -61,8 +61,8 @@ optim:
   lr: 3.0e-4
   head_lr: 3.0e-4
   weight_decay: 1.0e-4
-  grad_clip: 0.5   # actor and critic gradients are clipped separately, including
-                   # their shared-trunk components, then summed before step.
+  grad_clip: 1.0   # actor and critic flows are clipped separately, including
+                   # each flow's task head plus shared-trunk components.
   minibatch_size: 4096
   epochs_per_update: 4
 

@@ -117,7 +117,7 @@ def _fixed_minibatches_by_count(
     The final logical minibatch is padded with repeated rows and zero weights
     when `n` is not divisible by `minibatch_count`, so every real rollout row
     contributes once per epoch and every optimizer step sees the same leading
-    dimension.
+    dimension within that rollout update.
     """
     if n <= 0:
         return []
@@ -157,9 +157,15 @@ def _weighted_max(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return torch.where(torch.isfinite(out), out, values.sum() * 0.0)
 
 
-def _minibatch_loss_scale(row_weight: torch.Tensor) -> torch.Tensor:
+def _minibatch_loss_scale(
+    row_weight: torch.Tensor,
+    denominator: int | None = None,
+) -> torch.Tensor:
     """Scale padded-tail minibatch gradients by the fraction of real rows."""
-    return row_weight.sum().clamp_min(1.0) / max(1, row_weight.numel())
+    return row_weight.sum().clamp_min(1.0) / max(
+        1,
+        row_weight.numel() if denominator is None else int(denominator),
+    )
 
 
 def _distributional_value_loss(
@@ -352,6 +358,13 @@ def _clip_grad_norm(
     return torch.nn.utils.clip_grad_norm_(params, max_norm)
 
 
+def _grad_clip_scale(raw_norm: torch.Tensor, max_norm: float) -> torch.Tensor:
+    if not math.isfinite(max_norm):
+        return torch.ones_like(raw_norm)
+    max_norm_t = torch.as_tensor(max_norm, device=raw_norm.device, dtype=raw_norm.dtype)
+    return (max_norm_t / (raw_norm + 1e-6)).clamp(max=1.0)
+
+
 def _clear_param_grads(params: list[torch.nn.Parameter]) -> None:
     for param in params:
         param.grad = None
@@ -362,14 +375,31 @@ def _backward_actor_critic_with_group_clips(
     actor_loss: torch.Tensor,
     critic_loss: torch.Tensor,
     max_norm: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backprop actor and critic separately, clip each flow, then merge grads.
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Backprop actor and critic losses from one graph, then merge grads.
 
-    This mirrors the CleanRL dual-backward path: the critic loss is backpropagated
-    first, critic-head plus shared-trunk gradients are clipped and stashed, then
-    the actor loss is backpropagated and actor-head plus shared-trunk gradients
-    are clipped. The stashed critic gradients are finally added back, so shared
-    parameters receive a sum of separately clipped actor and critic signals.
+    This mirrors the CleanRL dual-backward path: the critic loss is
+    backpropagated first, critic-head plus shared-trunk gradients are clipped
+    and stashed, then the actor loss is backpropagated and actor-head plus
+    shared-trunk gradients are clipped. The stashed critic gradients are finally
+    added back, so shared parameters receive a sum of separately clipped actor
+    and critic signals.
+
+    The retained graph is consumed immediately by the actor backward in the
+    same minibatch; no trajectory, PPO batch, or logger should keep references
+    to tensors from that graph after this helper returns.
     """
     actor, critic, shared = _grad_clip_groups(model)
     device = _module_device(model)
@@ -380,8 +410,11 @@ def _backward_actor_critic_with_group_clips(
 
     _clear_param_grads(all_params)
     critic_loss.backward(retain_graph=True)
+    critic_shared_raw_norm = _clip_grad_norm(shared, float("inf"), device)
     critic_norm = _clip_grad_norm(critic_params, clip_norm, device)
-    critic_shared_norm = _clip_grad_norm(shared, float("inf"), device)
+    critic_clip_scale = _grad_clip_scale(critic_norm, clip_norm)
+    critic_shared_norm = critic_shared_raw_norm * critic_clip_scale
+    critic_clip_frac = (critic_clip_scale < 1.0).to(critic_norm.dtype)
     critic_grads = [
         (param, param.grad.detach().clone())
         for param in critic_params
@@ -390,8 +423,11 @@ def _backward_actor_critic_with_group_clips(
 
     _clear_param_grads(all_params)
     actor_loss.backward()
+    actor_shared_raw_norm = _clip_grad_norm(shared, float("inf"), device)
     actor_norm = _clip_grad_norm(actor_params, clip_norm, device)
-    actor_shared_norm = _clip_grad_norm(shared, float("inf"), device)
+    actor_clip_scale = _grad_clip_scale(actor_norm, clip_norm)
+    actor_shared_norm = actor_shared_raw_norm * actor_clip_scale
+    actor_clip_frac = (actor_clip_scale < 1.0).to(actor_norm.dtype)
     for param, grad in critic_grads:
         param.grad = grad if param.grad is None else param.grad + grad
 
@@ -402,6 +438,12 @@ def _backward_actor_critic_with_group_clips(
         actor_shared_norm,
         critic_shared_norm,
         shared_norm,
+        actor_shared_raw_norm,
+        critic_shared_raw_norm,
+        actor_clip_scale,
+        critic_clip_scale,
+        actor_clip_frac,
+        critic_clip_frac,
     )
 
 
@@ -425,6 +467,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         spo_eps_low: float,
         spo_eps_high: float,
         autocast_enabled: bool,
+        include_value: bool,
     ) -> None:
         super().__init__()
         self.model = model
@@ -435,6 +478,8 @@ class _PPOMinibatchKernel(torch.nn.Module):
         self.spo_eps_low = float(spo_eps_low)
         self.spo_eps_high = float(spo_eps_high)
         self.autocast_enabled = bool(autocast_enabled)
+        self.include_value = bool(include_value)
+        self._model_accepts_head_flags = isinstance(model, OrbitPolicy)
 
     def forward(
         self,
@@ -468,7 +513,10 @@ class _PPOMinibatchKernel(torch.nn.Module):
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
-            out = self.model(feats)
+            if self._model_accepts_head_flags:
+                out = self.model(feats, include_value=self.include_value)
+            else:
+                out = self.model(feats)
 
         target_legal_mask = target_legal_mask.bool()
         has_legal_target = target_legal_mask.any(dim=-1)
@@ -552,13 +600,16 @@ class _PPOMinibatchKernel(torch.nn.Module):
         policy_loss = -_weighted_mean(adv_actor * ratio - spo_penalty, owned_w)
         spo_penalty_mean = _weighted_mean(spo_penalty, owned_w)
 
-        value_loss = _distributional_value_loss(
-            self.model.value_encoder,
-            value_logits,
-            ret_mtp,
-            row_w,
-            ret_mtp_mask,
-        )
+        if self.include_value:
+            value_loss = _distributional_value_loss(
+                self.model.value_encoder,
+                value_logits,
+                ret_mtp,
+                row_w,
+                ret_mtp_mask,
+            )
+        else:
+            value_loss = policy_loss * 0.0
 
         frac_entropy_per_planet = _beta_entropy(fraction_alpha, fraction_beta)
         if action_logit_softcap is None:
@@ -657,7 +708,6 @@ class _PPOMinibatchKernel(torch.nn.Module):
         # Joschu's k3 approximation `E[(r - 1) - log r]`. The policy surrogate
         # above remains per-source-planet; this is only the reported KL scale.
         per_planet_kl = (((ratio - 1.0) - log_ratio) * owned_w).sum() / denom
-        per_planet_old_kl = ((-log_ratio) * owned_w).sum() / denom
         log_ratio_abs_mean = (log_ratio.abs() * owned_w).sum() / denom
         log_ratio_abs_max = _weighted_max(log_ratio.abs(), owned_w)
         spo_clip_frac = ((ratio_diff.abs() > eps).to(owned_f.dtype) * owned_w).sum() / denom
@@ -672,7 +722,6 @@ class _PPOMinibatchKernel(torch.nn.Module):
             ((row_launch_count <= 0.0).to(row_w.dtype) * row_w).sum() / row_denom
         )
         kl = (((row_ratio - 1.0) - row_log_ratio) * row_w).sum() / row_denom
-        old_kl = ((-row_log_ratio) * row_w).sum() / row_denom
         row_log_ratio_abs_mean = (row_log_ratio.abs() * row_w).sum() / row_denom
         owned_planets_mean = owned_w.sum() / row_denom
         pos_count = (owned_w * (adv_b >= 0.0).to(owned_f.dtype)).sum()
@@ -696,9 +745,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 fraction_concentration_max.detach(),
                 fraction_skew_abs_mean.detach(),
                 deterministic_fraction_mean.detach(),
-                old_kl.detach(),
                 per_planet_kl.detach(),
-                per_planet_old_kl.detach(),
                 log_ratio_abs_mean.detach(),
                 log_ratio_abs_max.detach(),
                 spo_clip_frac.detach(),
@@ -722,6 +769,7 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
         super().__init__()
         self.model = model
         self.autocast_enabled = bool(autocast_enabled)
+        self._model_accepts_head_flags = isinstance(model, OrbitPolicy)
 
     def forward(
         self,
@@ -748,7 +796,10 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
-            out = self.model(feats)
+            if self._model_accepts_head_flags:
+                out = self.model(feats, include_actor=False)
+            else:
+                out = self.model(feats)
         value_logits = out.value_logits.float()
         value_loss = _distributional_value_loss(
             self.model.value_encoder,
@@ -794,6 +845,7 @@ def _get_ppo_kernel(
     spo_eps_low: float,
     spo_eps_high: float,
     compile_mode: str | None,
+    include_value: bool,
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
@@ -806,6 +858,7 @@ def _get_ppo_kernel(
         bool(norm_advantage),
         float(spo_eps_low),
         float(spo_eps_high),
+        bool(include_value),
     )
     cache = _kernel_cache(model)
     cached = cache.get(key)
@@ -820,6 +873,7 @@ def _get_ppo_kernel(
         spo_eps_low=spo_eps_low,
         spo_eps_high=spo_eps_high,
         autocast_enabled=device.type == "cuda",
+        include_value=include_value,
     )
     kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
     cache[key] = kernel
@@ -860,6 +914,12 @@ class PPOLog:
     actor_shared_grad_norm: float = 0.0
     critic_shared_grad_norm: float = 0.0
     shared_grad_norm: float = 0.0
+    actor_shared_raw_grad_norm: float = 0.0
+    critic_shared_raw_grad_norm: float = 0.0
+    actor_clip_scale: float = 1.0
+    critic_clip_scale: float = 1.0
+    actor_clip_frac: float = 0.0
+    critic_clip_frac: float = 0.0
     target_entropy: float = 0.0
     fraction_entropy: float = 0.0
     move_prob: float = 0.0
@@ -870,9 +930,7 @@ class PPOLog:
     fraction_concentration_max: float = 0.0
     fraction_skew_abs_mean: float = 0.0
     deterministic_fraction_mean: float = 0.0
-    old_approx_kl: float = 0.0
     per_planet_approx_kl: float = 0.0
-    per_planet_old_approx_kl: float = 0.0
     log_ratio_abs_mean: float = 0.0
     log_ratio_abs_max: float = 0.0
     spo_clip_frac: float = 0.0
@@ -983,6 +1041,12 @@ def ppo_update(
     actor_shared_grad_norm_sum = torch.zeros((), device=device)
     critic_shared_grad_norm_sum = torch.zeros((), device=device)
     shared_grad_norm_sum = torch.zeros((), device=device)
+    actor_shared_raw_grad_norm_sum = torch.zeros((), device=device)
+    critic_shared_raw_grad_norm_sum = torch.zeros((), device=device)
+    actor_clip_scale_sum = torch.zeros((), device=device)
+    critic_clip_scale_sum = torch.zeros((), device=device)
+    actor_clip_frac_sum = torch.zeros((), device=device)
+    critic_clip_frac_sum = torch.zeros((), device=device)
     n_steps = 0
 
     kernel = _get_ppo_kernel(
@@ -994,13 +1058,19 @@ def ppo_update(
         spo_eps_low=spo_eps_low,
         spo_eps_high=spo_eps_high,
         compile_mode=compile_mode,
+        include_value=True,
     )
     for _ in range(epochs):
-        minibatches = (
-            _fixed_minibatches_by_count(n, minibatch_count, device)
-            if minibatch_count is not None
-            else _fixed_minibatches(n, minibatch_size, device)
-        )
+        if minibatch_count is not None:
+            logical_minibatch_size = math.ceil(n / max(1, int(minibatch_count)))
+            minibatches = _fixed_minibatches_by_count(
+                n,
+                minibatch_count,
+                device,
+            )
+        else:
+            logical_minibatch_size = None
+            minibatches = _fixed_minibatches(n, minibatch_size, device)
         for mb, row_weight in minibatches:
             if compile_mode is not None:
                 _mark_cuda_graph_step(device)
@@ -1023,15 +1093,22 @@ def ppo_update(
                 batch["owned_mask"][mb],
                 batch["target_legal_mask"][mb],
             )
+            metrics_for_step = metrics.detach().clone()
 
             optimizer.zero_grad(set_to_none=True)
-            loss_scale = _minibatch_loss_scale(row_weight)
+            loss_scale = _minibatch_loss_scale(row_weight, logical_minibatch_size)
             (
                 actor_grad_norm,
                 critic_grad_norm,
                 actor_shared_grad_norm,
                 critic_shared_grad_norm,
                 shared_grad_norm,
+                actor_shared_raw_grad_norm,
+                critic_shared_raw_grad_norm,
+                actor_clip_scale,
+                critic_clip_scale,
+                actor_clip_frac,
+                critic_clip_frac,
             ) = (
                 _backward_actor_critic_with_group_clips(
                     model,
@@ -1041,21 +1118,28 @@ def ppo_update(
                 )
             )
             optimizer.step()
+            del actor_loss, critic_loss, metrics
             actor_grad_norm_sum += actor_grad_norm.detach()
             critic_grad_norm_sum += critic_grad_norm.detach()
             actor_shared_grad_norm_sum += actor_shared_grad_norm.detach()
             critic_shared_grad_norm_sum += critic_shared_grad_norm.detach()
             shared_grad_norm_sum += shared_grad_norm.detach()
+            actor_shared_raw_grad_norm_sum += actor_shared_raw_grad_norm.detach()
+            critic_shared_raw_grad_norm_sum += critic_shared_raw_grad_norm.detach()
+            actor_clip_scale_sum += actor_clip_scale.detach()
+            critic_clip_scale_sum += critic_clip_scale.detach()
+            actor_clip_frac_sum += actor_clip_frac.detach()
+            critic_clip_frac_sum += critic_clip_frac.detach()
 
             if metric_sum is None:
-                metric_sum = torch.zeros_like(metrics)
-            metric_sum += metrics
-            last_metrics = metrics
+                metric_sum = torch.zeros_like(metrics_for_step)
+            metric_sum += metrics_for_step
+            last_metrics = metrics_for_step
             n_steps += 1
 
     n_steps = max(1, n_steps)
     mean_logs = (
-        [0.0] * 32
+        [0.0] * 30
         if metric_sum is None
         else (metric_sum / n_steps).detach().cpu().tolist()
     )
@@ -1064,7 +1148,7 @@ def ppo_update(
     # diagnostics stay averaged to preserve their lower-noise TensorBoard
     # behavior.
     kl_logs = (
-        [0.0] * 32
+        [0.0] * 30
         if last_metrics is None
         else last_metrics.detach().cpu().tolist()
     )
@@ -1076,6 +1160,12 @@ def ppo_update(
                 actor_shared_grad_norm_sum,
                 critic_shared_grad_norm_sum,
                 shared_grad_norm_sum,
+                actor_shared_raw_grad_norm_sum,
+                critic_shared_raw_grad_norm_sum,
+                actor_clip_scale_sum,
+                critic_clip_scale_sum,
+                actor_clip_frac_sum,
+                critic_clip_frac_sum,
             ]
         )
         / n_steps
@@ -1092,6 +1182,12 @@ def ppo_update(
         actor_shared_grad_norm=float(grad_logs[2]),
         critic_shared_grad_norm=float(grad_logs[3]),
         shared_grad_norm=float(grad_logs[4]),
+        actor_shared_raw_grad_norm=float(grad_logs[5]),
+        critic_shared_raw_grad_norm=float(grad_logs[6]),
+        actor_clip_scale=float(grad_logs[7]),
+        critic_clip_scale=float(grad_logs[8]),
+        actor_clip_frac=float(grad_logs[9]),
+        critic_clip_frac=float(grad_logs[10]),
         target_entropy=float(mean_logs[6]),
         fraction_entropy=float(mean_logs[7]),
         move_prob=float(mean_logs[8]),
@@ -1102,23 +1198,21 @@ def ppo_update(
         fraction_concentration_max=float(mean_logs[13]),
         fraction_skew_abs_mean=float(mean_logs[14]),
         deterministic_fraction_mean=float(mean_logs[15]),
-        old_approx_kl=float(kl_logs[16]),
-        per_planet_approx_kl=float(kl_logs[17]),
-        per_planet_old_approx_kl=float(kl_logs[18]),
-        log_ratio_abs_mean=float(mean_logs[19]),
-        log_ratio_abs_max=float(mean_logs[20]),
-        spo_clip_frac=float(mean_logs[21]),
-        owned_planets_mean=float(mean_logs[22]),
-        executed_launch_frac=float(mean_logs[23]),
-        source_non_action_frac=float(1.0 - mean_logs[23]),
-        turn_no_action_frac=float(mean_logs[29]),
-        row_log_ratio_abs_mean=float(mean_logs[24]),
-        launch_mean=float(mean_logs[25]),
-        launch_log_std_mean=float(mean_logs[26]),
-        launch_score_mean=float(mean_logs[27]),
-        action_logit_softcap=float(mean_logs[28]),
-        legal_target_count_mean=float(mean_logs[30]),
-        uniform_move_prior=float(mean_logs[31]),
+        per_planet_approx_kl=float(kl_logs[16]),
+        log_ratio_abs_mean=float(mean_logs[17]),
+        log_ratio_abs_max=float(mean_logs[18]),
+        spo_clip_frac=float(mean_logs[19]),
+        owned_planets_mean=float(mean_logs[20]),
+        executed_launch_frac=float(mean_logs[21]),
+        source_non_action_frac=float(1.0 - mean_logs[21]),
+        turn_no_action_frac=float(mean_logs[27]),
+        row_log_ratio_abs_mean=float(mean_logs[22]),
+        launch_mean=float(mean_logs[23]),
+        launch_log_std_mean=float(mean_logs[24]),
+        launch_score_mean=float(mean_logs[25]),
+        action_logit_softcap=float(mean_logs[26]),
+        legal_target_count_mean=float(mean_logs[28]),
+        uniform_move_prior=float(mean_logs[29]),
     )
 
 

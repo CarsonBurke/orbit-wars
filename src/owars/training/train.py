@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from contextlib import suppress
 from pathlib import Path
@@ -735,6 +736,7 @@ def _ppo_loop(
         batch_to_device_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
+        compile_mode = _compile_mode_for_model(model, cfg)
         log = ppo_update(
             model,
             optimizer,
@@ -750,7 +752,7 @@ def _ppo_loop(
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
             minibatch_count=cfg.optim.minibatch_count,
-            compile_mode=_compile_mode_for_model(model, cfg),
+            compile_mode=compile_mode,
         )
         ppo_s = perf_counter() - phase_t0
         value_ev = _explained_variance(batch["value"], batch["return"])
@@ -791,9 +793,7 @@ def _ppo_loop(
                 "value_loss": log.value_loss,
                 "entropy": log.entropy,
                 "approx_kl": log.approx_kl,
-                "old_approx_kl": log.old_approx_kl,
                 "per_planet_approx_kl": log.per_planet_approx_kl,
-                "per_planet_old_approx_kl": log.per_planet_old_approx_kl,
                 "spo_penalty": log.spo_penalty,
                 "spo_clip_frac": log.spo_clip_frac,
                 "explained_variance": value_ev,
@@ -801,8 +801,13 @@ def _ppo_loop(
                 "critic_grad_norm": log.critic_grad_norm,
                 "actor_shared_grad_norm": log.actor_shared_grad_norm,
                 "critic_shared_grad_norm": log.critic_shared_grad_norm,
-                "shared_grad_norm": log.shared_grad_norm,
                 "shared_merged_grad_norm": log.shared_grad_norm,
+                "actor_shared_raw_grad_norm": log.actor_shared_raw_grad_norm,
+                "critic_shared_raw_grad_norm": log.critic_shared_raw_grad_norm,
+                "actor_clip_scale": log.actor_clip_scale,
+                "critic_clip_scale": log.critic_clip_scale,
+                "actor_clip_frac": log.actor_clip_frac,
+                "critic_clip_frac": log.critic_clip_frac,
                 "log_ratio_abs_mean": log.log_ratio_abs_mean,
                 "log_ratio_abs_max": log.log_ratio_abs_max,
                 "row_log_ratio_abs_mean": log.row_log_ratio_abs_mean,
@@ -810,13 +815,26 @@ def _ppo_loop(
             },
             update,
         )
+        batch_rows = int(batch["planet_feats"].shape[0])
+        logical_minibatch_size = (
+            math.ceil(batch_rows / cfg.optim.minibatch_count)
+            if cfg.optim.minibatch_count is not None
+            else cfg.optim.minibatch_size
+        )
+        logger.scalars(
+            "batch",
+            {
+                "rows": batch_rows,
+                "logical_minibatch_size": logical_minibatch_size,
+                "minibatch_size": logical_minibatch_size,
+            },
+            update,
+        )
         logger.scalars(
             "kl",
             {
                 "approx": log.approx_kl,
-                "old_approx": log.old_approx_kl,
                 "per_planet_approx": log.per_planet_approx_kl,
-                "per_planet_old_approx": log.per_planet_old_approx_kl,
                 "spo_penalty": log.spo_penalty,
                 "spo_clip_frac": log.spo_clip_frac,
                 "log_ratio_abs_mean": log.log_ratio_abs_mean,

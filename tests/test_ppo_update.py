@@ -306,6 +306,12 @@ def test_ppo_update_minibatch_count_runs_exact_count():
     assert log.actor_shared_grad_norm >= 0.0
     assert log.critic_shared_grad_norm >= 0.0
     assert log.shared_grad_norm >= 0.0
+    assert log.actor_shared_raw_grad_norm >= log.actor_shared_grad_norm
+    assert log.critic_shared_raw_grad_norm >= log.critic_shared_grad_norm
+    assert 0.0 <= log.actor_clip_scale <= 1.0
+    assert 0.0 <= log.critic_clip_scale <= 1.0
+    assert 0.0 <= log.actor_clip_frac <= 1.0
+    assert 0.0 <= log.critic_clip_frac <= 1.0
 
 
 def test_fixed_minibatches_by_count_cover_rows_once_with_equal_shapes():
@@ -502,7 +508,7 @@ def test_rank_gaussian_advantage_maps_full_batch_ranks_to_normal_quantiles():
     assert torch.equal(got.argsort(), adv.argsort())
 
 
-def test_policy_value_grad_clip_uses_separate_backward_and_sums_shared_grads():
+def test_policy_value_grad_clip_clips_combined_head_and_shared_flows_then_sums_shared():
     class Toy(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -523,19 +529,31 @@ def test_policy_value_grad_clip_uses_separate_backward_and_sums_shared_grads():
         actor_shared_norm,
         critic_shared_norm,
         shared_norm,
+        actor_shared_raw_norm,
+        critic_shared_raw_norm,
+        actor_clip_scale,
+        critic_clip_scale,
+        actor_clip_frac,
+        critic_clip_frac,
     ) = _backward_actor_critic_with_group_clips(model, actor_loss, critic_loss, 1.0)
 
     assert torch.allclose(actor_norm, torch.tensor(5.0))
     assert torch.allclose(critic_norm, torch.tensor(50.0))
-    assert torch.allclose(actor_shared_norm, torch.tensor(0.8))
-    assert torch.allclose(critic_shared_norm, torch.tensor(0.8))
-    assert torch.allclose(shared_norm, torch.tensor(1.6))
+    assert torch.allclose(actor_shared_raw_norm, torch.tensor(4.0))
+    assert torch.allclose(critic_shared_raw_norm, torch.tensor(40.0))
+    assert torch.allclose(actor_shared_norm, torch.tensor(4.0 / (5.0 + 1e-6)))
+    assert torch.allclose(critic_shared_norm, torch.tensor(40.0 / (50.0 + 1e-6)))
+    assert torch.allclose(actor_clip_scale, torch.tensor(1.0 / (5.0 + 1e-6)))
+    assert torch.allclose(critic_clip_scale, torch.tensor(1.0 / (50.0 + 1e-6)))
+    assert torch.allclose(actor_clip_frac, torch.tensor(1.0))
+    assert torch.allclose(critic_clip_frac, torch.tensor(1.0))
+    assert torch.allclose(shared_norm, torch.tensor(1.6), atol=1e-6)
     assert torch.allclose(
         model.target_noop_key.weight.grad,
-        torch.tensor([[0.6]]),
+        torch.tensor([[3.0 / (5.0 + 1e-6)]]),
     )
-    assert torch.allclose(model.value_head.weight.grad, torch.tensor([[0.6]]))
-    assert torch.allclose(model.shared.weight.grad, torch.tensor([[1.6]]))
+    assert torch.allclose(model.value_head.weight.grad, torch.tensor([[30.0 / (50.0 + 1e-6)]]))
+    assert torch.allclose(model.shared.weight.grad, torch.tensor([[1.6]]), atol=1e-6)
 
 
 def test_policy_value_grad_clip_retains_shared_forward_graph():
@@ -562,15 +580,30 @@ def test_policy_value_grad_clip_retains_shared_forward_graph():
         actor_shared_norm,
         critic_shared_norm,
         shared_norm,
+        actor_shared_raw_norm,
+        critic_shared_raw_norm,
+        actor_clip_scale,
+        critic_clip_scale,
+        actor_clip_frac,
+        critic_clip_frac,
     ) = _backward_actor_critic_with_group_clips(model, actor_loss, critic_loss, 1.0)
 
     sqrt2 = math.sqrt(2.0)
     assert torch.allclose(actor_norm, torch.tensor(2.0 * sqrt2))
     assert torch.allclose(critic_norm, torch.tensor(20.0 * sqrt2))
-    assert torch.allclose(actor_shared_norm, torch.tensor(1.0 / sqrt2))
-    assert torch.allclose(critic_shared_norm, torch.tensor(1.0 / sqrt2))
-    assert torch.allclose(shared_norm, torch.tensor(sqrt2))
-    assert torch.allclose(model.trunk.weight.grad, torch.tensor([[sqrt2]]))
+    assert torch.allclose(actor_shared_raw_norm, torch.tensor(2.0))
+    assert torch.allclose(critic_shared_raw_norm, torch.tensor(20.0))
+    actor_scale = 1.0 / (2.0 * sqrt2 + 1e-6)
+    critic_scale = 1.0 / (20.0 * sqrt2 + 1e-6)
+    expected_shared = 2.0 * actor_scale + 20.0 * critic_scale
+    assert torch.allclose(actor_shared_norm, torch.tensor(2.0 * actor_scale))
+    assert torch.allclose(critic_shared_norm, torch.tensor(20.0 * critic_scale))
+    assert torch.allclose(actor_clip_scale, torch.tensor(actor_scale))
+    assert torch.allclose(critic_clip_scale, torch.tensor(critic_scale))
+    assert torch.allclose(actor_clip_frac, torch.tensor(1.0))
+    assert torch.allclose(critic_clip_frac, torch.tensor(1.0))
+    assert torch.allclose(shared_norm, torch.tensor(expected_shared))
+    assert torch.allclose(model.trunk.weight.grad, torch.tensor([[expected_shared]]))
 
 
 class _FixedPolicy(torch.nn.Module):

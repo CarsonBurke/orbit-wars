@@ -14,7 +14,7 @@ run:
   name: ppo_vs_sniper
   seed: 0
   device: cuda
-  compile_mode: ""
+  compile_mode: reduce-overhead
   log_root: runs
   ckpt_root: checkpoints
   total_updates: 1000
@@ -62,10 +62,15 @@ optim:
   lr: 3.0e-4
   head_lr: 3.0e-4
   weight_decay: 1.0e-4
-  grad_clip: 0.5   # actor and critic losses are backpropagated separately;
-                   # each flow clips its task head plus shared trunk before
-                   # their shared gradients are summed.
-  minibatch_count: 16
+  grad_clip: 1.0   # actor and critic flows are clipped separately, including
+                   # each flow's task head plus shared-trunk components.
+  # Fixed minibatch SIZE (no minibatch_count) so every optimizer step has the
+  # same leading dim across updates. `n` is the sum of full-episode trajectory
+  # lengths and swings widely per update, so a fixed COUNT would give a
+  # per-update-variable `ceil(n/count)` size — under `reduce-overhead` each new
+  # shape records a fresh CUDA-graph memory pool that is never freed, leaking
+  # VRAM and stalling on recompiles. A fixed size pads the tail to one constant
+  # shape, so a single cudagraph is captured once and replayed every update.
   minibatch_size: 1024
   epochs_per_update: 4
 

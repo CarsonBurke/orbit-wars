@@ -41,7 +41,7 @@ optim:
   lr: 2.0e-4
   head_lr: 2.0e-4
   weight_decay: 1.0e-4
-  grad_clip: 0.5
+  grad_clip: 1.0
   minibatch_size: 4096
   epochs_per_update: 4
 
