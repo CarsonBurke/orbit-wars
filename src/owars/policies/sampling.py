@@ -329,6 +329,22 @@ class SampleBatchRecord:
 
 
 @dataclass(slots=True)
+class _PreparedBatchActions:
+    launch: torch.Tensor
+    target_idx: torch.Tensor
+    frac: torch.Tensor
+    launch_logits: torch.Tensor
+    launch_log_std: torch.Tensor | None
+    action_logit_softcap: float | None
+    target_logits: torch.Tensor
+    fraction_param1: torch.Tensor
+    fraction_param2: torch.Tensor
+    fraction_dist: str
+    legality_fields_l: Any
+    target_legal_mask_l: Any
+
+
+@dataclass(slots=True)
 class ActionContext:
     """Fast action builder context backed by simulator planet rows."""
 
@@ -1370,6 +1386,127 @@ def _sample_categorical_action(
     return launch, target_idx
 
 
+def _prepare_batch_action_fields(
+    out: PolicyOutput,
+    batch_len: int,
+    deterministic: bool,
+    target_mask_builder: Any,
+    *,
+    ensure_deterministic_idle: bool,
+) -> _PreparedBatchActions:
+    """Sample factored actions and apply per-env target legality masks.
+
+    The three batched front doors differ only in where planet rows come from
+    (parsed observations, raw Kaggle dicts, or native-env contexts). This
+    helper keeps their shared tensor path identical.
+    """
+    launch_logits = out.launch_logits
+    launch_log_std = out.launch_log_std
+    action_logit_softcap = out.action_logit_softcap
+    target_logits = out.target_logits
+    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
+    b_dim, _p, _ = target_logits.shape
+    assert batch_len == b_dim, (batch_len, b_dim)
+
+    if action_logit_softcap is None:
+        launch, frac = _sample_launch_fraction(
+            launch_logits,
+            fraction_param1,
+            fraction_param2,
+            deterministic,
+            fraction_dist,
+            launch_log_std=launch_log_std,
+            launch_prob_floor=out.launch_prob_floor,
+        )
+        legality_launch = launch
+    else:
+        frac = _sample_fraction(
+            fraction_param1,
+            fraction_param2,
+            deterministic,
+            fraction_dist,
+        )
+        support_launch, _support_frac = _categorical_support_launch_fraction(
+            fraction_param1,
+            fraction_param2,
+            out.planet_owned_mask,
+            out.planet_mask,
+            fraction_dist,
+        )
+        legality_launch = support_launch
+
+    legality_fields_l = _packed_legality_fields(
+        legality_launch,
+        frac,
+        out.planet_owned_mask,
+        out.planet_mask,
+        out.planet_ids,
+    )
+    target_legal_mask_l = [
+        target_mask_builder(k, legality_fields_l[k]) for k in range(b_dim)
+    ]
+    target_legal_mask = _target_legal_mask_tensor(
+        target_legal_mask_l, target_logits.device
+    )
+    target_logits = _apply_target_legal_mask(
+        target_logits,
+        target_legal_mask,
+        legality_launch,
+        out.planet_owned_mask,
+        out.planet_mask,
+    )
+
+    if action_logit_softcap is None:
+        launch_logits, launch = _mask_impossible_launches(
+            launch_logits,
+            launch,
+            target_legal_mask,
+            out.planet_owned_mask,
+            out.planet_mask,
+        )
+        if ensure_deterministic_idle:
+            launch = _ensure_deterministic_launch_if_idle(
+                launch_logits,
+                launch,
+                target_legal_mask,
+                out.planet_owned_mask,
+                out.planet_mask,
+                deterministic,
+            )
+        target_idx = _sample_target(target_logits, deterministic)
+    else:
+        launch, target_idx = _sample_categorical_action(
+            launch_logits,
+            target_logits,
+            action_logit_softcap,
+            out.planet_owned_mask,
+            out.planet_mask,
+            deterministic,
+        )
+
+    legality_fields_l = _packed_legality_fields(
+        launch,
+        frac,
+        out.planet_owned_mask,
+        out.planet_mask,
+        out.planet_ids,
+    )
+    return _PreparedBatchActions(
+        launch=launch,
+        target_idx=target_idx,
+        frac=frac,
+        launch_logits=launch_logits,
+        launch_log_std=launch_log_std,
+        action_logit_softcap=action_logit_softcap,
+        target_logits=target_logits,
+        fraction_param1=fraction_param1,
+        fraction_param2=fraction_param2,
+        fraction_dist=fraction_dist,
+        legality_fields_l=legality_fields_l,
+        target_legal_mask_l=target_legal_mask_l,
+    )
+
+
 def _build_moves_from_packed_fields_with_mask(
     fields_l: list[list[float]],
     o: Observation,
@@ -2106,94 +2243,22 @@ def sample_batch_with_records(
     tensor — that's where the GPU win comes from. The per-element
     `_build_moves` walk is pure Python but cheap (one loop per env).
     """
-    launch_logits = out.launch_logits      # [B, P]
-    launch_log_std = out.launch_log_std
-    action_logit_softcap = out.action_logit_softcap
-    target_logits = out.target_logits      # [B, P, P]
-    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
-    b_dim, p, _ = target_logits.shape
-    assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
-
-    if action_logit_softcap is None:
-        launch, frac = _sample_launch_fraction(
-            launch_logits,
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-            launch_log_std=launch_log_std,
-            launch_prob_floor=out.launch_prob_floor,
-        )
-    else:
-        frac = _sample_fraction(
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-        )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            out.planet_owned_mask,
-            out.planet_mask,
-            fraction_dist,
-        )
-    legality_fields_l = _packed_legality_fields(
-        launch if action_logit_softcap is None else support_launch,
-        frac,
-        out.planet_owned_mask,
-        out.planet_mask,
-        out.planet_ids,
-    )
-    target_legal_mask_l = [
-        _target_legal_mask_from_packed_legality_fields(
-            legality_fields_l[k],
+    prepared = _prepare_batch_action_fields(
+        out,
+        len(parsed_list),
+        deterministic,
+        lambda k, fields: _target_legal_mask_from_packed_legality_fields(
+            fields,
             parsed_list[k].planets,
             parsed_list[k].angular_velocity,
             parsed_list[k].comet_planet_ids,
-        )
-        for k in range(b_dim)
-    ]
-    target_legal_mask = _target_legal_mask_tensor(
-        target_legal_mask_l, target_logits.device
+        ),
+        ensure_deterministic_idle=False,
     )
-    target_logits = _apply_target_legal_mask(
-        target_logits,
-        target_legal_mask,
-        launch if action_logit_softcap is None else support_launch,
-        out.planet_owned_mask,
-        out.planet_mask,
-    )
-    if action_logit_softcap is None:
-        launch_logits, launch = _mask_impossible_launches(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-        )
-        target_idx = _sample_target(target_logits, deterministic)
-    else:
-        launch, target_idx = _sample_categorical_action(
-            launch_logits,
-            target_logits,
-            action_logit_softcap,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-        legality_fields_l[..., 0] = launch.float().detach().cpu().numpy()
-
-    if action_logit_softcap is not None:
-        legality_fields_l = _packed_legality_fields(
-            launch,
-            frac,
-            out.planet_owned_mask,
-            out.planet_mask,
-            out.planet_ids,
-        )
     fields_l = _packed_action_fields_from_legality_fields(
-        target_idx, legality_fields_l, target_legal_mask_l
+        prepared.target_idx,
+        prepared.legality_fields_l,
+        prepared.target_legal_mask_l,
     )
 
     moves_list: list[list[Move]] = []
@@ -2206,7 +2271,7 @@ def sample_batch_with_records(
     materialized_rows: list[list[bool] | None] = (
         [None] * len(record_rows) if record_rows is not None else []
     )
-    for k in range(b_dim):
+    for k in range(len(parsed_list)):
         moves, materialized = _build_moves_from_packed_fields_with_mask(
             fields_l[k], parsed_list[k]
         )
@@ -2214,16 +2279,18 @@ def sample_batch_with_records(
         if record_pos is None:
             records.append(
                 _record_from_materialized_launch(
-                    launch[k],
-                    target_idx[k],
-                    frac[k],
-                    launch_logits[k],
-                    None if launch_log_std is None else launch_log_std[k],
-                    action_logit_softcap,
-                    target_logits[k],
-                    fraction_param1[k],
-                    fraction_param2[k],
-                    fraction_dist,
+                    prepared.launch[k],
+                    prepared.target_idx[k],
+                    prepared.frac[k],
+                    prepared.launch_logits[k],
+                    None
+                    if prepared.launch_log_std is None
+                    else prepared.launch_log_std[k],
+                    prepared.action_logit_softcap,
+                    prepared.target_logits[k],
+                    prepared.fraction_param1[k],
+                    prepared.fraction_param2[k],
+                    prepared.fraction_dist,
                     materialized,
                     launch_prob_floor=out.launch_prob_floor,
                 )
@@ -2232,16 +2299,16 @@ def sample_batch_with_records(
             materialized_rows[record_pos[k]] = materialized
     if record_rows is not None:
         return moves_list, _batch_record_from_materialized_launch(
-            launch,
-            target_idx,
-            frac,
-            launch_logits,
-            launch_log_std,
-            action_logit_softcap,
-            target_logits,
-            fraction_param1,
-            fraction_param2,
-            fraction_dist,
+            prepared.launch,
+            prepared.target_idx,
+            prepared.frac,
+            prepared.launch_logits,
+            prepared.launch_log_std,
+            prepared.action_logit_softcap,
+            prepared.target_logits,
+            prepared.fraction_param1,
+            prepared.fraction_param2,
+            prepared.fraction_dist,
             [row for row in materialized_rows if row is not None],
             record_rows,
             launch_prob_floor=out.launch_prob_floor,
@@ -2256,101 +2323,35 @@ def sample_batch_with_records_raw(
     record_rows: Sequence[int] | None = None,
 ) -> tuple[list[list[list]], list[SampleRecord] | SampleBatchRecord]:
     """Batched sampler that builds Kaggle action lists from raw obs dicts."""
-    launch_logits = out.launch_logits
-    launch_log_std = out.launch_log_std
-    action_logit_softcap = out.action_logit_softcap
-    target_logits = out.target_logits
-    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
-    b_dim, p, _ = target_logits.shape
-    assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
-
-    if action_logit_softcap is None:
-        launch, frac = _sample_launch_fraction(
-            launch_logits,
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-            launch_log_std=launch_log_std,
-            launch_prob_floor=out.launch_prob_floor,
-        )
-    else:
-        frac = _sample_fraction(
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-        )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            out.planet_owned_mask,
-            out.planet_mask,
-            fraction_dist,
-        )
-    legality_fields_l = _packed_legality_fields(
-        launch if action_logit_softcap is None else support_launch,
-        frac,
-        out.planet_owned_mask,
-        out.planet_mask,
-        out.planet_ids,
-    )
-    target_legal_mask_l = [
-        _target_legal_mask_from_packed_legality_fields(
-            legality_fields_l[k],
-            raw_observations[k].get("planets", [])
-            if isinstance(raw_observations[k], dict)
-            else getattr(raw_observations[k], "planets", []),
+    def _raw_target_mask(k: int, fields: Any) -> Any:
+        raw_obs = raw_observations[k]
+        return _target_legal_mask_from_packed_legality_fields(
+            fields,
+            raw_obs.get("planets", [])
+            if isinstance(raw_obs, dict)
+            else getattr(raw_obs, "planets", []),
             (
-                raw_observations[k].get("angular_velocity", 0.0)
-                if isinstance(raw_observations[k], dict)
-                else getattr(raw_observations[k], "angular_velocity", 0.0)
+                raw_obs.get("angular_velocity", 0.0)
+                if isinstance(raw_obs, dict)
+                else getattr(raw_obs, "angular_velocity", 0.0)
             )
             or 0.0,
-            raw_observations[k].get("comet_planet_ids", [])
-            if isinstance(raw_observations[k], dict)
-            else getattr(raw_observations[k], "comet_planet_ids", []),
+            raw_obs.get("comet_planet_ids", [])
+            if isinstance(raw_obs, dict)
+            else getattr(raw_obs, "comet_planet_ids", []),
         )
-        for k in range(b_dim)
-    ]
-    target_legal_mask = _target_legal_mask_tensor(
-        target_legal_mask_l, target_logits.device
+
+    prepared = _prepare_batch_action_fields(
+        out,
+        len(raw_observations),
+        deterministic,
+        _raw_target_mask,
+        ensure_deterministic_idle=False,
     )
-    target_logits = _apply_target_legal_mask(
-        target_logits,
-        target_legal_mask,
-        launch if action_logit_softcap is None else support_launch,
-        out.planet_owned_mask,
-        out.planet_mask,
-    )
-    if action_logit_softcap is None:
-        launch_logits, launch = _mask_impossible_launches(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-        )
-        target_idx = _sample_target(target_logits, deterministic)
-    else:
-        launch, target_idx = _sample_categorical_action(
-            launch_logits,
-            target_logits,
-            action_logit_softcap,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-        legality_fields_l[..., 0] = launch.float().detach().cpu().numpy()
-        legality_fields_l = _packed_legality_fields(
-            launch,
-            frac,
-            out.planet_owned_mask,
-            out.planet_mask,
-            out.planet_ids,
-        )
     fields_l = _packed_action_fields_from_legality_fields(
-        target_idx, legality_fields_l, target_legal_mask_l
+        prepared.target_idx,
+        prepared.legality_fields_l,
+        prepared.target_legal_mask_l,
     )
 
     actions_list: list[list[list]] = []
@@ -2363,7 +2364,7 @@ def sample_batch_with_records_raw(
     materialized_rows: list[list[bool] | None] = (
         [None] * len(record_rows) if record_rows is not None else []
     )
-    for k in range(b_dim):
+    for k in range(len(raw_observations)):
         actions, materialized = _build_action_lists_from_packed_fields_raw_with_mask(
             fields_l[k], raw_observations[k]
         )
@@ -2371,16 +2372,18 @@ def sample_batch_with_records_raw(
         if record_pos is None:
             records.append(
                 _record_from_materialized_launch(
-                    launch[k],
-                    target_idx[k],
-                    frac[k],
-                    launch_logits[k],
-                    None if launch_log_std is None else launch_log_std[k],
-                    action_logit_softcap,
-                    target_logits[k],
-                    fraction_param1[k],
-                    fraction_param2[k],
-                    fraction_dist,
+                    prepared.launch[k],
+                    prepared.target_idx[k],
+                    prepared.frac[k],
+                    prepared.launch_logits[k],
+                    None
+                    if prepared.launch_log_std is None
+                    else prepared.launch_log_std[k],
+                    prepared.action_logit_softcap,
+                    prepared.target_logits[k],
+                    prepared.fraction_param1[k],
+                    prepared.fraction_param2[k],
+                    prepared.fraction_dist,
                     materialized,
                     launch_prob_floor=out.launch_prob_floor,
                 )
@@ -2389,16 +2392,16 @@ def sample_batch_with_records_raw(
             materialized_rows[record_pos[k]] = materialized
     if record_rows is not None:
         return actions_list, _batch_record_from_materialized_launch(
-            launch,
-            target_idx,
-            frac,
-            launch_logits,
-            launch_log_std,
-            action_logit_softcap,
-            target_logits,
-            fraction_param1,
-            fraction_param2,
-            fraction_dist,
+            prepared.launch,
+            prepared.target_idx,
+            prepared.frac,
+            prepared.launch_logits,
+            prepared.launch_log_std,
+            prepared.action_logit_softcap,
+            prepared.target_logits,
+            prepared.fraction_param1,
+            prepared.fraction_param2,
+            prepared.fraction_dist,
             [row for row in materialized_rows if row is not None],
             record_rows,
             launch_prob_floor=out.launch_prob_floor,
@@ -2413,92 +2416,22 @@ def sample_batch_with_records_context(
     record_rows: Sequence[int] | None = None,
 ) -> tuple[list[list[list]], list[SampleRecord] | SampleBatchRecord]:
     """Batched sampler that builds action lists from fast env contexts."""
-    launch_logits = out.launch_logits
-    launch_log_std = out.launch_log_std
-    action_logit_softcap = out.action_logit_softcap
-    target_logits = out.target_logits
-    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
-    b_dim, p, _ = target_logits.shape
-    assert len(contexts) == b_dim, (len(contexts), b_dim)
-
-    if action_logit_softcap is None:
-        launch, frac = _sample_launch_fraction(
-            launch_logits,
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-            launch_log_std=launch_log_std,
-            launch_prob_floor=out.launch_prob_floor,
-        )
-    else:
-        frac = _sample_fraction(
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-        )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            out.planet_owned_mask,
-            out.planet_mask,
-            fraction_dist,
-        )
-    legality_fields_l = _packed_legality_fields(
-        launch if action_logit_softcap is None else support_launch,
-        frac,
-        out.planet_owned_mask,
-        out.planet_mask,
-        out.planet_ids,
-    )
-    target_legal_mask_l = [
-        _target_legal_mask_from_packed_legality_fields(
-            legality_fields_l[k],
+    prepared = _prepare_batch_action_fields(
+        out,
+        len(contexts),
+        deterministic,
+        lambda k, fields: _target_legal_mask_from_packed_legality_fields(
+            fields,
             contexts[k].planets,
             contexts[k].angular_velocity,
             contexts[k].comet_planet_ids,
-        )
-        for k in range(b_dim)
-    ]
-    target_legal_mask = _target_legal_mask_tensor(
-        target_legal_mask_l, target_logits.device
+        ),
+        ensure_deterministic_idle=False,
     )
-    target_logits = _apply_target_legal_mask(
-        target_logits,
-        target_legal_mask,
-        launch if action_logit_softcap is None else support_launch,
-        out.planet_owned_mask,
-        out.planet_mask,
-    )
-    if action_logit_softcap is None:
-        launch_logits, launch = _mask_impossible_launches(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-        )
-        target_idx = _sample_target(target_logits, deterministic)
-    else:
-        launch, target_idx = _sample_categorical_action(
-            launch_logits,
-            target_logits,
-            action_logit_softcap,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-        legality_fields_l[..., 0] = launch.float().detach().cpu().numpy()
-        legality_fields_l = _packed_legality_fields(
-            launch,
-            frac,
-            out.planet_owned_mask,
-            out.planet_mask,
-            out.planet_ids,
-        )
     fields_l = _packed_action_fields_from_legality_fields(
-        target_idx, legality_fields_l, target_legal_mask_l
+        prepared.target_idx,
+        prepared.legality_fields_l,
+        prepared.target_legal_mask_l,
     )
 
     actions_list: list[list[list]] = []
@@ -2511,7 +2444,7 @@ def sample_batch_with_records_context(
     materialized_rows: list[list[bool] | None] = (
         [None] * len(record_rows) if record_rows is not None else []
     )
-    for k in range(b_dim):
+    for k in range(len(contexts)):
         actions, materialized = _build_action_lists_from_packed_fields_context_with_mask(
             fields_l[k], contexts[k]
         )
@@ -2519,16 +2452,18 @@ def sample_batch_with_records_context(
         if record_pos is None:
             records.append(
                 _record_from_materialized_launch(
-                    launch[k],
-                    target_idx[k],
-                    frac[k],
-                    launch_logits[k],
-                    None if launch_log_std is None else launch_log_std[k],
-                    action_logit_softcap,
-                    target_logits[k],
-                    fraction_param1[k],
-                    fraction_param2[k],
-                    fraction_dist,
+                    prepared.launch[k],
+                    prepared.target_idx[k],
+                    prepared.frac[k],
+                    prepared.launch_logits[k],
+                    None
+                    if prepared.launch_log_std is None
+                    else prepared.launch_log_std[k],
+                    prepared.action_logit_softcap,
+                    prepared.target_logits[k],
+                    prepared.fraction_param1[k],
+                    prepared.fraction_param2[k],
+                    prepared.fraction_dist,
                     materialized,
                     launch_prob_floor=out.launch_prob_floor,
                 )
@@ -2537,16 +2472,16 @@ def sample_batch_with_records_context(
             materialized_rows[record_pos[k]] = materialized
     if record_rows is not None:
         return actions_list, _batch_record_from_materialized_launch(
-            launch,
-            target_idx,
-            frac,
-            launch_logits,
-            launch_log_std,
-            action_logit_softcap,
-            target_logits,
-            fraction_param1,
-            fraction_param2,
-            fraction_dist,
+            prepared.launch,
+            prepared.target_idx,
+            prepared.frac,
+            prepared.launch_logits,
+            prepared.launch_log_std,
+            prepared.action_logit_softcap,
+            prepared.target_logits,
+            prepared.fraction_param1,
+            prepared.fraction_param2,
+            prepared.fraction_dist,
             [row for row in materialized_rows if row is not None],
             record_rows,
             launch_prob_floor=out.launch_prob_floor,
@@ -2560,107 +2495,27 @@ def sample_batch_actions(
     deterministic: bool = True,
 ) -> list[list[Move]]:
     """Batched moves-only sampler for eval and opponent inference paths."""
-    launch_logits = out.launch_logits
-    launch_log_std = out.launch_log_std
-    action_logit_softcap = out.action_logit_softcap
-    target_logits = out.target_logits
-    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
-    b_dim, p, _ = target_logits.shape
-    assert len(parsed_list) == b_dim, (len(parsed_list), b_dim)
-
-    if action_logit_softcap is None:
-        launch, frac = _sample_launch_fraction(
-            launch_logits,
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-            launch_log_std=launch_log_std,
-            launch_prob_floor=out.launch_prob_floor,
-        )
-    else:
-        frac = _sample_fraction(
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-        )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            out.planet_owned_mask,
-            out.planet_mask,
-            fraction_dist,
-        )
-    legality_fields_l = _packed_legality_fields(
-        launch if action_logit_softcap is None else support_launch,
-        frac,
-        out.planet_owned_mask,
-        out.planet_mask,
-        out.planet_ids,
-    )
-    target_legal_mask_l = [
-        _target_legal_mask_from_packed_legality_fields(
-            legality_fields_l[k],
+    prepared = _prepare_batch_action_fields(
+        out,
+        len(parsed_list),
+        deterministic,
+        lambda k, fields: _target_legal_mask_from_packed_legality_fields(
+            fields,
             parsed_list[k].planets,
             parsed_list[k].angular_velocity,
             parsed_list[k].comet_planet_ids,
-        )
-        for k in range(b_dim)
-    ]
-    target_legal_mask = _target_legal_mask_tensor(
-        target_legal_mask_l, target_logits.device
+        ),
+        ensure_deterministic_idle=True,
     )
-    target_logits = _apply_target_legal_mask(
-        target_logits,
-        target_legal_mask,
-        launch if action_logit_softcap is None else support_launch,
-        out.planet_owned_mask,
-        out.planet_mask,
-    )
-    if action_logit_softcap is None:
-        _launch_logits, launch = _mask_impossible_launches(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-        )
-        launch = _ensure_deterministic_launch_if_idle(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-        target_idx = _sample_target(target_logits, deterministic)
-    else:
-        launch, target_idx = _sample_categorical_action(
-            launch_logits,
-            target_logits,
-            action_logit_softcap,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-    legality_fields_l[..., 0] = launch.float().detach().cpu().numpy()
-    if action_logit_softcap is not None:
-        legality_fields_l = _packed_legality_fields(
-            launch,
-            frac,
-            out.planet_owned_mask,
-            out.planet_mask,
-            out.planet_ids,
-        )
-
     fields_l = _packed_action_fields_from_legality_fields(
-        target_idx, legality_fields_l, target_legal_mask_l
+        prepared.target_idx,
+        prepared.legality_fields_l,
+        prepared.target_legal_mask_l,
     )
 
     return [
         _build_moves_from_packed_fields(fields_l[k], parsed_list[k])
-        for k in range(b_dim)
+        for k in range(len(parsed_list))
     ]
 
 
@@ -2670,117 +2525,41 @@ def sample_batch_actions_raw(
     deterministic: bool = True,
 ) -> list[list[list]]:
     """Batched moves-only sampler for raw Kaggle-style observations."""
-    launch_logits = out.launch_logits
-    launch_log_std = out.launch_log_std
-    action_logit_softcap = out.action_logit_softcap
-    target_logits = out.target_logits
-    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
-    b_dim, p, _ = target_logits.shape
-    assert len(raw_observations) == b_dim, (len(raw_observations), b_dim)
-
-    if action_logit_softcap is None:
-        launch, frac = _sample_launch_fraction(
-            launch_logits,
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-            launch_log_std=launch_log_std,
-            launch_prob_floor=out.launch_prob_floor,
-        )
-    else:
-        frac = _sample_fraction(
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-        )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            out.planet_owned_mask,
-            out.planet_mask,
-            fraction_dist,
-        )
-    legality_fields_l = _packed_legality_fields(
-        launch if action_logit_softcap is None else support_launch,
-        frac,
-        out.planet_owned_mask,
-        out.planet_mask,
-        out.planet_ids,
-    )
-    target_legal_mask_l = [
-        _target_legal_mask_from_packed_legality_fields(
-            legality_fields_l[k],
-            raw_observations[k].get("planets", [])
-            if isinstance(raw_observations[k], dict)
-            else getattr(raw_observations[k], "planets", []),
+    def _raw_target_mask(k: int, fields: Any) -> Any:
+        raw_obs = raw_observations[k]
+        return _target_legal_mask_from_packed_legality_fields(
+            fields,
+            raw_obs.get("planets", [])
+            if isinstance(raw_obs, dict)
+            else getattr(raw_obs, "planets", []),
             (
-                raw_observations[k].get("angular_velocity", 0.0)
-                if isinstance(raw_observations[k], dict)
-                else getattr(raw_observations[k], "angular_velocity", 0.0)
+                raw_obs.get("angular_velocity", 0.0)
+                if isinstance(raw_obs, dict)
+                else getattr(raw_obs, "angular_velocity", 0.0)
             )
             or 0.0,
-            raw_observations[k].get("comet_planet_ids", [])
-            if isinstance(raw_observations[k], dict)
-            else getattr(raw_observations[k], "comet_planet_ids", []),
-        )
-        for k in range(b_dim)
-    ]
-    target_legal_mask = _target_legal_mask_tensor(
-        target_legal_mask_l, target_logits.device
-    )
-    target_logits = _apply_target_legal_mask(
-        target_logits,
-        target_legal_mask,
-        launch if action_logit_softcap is None else support_launch,
-        out.planet_owned_mask,
-        out.planet_mask,
-    )
-    if action_logit_softcap is None:
-        _launch_logits, launch = _mask_impossible_launches(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-        )
-        launch = _ensure_deterministic_launch_if_idle(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-        target_idx = _sample_target(target_logits, deterministic)
-    else:
-        launch, target_idx = _sample_categorical_action(
-            launch_logits,
-            target_logits,
-            action_logit_softcap,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-    legality_fields_l[..., 0] = launch.float().detach().cpu().numpy()
-    if action_logit_softcap is not None:
-        legality_fields_l = _packed_legality_fields(
-            launch,
-            frac,
-            out.planet_owned_mask,
-            out.planet_mask,
-            out.planet_ids,
+            raw_obs.get("comet_planet_ids", [])
+            if isinstance(raw_obs, dict)
+            else getattr(raw_obs, "comet_planet_ids", []),
         )
 
+    prepared = _prepare_batch_action_fields(
+        out,
+        len(raw_observations),
+        deterministic,
+        _raw_target_mask,
+        ensure_deterministic_idle=True,
+    )
     fields_l = _packed_action_fields_from_legality_fields(
-        target_idx, legality_fields_l, target_legal_mask_l
+        prepared.target_idx,
+        prepared.legality_fields_l,
+        prepared.target_legal_mask_l,
     )
     return [
         _build_action_lists_from_packed_fields_raw(
             fields_l[k], raw_observations[k]
         )
-        for k in range(b_dim)
+        for k in range(len(raw_observations))
     ]
 
 
@@ -2790,106 +2569,26 @@ def sample_batch_actions_context(
     deterministic: bool = True,
 ) -> list[list[list]]:
     """Batched moves-only sampler for fast env action contexts."""
-    launch_logits = out.launch_logits
-    launch_log_std = out.launch_log_std
-    action_logit_softcap = out.action_logit_softcap
-    target_logits = out.target_logits
-    fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
-    b_dim, p, _ = target_logits.shape
-    assert len(contexts) == b_dim, (len(contexts), b_dim)
-
-    if action_logit_softcap is None:
-        launch, frac = _sample_launch_fraction(
-            launch_logits,
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-            launch_log_std=launch_log_std,
-            launch_prob_floor=out.launch_prob_floor,
-        )
-    else:
-        frac = _sample_fraction(
-            fraction_param1,
-            fraction_param2,
-            deterministic,
-            fraction_dist,
-        )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            out.planet_owned_mask,
-            out.planet_mask,
-            fraction_dist,
-        )
-    legality_fields_l = _packed_legality_fields(
-        launch if action_logit_softcap is None else support_launch,
-        frac,
-        out.planet_owned_mask,
-        out.planet_mask,
-        out.planet_ids,
-    )
-    target_legal_mask_l = [
-        _target_legal_mask_from_packed_legality_fields(
-            legality_fields_l[k],
+    prepared = _prepare_batch_action_fields(
+        out,
+        len(contexts),
+        deterministic,
+        lambda k, fields: _target_legal_mask_from_packed_legality_fields(
+            fields,
             contexts[k].planets,
             contexts[k].angular_velocity,
             contexts[k].comet_planet_ids,
-        )
-        for k in range(b_dim)
-    ]
-    target_legal_mask = _target_legal_mask_tensor(
-        target_legal_mask_l, target_logits.device
+        ),
+        ensure_deterministic_idle=True,
     )
-    target_logits = _apply_target_legal_mask(
-        target_logits,
-        target_legal_mask,
-        launch if action_logit_softcap is None else support_launch,
-        out.planet_owned_mask,
-        out.planet_mask,
-    )
-    if action_logit_softcap is None:
-        _launch_logits, launch = _mask_impossible_launches(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-        )
-        launch = _ensure_deterministic_launch_if_idle(
-            launch_logits,
-            launch,
-            target_legal_mask,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-        target_idx = _sample_target(target_logits, deterministic)
-    else:
-        launch, target_idx = _sample_categorical_action(
-            launch_logits,
-            target_logits,
-            action_logit_softcap,
-            out.planet_owned_mask,
-            out.planet_mask,
-            deterministic,
-        )
-    legality_fields_l[..., 0] = launch.float().detach().cpu().numpy()
-    if action_logit_softcap is not None:
-        legality_fields_l = _packed_legality_fields(
-            launch,
-            frac,
-            out.planet_owned_mask,
-            out.planet_mask,
-            out.planet_ids,
-        )
-
     fields_l = _packed_action_fields_from_legality_fields(
-        target_idx, legality_fields_l, target_legal_mask_l
+        prepared.target_idx,
+        prepared.legality_fields_l,
+        prepared.target_legal_mask_l,
     )
     return [
         _build_action_lists_from_packed_fields_context(
             fields_l[k], contexts[k]
         )
-        for k in range(b_dim)
+        for k in range(len(contexts))
     ]
