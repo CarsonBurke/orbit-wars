@@ -1,0 +1,98 @@
+# PPO vs. a fixed sniper opponent — low-noise, stationary baseline.
+#
+# Same model / optim / reward as `ppo_base`, but matchmaking is `mode: fixed`
+# against the builtin `sniper`: no self-play, no snapshot pool. This is the
+# low-variance setting for measuring learner progress against a stationary
+# opponent (see OpponentsCfg docstring). Train from scratch — pass no `--load`.
+
+run:
+  name: ppo_sniper
+  seed: 0
+  device: cuda
+  compile_mode: reduce-overhead
+  log_root: runs
+  ckpt_root: checkpoints
+  total_updates: 1000
+
+game:
+  num_players: 2
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  dim: 128
+  ff_dim: 256
+  depth: 3
+  n_heads: 4
+  n_kv_heads: 1
+  dropout: 0.0
+  # Faithful nGPT defaults (gentle cold start). The "old-block" residual profile
+  # lives in configs/ppo_sniper_oldblock.yaml.
+  planet_rope_fraction: 0.25
+  planet_rope_base: 10000.0
+  encoder_backend: fleet_latent
+  num_fleet_latents: 64
+  fleet_tokenizer_depth: 1
+  value_min: -100000.0
+  value_max: 100000.0
+  value_num_bins: 153
+  critic_mtp_horizon: 6
+  value_symlog: true
+
+optim:
+  muon_lr: 0.022
+  lr: 3.0e-4
+  head_lr: 3.0e-4
+  control_lr: 3.0e-4    # reference-faithful: nGPT trains the hypersphere scalars
+                        # (sqk/suv/alpha) at the SAME base AdamW lr as everything
+                        # else — there is no separate fast "control" group. The
+                        # old 0.02 (≈67x lr, to "match muon_lr") over-drove the
+                        # gating scalars: their gain ran away until the PPO trust
+                        # region snapped (KL blowup ~u150 even at 0.01 ≈33x). A
+                        # Muon step (orthogonalized, bounded) is NOT comparable to
+                        # an AdamW scalar step, so matching muon_lr was the bug.
+                        # Knob: raise toward lr×2-3 if the scalars learn too slow.
+  lr_warmup_steps: 200   # ramp all LRs over ~3-6 updates — kills the update-0
+                         # cold-start KL spike (uncalibrated AdamW × control_lr).
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  minibatch_size: 4096
+  epochs_per_update: 4
+
+ppo:
+  gamma: 0.997
+  gae_lambda: 0.95
+  advantage_transform: rankgauss
+  norm_advantage: true
+  spo_eps_low: 0.4
+  spo_eps_high: 0.56
+  value_coef: 1.0
+  target_entropy_coef: 0.01
+  fraction_entropy_coef: 0.0
+  pretrain_updates: 0
+  pretrain_episodes: 32
+  pretrain_lr: 1.0e-3
+  pretrain_behavior: heuristic
+
+rollout:
+  num_envs: 128
+  num_workers: 0
+  env_backend: rust
+
+opponents:
+  mode: fixed              # stationary: no self-play, no snapshot pool
+  fixed_opponents:
+    - sniper
+  # snapshot_every / top_k / self_play_prob are ignored in fixed mode.
+  snapshot_device: train
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+reward:
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
+  draw_value: 0.0
+  margin_scale: 0.0

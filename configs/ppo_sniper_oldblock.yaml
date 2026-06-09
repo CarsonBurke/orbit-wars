@@ -1,0 +1,91 @@
+# PPO vs. a fixed sniper opponent — "old-block" residual profile on nGPT.
+#
+# Identical to ppo_sniper.yaml except the model uses the full-strength residual
+# profile (the old pre-nGPT block, re-expressed faithfully on the hypersphere):
+#   - eigen_alpha_init: 0.5  — full residual add (α=0.5 ≡ justnorm(x̂+â))
+#   - qk_gain_init: 5.0      — sharp attention (≡ parameter-golf q_gain=5)
+#   - block_skip: true       — learnable per-channel U-net skip toward x0 (resid_mix)
+# Train from scratch — pass no `--load`.
+
+run:
+  name: ppo_sniper_oldblock
+  seed: 0
+  device: cuda
+  compile_mode: reduce-overhead
+  log_root: runs
+  ckpt_root: checkpoints
+  total_updates: 1000
+
+game:
+  num_players: 2
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  dim: 128
+  ff_dim: 256
+  depth: 3
+  n_heads: 4
+  n_kv_heads: 1
+  dropout: 0.0
+  eigen_alpha_init: 0.5
+  qk_gain_init: 5.0
+  block_skip: true
+  planet_rope_fraction: 0.25
+  planet_rope_base: 10000.0
+  encoder_backend: fleet_latent
+  num_fleet_latents: 64
+  fleet_tokenizer_depth: 1
+  value_min: -100000.0
+  value_max: 100000.0
+  value_num_bins: 153
+  critic_mtp_horizon: 6
+  value_symlog: true
+
+optim:
+  muon_lr: 0.022
+  lr: 3.0e-4
+  head_lr: 3.0e-4
+  control_lr: 0.02
+  lr_warmup_steps: 200   # cold-start KL guard (see ppo_sniper.yaml)
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  minibatch_size: 4096
+  epochs_per_update: 4
+
+ppo:
+  gamma: 0.997
+  gae_lambda: 0.95
+  advantage_transform: rankgauss
+  norm_advantage: true
+  spo_eps_low: 0.4
+  spo_eps_high: 0.56
+  value_coef: 1.0
+  target_entropy_coef: 0.01
+  fraction_entropy_coef: 0.0
+  pretrain_updates: 0
+  pretrain_episodes: 32
+  pretrain_lr: 1.0e-3
+  pretrain_behavior: heuristic
+
+rollout:
+  num_envs: 128
+  num_workers: 0
+  env_backend: rust
+
+opponents:
+  mode: fixed
+  fixed_opponents:
+    - sniper
+  snapshot_device: train
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+reward:
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
+  draw_value: 0.0
+  margin_scale: 0.0
