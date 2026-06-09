@@ -69,6 +69,8 @@ from .model import (
     Rotary2D,
     SquaredReLU,
     TransformerBlock,
+    justnorm,
+    normalize_matrices,
 )
 
 _PLANET_XY_SCALE: float = 100.0
@@ -156,13 +158,15 @@ class SACEncoder(nn.Module):
                 num_latents=cfg.num_fleet_latents,
                 depth=cfg.fleet_tokenizer_depth,
                 dropout=cfg.dropout,
+                eigen_alpha_init=cfg.eigen_alpha_init,
+                qk_gain_init=cfg.qk_gain_init,
+                block_skip=cfg.block_skip,
             )
             if cfg.encoder_backend == "fleet_latent"
             else None
         )
         self.summary_token = nn.Parameter(torch.zeros(cfg.dim))
         nn.init.trunc_normal_(self.summary_token, std=0.02)
-        self.embed_norm = nn.RMSNorm(cfg.dim, elementwise_affine=False)
         head_dim = cfg.dim // cfg.n_heads
         self.planet_rope = Rotary2D(
             head_dim,
@@ -178,11 +182,13 @@ class SACEncoder(nn.Module):
                     cfg.dropout,
                     n_kv_heads=cfg.n_kv_heads,
                     layer_idx=i,
+                    eigen_alpha_init=cfg.eigen_alpha_init,
+                    qk_gain_init=cfg.qk_gain_init,
+                    block_skip=cfg.block_skip,
                 )
                 for i in range(cfg.depth)
             ]
         )
-        self.final_norm = nn.RMSNorm(cfg.dim, elementwise_affine=False)
         # Global time FiLM. The reward is a production-margin LEVEL, so the
         # value-to-go = Σ_{k≥t} γ^{k−t}·prod_margin shrinks as the remaining
         # horizon shortens — a dependence on the game clock that is NOT in the
@@ -201,6 +207,9 @@ class SACEncoder(nn.Module):
         )
         nn.init.zeros_(self.time_film[-1].weight)
         nn.init.zeros_(self.time_film[-1].bias)
+        # Put the encoder trunk matrices on the hypersphere at init (nGPT);
+        # the SAC trainer re-normalizes after each optimizer step.
+        normalize_matrices(self)
 
     def _embed(
         self,
@@ -247,7 +256,9 @@ class SACEncoder(nn.Module):
 
         summary_t = self.summary_token.view(1, 1, -1).expand(b, 1, -1)
         h = torch.cat([summary_t, h_p, h_f], dim=1)
-        h = self.embed_norm(h)
+        # Project the residual-stream entry point onto the unit hypersphere
+        # (nGPT). Padded slots are normed too (eps-safe) but masked in attention.
+        h = justnorm(h)
         summary_mask = torch.ones(b, 1, dtype=torch.bool, device=planet_mask.device)
         full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
 
@@ -266,17 +277,20 @@ class SACEncoder(nn.Module):
         h, full_mask, planet_mask, fleet_mask, planet_slice, p, _f, rope_cache = (
             self._embed(feats, action_feats)
         )
+        # Block-stack input for the per-block U-net skip (no-op unless block_skip).
         x0 = h
         for layer in self.layers:
             h = layer(
                 h,
-                x0,
                 full_mask,
+                x0=x0,
                 rope=self.planet_rope,
                 rope_cache=rope_cache,
                 rope_slice=planet_slice,
             )
-        h = self.final_norm(h)
+        # Each block already ends on the sphere; final justnorm makes the head
+        # inputs explicitly unit-norm.
+        h = justnorm(h)
         summary_h = h[:, 0]
         planet_h = h[:, 1 : 1 + p]
         if time_feat is not None:

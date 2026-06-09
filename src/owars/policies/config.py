@@ -42,6 +42,22 @@ class OrbitPolicyConfig:
     # set to `1` for MQA or another divisor of `n_heads` for GQA.
     n_kv_heads: int | None = None
     dropout: float = 0.0
+    # nGPT residual / attention init profile. Defaults are the faithful nGPT
+    # values (gentle cold start: each sublayer contributes a small geodesic
+    # step, soft attention). The "old-block" residual profile is opt-in:
+    #   - eigen_alpha_init=0.5  — full-strength residual. α=0.5 makes the eigen
+    #     step `justnorm(x̂ + α(â−x̂))` equal `justnorm(x̂ + â)`, i.e. the old
+    #     Euclidean `x + sublayer` add projected back onto the sphere.
+    #   - qk_gain_init=5.0      — sharp attention. Sets the effective per-channel
+    #     `sqk_q` scale on the unit-norm queries to 5, reproducing the old
+    #     parameter-golf `q_gain=5` logit magnitude under the √head_dim softmax
+    #     scale (the unit-norm vs unit-RMS difference cancels exactly).
+    #   - block_skip=True       — learnable per-channel U-net skip toward the
+    #     block-stack input (the embedding), the on-sphere analog of the old
+    #     `resid_mix` x0 term. Zero-init ⇒ identity at start, learns from there.
+    eigen_alpha_init: float = 0.05
+    qk_gain_init: float = 1.0
+    block_skip: bool = False
     # Apply 2D RoPE to this fraction of each self-attention head for physical
     # planet tokens. Summary/fleet tokens keep the ordinary content attention.
     # The actual rotated width is rounded to a valid 2D pair count.

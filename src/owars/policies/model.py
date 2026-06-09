@@ -85,6 +85,70 @@ from .features import EncodedObs
 _PLANET_XY_SCALE: float = 100.0
 _PLANET_XY_OFFSET: float = 50.0
 
+# Hypersphere-normalization epsilon. nGPT's `justnorm` divides by the raw L2
+# norm with no floor (model.py:103-106), which is safe for a dense LM where
+# every token is a real embedding. Our set-transformer carries *padded* token
+# slots (planet_mask / fleet_mask) whose pre-norm vectors can be ~zero, so we
+# clamp the norm to avoid a 0/0 → NaN that would otherwise sit in padded rows
+# and poison any global op that touches them. Valid tokens are far from this
+# floor, so the projection is unaffected for them.
+_JUSTNORM_EPS: float = 1e-6
+
+
+def justnorm(x: torch.Tensor, dim: int = -1, eps: float = _JUSTNORM_EPS) -> torch.Tensor:
+    """Project `x` onto the unit hypersphere along `dim` (nGPT `justnorm`).
+
+    nGPT does the reduction in fp32 (`ngpt/model.py:103`) regardless of the
+    activation dtype, because the residual stream's geometry is the whole point
+    of the method and bf16 norm accumulation is too coarse. We mirror that and
+    cast back to the input dtype, with the padded-slot eps floor described
+    above.
+    """
+    dtype = x.dtype
+    x = x.float()
+    return (x / x.norm(p=2, dim=dim, keepdim=True).clamp_min(eps)).to(dtype)
+
+
+def eigen_residual(
+    h: torch.Tensor, update: torch.Tensor, alpha: torch.Tensor
+) -> torch.Tensor:
+    """nGPT hypersphere residual step (`ngpt/model.py:148-153`).
+
+    Both the running stream `h` and the sublayer output `update` are projected
+    to the sphere, then `h` is moved a per-channel *eigen learning rate* `alpha`
+    of the way toward `update` along the chord and re-projected:
+
+        h ← justnorm( norm(h) + alpha · (norm(update) − norm(h)) )
+
+    This replaces the additive pre-norm residual (`h + scale · sublayer`). At
+    small `alpha` the step is a near-geodesic interpolation toward the sublayer
+    direction, which is what keeps every block's output on the unit sphere.
+    `alpha` is the already-rescaled effective LR (see `_EigenAlpha`).
+    """
+    a = justnorm(h)
+    b = justnorm(update)
+    return justnorm(a + alpha * (b - a))
+
+
+class _EigenAlpha(nn.Module):
+    """Per-channel eigen learning rate with nGPT's stored/effective split.
+
+    nGPT stores `alpha` at scale `base_scale = 1/√dim` so AdamW sees a unit-ish
+    gradient regime, then rescales to the *effective* value
+    `|alpha · (init_value / base_scale)|` in the forward (`ngpt/model.py:88,
+    145-146`). The `abs` keeps the LR non-negative. We keep the same trick so
+    these params live in the scalar/control optimizer group at a sane scale.
+    """
+
+    def __init__(self, dim: int, init_value: float, base_scale: float):
+        super().__init__()
+        self.init_value = float(init_value)
+        self.base_scale = float(base_scale)
+        self.alpha = nn.Parameter(torch.full((dim,), float(base_scale)))
+
+    def forward(self) -> torch.Tensor:
+        return (self.alpha * (self.init_value / self.base_scale)).abs()
+
 
 class SquaredReLU(nn.Module):
     """Activation: `relu(x)²` — Primer / modded-nanogpt / parameter-golf
@@ -137,10 +201,15 @@ class CastedLinear(nn.Linear):
 # `model.bfloat16()` — small tensors with high-precision-sensitive
 # updates (per-channel residual scales, attention temperature, summary
 # tokens). Matches parameter-golf's `CONTROL_TENSOR_NAME_PATTERNS`.
+# nGPT hypersphere controls (`alpha` eigen LRs, `sqk` QK scale, `suv` MLP
+# scale) are all 1D, so the `ndim < 2` rule already keeps them fp32; they are
+# listed here for intent. `fleet_latents` is the only 2D control tensor that
+# needs the explicit name match. `q_gain`/`target_q_gain` remain for the target
+# readout's attention temperature, which is not part of the hypersphere trunk.
 _FP32_NAME_SUBSTRINGS: tuple[str, ...] = (
-    "attn_scale",
-    "ff_scale",
-    "resid_mix",
+    "alpha",
+    "sqk",
+    "suv",
     "q_gain",
     "target_q_gain",
     "actor_token",
@@ -170,6 +239,29 @@ def restore_fp32_params(model: nn.Module) -> None:
         )
         if wants_fp32 and param.dtype != torch.float32:
             param.data = param.data.float()
+
+
+def normalize_matrices(model: nn.Module) -> None:
+    """Re-project every hypersphere-trunk matrix onto the unit sphere.
+
+    nGPT keeps its weight matrices on the hypersphere by renormalizing them
+    once at init and after every optimizer step (`ngpt/train.py:410-411,
+    499-500`). Each `SelfAttention` / `CrossAttention` / `TransformerBlock`
+    owns the row/column axis convention for its own matrices via
+    `normalize_weights`; we walk the module tree and invoke them. Task heads
+    (the target-attention readout, the Beta-fraction and distributional value
+    heads, the input feature embeddings) are deliberately NOT normalized — the
+    hypersphere is a property of the encoder trunk, not the readouts.
+
+    Operates in-place on the fp32 master weights (`CastedLinear` keeps weights
+    fp32 after `restore_fp32_params`), so it composes with the bf16-compute
+    path. Cheap: a handful of small `norm` reductions, no matmuls. Call it
+    after each `optimizer.step()` in the training loop.
+    """
+    for module in model.modules():
+        normalize = getattr(module, "normalize_weights", None)
+        if callable(normalize):
+            normalize()
 
 
 class Rotary2D(nn.Module):
@@ -322,26 +414,29 @@ def _splice_rope(
 
 
 class SelfAttention(nn.Module):
-    """Multi-head self-attention with QK-norm + per-head q_gain.
+    """Multi-head self-attention with nGPT hypersphere QK normalization.
 
-    parameter-golf pattern (`sota_train_gpt.py:CausalSelfAttention`):
+    nGPT pattern (`ngpt/model.py:128-136`):
       1. Project x → Q, K, V.
-      2. **RMSNorm Q and K per-head** along the head-dim. Pins ‖q_h‖ and
-         ‖k_h‖ to fixed magnitude so attention-logit magnitude does not
-         drift as the QKV projections move under Muon (or any optimizer).
-      3. Multiply Q by per-head learnable `q_gain` (init=5). This is the
-         *attention temperature*: high gain → sharp softmax, low → flat.
-      4. SDPA on dense padded tokens with a key mask.
-      5. Output projection (zero-init for cold-start identity).
+      2. Apply RoPE to Q/K (here: only the physical planet-token slice).
+      3. **Unit-normalize Q and K per head** onto the hypersphere
+         (`justnorm`), then scale per channel by the learnable `sqk`. Pins
+         ‖q_h‖,‖k_h‖ to a learned magnitude so logit scale doesn't drift as
+         the QKV matrices (kept on the sphere by `normalize_matrices`) move.
+      4. SDPA with `softmax_scale = √head_dim` (nGPT inverts the usual
+         `1/√head_dim`: with unit-norm q,k the raw dot is in [−1,1], so the
+         softmax needs scaling *up*, not down).
+      5. Output projection — normalized like every trunk matrix; cold-start
+         smallness comes from the eigen-LR `alpha`, not a zero-init here.
     """
 
     def __init__(
         self,
         dim: int,
         n_heads: int,
-        qk_gain_init: float = 5.0,
         *,
         n_kv_heads: int | None = None,
+        qk_gain_init: float = 1.0,
     ):
         super().__init__()
         n_kv_heads, head_dim, kv_dim = normalize_attention_config(
@@ -350,30 +445,45 @@ class SelfAttention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
-        # Three separate Q/K/V projections (parameter-golf style).
+        self.base_scale = dim**-0.5
+        # Three separate Q/K/V projections (nGPT keeps them split).
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.out_proj = CastedLinear(dim, dim, bias=False)
-        # Per-head scalar gain on Q after RMSNorm — sets the attention
-        # softmax temperature. Init 5.0 ≈ parameter-golf's `qk_gain_init`.
-        self.q_gain = nn.Parameter(torch.full((n_heads,), float(qk_gain_init)))
-        # Orthogonal init for Q/K/V projections (parameter-golf
-        # `_init_weights`, sota_train_gpt.py:146 — applied to every Linear
-        # with both dims ≥64 that isn't `_zero_init`). At spectral norm 1
-        # the relative perturbation per Muon NS5 step is `lr` (= 0.02 in
-        # our default), vs. 2× larger from PyTorch's kaiming_uniform_(a=√5)
-        # whose spectral norm is ~0.5 at dim=128 — so orthogonal init
-        # halves first-step log-prob drift.
-        nn.init.orthogonal_(self.c_q.weight, gain=0.1)
-        nn.init.orthogonal_(self.c_k.weight, gain=0.1)
-        nn.init.orthogonal_(self.c_v.weight, gain=0.1)
-        # Zero-init output projection — see block-level docstring on
-        # cold-start identity. Wins over orthogonal because it's *after*.
-        # No bias (parameter-golf: every Linear is `bias=False`); the bias
-        # would be a per-channel drift channel with no upside since the
-        # residual already adds zero contribution at cold-start.
-        nn.init.zeros_(self.out_proj.weight)
+        # Per-channel QK scale on the unit-normed Q/K (nGPT `sqk`, stored at
+        # `base_scale` so the effective value is `stored / base_scale`). The
+        # query scale carries the sharp-attention gain: effective `sqk_q` =
+        # `qk_gain_init` (1.0 = nGPT-soft, 5.0 = old `q_gain`), applied to Q
+        # only — exactly like the old block — so logits scale by the gain, not
+        # its square. K stays at effective 1.0. GQA gives Q and K different
+        # head counts, so they carry separate scales.
+        self.sqk_q = nn.Parameter(
+            torch.full((dim,), float(self.base_scale * qk_gain_init))
+        )
+        self.sqk_k = nn.Parameter(torch.full((kv_dim,), float(self.base_scale)))
+        # Init is largely vacuous: `normalize_matrices` projects every row/col
+        # of these matrices onto the unit sphere at build and after each
+        # optimizer step, so only the direction (not the gain) survives.
+        nn.init.orthogonal_(self.c_q.weight)
+        nn.init.orthogonal_(self.c_k.weight)
+        nn.init.orthogonal_(self.c_v.weight)
+        nn.init.orthogonal_(self.out_proj.weight)
+
+    def normalize_weights(self) -> None:
+        """Project the four projection matrices back onto the hypersphere.
+
+        Q/K/V read the unit-norm stream, so each output row's input-weight
+        vector is normed along the input dim (`dim=1`, nGPT
+        `train.py:402-404`). The output projection writes the stream, so each
+        input column is normed along the output dim (`dim=0`,
+        `train.py:405`).
+        """
+        with torch.no_grad():
+            self.c_q.weight.copy_(justnorm(self.c_q.weight, dim=1))
+            self.c_k.weight.copy_(justnorm(self.c_k.weight, dim=1))
+            self.c_v.weight.copy_(justnorm(self.c_v.weight, dim=1))
+            self.out_proj.weight.copy_(justnorm(self.out_proj.weight, dim=0))
 
     def forward(
         self,
@@ -385,24 +495,31 @@ class SelfAttention(nn.Module):
         rope_slice: slice | None = None,
     ) -> torch.Tensor:
         # `x` is a dense padded tensor [B, T, D] with `valid_mask=True` for
-        # real tokens.
+        # real tokens, already on the unit hypersphere.
         q = self.c_q(x).unflatten(-1, (self.n_heads, self.head_dim))
         k = self.c_k(x).unflatten(-1, (self.n_kv_heads, self.head_dim))
         v = self.c_v(x).unflatten(-1, (self.n_kv_heads, self.head_dim))
-        q = F.rms_norm(q, (self.head_dim,))
-        k = F.rms_norm(k, (self.head_dim,))
+        # RoPE first (nGPT order): it's a per-pair rotation, so it preserves
+        # the per-head norm that `justnorm` then pins.
         if rope is not None and rope_cache is not None and rope_slice is not None:
             q_planet, k_planet = rope(q[:, rope_slice], k[:, rope_slice], rope_cache)
             q = _splice_rope(q, q_planet, rope_slice, rope.rotate_dim)
             k = _splice_rope(k, k_planet, rope_slice, rope.rotate_dim)
-        q = q * self.q_gain.to(q.dtype)[None, None, :, None]
-        # SDPA expects [B, H, j, head_dim]. Caller is responsible for
-        # bf16 autocast on CUDA — that's what enables FA-2 dispatch.
-        # Putting an inner autocast or `sdpa_kernel` here breaks AOT
-        # autograd under `torch.compile` (see parameter-golf
-        # `sota_train_gpt.py`: outer autocast around the whole training step,
-        # no inner contexts).
-        # On CPU SDPA dispatches to the math kernel — used only by tests.
+        # Hypersphere QK: unit-norm per head, then per-channel `sqk` scale.
+        sqk_q = (self.sqk_q * (1.0 / self.base_scale)).to(q.dtype).view(
+            1, 1, self.n_heads, self.head_dim
+        )
+        sqk_k = (self.sqk_k * (1.0 / self.base_scale)).to(k.dtype).view(
+            1, 1, self.n_kv_heads, self.head_dim
+        )
+        q = sqk_q * justnorm(q)
+        k = sqk_k * justnorm(k)
+        # SDPA expects [B, H, j, head_dim]. Caller is responsible for bf16
+        # autocast on CUDA — that's what keeps the FlashAttention-2 /
+        # mem-efficient backend in play (the key-padding mask routes to the
+        # mem-efficient kernel; flash proper only fires for unmasked rows).
+        # No inner autocast/`sdpa_kernel` context — that breaks AOT autograd
+        # under `torch.compile`. On CPU SDPA falls to the math kernel (tests).
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -415,6 +532,7 @@ class SelfAttention(nn.Module):
             v,
             attn_mask=attn_mask,
             is_causal=False,
+            scale=self.head_dim**0.5,
             enable_gqa=self.n_kv_heads != self.n_heads,
         )
         o = o.transpose(1, 2).flatten(-2)  # [B, T, H*head_dim]
@@ -428,9 +546,9 @@ class CrossAttention(nn.Module):
         self,
         dim: int,
         n_heads: int,
-        qk_gain_init: float = 1.0,
         *,
         n_kv_heads: int | None = None,
+        qk_gain_init: float = 1.0,
     ):
         super().__init__()
         n_kv_heads, head_dim, kv_dim = normalize_attention_config(
@@ -439,16 +557,30 @@ class CrossAttention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
+        self.base_scale = dim**-0.5
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.out_proj = CastedLinear(dim, dim, bias=False)
-        self.q_gain = nn.Parameter(torch.full((n_heads,), float(qk_gain_init)))
+        # Sharp-attention gain on the query scale only (see SelfAttention).
+        self.sqk_q = nn.Parameter(
+            torch.full((dim,), float(self.base_scale * qk_gain_init))
+        )
+        self.sqk_k = nn.Parameter(torch.full((kv_dim,), float(self.base_scale)))
 
-        nn.init.orthogonal_(self.c_q.weight, gain=0.1)
-        nn.init.orthogonal_(self.c_k.weight, gain=0.1)
-        nn.init.orthogonal_(self.c_v.weight, gain=0.1)
-        nn.init.zeros_(self.out_proj.weight)
+        nn.init.orthogonal_(self.c_q.weight)
+        nn.init.orthogonal_(self.c_k.weight)
+        nn.init.orthogonal_(self.c_v.weight)
+        nn.init.orthogonal_(self.out_proj.weight)
+
+    def normalize_weights(self) -> None:
+        """Project the projection matrices onto the hypersphere (see
+        `SelfAttention.normalize_weights`)."""
+        with torch.no_grad():
+            self.c_q.weight.copy_(justnorm(self.c_q.weight, dim=1))
+            self.c_k.weight.copy_(justnorm(self.c_k.weight, dim=1))
+            self.c_v.weight.copy_(justnorm(self.c_v.weight, dim=1))
+            self.out_proj.weight.copy_(justnorm(self.out_proj.weight, dim=0))
 
     def forward(
         self,
@@ -467,9 +599,15 @@ class CrossAttention(nn.Module):
         q = self.c_q(queries).unflatten(-1, (self.n_heads, self.head_dim))
         k = self.c_k(keys_values).unflatten(-1, (self.n_kv_heads, self.head_dim))
         v = self.c_v(keys_values).unflatten(-1, (self.n_kv_heads, self.head_dim))
-        q = F.rms_norm(q, (self.head_dim,))
-        k = F.rms_norm(k, (self.head_dim,))
-        q = q * self.q_gain.to(q.dtype)[None, None, :, None]
+        # Hypersphere QK: unit-norm per head, then per-channel `sqk` scale.
+        sqk_q = (self.sqk_q * (1.0 / self.base_scale)).to(q.dtype).view(
+            1, 1, self.n_heads, self.head_dim
+        )
+        sqk_k = (self.sqk_k * (1.0 / self.base_scale)).to(k.dtype).view(
+            1, 1, self.n_kv_heads, self.head_dim
+        )
+        q = sqk_q * justnorm(q)
+        k = sqk_k * justnorm(k)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -480,6 +618,7 @@ class CrossAttention(nn.Module):
             k,
             v,
             attn_mask=attn_mask,
+            scale=self.head_dim**0.5,
             enable_gqa=self.n_kv_heads != self.n_heads,
         )
         o = o.transpose(1, 2).flatten(-2)
@@ -487,6 +626,18 @@ class CrossAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
+    """nGPT normalized-transformer block (`ngpt/model.py:108-179`).
+
+    The residual stream lives on the unit hypersphere. There is no pre-norm
+    RMSNorm: each sublayer reads the already-unit-norm stream directly, and the
+    eigen-LR `eigen_residual` step both injects the sublayer output and
+    re-projects to the sphere — so the additive `attn_scale`/`ff_scale`/
+    `resid_mix` levers and the zero-init cold-start identity are gone. The FF
+    is nGPT's SwiGLU (`u · silu(v)`, `ngpt/model.py:158-164`), with nGPT's
+    per-channel `suv` scale restoring O(1) pre-activation magnitude after the
+    unit-norm input is read by the normalized `c_fc` rows.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -496,74 +647,75 @@ class TransformerBlock(nn.Module):
         *,
         n_kv_heads: int | None = None,
         layer_idx: int = 0,
+        eigen_alpha_init: float = 0.05,
+        qk_gain_init: float = 1.0,
+        block_skip: bool = False,
     ):
         super().__init__()
-        # RMSNorm without learnable affine — parameter-golf moves all
-        # per-channel scale into explicit `attn_scale`/`ff_scale`/`resid_mix`
-        # so the norm itself is a pure unit-RMS projection. LayerNorm's γ
-        # would otherwise be a free per-channel scale that competes with
-        # those explicit params and isn't routed to the scalar AdamW group.
-        self.ln1 = nn.RMSNorm(dim, elementwise_affine=False)
-        self.ln2 = nn.RMSNorm(dim, elementwise_affine=False)
-        self.attn = SelfAttention(dim, n_heads, n_kv_heads=n_kv_heads)
-        # Depth attenuation disabled (no-op constant). Was `1/√(layer+1)`
-        # following parameter-golf `Block.ln_scale_factor`, but with ortho
-        # init at gain=0.1 the residual-stream growth is already bounded
-        # by tiny step-0 weights — the depth scale was over-suppressing
-        # gradient flow into deeper layers and giving worse KL than a
-        # plain pre-norm block. Kept as an attribute (=1.0) so re-enabling
-        # is a one-line change.
-        self.ln_scale_factor = 1.0
-        self.ff = nn.Sequential(
-            CastedLinear(dim, ff_dim, bias=False),
-            SquaredReLU(),
-            CastedLinear(ff_dim, dim, bias=False),
+        self.base_scale = dim**-0.5
+        self.attn = SelfAttention(
+            dim, n_heads, n_kv_heads=n_kv_heads, qk_gain_init=qk_gain_init
         )
+        # nGPT SwiGLU FF (`ngpt/model.py:158-164`): one `c_fc` projects to
+        # 2·ff_dim, split into gate `u` and value `v`; activation is
+        # `u · silu(v)`; `mlp_proj` reads the ff_dim-wide gated result.
+        self.c_fc = CastedLinear(dim, 2 * ff_dim, bias=False)
+        self.mlp_proj = CastedLinear(ff_dim, dim, bias=False)
         self.drop = nn.Dropout(dropout)
-        # Orthogonal init for the input projection (both dims ≥64 →
-        # parameter-golf init policy). Output projection is zero-init
-        # for the cold-start identity property and wins over orthogonal
-        # because the zeros_ runs after.
-        nn.init.orthogonal_(self.ff[0].weight, gain=0.1)
-        # Zero-init the FF output projection. Attn already zero-inits its
-        # own out_proj inside `SelfAttention.__init__`. Combined with
-        # `resid_mix=(1, 0)` and `attn_scale=ff_scale=1`, each block is an
-        # exact identity at step 0 — the residual stream carries
-        # `embed_norm(embeds)` through unchanged.
-        nn.init.zeros_(self.ff[-1].weight)
-        # Per-channel learnable residual scaling on each branch
-        # (parameter-golf `Block.attn_scale/mlp_scale`, sota_train_gpt.py:111).
-        # Ones-init → identity to a vanilla pre-norm block at step 0, but the
-        # optimizer can learn to attenuate each residual branch per channel.
-        self.attn_scale = nn.Parameter(torch.ones(dim))
-        self.ff_scale = nn.Parameter(torch.ones(dim))
-        # Per-channel learnable mix between the current residual stream `x`
-        # and the original block-stack input `x0` (parameter-golf `resid_mix`,
-        # sota_train_gpt.py:111). Initialized to (1, 0) so the block sees `x`
-        # unchanged at step 0. Lets each block independently re-mix the
-        # un-transformed embedding stream when middle layers dominate norms.
-        self.resid_mix = nn.Parameter(
-            torch.stack([torch.ones(dim), torch.zeros(dim)])
+        # Init is vacuous post-`normalize_weights` (rows/cols are re-projected
+        # onto the sphere); orthogonal just gives a well-conditioned direction.
+        nn.init.orthogonal_(self.c_fc.weight)
+        nn.init.orthogonal_(self.mlp_proj.weight)
+        # Per-channel pre-activation scale (nGPT `suv`, init 1.0 via the ×√dim
+        # split), applied to the full 2·ff_dim `uv` before the gate split. The
+        # √dim factor undoes the 1/√dim shrink from a unit-norm input hitting a
+        # unit-norm `c_fc` row, so the SwiGLU pre-activation is O(1).
+        self.suv = nn.Parameter(torch.ones(2 * ff_dim))
+        self.suv_scale = float(dim**0.5)
+        # Eigen learning rates — per-channel geodesic step size for each
+        # sublayer's hypersphere residual update (nGPT init 0.05; 0.5 gives the
+        # full-strength residual add, see OrbitPolicyConfig).
+        self.attn_alpha = _EigenAlpha(
+            dim, init_value=eigen_alpha_init, base_scale=self.base_scale
         )
+        self.mlp_alpha = _EigenAlpha(
+            dim, init_value=eigen_alpha_init, base_scale=self.base_scale
+        )
+        # Optional learnable per-channel U-net skip toward the block-stack input
+        # `x0` (the on-sphere analog of parameter-golf `resid_mix`). Applied at
+        # block input as a third eigen step `justnorm(x̂ + β(x̂₀−x̂))`. Plain
+        # zero-init (not the `_EigenAlpha` stored/effective split, which is
+        # degenerate at init 0) ⇒ identity at start, signed β learnable from
+        # layer 1 on (at layer 0 `x == x0` so the step is an exact no-op).
+        self.block_skip = bool(block_skip)
+        if self.block_skip:
+            self.skip_alpha = nn.Parameter(torch.zeros(dim))
+
+    def normalize_weights(self) -> None:
+        """Project the FF matrices onto the hypersphere. `c_fc` reads the
+        unit-norm stream (norm along input `dim=1`); `mlp_proj` writes it (norm
+        along output `dim=0`). The attention matrices normalize themselves via
+        `self.attn.normalize_weights()`."""
+        with torch.no_grad():
+            self.c_fc.weight.copy_(justnorm(self.c_fc.weight, dim=1))
+            self.mlp_proj.weight.copy_(justnorm(self.mlp_proj.weight, dim=0))
 
     def forward(
         self,
         x: torch.Tensor,
-        x0: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
         *,
+        x0: torch.Tensor | None = None,
         rope: Rotary2D | None = None,
         rope_cache: Rotary2DCache | None = None,
         rope_slice: slice | None = None,
     ) -> torch.Tensor:
-        # `x` and `x0` are dense padded [B, T, D]. Cast scale/mix params to
-        # activation dtype to keep the bf16 residual path bf16 (see
-        # parameter-golf `sota_train_gpt.py`).
-        dt = x.dtype
-        mix = self.resid_mix.to(dt)
-        x_in = mix[0] * x + mix[1] * x0
+        # `x` is a dense padded [B, T, D] on the unit hypersphere.
+        # Optional U-net skip toward the block-stack input before the sublayers.
+        if self.block_skip and x0 is not None:
+            x = eigen_residual(x, x0, self.skip_alpha.to(x.dtype))
         a = self.attn(
-            self.ln1(x_in) * self.ln_scale_factor,
+            x,
             valid_mask,
             rope=rope,
             rope_cache=rope_cache,
@@ -571,11 +723,14 @@ class TransformerBlock(nn.Module):
         )
         if self.drop.p:
             a = self.drop(a)
-        x = x_in + self.attn_scale.to(dt) * a
-        ff = self.ff(self.ln2(x) * self.ln_scale_factor)
+        x = eigen_residual(x, a, self.attn_alpha().to(x.dtype))
+        suv = (self.suv * self.suv_scale).to(x.dtype)
+        uv = suv * self.c_fc(x)
+        u, v = uv.chunk(2, dim=-1)
+        ff = self.mlp_proj(u * F.silu(v))
         if self.drop.p:
             ff = self.drop(ff)
-        x = x + self.ff_scale.to(dt) * ff
+        x = eigen_residual(x, ff, self.mlp_alpha().to(x.dtype))
         return x
 
 
@@ -595,12 +750,20 @@ class FleetLatentBlock(nn.Module):
         *,
         n_kv_heads: int | None = None,
         layer_idx: int = 0,
+        eigen_alpha_init: float = 0.05,
+        qk_gain_init: float = 1.0,
+        block_skip: bool = False,
     ):
         super().__init__()
-        self.latent_norm = nn.RMSNorm(dim, elementwise_affine=False)
-        self.fleet_norm = nn.RMSNorm(dim, elementwise_affine=False)
-        self.cross_attn = CrossAttention(dim, n_heads, n_kv_heads=n_kv_heads)
-        self.cross_scale = nn.Parameter(torch.ones(dim))
+        self.base_scale = dim**-0.5
+        self.cross_attn = CrossAttention(
+            dim, n_heads, n_kv_heads=n_kv_heads, qk_gain_init=qk_gain_init
+        )
+        # Eigen-LR for the cross-attention hypersphere residual (nGPT init 0.05;
+        # 0.5 gives the full-strength residual add).
+        self.cross_alpha = _EigenAlpha(
+            dim, init_value=eigen_alpha_init, base_scale=self.base_scale
+        )
         self.self_block = TransformerBlock(
             dim,
             ff_dim,
@@ -608,6 +771,9 @@ class FleetLatentBlock(nn.Module):
             dropout,
             n_kv_heads=n_kv_heads,
             layer_idx=layer_idx,
+            eigen_alpha_init=eigen_alpha_init,
+            qk_gain_init=qk_gain_init,
+            block_skip=block_skip,
         )
 
     def forward(
@@ -615,15 +781,16 @@ class FleetLatentBlock(nn.Module):
         latents: torch.Tensor,
         fleets: torch.Tensor,
         fleet_mask: torch.Tensor,
-        x0: torch.Tensor,
+        *,
+        latents0: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        dt = latents.dtype
-        latents = latents + self.cross_scale.to(dt) * self.cross_attn(
-            self.latent_norm(latents),
-            self.fleet_norm(fleets),
-            fleet_mask,
-        )
-        return self.self_block(latents, x0)
+        # Latents and fleets are already on the hypersphere; cross-attention
+        # justnorms Q/K internally, then the eigen-LR step injects the result
+        # and re-projects the latents onto the sphere. `latents0` is the
+        # tokenizer's block-stack input, fed to the self-block's U-net skip.
+        cross = self.cross_attn(latents, fleets, fleet_mask)
+        latents = eigen_residual(latents, cross, self.cross_alpha().to(latents.dtype))
+        return self.self_block(latents, x0=latents0)
 
 
 class FleetLatentTokenizer(nn.Module):
@@ -639,6 +806,9 @@ class FleetLatentTokenizer(nn.Module):
         dropout: float = 0.0,
         *,
         n_kv_heads: int | None = None,
+        eigen_alpha_init: float = 0.05,
+        qk_gain_init: float = 1.0,
+        block_skip: bool = False,
     ):
         super().__init__()
         if num_latents < 1:
@@ -648,7 +818,6 @@ class FleetLatentTokenizer(nn.Module):
         self.num_latents = num_latents
         self.fleet_latents = nn.Parameter(torch.zeros(num_latents, dim))
         nn.init.trunc_normal_(self.fleet_latents, std=0.02)
-        self.input_norm = nn.RMSNorm(dim, elementwise_affine=False)
         self.layers = nn.ModuleList(
             [
                 FleetLatentBlock(
@@ -658,21 +827,29 @@ class FleetLatentTokenizer(nn.Module):
                     dropout,
                     n_kv_heads=n_kv_heads,
                     layer_idx=i,
+                    eigen_alpha_init=eigen_alpha_init,
+                    qk_gain_init=qk_gain_init,
+                    block_skip=block_skip,
                 )
                 for i in range(depth)
             ]
         )
-        self.final_norm = nn.RMSNorm(dim, elementwise_affine=False)
 
     def forward(self, fleets: torch.Tensor, fleet_mask: torch.Tensor) -> torch.Tensor:
         b = fleets.shape[0]
-        fleets = self.input_norm(fleets)
+        # Put fleet tokens and latents on the hypersphere before the Perceiver
+        # blocks; padded fleet slots are zeroed (justnorm's eps floor keeps the
+        # projection finite for near-zero pad vectors first).
+        fleets = justnorm(fleets)
         fleets = fleets.masked_fill(~fleet_mask.unsqueeze(-1), 0.0)
-        latents = self.fleet_latents.view(1, self.num_latents, -1).expand(b, -1, -1)
-        x0 = latents
+        latents = justnorm(self.fleet_latents).view(1, self.num_latents, -1).expand(
+            b, -1, -1
+        )
+        # Block-stack input for the per-block U-net skip (no-op unless block_skip).
+        latents0 = latents
         for layer in self.layers:
-            latents = layer(latents, fleets, fleet_mask, x0)
-        return self.final_norm(latents)
+            latents = layer(latents, fleets, fleet_mask, latents0=latents0)
+        return justnorm(latents)
 
 
 # Beta samples live on an open interval. Clamp sampled fractions off exactly
@@ -805,6 +982,9 @@ class OrbitPolicy(nn.Module):
                 num_latents=cfg.num_fleet_latents,
                 depth=cfg.fleet_tokenizer_depth,
                 dropout=cfg.dropout,
+                eigen_alpha_init=cfg.eigen_alpha_init,
+                qk_gain_init=cfg.qk_gain_init,
+                block_skip=cfg.block_skip,
             )
             if cfg.encoder_backend == "fleet_latent"
             else None
@@ -820,11 +1000,6 @@ class OrbitPolicy(nn.Module):
         self.critic_token = nn.Parameter(torch.zeros(cfg.dim))
         nn.init.trunc_normal_(self.actor_token, std=0.02)
         nn.init.trunc_normal_(self.critic_token, std=0.02)
-        # Embed-LN normalizes the residual-stream entry point. The per-token
-        # embeddings (planet_embed, fleet_embed) and the two summary tokens
-        # have heterogeneous scales, so a single LN here gives every block
-        # the same input regime and stabilizes resid_mix's `x0` reference.
-        self.embed_norm = nn.RMSNorm(cfg.dim, elementwise_affine=False)
         head_dim = cfg.dim // cfg.n_heads
         self.planet_rope = Rotary2D(
             head_dim,
@@ -840,15 +1015,13 @@ class OrbitPolicy(nn.Module):
                     cfg.dropout,
                     n_kv_heads=cfg.n_kv_heads,
                     layer_idx=i,
+                    eigen_alpha_init=cfg.eigen_alpha_init,
+                    qk_gain_init=cfg.qk_gain_init,
+                    block_skip=cfg.block_skip,
                 )
                 for i in range(cfg.depth)
             ]
         )
-        # Final-LN — standard for pre-norm transformers. Without it the
-        # residual stream's scale grows ~unbounded (every block adds; nothing
-        # normalizes the running sum), and downstream linear heads see
-        # depth-dependent activation magnitudes.
-        self.final_norm = nn.RMSNorm(cfg.dim, elementwise_affine=False)
         # `target_query` consumes [planet_h || h_actor] → 2·dim. `target_key`
         # stays at `dim` because adding the same h_actor to every key shifts
         # all `q·k` row-wise by a constant and cancels in the softmax — it
@@ -942,6 +1115,9 @@ class OrbitPolicy(nn.Module):
             torch.eye(MAX_PLANETS, dtype=torch.bool),
             persistent=False,
         )
+        # Put the trunk matrices on the hypersphere at init (nGPT
+        # `train.py:410-411`); the training loop re-normalizes after each step.
+        normalize_matrices(self)
 
     def _embed_tokens(
         self, feats: EncodedObs
@@ -993,10 +1169,10 @@ class OrbitPolicy(nn.Module):
         actor_t = self.actor_token.view(1, 1, -1).expand(b, 1, -1)
         critic_t = self.critic_token.view(1, 1, -1).expand(b, 1, -1)
         h = torch.cat([actor_t, critic_t, h_p, h_f], dim=1)
-        # Normalize the residual-stream entry point. embed_norm runs on
-        # padded `[B, T, D]` since LN is per-token — padded positions are
-        # normalized too; masks make padded tokens inert in attention.
-        h = self.embed_norm(h)
+        # Project the residual-stream entry point onto the unit hypersphere
+        # (nGPT). Runs on padded `[B, T, D]` — padded slots are normed too
+        # (eps-safe) but masks keep them inert in attention.
+        h = justnorm(h)
         summary_mask = torch.ones(b, 2, dtype=torch.bool, device=planet_mask.device)
         full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
         # Planet features store centered normalized coordinates:
@@ -1039,17 +1215,20 @@ class OrbitPolicy(nn.Module):
         attention work on padded slots to avoid NestedTensor Python subclass
         dispatch and jagged pack/unpack overhead.
         """
+        # Block-stack input for the per-block U-net skip (no-op unless block_skip).
         x0 = h
         for layer in self.layers:
             h = layer(
                 h,
-                x0,
                 full_mask,
+                x0=x0,
                 rope=self.planet_rope,
                 rope_cache=rope_cache,
                 rope_slice=planet_slice,
             )
-        h = self.final_norm(h)
+        # Each block already ends on the sphere; a final justnorm makes the
+        # head inputs explicitly unit-norm regardless of accumulated drift.
+        h = justnorm(h)
         return self._split_encoded(h, planet_mask, fleet_mask, p, f)
 
     def encode(
@@ -1134,11 +1313,29 @@ class OrbitPolicy(nn.Module):
 
             # Fraction head: native-support unimodal Beta, matching the CleanRL
             # IterThink v24 / Dreamer4 beta path.
+            #
+            # RMS-norm the input first. The nGPT encoder exits on the unit L2
+            # sphere (per-element RMS ≈ 1/√d), but these single-linear heads
+            # (gain=0.01) were tuned for the old RMSNorm exit's per-element-RMS-1
+            # scale. Without restoring it the raw logit collapses by ≈√d ≈ 11×,
+            # pinning the Beta at α=β=1+softplus(0)≈1.69 (a dead, state-independent
+            # fraction) with an ≈11×-attenuated gradient it can't escape. The
+            # target categorical above is immune because it RMS-norms q/k post
+            # -projection; the value head recovers via its 2-layer MLP; this
+            # single-linear head cannot, so it needs the scale restored here.
+            # Mechanically this is a constant ×√d on the already-unit-L2 input
+            # (no learnable weight, no per-token-varying divisor for valid
+            # tokens) — it is NOT nGPT's `sz` (a learnable per-output-channel
+            # scale applied *after* the logits). We don't need `sz` here: these
+            # heads are excluded from `normalize_matrices`, so their free weight
+            # rows can absorb any output gain directly; rms_norm only restores
+            # the head-input scale the cold-start init was tuned for.
+            ctx_n = F.rms_norm(planet_with_ctx, (planet_with_ctx.size(-1),))
             fraction_alpha = 1.0 + F.softplus(
-                self.fraction_alpha_head(planet_with_ctx).squeeze(-1).float()
+                self.fraction_alpha_head(ctx_n).squeeze(-1).float()
             )
             fraction_beta = 1.0 + F.softplus(
-                self.fraction_beta_head(planet_with_ctx).squeeze(-1).float()
+                self.fraction_beta_head(ctx_n).squeeze(-1).float()
             )
         else:
             noop_logits = h_actor.new_empty((b, p), dtype=torch.float32)
@@ -1149,7 +1346,11 @@ class OrbitPolicy(nn.Module):
         if include_value:
             # Value: distributional head over the dedicated critic token.
             # Horizon 0 is V(s_t); later horizons are critic-only MTP targets.
-            value_logits = self.value_head(h_critic).view(
+            # RMS-norm the unit-L2 critic token back to the per-element-RMS-1
+            # scale the head's gain was tuned for (see the fraction head above).
+            # The MLP critic recovers without this, but restoring the scale
+            # makes its cold-start well-conditioned rather than ~11× under-driven.
+            value_logits = self.value_head(F.rms_norm(h_critic, (h_critic.size(-1),))).view(
                 b,
                 int(self.cfg.critic_mtp_horizon),
                 int(self.cfg.value_num_bins),
