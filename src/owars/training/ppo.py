@@ -1130,6 +1130,16 @@ def ppo_update(
                 )
             )
             optimizer.step()
+            # nGPT: re-project the encoder-trunk matrices onto the unit
+            # hypersphere after EVERY optimizer step (the actual nGPT invariant;
+            # `ngpt/train.py:499-500`, and `normalize_matrices`' own contract).
+            # Muon's update is ambient-additive, so each step nudges the trunk
+            # rows off the sphere; deferring re-projection to once-per-update
+            # lets that drift compound across the epochs×minibatches steps and
+            # pulls the policy away from the frozen `old_log_prob`, exploding
+            # within-update KL that ratio clipping cannot constrain. Eager —
+            # outside the compiled kernel.
+            normalize_matrices(model)
             del actor_loss, critic_loss, metrics
             actor_grad_norm_sum += actor_grad_norm.detach()
             critic_grad_norm_sum += critic_grad_norm.detach()
@@ -1148,17 +1158,6 @@ def ppo_update(
             metric_sum += metrics_for_step
             last_metrics = metrics_for_step
             n_steps += 1
-
-    # nGPT: re-project the encoder-trunk matrices onto the hypersphere ONCE per
-    # PPO update, not per minibatch. PPO freezes `old_log_prob` at the update
-    # start; re-projecting after every one of the ~epochs×minibatches optimizer
-    # steps bakes in each Muon tangential rotation and compounds undamped
-    # representation drift on the unit sphere, so by the last minibatch the
-    # policy output has moved far from `old_log_prob` → exploding within-update
-    # KL that SPO clipping can't constrain. One projection per update keeps the
-    # weights on the sphere across updates (the actual nGPT invariant) without
-    # injecting per-minibatch policy churn. Eager — outside the compiled kernel.
-    normalize_matrices(model)
 
     n_steps = max(1, n_steps)
     mean_logs = (
