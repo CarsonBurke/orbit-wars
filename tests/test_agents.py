@@ -1,6 +1,6 @@
 import math
 
-from owars.agents import HeuristicAgent, random_agent, sniper_agent
+from owars.agents import HeuristicAgent, random_agent, sniper_agent, sniper_v4_agent
 from owars.agents.learned import _FleetTargetTracker
 from owars.policies.sampling import _lead_solution
 
@@ -149,6 +149,50 @@ def test_sniper_skips_route_swept_moving_source_shot():
 def test_sniper_holds_when_weak():
     moves = sniper_agent(_obs((10, 10), (90, 90), my_ships=5, enemy_ships=20))
     assert moves == []
+
+
+def test_sniper_v4_does_not_duplicate_completed_capture():
+    obs = {
+        "player": 0,
+        "step": 0,
+        "planets": [
+            [0, 0, 10.0, 10.0, 1.0, 35, 3],
+            [1, 0, 10.0, 20.0, 1.0, 35, 3],
+            [2, -1, 40.0, 10.0, 1.0, 8, 2],
+        ],
+        "fleets": [],
+        "angular_velocity": 0.0,
+        "initial_planets": [],
+        "comet_planet_ids": [],
+        "comets": [],
+        "remainingOverageTime": 60.0,
+    }
+
+    moves = sniper_v4_agent(obs)
+
+    assert len(moves) == 1
+    assert sum(move[2] for move in moves if move[0] in {0, 1}) <= 9
+
+
+def test_sniper_v4_reserves_against_inbound_enemy_fleet():
+    obs = {
+        "player": 0,
+        "step": 0,
+        "planets": [
+            [0, 0, 20.0, 20.0, 1.0, 20, 3],
+            [1, -1, 45.0, 20.0, 1.0, 5, 2],
+        ],
+        "fleets": [
+            [9, 1, 35.0, 20.0, math.pi, 3, 15],
+        ],
+        "angular_velocity": 0.0,
+        "initial_planets": [],
+        "comet_planet_ids": [],
+        "comets": [],
+        "remainingOverageTime": 60.0,
+    }
+
+    assert sniper_v4_agent(obs) == []
 
 
 def test_heuristic_keeps_reserve():

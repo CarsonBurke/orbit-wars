@@ -22,9 +22,9 @@ from ..policies.sampling import (
     ActionContext,
     _apply_target_legal_mask,
     _batch_record_from_materialized_launch,
+    _categorical_support_launch_fraction,
     _ensure_deterministic_launch_if_idle,
     _mask_impossible_launches,
-    _categorical_support_launch_fraction,
     _policy_fraction_params,
     _sample_categorical_action,
     _sample_fraction,
@@ -115,7 +115,21 @@ def _numpy_from_tensor(tensor: torch.Tensor) -> np.ndarray:
 class RustVecEnv:
     fast_rollout = True
     supports_replay = False
-    native_builtin_opponents = frozenset({"sniper"})
+    native_builtin_opponents = frozenset(
+        {
+            "sniper",
+            "sniper_v2",
+            "sniper_v3",
+            "sniper_v4",
+            "sniper_v5",
+            "sniper_v6",
+            "sniper_v7",
+            "sniper_v8",
+            "sniper_v9",
+            "sniper_v10",
+            "sniper_v11",
+        }
+    )
 
     def __init__(
         self,
@@ -265,11 +279,9 @@ class RustVecEnv:
             elif record_rows and action_logit_softcap is None:
                 active_fields_np[record_rows, :, 1] = 1.0
             frac_np = active_fields_np[:, :, 0]
-            materialize_frac_np = _numpy_from_tensor(frac.float())
             target_legal_mask_np = active_fields_masker(row_pairs, active_fields_np)
         else:
             frac_np = _numpy_from_tensor(mask_frac.float())
-            materialize_frac_np = _numpy_from_tensor(frac.float())
         if not has_active_fields_masker and callable(active_masker):
             active_source = mask_launch.to(dtype=torch.bool)
             if deterministic_fallback:
@@ -353,7 +365,7 @@ class RustVecEnv:
                 row_pairs,
                 _numpy_from_tensor(launch.float()),
                 _numpy_from_tensor(target_idx.to(torch.int64)),
-                materialize_frac_np,
+                _numpy_from_tensor(frac.float()),
                 bool(native_actions),
             )
         actions_list = materialized["actions"]

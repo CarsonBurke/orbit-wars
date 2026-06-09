@@ -32,7 +32,19 @@ import torch
 from ..agents.heuristic import heuristic_agent
 from ..agents.learned import LearnedAgent
 from ..agents.random_agent import random_agent
-from ..agents.sniper import sniper_agent
+from ..agents.sniper import (
+    sniper_agent,
+    sniper_v2_agent,
+    sniper_v3_agent,
+    sniper_v4_agent,
+    sniper_v5_agent,
+    sniper_v6_agent,
+    sniper_v7_agent,
+    sniper_v8_agent,
+    sniper_v9_agent,
+    sniper_v10_agent,
+    sniper_v11_agent,
+)
 from ..policies.model import OrbitPolicy
 from .elo import EloTracker
 
@@ -43,6 +55,16 @@ LEARNER_NAME = "learner"
 BUILTIN: dict[str, AgentFn] = {
     "random": random_agent,
     "sniper": sniper_agent,
+    "sniper_v2": sniper_v2_agent,
+    "sniper_v3": sniper_v3_agent,
+    "sniper_v4": sniper_v4_agent,
+    "sniper_v5": sniper_v5_agent,
+    "sniper_v6": sniper_v6_agent,
+    "sniper_v7": sniper_v7_agent,
+    "sniper_v8": sniper_v8_agent,
+    "sniper_v9": sniper_v9_agent,
+    "sniper_v10": sniper_v10_agent,
+    "sniper_v11": sniper_v11_agent,
     "heuristic": heuristic_agent,
 }
 

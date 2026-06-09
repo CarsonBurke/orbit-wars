@@ -48,6 +48,53 @@ struct TargetMotion {
     positions: Option<Vec<(f64, f64)>>,
 }
 
+#[derive(Clone, Copy)]
+struct SniperProfile {
+    reserve_base: i32,
+    reserve_production: f64,
+    send_buffer: i32,
+    enemy_growth: bool,
+    enemy_value: f64,
+    neutral_value: f64,
+    production_weight: f64,
+    ship_cost_weight: f64,
+    time_cost_weight: f64,
+    duplicate_penalty: f64,
+    allow_partial: bool,
+    partial_min_fraction: f64,
+    partial_score_scale: f64,
+    net_defense_reserve: bool,
+    defense_horizon: f64,
+    contested_extra_buffer: i32,
+    contested_window: f64,
+    reinforce_owned: bool,
+    defense_arrival_slack: f64,
+    defense_score_weight: f64,
+    chronological_forecast: bool,
+    comet_max_eta: Option<f64>,
+    counter_recapture: bool,
+    recapture_min_gap: f64,
+    recapture_max_gap: f64,
+    recapture_score_weight: f64,
+    recapture_gap_cost: f64,
+    aggressive_sources: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ScoredAction {
+    target_idx: usize,
+    eta: f64,
+    score: f64,
+    action: Action,
+}
+
+#[derive(Clone, Copy)]
+struct PressureEntry {
+    eta: f64,
+    owner: i32,
+    ships: i32,
+}
+
 #[derive(Clone)]
 struct LegalMaskState {
     planet_limit: usize,
@@ -564,11 +611,24 @@ impl RustCoreVecEnv {
         rows: Vec<(usize, usize)>,
         native: bool,
     ) -> PyResult<Bound<'py, PyList>> {
-        if name != "sniper" {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unsupported native builtin opponent: {name}"
-            )));
-        }
+        let action_fn: fn(&Game, usize) -> PlayerAction = match name {
+            "sniper" => sniper_actions,
+            "sniper_v2" => sniper_v2_actions,
+            "sniper_v3" => sniper_v3_actions,
+            "sniper_v4" => sniper_v4_actions,
+            "sniper_v5" => sniper_v5_actions,
+            "sniper_v6" => sniper_v6_actions,
+            "sniper_v7" => sniper_v7_actions,
+            "sniper_v8" => sniper_v8_actions,
+            "sniper_v9" => sniper_v9_actions,
+            "sniper_v10" => sniper_v10_actions,
+            "sniper_v11" => sniper_v11_actions,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unsupported native builtin opponent: {name}"
+                )));
+            }
+        };
         for &(env_idx, player) in &rows {
             if env_idx >= self.games.len() {
                 return Err(pyo3::exceptions::PyIndexError::new_err(
@@ -584,7 +644,7 @@ impl RustCoreVecEnv {
         let games = &self.games;
         let actions = py.detach(|| {
             rows.into_par_iter()
-                .map(|(env_idx, player)| sniper_actions(&games[env_idx], player))
+                .map(|(env_idx, player)| action_fn(&games[env_idx], player))
                 .collect::<Vec<_>>()
         });
         let out = PyList::empty(py);
@@ -855,13 +915,10 @@ fn sniper_actions(game: &Game, player: usize) -> PlayerAction {
     let mut static_cols = Vec::new();
     let mut moving_cols = Vec::new();
     for (idx, planet) in game.planets.iter().enumerate() {
-        let motion = target_motion(
-            planet,
-            game.angular_velocity,
-            comet_ids
-                .as_ref()
-                .is_some_and(|ids| ids.contains(&planet.id)),
-        );
+        let is_comet = comet_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&planet.id));
+        let motion = target_motion(planet, game.angular_velocity, is_comet);
         if motion.is_orbiting {
             moving_cols.push(idx);
         } else {
@@ -910,6 +967,1165 @@ fn sniper_actions(game: &Game, player: usize) -> PlayerAction {
         }
     }
     moves
+}
+
+fn sniper_v2_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 6,
+            reserve_production: 1.2,
+            send_buffer: 2,
+            enemy_growth: true,
+            enemy_value: 2.4,
+            neutral_value: 1.35,
+            production_weight: 5.0,
+            ship_cost_weight: 0.82,
+            time_cost_weight: 0.55,
+            duplicate_penalty: 0.45,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: false,
+            defense_horizon: 35.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: false,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 7.5,
+            chronological_forecast: false,
+            comet_max_eta: None,
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v3_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 3,
+            reserve_production: 0.7,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.1,
+            neutral_value: 1.15,
+            production_weight: 5.8,
+            ship_cost_weight: 0.72,
+            time_cost_weight: 0.42,
+            duplicate_penalty: 0.30,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: false,
+            defense_horizon: 35.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: false,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 7.5,
+            chronological_forecast: false,
+            comet_max_eta: None,
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v4_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 2,
+            reserve_production: 0.5,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.4,
+            neutral_value: 1.05,
+            production_weight: 6.2,
+            ship_cost_weight: 0.68,
+            time_cost_weight: 0.35,
+            duplicate_penalty: 0.22,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: false,
+            defense_horizon: 35.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: false,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 7.5,
+            chronological_forecast: false,
+            comet_max_eta: None,
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v5_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 2,
+            reserve_production: 0.45,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.7,
+            neutral_value: 1.0,
+            production_weight: 6.6,
+            ship_cost_weight: 0.64,
+            time_cost_weight: 0.34,
+            duplicate_penalty: 0.16,
+            allow_partial: true,
+            partial_min_fraction: 0.38,
+            partial_score_scale: 0.62,
+            net_defense_reserve: false,
+            defense_horizon: 35.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: false,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 7.5,
+            chronological_forecast: false,
+            comet_max_eta: None,
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v6_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 1,
+            reserve_production: 0.35,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.55,
+            neutral_value: 1.0,
+            production_weight: 6.5,
+            ship_cost_weight: 0.66,
+            time_cost_weight: 0.34,
+            duplicate_penalty: 0.20,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: true,
+            defense_horizon: 42.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: false,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 7.5,
+            chronological_forecast: false,
+            comet_max_eta: None,
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v7_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 2,
+            reserve_production: 0.5,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.5,
+            neutral_value: 1.0,
+            production_weight: 6.4,
+            ship_cost_weight: 0.67,
+            time_cost_weight: 0.34,
+            duplicate_penalty: 0.20,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: false,
+            defense_horizon: 35.0,
+            contested_extra_buffer: 2,
+            contested_window: 2.0,
+            reinforce_owned: false,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 7.5,
+            chronological_forecast: false,
+            comet_max_eta: None,
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v8_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 1,
+            reserve_production: 0.35,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.55,
+            neutral_value: 1.0,
+            production_weight: 6.5,
+            ship_cost_weight: 0.66,
+            time_cost_weight: 0.34,
+            duplicate_penalty: 0.20,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: true,
+            defense_horizon: 42.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: true,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 9.0,
+            chronological_forecast: false,
+            comet_max_eta: None,
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v9_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 1,
+            reserve_production: 0.35,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.55,
+            neutral_value: 1.0,
+            production_weight: 6.5,
+            ship_cost_weight: 0.66,
+            time_cost_weight: 0.34,
+            duplicate_penalty: 0.20,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: true,
+            defense_horizon: 42.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: true,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 9.0,
+            chronological_forecast: true,
+            comet_max_eta: None,
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v10_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 1,
+            reserve_production: 0.35,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.55,
+            neutral_value: 1.0,
+            production_weight: 6.5,
+            ship_cost_weight: 0.66,
+            time_cost_weight: 0.34,
+            duplicate_penalty: 0.20,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: true,
+            defense_horizon: 42.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: true,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 9.0,
+            chronological_forecast: false,
+            comet_max_eta: Some(8.0),
+            counter_recapture: false,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn sniper_v11_actions(game: &Game, player: usize) -> PlayerAction {
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 1,
+            reserve_production: 0.35,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.55,
+            neutral_value: 1.0,
+            production_weight: 6.5,
+            ship_cost_weight: 0.66,
+            time_cost_weight: 0.34,
+            duplicate_penalty: 0.20,
+            allow_partial: false,
+            partial_min_fraction: 0.5,
+            partial_score_scale: 0.45,
+            net_defense_reserve: true,
+            defense_horizon: 42.0,
+            contested_extra_buffer: 0,
+            contested_window: 2.0,
+            reinforce_owned: true,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 9.0,
+            chronological_forecast: false,
+            comet_max_eta: Some(8.0),
+            counter_recapture: true,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 8.0,
+            recapture_score_weight: 6.0,
+            recapture_gap_cost: 0.25,
+            aggressive_sources: true,
+        },
+    )
+}
+
+fn scored_sniper_actions(game: &Game, player: usize, profile: SniperProfile) -> PlayerAction {
+    let player = player as i32;
+    let mut targets = game
+        .planets
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, planet)| (planet.owner >= 0 && planet.owner != player).then_some(idx))
+        .collect::<Vec<_>>();
+    targets.extend(
+        game.planets
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, planet)| (planet.owner == -1).then_some(idx)),
+    );
+    let comet_ids = comet_id_set(game);
+    let mut is_comet_by_idx = Vec::with_capacity(game.planets.len());
+    let mut blockers = Vec::with_capacity(game.planets.len());
+    let mut static_cols = Vec::new();
+    let mut moving_cols = Vec::new();
+    for (idx, planet) in game.planets.iter().enumerate() {
+        let is_comet = comet_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&planet.id));
+        let motion = target_motion(planet, game.angular_velocity, is_comet);
+        is_comet_by_idx.push(is_comet);
+        if motion.is_orbiting {
+            moving_cols.push(idx);
+        } else {
+            static_cols.push(idx);
+        }
+        blockers.push(Some(motion));
+    }
+
+    let mut sources = game
+        .planets
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, planet)| (planet.owner == player).then_some(idx))
+        .collect::<Vec<_>>();
+    if profile.aggressive_sources {
+        sources.sort_by(|&a, &b| {
+            let lhs = &game.planets[a];
+            let rhs = &game.planets[b];
+            rhs.ships
+                .cmp(&lhs.ships)
+                .then_with(|| rhs.production.cmp(&lhs.production))
+        });
+    }
+    if targets.is_empty() && sources.is_empty() {
+        return Vec::new();
+    }
+
+    let pressure = fleet_pressure(game, &blockers);
+    let mut planned_by_target: HashMap<usize, Vec<(f64, i32)>> = HashMap::new();
+    let mut moves = Vec::new();
+    for &source_idx in &sources {
+        let source = &game.planets[source_idx];
+        let mut reserve = (profile.reserve_base as f64
+            + profile.reserve_production * source.production as f64)
+            .ceil() as i32;
+        reserve += if profile.net_defense_reserve {
+            defensive_reserve(
+                &pressure,
+                source_idx,
+                source.owner,
+                source.production,
+                profile.defense_horizon,
+            )
+        } else {
+            enemy_pressure_by(&pressure, source_idx, source.owner, profile.defense_horizon)
+        };
+        let budget = source.ships - reserve;
+        if budget <= 1 {
+            continue;
+        }
+
+        let mut best: Option<ScoredAction> = None;
+        if profile.reinforce_owned {
+            for &target_idx in &sources {
+                if target_idx == source_idx {
+                    continue;
+                }
+                let planned = planned_by_target
+                    .get(&target_idx)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                if let Some(candidate) = defense_sniper_candidate(
+                    game,
+                    source,
+                    target_idx,
+                    budget,
+                    planned,
+                    &pressure,
+                    profile,
+                    &blockers,
+                    &static_cols,
+                    &moving_cols,
+                ) {
+                    if best
+                        .as_ref()
+                        .is_none_or(|current| candidate.score > current.score)
+                    {
+                        best = Some(candidate);
+                    }
+                }
+                if profile.counter_recapture {
+                    if let Some(candidate) = recapture_sniper_candidate(
+                        game,
+                        source,
+                        target_idx,
+                        budget,
+                        planned,
+                        &pressure,
+                        profile,
+                        &blockers,
+                        &static_cols,
+                        &moving_cols,
+                    ) {
+                        if best
+                            .as_ref()
+                            .is_none_or(|current| candidate.score > current.score)
+                        {
+                            best = Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        for &target_idx in &targets {
+            let planned = planned_by_target
+                .get(&target_idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let Some(candidate) = scored_sniper_candidate(
+                game,
+                player,
+                source,
+                target_idx,
+                budget,
+                planned,
+                &pressure,
+                profile,
+                &blockers,
+                &is_comet_by_idx,
+                &static_cols,
+                &moving_cols,
+            ) else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|current| candidate.score > current.score)
+            {
+                best = Some(candidate);
+            }
+        }
+
+        if let Some(choice) = best {
+            planned_by_target
+                .entry(choice.target_idx)
+                .or_default()
+                .push((choice.eta, choice.action.ships));
+            moves.push(choice.action);
+        }
+    }
+    moves
+}
+
+#[allow(clippy::too_many_arguments)]
+fn defense_sniper_candidate(
+    game: &Game,
+    source: &Planet,
+    target_idx: usize,
+    budget: i32,
+    planned: &[(f64, i32)],
+    pressure: &[Vec<PressureEntry>],
+    profile: SniperProfile,
+    blockers: &[Option<TargetMotion>],
+    static_cols: &[usize],
+    moving_cols: &[usize],
+) -> Option<ScoredAction> {
+    let target = &game.planets[target_idx];
+    let (threat_eta, mut ships_needed) = defense_need(
+        target,
+        target_idx,
+        planned,
+        pressure,
+        profile.defense_horizon,
+    )?;
+    ships_needed = ships_needed.min(budget);
+    if ships_needed <= 0 {
+        return None;
+    }
+    let speed = fleet_speed_local(ships_needed, game.ship_speed);
+    let target_motion = blockers
+        .get(target_idx)
+        .and_then(|motion| motion.as_ref())?;
+    let solution = lead_solution_cached_with_speed(source, target_motion, speed)?;
+    if solution.time > threat_eta + profile.defense_arrival_slack {
+        return None;
+    }
+    if !route_clear_to_solution_with_cols(
+        source.id,
+        target.id,
+        source.x,
+        source.y,
+        source.radius,
+        &solution,
+        speed,
+        blockers,
+        static_cols,
+        moving_cols,
+    ) {
+        return None;
+    }
+    let urgency = 1.0 + (profile.defense_horizon - threat_eta).max(0.0) / profile.defense_horizon;
+    let value = profile.defense_score_weight * urgency * (2.0 + target.production as f64);
+    let cost = ships_needed as f64 + 0.35 * solution.time.max(1.0);
+    Some(ScoredAction {
+        target_idx,
+        eta: solution.time,
+        score: value / cost.max(1.0),
+        action: Action {
+            from_planet_id: source.id,
+            angle: solution.angle,
+            ships: ships_needed,
+            target_id: target.id,
+            eta: solution.time,
+            target_x: solution.x,
+            target_y: solution.y,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recapture_sniper_candidate(
+    game: &Game,
+    source: &Planet,
+    target_idx: usize,
+    budget: i32,
+    planned: &[(f64, i32)],
+    pressure: &[Vec<PressureEntry>],
+    profile: SniperProfile,
+    blockers: &[Option<TargetMotion>],
+    static_cols: &[usize],
+    moving_cols: &[usize],
+) -> Option<ScoredAction> {
+    let target = &game.planets[target_idx];
+    let (capture_eta, captor, surplus) = project_hostile_capture(
+        target,
+        target_idx,
+        planned,
+        pressure,
+        profile.defense_horizon,
+    )?;
+    let mut ships_needed = surplus + profile.send_buffer;
+    let mut solution: Option<LeadSolution> = None;
+    for _ in 0..4 {
+        if ships_needed > budget {
+            return None;
+        }
+        let speed = fleet_speed_local(ships_needed, game.ship_speed);
+        let target_motion = blockers
+            .get(target_idx)
+            .and_then(|motion| motion.as_ref())?;
+        let candidate_solution = lead_solution_cached_with_speed(source, target_motion, speed)?;
+        let gap = candidate_solution.time - capture_eta;
+        if gap < profile.recapture_min_gap || gap > profile.recapture_max_gap {
+            return None;
+        }
+        let later_enemy = pressure_between(
+            pressure,
+            target_idx,
+            captor,
+            capture_eta,
+            candidate_solution.time,
+        );
+        let planned_recapture = planned_between(planned, capture_eta, candidate_solution.time);
+        let revised = (surplus
+            + (gap.max(0.0) * target.production as f64).floor() as i32
+            + later_enemy
+            + profile.send_buffer
+            - planned_recapture)
+            .max(1);
+        solution = Some(candidate_solution);
+        if revised == ships_needed {
+            break;
+        }
+        ships_needed = revised;
+    }
+    let solution = solution?;
+    if ships_needed > budget {
+        return None;
+    }
+    let speed = fleet_speed_local(ships_needed, game.ship_speed);
+    if !route_clear_to_solution_with_cols(
+        source.id,
+        target.id,
+        source.x,
+        source.y,
+        source.radius,
+        &solution,
+        speed,
+        blockers,
+        static_cols,
+        moving_cols,
+    ) {
+        return None;
+    }
+    let gap = solution.time - capture_eta;
+    let urgency = 1.0 + (profile.defense_horizon - capture_eta).max(0.0) / profile.defense_horizon;
+    let gap_penalty = 1.0 / (1.0 + profile.recapture_gap_cost * gap);
+    let value =
+        profile.recapture_score_weight * urgency * (2.0 + target.production as f64) * gap_penalty;
+    let cost = ships_needed as f64 + 0.35 * solution.time.max(1.0);
+    Some(ScoredAction {
+        target_idx,
+        eta: solution.time,
+        score: value / cost.max(1.0),
+        action: Action {
+            from_planet_id: source.id,
+            angle: solution.angle,
+            ships: ships_needed,
+            target_id: target.id,
+            eta: solution.time,
+            target_x: solution.x,
+            target_y: solution.y,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scored_sniper_candidate(
+    game: &Game,
+    player: i32,
+    source: &Planet,
+    target_idx: usize,
+    budget: i32,
+    planned: &[(f64, i32)],
+    pressure: &[Vec<PressureEntry>],
+    profile: SniperProfile,
+    blockers: &[Option<TargetMotion>],
+    is_comet_by_idx: &[bool],
+    static_cols: &[usize],
+    moving_cols: &[usize],
+) -> Option<ScoredAction> {
+    let target = &game.planets[target_idx];
+    let mut ships_needed = target.ships + profile.send_buffer - planned_by(planned, 0.0);
+    if ships_needed <= 0 {
+        return None;
+    }
+    let mut partial_required = ships_needed;
+    let mut partial = false;
+    let target_motion = blockers
+        .get(target_idx)
+        .and_then(|motion| motion.as_ref())?;
+    let mut last_solution: Option<(i32, f64, LeadSolution)> = None;
+    for _ in 0..4 {
+        if ships_needed > budget {
+            if !partial_allowed(ships_needed, budget, profile) {
+                return None;
+            }
+            partial_required = ships_needed;
+            ships_needed = budget;
+            partial = true;
+        }
+        let speed = fleet_speed_local(ships_needed, game.ship_speed);
+        let solution = lead_solution_cached_with_speed(source, target_motion, speed)?;
+        last_solution = Some((ships_needed, speed, solution));
+        if profile.comet_max_eta.is_some_and(|max_eta| {
+            is_comet_by_idx.get(target_idx).copied().unwrap_or(false) && solution.time > max_eta
+        }) {
+            return None;
+        }
+        let revised = ships_needed_at_eta(
+            player,
+            target_idx,
+            target,
+            solution.time,
+            planned,
+            pressure,
+            profile,
+        );
+        if revised <= 0 {
+            return None;
+        }
+        if partial && revised >= ships_needed {
+            partial_required = revised;
+            break;
+        }
+        if revised == ships_needed {
+            break;
+        }
+        ships_needed = revised;
+    }
+    if ships_needed > budget {
+        return None;
+    }
+
+    let (speed, solution) = if let Some((last_ships, last_speed, last_solution)) = last_solution
+        && last_ships == ships_needed
+    {
+        (last_speed, last_solution)
+    } else {
+        let speed = fleet_speed_local(ships_needed, game.ship_speed);
+        let solution = lead_solution_cached_with_speed(source, target_motion, speed)?;
+        (speed, solution)
+    };
+    if !route_clear_to_solution_with_cols(
+        source.id,
+        target.id,
+        source.x,
+        source.y,
+        source.radius,
+        &solution,
+        speed,
+        blockers,
+        static_cols,
+        moving_cols,
+    ) {
+        return None;
+    }
+
+    let owner_value = if target.owner == -1 {
+        profile.neutral_value
+    } else {
+        profile.enemy_value
+    };
+    let production_value =
+        owner_value * (1.0 + profile.production_weight * target.production as f64);
+    let dist = ((source.x - target.x).powi(2) + (source.y - target.y).powi(2)).sqrt();
+    let distance_bonus = 1.0 / (1.0 + 0.02 * dist);
+    let already_planned = planned_by(planned, solution.time);
+    let duplicate_scale = 1.0 / (1.0 + profile.duplicate_penalty * already_planned.max(0) as f64);
+    let cost = profile.ship_cost_weight * ships_needed.max(1) as f64
+        + profile.time_cost_weight * solution.time.max(1.0);
+    let mut score = production_value * distance_bonus * duplicate_scale / cost.max(1.0);
+    if partial {
+        score *=
+            profile.partial_score_scale * (ships_needed as f64 / partial_required.max(1) as f64);
+    }
+    Some(ScoredAction {
+        target_idx,
+        eta: solution.time,
+        score,
+        action: Action {
+            from_planet_id: source.id,
+            angle: solution.angle,
+            ships: ships_needed,
+            target_id: target.id,
+            eta: solution.time,
+            target_x: solution.x,
+            target_y: solution.y,
+        },
+    })
+}
+
+fn partial_allowed(ships_needed: i32, budget: i32, profile: SniperProfile) -> bool {
+    profile.allow_partial
+        && budget > 1
+        && budget
+            >= (ships_needed as f64 * profile.partial_min_fraction)
+                .ceil()
+                .max(2.0) as i32
+}
+
+fn ships_needed_at_eta(
+    player: i32,
+    target_idx: usize,
+    target: &Planet,
+    eta: f64,
+    planned: &[(f64, i32)],
+    pressure: &[Vec<PressureEntry>],
+    profile: SniperProfile,
+) -> i32 {
+    if profile.chronological_forecast {
+        let (owner, ships) =
+            forecast_target_state(player, target, target_idx, eta, planned, pressure);
+        if owner == player {
+            return 0;
+        }
+        return (ships + profile.send_buffer).max(0);
+    }
+
+    let friendly = planned_by(planned, eta) + pressure_by(pressure, target_idx, player, eta);
+    let contested_eta = eta + profile.contested_window;
+    let hostile = if target.owner != -1 && target.owner != player {
+        pressure_by(pressure, target_idx, target.owner, eta)
+    } else {
+        non_player_pressure_by(pressure, target_idx, player, eta)
+    };
+    let contested_hostile = if target.owner != -1 && target.owner != player {
+        pressure_by(pressure, target_idx, target.owner, contested_eta)
+    } else {
+        non_player_pressure_by(pressure, target_idx, player, contested_eta)
+    };
+    let growth = if profile.enemy_growth && target.owner != player && target.owner != -1 {
+        (target.production as f64 * eta.max(1.0)).ceil() as i32
+    } else {
+        0
+    };
+    let contested_buffer = if contested_hostile > friendly {
+        profile.contested_extra_buffer
+    } else {
+        0
+    };
+    (target.ships + growth + hostile + profile.send_buffer + contested_buffer - friendly).max(0)
+}
+
+fn forecast_target_state(
+    player: i32,
+    target: &Planet,
+    target_idx: usize,
+    eta: f64,
+    planned: &[(f64, i32)],
+    pressure: &[Vec<PressureEntry>],
+) -> (i32, i32) {
+    let horizon = eta.ceil().max(0.0) as i32;
+    let mut events: std::collections::BTreeMap<i32, HashMap<i32, i32>> =
+        std::collections::BTreeMap::new();
+    if let Some(entries) = pressure.get(target_idx) {
+        for entry in entries {
+            let turn = entry.eta.ceil() as i32;
+            if (0..=horizon).contains(&turn) {
+                *events
+                    .entry(turn)
+                    .or_default()
+                    .entry(entry.owner)
+                    .or_default() += entry.ships;
+            }
+        }
+    }
+    for (arrival, ships) in planned {
+        let turn = arrival.ceil() as i32;
+        if (0..=horizon).contains(&turn) {
+            *events.entry(turn).or_default().entry(player).or_default() += *ships;
+        }
+    }
+
+    let mut owner = target.owner;
+    let mut garrison = target.ships;
+    let mut prev_turn = 0;
+    for (turn, arrivals) in events {
+        if owner != -1 {
+            garrison += (turn - prev_turn).max(0) * target.production;
+        }
+        let (survivor_owner, survivor_ships) = resolve_arrivals(&arrivals);
+        if survivor_ships > 0 {
+            if survivor_owner == owner {
+                garrison += survivor_ships;
+            } else {
+                garrison -= survivor_ships;
+                if garrison < 0 {
+                    owner = survivor_owner;
+                    garrison = -garrison;
+                }
+            }
+        }
+        prev_turn = turn;
+    }
+    if owner != -1 {
+        garrison += (horizon - prev_turn).max(0) * target.production;
+    }
+    (owner, garrison.max(0))
+}
+
+fn resolve_arrivals(arrivals: &HashMap<i32, i32>) -> (i32, i32) {
+    let mut rows = arrivals
+        .iter()
+        .map(|(owner, ships)| (*owner, *ships))
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if rows.is_empty() {
+        return (-1, 0);
+    }
+    if rows.len() == 1 {
+        return rows[0];
+    }
+    let diff = rows[0].1 - rows[1].1;
+    if diff <= 0 {
+        (-1, 0)
+    } else {
+        (rows[0].0, diff)
+    }
+}
+
+fn planned_by(planned: &[(f64, i32)], eta: f64) -> i32 {
+    planned
+        .iter()
+        .filter_map(|(arrival, ships)| (*arrival <= eta + 1.0).then_some(*ships))
+        .sum()
+}
+
+fn pressure_by(pressure: &[Vec<PressureEntry>], target_idx: usize, owner: i32, eta: f64) -> i32 {
+    pressure
+        .get(target_idx)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| (entry.owner == owner && entry.eta <= eta + 1.0).then_some(entry.ships))
+        .sum()
+}
+
+fn non_player_pressure_by(
+    pressure: &[Vec<PressureEntry>],
+    target_idx: usize,
+    player: i32,
+    eta: f64,
+) -> i32 {
+    pressure
+        .get(target_idx)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            (entry.owner != player && entry.eta <= eta + 1.0).then_some(entry.ships)
+        })
+        .sum()
+}
+
+fn enemy_pressure_by(
+    pressure: &[Vec<PressureEntry>],
+    target_idx: usize,
+    owner: i32,
+    eta: f64,
+) -> i32 {
+    pressure
+        .get(target_idx)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| (entry.owner != owner && entry.eta <= eta + 1.0).then_some(entry.ships))
+        .sum()
+}
+
+fn defensive_reserve(
+    pressure: &[Vec<PressureEntry>],
+    target_idx: usize,
+    owner: i32,
+    production: i32,
+    eta: f64,
+) -> i32 {
+    let mut needed = 0;
+    if let Some(entries) = pressure.get(target_idx) {
+        for entry in entries {
+            if entry.owner == owner || entry.eta > eta {
+                continue;
+            }
+            let hostile = enemy_pressure_by(pressure, target_idx, owner, entry.eta);
+            let friendly = pressure_by(pressure, target_idx, owner, entry.eta);
+            let produced = (entry.eta.max(0.0) * production as f64).floor() as i32;
+            needed = needed.max(hostile - friendly - produced + 1);
+        }
+    }
+    needed.max(0)
+}
+
+fn defense_need(
+    target: &Planet,
+    target_idx: usize,
+    planned: &[(f64, i32)],
+    pressure: &[Vec<PressureEntry>],
+    horizon: f64,
+) -> Option<(f64, i32)> {
+    let mut best: Option<(f64, i32)> = None;
+    let entries = pressure.get(target_idx)?;
+    for entry in entries {
+        if entry.owner == target.owner || entry.eta > horizon {
+            continue;
+        }
+        let hostile = enemy_pressure_by(pressure, target_idx, target.owner, entry.eta);
+        let friendly = pressure_by(pressure, target_idx, target.owner, entry.eta);
+        let planned_friendly = planned_by(planned, entry.eta);
+        let produced = (entry.eta.max(0.0) * target.production as f64).floor() as i32;
+        let deficit = hostile + 1 - target.ships - produced - friendly - planned_friendly;
+        if deficit > 0 && best.is_none_or(|(arrival, _)| entry.eta < arrival) {
+            best = Some((entry.eta, deficit));
+        }
+    }
+    best
+}
+
+fn project_hostile_capture(
+    target: &Planet,
+    target_idx: usize,
+    planned: &[(f64, i32)],
+    pressure: &[Vec<PressureEntry>],
+    horizon: f64,
+) -> Option<(f64, i32, i32)> {
+    let entries = pressure.get(target_idx)?;
+    for entry in entries {
+        if entry.owner == target.owner || entry.eta > horizon {
+            continue;
+        }
+        let hostile = enemy_pressure_by(pressure, target_idx, target.owner, entry.eta);
+        let friendly = pressure_by(pressure, target_idx, target.owner, entry.eta);
+        let planned_friendly = planned_by(planned, entry.eta);
+        let produced = (entry.eta.max(0.0) * target.production as f64).floor() as i32;
+        let surplus = hostile - target.ships - produced - friendly - planned_friendly;
+        if surplus > 0 {
+            return Some((entry.eta, entry.owner, surplus));
+        }
+    }
+    None
+}
+
+fn pressure_between(
+    pressure: &[Vec<PressureEntry>],
+    target_idx: usize,
+    owner: i32,
+    start: f64,
+    end: f64,
+) -> i32 {
+    pressure
+        .get(target_idx)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            (entry.owner == owner && start < entry.eta && entry.eta <= end + 1.0)
+                .then_some(entry.ships)
+        })
+        .sum()
+}
+
+fn planned_between(planned: &[(f64, i32)], start: f64, end: f64) -> i32 {
+    planned
+        .iter()
+        .filter_map(|(arrival, ships)| {
+            (start < *arrival && *arrival <= end + 1.0).then_some(*ships)
+        })
+        .sum()
+}
+
+fn fleet_pressure(game: &Game, blockers: &[Option<TargetMotion>]) -> Vec<Vec<PressureEntry>> {
+    let mut pressure = vec![Vec::new(); game.planets.len()];
+    for fleet in &game.fleets {
+        let Some((target_idx, eta)) = inferred_fleet_target(game, fleet, blockers) else {
+            continue;
+        };
+        pressure[target_idx].push(PressureEntry {
+            eta,
+            owner: fleet.owner,
+            ships: fleet.ships,
+        });
+    }
+    for entries in &mut pressure {
+        entries.sort_by(|a, b| {
+            a.eta
+                .partial_cmp(&b.eta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    pressure
+}
+
+fn inferred_fleet_target(
+    game: &Game,
+    fleet: &owars_env::Fleet,
+    blockers: &[Option<TargetMotion>],
+) -> Option<(usize, f64)> {
+    let speed = fleet_speed_local(fleet.ships, game.ship_speed);
+    let dir_x = fleet.angle.cos();
+    let dir_y = fleet.angle.sin();
+    let mut best: Option<(f64, usize)> = None;
+    for (idx, planet) in game.planets.iter().enumerate() {
+        let Some(motion) = blockers.get(idx).and_then(|motion| motion.as_ref()) else {
+            continue;
+        };
+        let max_turns = bounded_lead_scan_turns(speed, planet.radius).max(1) as usize;
+        for turn in 1..=max_turns {
+            let old = (
+                fleet.x + dir_x * speed * (turn - 1) as f64,
+                fleet.y + dir_y * speed * (turn - 1) as f64,
+            );
+            let new = (
+                fleet.x + dir_x * speed * turn as f64,
+                fleet.y + dir_y * speed * turn as f64,
+            );
+            let pos = motion_position_at(&motion, turn - 1);
+            if point_to_segment_distance_sq_local(pos, old, new) >= (planet.radius + 0.05).powi(2) {
+                continue;
+            }
+            let eta = turn as f64;
+            if best.is_none_or(|(current_eta, _)| eta < current_eta) {
+                best = Some((eta, idx));
+            }
+            break;
+        }
+    }
+    best.map(|(eta, idx)| (idx, eta))
 }
 
 fn production_margin(game: &Game, player: usize) -> f32 {

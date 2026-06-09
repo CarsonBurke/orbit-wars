@@ -344,11 +344,28 @@ def test_rust_vec_env_step_subset_fast_rejects_duplicate_indices():
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
-def test_rust_vec_env_native_sniper_matches_python_sniper():
+@pytest.mark.parametrize(
+    ("name", "agent_name"),
+    [
+        ("sniper", "sniper_agent"),
+        ("sniper_v2", "sniper_v2_agent"),
+        ("sniper_v3", "sniper_v3_agent"),
+        ("sniper_v4", "sniper_v4_agent"),
+        ("sniper_v5", "sniper_v5_agent"),
+        ("sniper_v6", "sniper_v6_agent"),
+        ("sniper_v7", "sniper_v7_agent"),
+        ("sniper_v8", "sniper_v8_agent"),
+        ("sniper_v9", "sniper_v9_agent"),
+        ("sniper_v10", "sniper_v10_agent"),
+        ("sniper_v11", "sniper_v11_agent"),
+    ],
+)
+def test_rust_vec_env_native_sniper_matches_python_sniper(name: str, agent_name: str):
     _build_rust_extension()
-    from owars.agents.sniper import sniper_agent
+    import owars.agents.sniper as sniper_agents
     from owars.training.rust_env import RustVecEnv
 
+    agent = getattr(sniper_agents, agent_name)
     rust = RustVecEnv(
         num_envs=2,
         num_players=2,
@@ -359,10 +376,10 @@ def test_rust_vec_env_native_sniper_matches_python_sniper():
     rust.reset()
     rust.step_subset_fast([0, 1], [[[], []], [[], []]])
     rows = [(0, 0), (0, 1), (1, 0), (1, 1)]
-    native = rust.builtin_actions("sniper", rows, native_actions=False)
+    native = rust.builtin_actions(name, rows, native_actions=False)
 
     for row_actions, (env_idx, player) in zip(native, rows, strict=True):
-        expected = sniper_agent(rust.observation(env_idx, player))
+        expected = agent(rust.observation(env_idx, player))
         assert len(row_actions) == len(expected)
         for got, want in zip(row_actions, expected, strict=True):
             assert int(got[0]) == int(want[0])
