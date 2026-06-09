@@ -48,7 +48,7 @@ def test_fused_muon_matches_scalar_muon_step():
             momentum=0.9,
             backend_steps=3,
             nesterov=nesterov,
-            row_normalize=True,
+            normuon=True,
             fused=False,
             momentum_warmup_steps=2,
             momentum_warmup_start=0.8,
@@ -62,7 +62,7 @@ def test_fused_muon_matches_scalar_muon_step():
             momentum=0.9,
             backend_steps=3,
             nesterov=nesterov,
-            row_normalize=True,
+            normuon=True,
             fused=True,
             momentum_warmup_steps=2,
             momentum_warmup_start=0.8,
@@ -82,6 +82,11 @@ def test_fused_muon_matches_scalar_muon_step():
             b_scalar = scalar.state[p_scalar]["momentum_buffer"]
             b_fused = fused.state[p_fused]["momentum_buffer"]
             assert torch.allclose(b_scalar, b_fused, atol=1e-6, rtol=1e-6)
+            # NorMuon's per-neuron second-moment EMA must also stay in lockstep
+            # between the scalar and fused (bucketed) paths.
+            v_scalar = scalar.state[p_scalar]["second_momentum_buffer"]
+            v_fused = fused.state[p_fused]["second_momentum_buffer"]
+            assert torch.allclose(v_scalar, v_fused, atol=1e-6, rtol=1e-6)
 
 
 def test_muon_state_dict_preserves_warmup_step_count():

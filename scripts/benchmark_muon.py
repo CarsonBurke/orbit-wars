@@ -89,7 +89,7 @@ def _bench(
     iters: int,
     momentum: float,
     backend_steps: int,
-    row_normalize: bool,
+    normuon: bool,
 ) -> BenchResult:
     params = _all_params(groups)
     device = params[0].device
@@ -98,7 +98,7 @@ def _bench(
         lr=groups[0]["lr"],
         momentum=momentum,
         backend_steps=backend_steps,
-        row_normalize=row_normalize,
+        normuon=normuon,
         fused=fused,
     )
     total_steps = warmup + iters
@@ -132,7 +132,7 @@ def _trajectory_check(
     *,
     momentum: float,
     backend_steps: int,
-    row_normalize: bool,
+    normuon: bool,
 ) -> float:
     scalar_groups = _clone_groups(groups)
     fused_groups = _clone_groups(groups)
@@ -143,7 +143,7 @@ def _trajectory_check(
         lr=scalar_groups[0]["lr"],
         momentum=momentum,
         backend_steps=backend_steps,
-        row_normalize=row_normalize,
+        normuon=normuon,
         fused=False,
     )
     fused = Muon(
@@ -151,7 +151,7 @@ def _trajectory_check(
         lr=fused_groups[0]["lr"],
         momentum=momentum,
         backend_steps=backend_steps,
-        row_normalize=row_normalize,
+        normuon=normuon,
         fused=True,
     )
 
@@ -175,7 +175,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--backend-steps", type=int, default=5)
     parser.add_argument("--momentum", type=float, default=0.95)
-    parser.add_argument("--no-row-normalize", action="store_true")
+    parser.add_argument("--no-normuon", action="store_true")
     parser.add_argument("--trajectory-steps", type=int, default=20)
     args = parser.parse_args()
 
@@ -203,7 +203,7 @@ def main() -> None:
         iters=args.iters,
         momentum=args.momentum,
         backend_steps=args.backend_steps,
-        row_normalize=not args.no_row_normalize,
+        normuon=not args.no_normuon,
     )
     fused = _bench(
         _clone_groups(base_groups),
@@ -213,7 +213,7 @@ def main() -> None:
         iters=args.iters,
         momentum=args.momentum,
         backend_steps=args.backend_steps,
-        row_normalize=not args.no_row_normalize,
+        normuon=not args.no_normuon,
     )
     speedup = scalar.ms_per_step / fused.ms_per_step
     print(f"scalar: {scalar.ms_per_step:.4f} ms/step peak={scalar.peak_mb:.1f} MiB")
@@ -226,7 +226,7 @@ def main() -> None:
         traj_grads,
         momentum=args.momentum,
         backend_steps=args.backend_steps,
-        row_normalize=not args.no_row_normalize,
+        normuon=not args.no_normuon,
     )
     print(f"trajectory_max_abs_param_delta_vs_scalar: {max_abs:.3e}")
 

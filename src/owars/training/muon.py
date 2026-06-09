@@ -1,4 +1,4 @@
-"""Muon optimizer with optional row normalization ("normuon").
+"""Muon optimizer with optional NorMuon neuron-wise normalization.
 
 Lifted from parameter-golf's `sota_train_gpt.py:Muon`, expanded for
 readability. Designed for 2D matrix weights — the orthogonalization step
@@ -16,10 +16,22 @@ Newton-Schulz before the lr multiply, so the first step has bounded
 spectral norm regardless of gradient magnitude — first-step parameter
 movement is *predictable*, not gradient-magnitude-dependent.
 
-Row normalization (`row_normalize=True`) divides each row of the gradient
-by its norm before orthogonalization. Per-row bounded updates further
-stabilize matrix-weight training. parameter-golf uses this on all matrix
-params by default (`muon_row_normalize=1`).
+NorMuon (`normuon=True`) is the neuron-wise second-moment normalization of
+Liu et al. (arXiv:2510.05491; reference impl in `../NorMuon/normuon.py`). It
+runs *after* Newton-Schulz, on the orthogonalized update `US'V^T`:
+
+  1. Per output neuron (matrix row) track a running mean-of-squares
+     `v_i` via an Adam-style EMA with decay `beta2` (default 0.95).
+  2. Scale each row by `1/sqrt(v_i)` — Adam's per-neuron adaptivity, but
+     applied to the orthogonal update rather than the raw gradient.
+  3. Restore the update's Frobenius norm so the overall step magnitude
+     matches plain Muon — this is what keeps NorMuon lr-compatible with
+     Muon (without it the effective step size drifts run-to-run).
+
+The order matters: normalizing rows *before* Newton-Schulz (the old, wrongly
+named "row_normalize") is scrambled by the subsequent `X @ X.T` row mixing
+and leaves the update magnitude uncalibrated. NorMuon's whole point is the
+running second moment and the post-orthogonalization, norm-preserving scale.
 """
 
 from __future__ import annotations
@@ -57,6 +69,35 @@ def _shape_correction(g: torch.Tensor) -> float:
     return max(1.0, g.size(-2) / g.size(-1)) ** 0.5
 
 
+@torch.no_grad()
+def _normuon_normalize(
+    update: torch.Tensor, state: dict, beta2: float
+) -> torch.Tensor:
+    """NorMuon neuron-wise normalization of an orthogonalized update.
+
+    `update` is the post-Newton-Schulz matrix `[rows, cols]` (rows = output
+    neurons). Tracks a per-row running mean-of-squares in `state` under
+    `second_momentum_buffer`, scales each row by `1/sqrt(EMA)`, then rescales
+    so the Frobenius norm matches the pre-normalization update — a faithful
+    port of `normuon_update` in `../NorMuon/normuon.py:47-62`. Computes in
+    fp32 (the update arrives in bf16 from Newton-Schulz); returns fp32, cast
+    to the parameter dtype by the caller. Mutates the EMA buffer in place.
+    """
+    second = state.get("second_momentum_buffer")
+    if second is None:
+        second = torch.zeros_like(update[..., :1], dtype=torch.float32)
+        state["second_momentum_buffer"] = second
+    u = update.float()
+    row_sq_sum = u.norm(dim=-1, keepdim=True).square()  # [rows, 1]
+    v_mean = row_sq_sum / u.size(-1)
+    vnorm_sq = row_sq_sum.sum(dim=-2, keepdim=True)  # Frobenius^2, [1, 1]
+    second.lerp_(v_mean, 1.0 - beta2)
+    step_size = second.sqrt().add(1e-10).reciprocal()
+    vnorm_new_sq = (step_size.square() * row_sq_sum).sum(dim=-2, keepdim=True)
+    scale = step_size * (vnorm_sq.sqrt() / vnorm_new_sq.sqrt().add(1e-10))
+    return u * scale
+
+
 class Muon(torch.optim.Optimizer):
     """Matrix-only optimizer with Newton-Schulz orthogonalization.
 
@@ -78,7 +119,8 @@ class Muon(torch.optim.Optimizer):
         backend_steps: int = 5,
         nesterov: bool = True,
         weight_decay: float = 0.0,
-        row_normalize: bool = False,
+        normuon: bool = False,
+        beta2: float = 0.95,
         fused: bool = True,
         momentum_warmup_steps: int = 0,
         momentum_warmup_start: float = 0.85,
@@ -89,7 +131,8 @@ class Muon(torch.optim.Optimizer):
             backend_steps=backend_steps,
             nesterov=nesterov,
             weight_decay=weight_decay,
-            row_normalize=row_normalize,
+            normuon=normuon,
+            beta2=beta2,
             fused=fused,
             momentum_warmup_steps=momentum_warmup_steps,
             momentum_warmup_start=momentum_warmup_start,
@@ -123,7 +166,8 @@ class Muon(torch.optim.Optimizer):
                 momentum = (1.0 - frac) * warmup_start + frac * momentum
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
-            row_normalize = group["row_normalize"]
+            normuon = group["normuon"]
+            beta2 = group["beta2"]
             fused = group["fused"]
             wd = group["weight_decay"]
             if fused:
@@ -133,7 +177,8 @@ class Muon(torch.optim.Optimizer):
                     momentum=momentum,
                     backend_steps=backend_steps,
                     nesterov=nesterov,
-                    row_normalize=row_normalize,
+                    normuon=normuon,
+                    beta2=beta2,
                     weight_decay=wd,
                 )
                 continue
@@ -146,7 +191,8 @@ class Muon(torch.optim.Optimizer):
                     momentum=momentum,
                     backend_steps=backend_steps,
                     nesterov=nesterov,
-                    row_normalize=row_normalize,
+                    normuon=normuon,
+                    beta2=beta2,
                     weight_decay=wd,
                 )
         self._step_count += 1
@@ -160,7 +206,8 @@ class Muon(torch.optim.Optimizer):
         momentum: float,
         backend_steps: int,
         nesterov: bool,
-        row_normalize: bool,
+        normuon: bool,
+        beta2: float,
         weight_decay: float,
     ) -> None:
         g = p.grad
@@ -171,14 +218,14 @@ class Muon(torch.optim.Optimizer):
         buf.mul_(momentum).add_(g)
         if nesterov:
             g = g.add(buf, alpha=momentum)
-        if row_normalize:
-            row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
-            g = g / row_norms.to(g.dtype)
         g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-        g = g * _shape_correction(g)
+        if normuon:
+            g = _normuon_normalize(g, state, beta2)
         if weight_decay > 0.0:
             p.data.mul_(1.0 - lr * weight_decay)
-        p.data.add_(g.to(p.dtype), alpha=-lr)
+        # Fold the (scalar) shape correction into the lr so the update skips a
+        # full-matrix elementwise pass.
+        p.data.add_(g.to(p.dtype), alpha=-lr * _shape_correction(g))
 
     def _step_fused_group(
         self,
@@ -188,7 +235,8 @@ class Muon(torch.optim.Optimizer):
         momentum: float,
         backend_steps: int,
         nesterov: bool,
-        row_normalize: bool,
+        normuon: bool,
+        beta2: float,
         weight_decay: float,
     ) -> None:
         buckets: dict[tuple[torch.device, torch.dtype, torch.Size], list[torch.nn.Parameter]] = {}
@@ -206,7 +254,8 @@ class Muon(torch.optim.Optimizer):
                     momentum=momentum,
                     backend_steps=backend_steps,
                     nesterov=nesterov,
-                    row_normalize=row_normalize,
+                    normuon=normuon,
+                    beta2=beta2,
                     weight_decay=weight_decay,
                 )
                 continue
@@ -232,16 +281,26 @@ class Muon(torch.optim.Optimizer):
                 update_inputs = grad_tensors
 
             g = torch.stack(update_inputs)
-            if row_normalize:
-                row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
-                g = g / row_norms.to(g.dtype)
             g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-            g = g * _shape_correction(g)
+            if normuon:
+                # Per-parameter NorMuon normalization, reusing the scalar-path
+                # helper on each bucket slice so the EMA buffers live in each
+                # param's own state and the fused result stays bit-identical
+                # to the per-parameter path (see test_muon).
+                g = torch.stack(
+                    [
+                        _normuon_normalize(gi, self.state[p], beta2)
+                        for p, gi in zip(bucket, g.unbind(0))
+                    ]
+                )
+            # All bucketed params share a shape, so the shape correction is a
+            # single scalar — fold it into the lr instead of scaling `g`.
+            shape_corr = _shape_correction(g)
 
             if weight_decay > 0.0:
                 torch._foreach_mul_(bucket, 1.0 - lr * weight_decay)
             updates = list(g.to(bucket[0].dtype).unbind(0))
-            torch._foreach_add_(bucket, updates, alpha=-lr)
+            torch._foreach_add_(bucket, updates, alpha=-lr * shape_corr)
 
     def state_dict(self) -> dict:
         state = super().state_dict()
@@ -293,9 +352,15 @@ class MultiOptimizer:
             opt.zero_grad(set_to_none=set_to_none)
 
     def step(self, closure=None):
-        if self.lr_warmup_steps > 0:
+        # Linear LR warmup, active only until `_step_count` reaches
+        # `lr_warmup_steps`; afterwards every lr is left at its base value and we
+        # skip the loop (rather than re-assigning `base_lr * 1.0` forever). Read
+        # `param_groups` fresh inside the warmup window instead of caching it:
+        # torch's `load_state_dict` rebinds the group dicts, so a cached list
+        # would go stale across an optimizer-state resume.
+        if self.lr_warmup_steps > 0 and self._step_count < self.lr_warmup_steps:
             self._step_count += 1
-            frac = min(self._step_count / self.lr_warmup_steps, 1.0)
+            frac = self._step_count / self.lr_warmup_steps
             for group, base_lr in zip(self.param_groups, self._base_lrs):
                 group["lr"] = base_lr * frac
         for opt in self.optimizers:

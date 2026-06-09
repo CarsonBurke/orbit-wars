@@ -60,8 +60,8 @@ class ModelCfg:
 class OptimCfg:
     """Optimizer hyperparameters.
 
-    We use a parameter-golf-style dual-optimizer setup: **Muon (with row
-    normalization, "normuon")** for 2D matrix weights inside transformer
+    We use a parameter-golf-style dual-optimizer setup: **Muon (with NorMuon
+    neuron-wise normalization)** for 2D matrix weights inside transformer
     blocks, and fused **AdamW** for everything else (input projections,
     action/value readouts, biases, summary tokens, and the nGPT hypersphere
     control tensors `attn_alpha`/`mlp_alpha`/`cross_alpha`/`sqk`/`suv`).
@@ -81,10 +81,15 @@ class OptimCfg:
     muon_lr: float = 0.022
     muon_momentum: float = 0.95
     muon_backend_steps: int = 5
-    muon_row_normalize: bool = True
-    # Group same-shaped matrices so Muon's row-normalization and
-    # Newton-Schulz backend run as batched/foreach operations instead of a
-    # Python loop of tiny per-parameter matmuls.
+    # NorMuon (arXiv:2510.05491): per-output-neuron second-moment EMA applied
+    # AFTER Newton-Schulz, with Frobenius-norm restoration so the step stays
+    # lr-compatible with plain Muon. See `_normuon_normalize` in `muon.py`.
+    muon_normuon: bool = True
+    # Decay for the NorMuon per-neuron second-moment EMA (Adam-style beta2).
+    muon_beta2: float = 0.95
+    # Group same-shaped matrices so Muon's Newton-Schulz backend runs as
+    # batched/foreach operations instead of a Python loop of tiny
+    # per-parameter matmuls.
     muon_fused: bool = True
     muon_weight_decay: float = 0.0
     # Linear ramp `momentum_warmup_start` → `muon_momentum` over the first
