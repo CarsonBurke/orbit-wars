@@ -112,18 +112,21 @@ class OptimCfg:
     # AdamW (control-tensor group: nGPT hypersphere controls — per-channel
     # eigen LRs `attn_alpha`/`mlp_alpha`/`cross_alpha`, QK scale `sqk`, MLP
     # scale `suv` — plus the target-readout temperature `q_gain`).
-    # parameter-golf runs `scalar_lr ≈ matrix_lr` (0.02 vs 0.022) — equal
-    # update magnitudes between Muon-driven matrices and AdamW-driven
-    # scalars. With `lr=3e-4` the scalars move 67× slower than the matrices
-    # and can't damp residual contribution fast enough to compensate for
-    # actor drift, so KL accumulates. Match `muon_lr` to restore parity.
-    control_lr: float = 0.02
+    # Reference-faithful: nGPT trains these 1-D control scalars at the SAME
+    # base AdamW lr as the matrices (ngpt/model.py:305-319 — the ndim<2 group
+    # shares `learning_rate`); there is no separate fast "control" group. The
+    # old 0.02 (≈67× lr, to "match muon_lr") over-drove the gating scalars: an
+    # orthogonalized, bounded Muon step is NOT comparable to an AdamW scalar
+    # step, so matching muon_lr was a bug — the scalar gain ran away until the
+    # PPO trust region snapped (KL blowup). Raise toward lr×2-3 only if the
+    # scalars learn too slowly.
+    control_lr: float = 3e-4
     # Linear LR warmup over the first `lr_warmup_steps` optimizer-step calls
     # (ramping every group's lr from ~0 → configured value). The nGPT port
     # needs this cold-start guard: a fresh policy has uncalibrated AdamW
     # second moments, so the first ~tens of minibatch steps take near-full
-    # `lr`·sign() steps; at `control_lr≈0.02` the trunk-gating scalars swing by
-    # ~1 across the first PPO update and spike the policy KL far outside the
+    # `lr`·sign() steps; without the ramp the trunk-gating scalars swing hard
+    # across the first PPO update and spike the policy KL far outside the
     # frozen-`old_log_prob` trust region. ~2-3 PPO updates of ramp removes the
     # update-0 KL spike. 0 disables. Counted in optimizer steps (≈ epochs ×
     # minibatches per update), matching the Muon momentum warmup.

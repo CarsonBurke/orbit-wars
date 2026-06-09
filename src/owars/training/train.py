@@ -61,12 +61,12 @@ from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
 from .vec_rollout import alternating_learner_seats, rollout_episodes_batched
 
-# Subset of control tensors that route to the *fast* AdamW group at
-# `control_lr` (≈ `muon_lr`) — the nGPT hypersphere controls (per-channel
-# eigen LRs `attn_alpha`/`mlp_alpha`/`cross_alpha`, QK scale `sqk`, MLP scale
-# `suv`) and the target-readout attention temperature (`q_gain`/
-# `target_q_gain`). These need update magnitudes comparable to Muon's matrix
-# updates. The summary tokens (`actor_token`, `critic_token`) intentionally
+# Subset of control tensors that route to the dedicated `control_lr` AdamW
+# group — the nGPT hypersphere controls (per-channel eigen LRs
+# `attn_alpha`/`mlp_alpha`/`cross_alpha`, QK scale `sqk`, MLP scale `suv`) and
+# the target-readout attention temperature (`q_gain`/`target_q_gain`). They get
+# their own group (zero weight decay, reference-faithful base lr) rather than a
+# faster lr. The summary tokens (`actor_token`, `critic_token`) intentionally
 # stay in the slow default group: they are learnable biases on the residual
 # stream and moving them at scalar speed destabilizes early training.
 _CONTROL_LR_PATTERNS: tuple[str, ...] = (
@@ -117,9 +117,9 @@ def _split_params(
     AdamW (head-lr): task readout matrices — `target_query`, `target_key`,
     Beta fraction heads, categorical action heads, and `value_head`.
 
-    AdamW (control-lr): per-channel residual scales and `q_gain`s — need
-    update magnitudes comparable to Muon's matrix updates, see
-    `OptimCfg.control_lr`.
+    AdamW (control-lr): per-channel residual scales and `q_gain`s — the nGPT
+    hypersphere controls, kept in their own zero-decay group at the
+    reference-faithful base lr, see `OptimCfg.control_lr`.
 
     AdamW (default-lr): everything else — input projections, biases,
     summary tokens, and latent tokens.
@@ -179,8 +179,8 @@ def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
     # step size, which translates into oversized parameter updates.
     #
     # Three AdamW param-groups: default tensors at `lr`, control tensors at
-    # `control_lr` (≈ muon_lr, parity with matrix updates), and task readouts
-    # at `head_lr`.
+    # `control_lr` (reference-faithful: == `lr`, the nGPT scalars train at the
+    # base AdamW lr, not at muon_lr), and task readouts at `head_lr`.
     adamw_opt = torch.optim.AdamW(
         [
             {"params": adamw_default, "lr": cfg.lr},
