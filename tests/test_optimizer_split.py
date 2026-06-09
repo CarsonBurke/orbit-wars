@@ -32,12 +32,12 @@ def test_optimizer_split_matches_parameter_golf_boundary():
         "layers.0.attn.c_k.weight",
         "layers.0.attn.c_v.weight",
         "layers.0.attn.out_proj.weight",
-        "layers.0.ff.0.weight",
-        "layers.0.ff.2.weight",
+        "layers.0.c_fc.weight",
+        "layers.0.mlp_proj.weight",
         "fleet_tokenizer.layers.0.cross_attn.c_q.weight",
         "fleet_tokenizer.layers.0.cross_attn.out_proj.weight",
         "fleet_tokenizer.layers.0.self_block.attn.c_q.weight",
-        "fleet_tokenizer.layers.0.self_block.ff.2.weight",
+        "fleet_tokenizer.layers.0.self_block.mlp_proj.weight",
     ):
         assert group[name] == "muon_blocks"
 
