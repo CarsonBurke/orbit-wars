@@ -101,8 +101,8 @@ optim:
 ppo:
   gamma: 0.99
   gae_lambda: 0.95
-  spo_eps_low: 0.2
-  spo_eps_high: 0.28
+  clip_coef: 0.2
+  clip_coef_high: 0.28
   value_coef: 1.0
   target_entropy_coef: 0.0
   fraction_entropy_coef: 0.0

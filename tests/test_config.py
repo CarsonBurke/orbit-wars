@@ -118,12 +118,12 @@ def test_fixed_opponent_mode_requires_non_empty_opponents():
 @pytest.mark.parametrize(
     "ppo_cfg",
     [
-        {"spo_eps_low": 0.0},
-        {"spo_eps_high": 0.0},
-        {"spo_eps_low": 0.3, "spo_eps_high": 0.2},
+        {"clip_coef": 0.0},
+        {"clip_coef_high": 0.0},
+        {"clip_coef": 0.3, "clip_coef_high": 0.2},
     ],
 )
-def test_invalid_spo_eps_raises(ppo_cfg):
+def test_invalid_clip_coef_raises(ppo_cfg):
     with pytest.raises(ValueError):
         RunConfig.from_dict({"ppo": ppo_cfg})
 

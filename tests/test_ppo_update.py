@@ -128,8 +128,8 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         fraction_entropy_coef=0.0,
         norm_advantage=True,
         advantage_transform="rankgauss",
-        spo_eps_low=0.2,
-        spo_eps_high=0.28,
+        clip_coef=0.2,
+        clip_coef_high=0.28,
         epochs=2, minibatch_size=4, grad_clip=0.5,
     )
 
@@ -138,7 +138,7 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         "value_loss",
         "entropy",
         "approx_kl",
-        "spo_penalty",
+        "ratio_clip_frac_high",
         "pos_frac",
         "target_entropy",
         "fraction_entropy",
@@ -154,8 +154,8 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         v = getattr(log, name)
         assert math.isfinite(v), f"{name}={v!r}"
     # Reported number is the running mean across all (epoch, minibatch)
-    # updates, so we just sanity-check non-negativity here.
-    assert log.spo_penalty >= 0.0, log.spo_penalty
+    # updates, so we just sanity-check the [0, 1] range here.
+    assert 0.0 <= log.ratio_clip_frac_high <= 1.0, log.ratio_clip_frac_high
     assert 0.0 <= log.pos_frac <= 1.0, log.pos_frac
     assert log.value_loss >= 0.0, log.value_loss
 
@@ -294,8 +294,8 @@ def test_ppo_update_minibatch_count_runs_exact_count():
         fraction_entropy_coef=0.0,
         norm_advantage=True,
         advantage_transform="rankgauss",
-        spo_eps_low=0.2,
-        spo_eps_high=0.28,
+        clip_coef=0.2,
+        clip_coef_high=0.28,
         epochs=1, minibatch_size=2, minibatch_count=3, grad_clip=0.5,
     )
 
@@ -675,7 +675,9 @@ def _fixed_policy_batch(
     }
 
 
-def test_spo_asym_policy_loss_uses_high_eps_when_drift_agrees_with_advantage():
+def test_clip_higher_clamps_ratio_above_upper_bound_with_positive_advantage():
+    # ratio = 1.5 exceeds the looser upper bound 1 + clip_coef_high = 1.28, so
+    # with a positive advantage the pessimistic max picks the clamped surrogate.
     model = _FixedPolicy()
     launch_lp = torch.log(model.new_launch_logits.sigmoid()[0, 0])
     target_lp = torch.log(model.new_target_logits.exp()[0, 0, 1])
@@ -700,15 +702,15 @@ def test_spo_asym_policy_loss_uses_high_eps_when_drift_agrees_with_advantage():
         fraction_entropy_coef=0.0,
         norm_advantage=False,
         advantage_transform="none",
-        spo_eps_low=0.2,
-        spo_eps_high=0.28,
+        clip_coef=0.2,
+        clip_coef_high=0.28,
         epochs=1, minibatch_size=1, grad_clip=1.0,
     )
 
-    expected_penalty = 0.5**2 / (2.0 * 0.28)
-    expected_loss = -(1.5 - expected_penalty)
+    # max(-A*ratio, -A*clamp) = max(-1.5, -1.28) = -1.28 = -(1 + clip_coef_high).
+    expected_loss = -(1.0 + 0.28)
     assert math.isclose(log.policy_loss, expected_loss, rel_tol=1e-6)
-    assert math.isclose(log.spo_penalty, expected_penalty, rel_tol=1e-6)
+    assert math.isclose(log.ratio_clip_frac_high, 1.0, rel_tol=1e-6)
     expected_kl = (1.5 - 1.0) - math.log(1.5)
     assert math.isclose(log.approx_kl, expected_kl, rel_tol=1e-6)
 
@@ -739,8 +741,8 @@ def test_approx_kl_sums_owned_planet_log_probs_cleanrl_style():
         fraction_entropy_coef=0.0,
         norm_advantage=False,
         advantage_transform="none",
-        spo_eps_low=0.2,
-        spo_eps_high=0.28,
+        clip_coef=0.2,
+        clip_coef_high=0.28,
         epochs=1, minibatch_size=1, grad_clip=1.0,
     )
 
@@ -795,8 +797,8 @@ def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
         fraction_entropy_coef=0.0,
         norm_advantage=False,
         advantage_transform="none",
-        spo_eps_low=0.2,
-        spo_eps_high=0.28,
+        clip_coef=0.2,
+        clip_coef_high=0.28,
         epochs=1, minibatch_size=1, grad_clip=1.0,
     )
 
@@ -806,7 +808,10 @@ def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
     assert not math.isclose(log.approx_kl, mean_kl, rel_tol=1e-6)
 
 
-def test_spo_asym_policy_loss_uses_low_eps_when_drift_opposes_advantage():
+def test_clip_clamps_ratio_below_lower_bound_with_negative_advantage():
+    # ratio = 0.5 is below the lower bound 1 - clip_coef = 0.8. With a negative
+    # advantage the pessimistic max picks the clamped surrogate (the lower bound
+    # binds), and the looser-upper-bound counter stays zero.
     model = _FixedPolicy()
     launch_lp = torch.log(model.new_launch_logits.sigmoid()[0, 0])
     target_lp = torch.log(model.new_target_logits.exp()[0, 0, 1])
@@ -819,7 +824,7 @@ def test_spo_asym_policy_loss_uses_low_eps_when_drift_opposes_advantage():
     old_log_prob = new_log_prob + math.log(2.0)
     batch = _fixed_policy_batch(
         launch=1.0,
-        advantage=1.0,
+        advantage=-1.0,
         old_log_prob=old_log_prob,
     )
     optim = torch.optim.AdamW(model.parameters(), lr=0.0)
@@ -831,15 +836,16 @@ def test_spo_asym_policy_loss_uses_low_eps_when_drift_opposes_advantage():
         fraction_entropy_coef=0.0,
         norm_advantage=False,
         advantage_transform="none",
-        spo_eps_low=0.2,
-        spo_eps_high=0.28,
+        clip_coef=0.2,
+        clip_coef_high=0.28,
         epochs=1, minibatch_size=1, grad_clip=1.0,
     )
 
-    expected_penalty = 0.5**2 / (2.0 * 0.2)
-    expected_loss = -(0.5 - expected_penalty)
+    # max(-A*ratio, -A*clamp) = max(0.5, 0.8) = 0.8 = (1 - clip_coef).
+    expected_loss = 1.0 - 0.2
     assert math.isclose(log.policy_loss, expected_loss, rel_tol=1e-6)
-    assert math.isclose(log.spo_penalty, expected_penalty, rel_tol=1e-6)
+    assert math.isclose(log.ratio_clip_frac, 1.0, rel_tol=1e-6)
+    assert math.isclose(log.ratio_clip_frac_high, 0.0, abs_tol=1e-9)
 
 
 class _ValueOnlyPolicy(torch.nn.Module):

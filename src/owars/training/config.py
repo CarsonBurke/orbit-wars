@@ -143,7 +143,7 @@ class OptimCfg:
 
 @dataclass
 class PPOCfg:
-    """SPO-asym policy objective + distributional critic.
+    """Asymmetric clip-higher policy objective + distributional critic.
 
     Dense potential rewards make the per-step signal informative, so the
     default is conventional PPO GAE with one lambda. Sparse terminal rewards
@@ -159,10 +159,12 @@ class PPOCfg:
     # minibatching; "none" keeps raw GAE.
     advantage_transform: Literal["rankgauss", "none"] = "rankgauss"
     norm_advantage: bool = True
-    # CleanRL SPO asym: quadratic ratio penalty with a looser bound when
-    # ratio drift agrees with the advantage sign.
-    spo_eps_low: float = 0.2
-    spo_eps_high: float = 0.28
+    # Asymmetric PPO clip-higher (DAPO / cleanRL iterthink_v24_beta): the
+    # surrogate ratio is clamped to [1-clip_coef, 1+clip_coef_high]. The upper
+    # bound is deliberately looser so an under-weighted action can recover while
+    # an already-favored one stays capped.
+    clip_coef: float = 0.2
+    clip_coef_high: float = 0.28
     # Distributional CE gradients are naturally bounded (per-bin
     # `softmax − target_probs` has ‖∇‖ ~ O(1)), unlike MSE which blew
     # up under bad predictions. dreamer4 effectively runs the equivalent
@@ -444,8 +446,8 @@ class RunConfig:
             raise ValueError("ppo.gamma must be in (0, 1]")
         if cfg.reward.signal == "win_terminal" and cfg.ppo.gamma != 1.0:
             raise ValueError("reward.signal='win_terminal' requires ppo.gamma=1.0")
-        if cfg.ppo.spo_eps_low <= 0.0 or cfg.ppo.spo_eps_high <= 0.0:
-            raise ValueError("ppo.spo_eps_low/high must be positive")
+        if cfg.ppo.clip_coef <= 0.0 or cfg.ppo.clip_coef_high <= 0.0:
+            raise ValueError("ppo.clip_coef/high must be positive")
         if (
             cfg.reward.signal == "win_terminal"
             and cfg.ppo.value_gae_lambda != 1.0
@@ -453,8 +455,8 @@ class RunConfig:
             raise ValueError(
                 "reward.signal='win_terminal' requires ppo.value_gae_lambda=1.0"
             )
-        if cfg.ppo.spo_eps_high < cfg.ppo.spo_eps_low:
-            raise ValueError("ppo.spo_eps_high must be >= ppo.spo_eps_low")
+        if cfg.ppo.clip_coef_high < cfg.ppo.clip_coef:
+            raise ValueError("ppo.clip_coef_high must be >= ppo.clip_coef")
         if cfg.ppo.advantage_transform not in {"rankgauss", "none"}:
             raise ValueError("ppo.advantage_transform must be 'rankgauss' or 'none'")
         if cfg.optim.minibatch_count is not None and cfg.optim.minibatch_count <= 0:

@@ -3,8 +3,8 @@
 # 2-player PPO config.
 #
 # Defaults baked in:
-#   - CleanRL SPO-asym surrogate with `spo_eps_low = 0.4`,
-#     `spo_eps_high = 0.56`, rank-Gaussian policy advantages, and
+#   - CleanRL clip-higher surrogate with `clip_coef = 0.2`,
+#     `clip_coef_high = 0.28`, rank-Gaussian policy advantages, and
 #     minibatch advantage normalization.
 #   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
@@ -79,8 +79,8 @@ ppo:
   gae_lambda: 0.95
   advantage_transform: rankgauss
   norm_advantage: true
-  spo_eps_low: 0.4
-  spo_eps_high: 0.56
+  clip_coef: 0.2
+  clip_coef_high: 0.28
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
 
   target_entropy_coef: 0.0      # no explicit entropy bonus; exploration comes from stochastic sampling

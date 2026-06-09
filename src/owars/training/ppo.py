@@ -1,14 +1,16 @@
-"""SPO-asym policy update with a distributional critic.
+"""Asymmetric clip-higher PPO update with a distributional critic.
 
-The policy loss follows CleanRL's SPO asymmetric variant:
+The policy loss is CleanRL iterthink_v24_beta's asymmetric "clip-higher"
+(DAPO) surrogate:
 
-    J = E[r*A - |A|*(r-1)^2/(2*eps)]
+    J = E[ min(r*A, clamp(r, 1-clip_coef, 1+clip_coef_high)*A) ]
 
-where `eps` is larger when ratio drift agrees with the advantage sign and
-smaller otherwise. The critic emits `value_logits` over a fixed bin support
-and trains with cross-entropy against HL-Gauss-encoded returns. No scalar value
-clipping is used because the distributional CE gradients are already bounded
-per bin.
+with a looser upper bound (`clip_coef_high`) than lower (`clip_coef`), so an
+already-favored action's probability is capped per update while an
+under-weighted one can still recover. The critic emits `value_logits` over a
+fixed bin support and trains with cross-entropy against HL-Gauss-encoded
+returns. No scalar value clipping is used because the distributional CE
+gradients are already bounded per bin.
 """
 
 from __future__ import annotations
@@ -464,8 +466,8 @@ class _PPOMinibatchKernel(torch.nn.Module):
         target_entropy_coef: float,
         fraction_entropy_coef: float,
         norm_advantage: bool,
-        spo_eps_low: float,
-        spo_eps_high: float,
+        clip_coef: float,
+        clip_coef_high: float,
         autocast_enabled: bool,
         include_value: bool,
     ) -> None:
@@ -475,8 +477,8 @@ class _PPOMinibatchKernel(torch.nn.Module):
         self.target_entropy_coef = float(target_entropy_coef)
         self.fraction_entropy_coef = float(fraction_entropy_coef)
         self.norm_advantage = bool(norm_advantage)
-        self.spo_eps_low = float(spo_eps_low)
-        self.spo_eps_high = float(spo_eps_high)
+        self.clip_coef = float(clip_coef)
+        self.clip_coef_high = float(clip_coef_high)
         self.autocast_enabled = bool(autocast_enabled)
         self.include_value = bool(include_value)
         self._model_accepts_head_flags = isinstance(model, OrbitPolicy)
@@ -590,15 +592,15 @@ class _PPOMinibatchKernel(torch.nn.Module):
             adv_mean = (adv_actor * owned_w).sum() / denom
             adv_var = (((adv_actor - adv_mean).square()) * owned_w).sum() / denom
             adv_actor = (adv_actor - adv_mean) * torch.rsqrt(adv_var + 1e-8)
-        ratio_diff = ratio - 1.0
-        eps = torch.where(
-            adv_actor * ratio_diff > 0.0,
-            torch.full_like(ratio, self.spo_eps_high),
-            torch.full_like(ratio, self.spo_eps_low),
-        )
-        spo_penalty = adv_actor.abs() * ratio_diff.square() / (2.0 * eps)
-        policy_loss = -_weighted_mean(adv_actor * ratio - spo_penalty, owned_w)
-        spo_penalty_mean = _weighted_mean(spo_penalty, owned_w)
+        # Asymmetric PPO "clip-higher" (DAPO / cleanRL iterthink_v24_beta): the
+        # pessimistic max of the unclipped and ratio-clamped surrogates, with a
+        # looser upper bound (`clip_coef_high`) than lower (`clip_coef`). The
+        # clamp caps how far one update can push an already-favored action while
+        # still letting the policy recover an under-weighted one.
+        ratio_clamped = ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef_high)
+        pg_unclipped = -adv_actor * ratio
+        pg_clipped = -adv_actor * ratio_clamped
+        policy_loss = _weighted_mean(torch.maximum(pg_unclipped, pg_clipped), owned_w)
 
         if self.include_value:
             value_loss = _distributional_value_loss(
@@ -710,7 +712,17 @@ class _PPOMinibatchKernel(torch.nn.Module):
         per_planet_kl = (((ratio - 1.0) - log_ratio) * owned_w).sum() / denom
         log_ratio_abs_mean = (log_ratio.abs() * owned_w).sum() / denom
         log_ratio_abs_max = _weighted_max(log_ratio.abs(), owned_w)
-        spo_clip_frac = ((ratio_diff.abs() > eps).to(owned_f.dtype) * owned_w).sum() / denom
+        # Trust-region diagnostics: fraction of owned-planet ratios outside the
+        # asymmetric clip band, and the subset hitting the looser upper bound
+        # (the side `clip_coef_high` deliberately relaxes).
+        clipped_low = ratio < (1.0 - self.clip_coef)
+        clipped_high = ratio > (1.0 + self.clip_coef_high)
+        ratio_clip_frac = (
+            (clipped_low | clipped_high).to(owned_f.dtype) * owned_w
+        ).sum() / denom
+        ratio_clip_frac_high = (
+            clipped_high.to(owned_f.dtype) * owned_w
+        ).sum() / denom
         executed_launch_frac = (launch_f * owned_w).sum() / denom
 
         row_log_ratio = (log_ratio * owned_f).sum(dim=-1)
@@ -733,7 +745,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 value_loss.detach(),
                 entropy.detach(),
                 kl.detach(),
-                spo_penalty_mean.detach(),
+                ratio_clip_frac_high.detach(),
                 pos_frac.detach(),
                 target_entropy.detach(),
                 fraction_entropy.detach(),
@@ -748,7 +760,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 per_planet_kl.detach(),
                 log_ratio_abs_mean.detach(),
                 log_ratio_abs_max.detach(),
-                spo_clip_frac.detach(),
+                ratio_clip_frac.detach(),
                 owned_planets_mean.detach(),
                 executed_launch_frac.detach(),
                 row_log_ratio_abs_mean.detach(),
@@ -842,8 +854,8 @@ def _get_ppo_kernel(
     target_entropy_coef: float,
     fraction_entropy_coef: float,
     norm_advantage: bool,
-    spo_eps_low: float,
-    spo_eps_high: float,
+    clip_coef: float,
+    clip_coef_high: float,
     compile_mode: str | None,
     include_value: bool,
 ) -> torch.nn.Module:
@@ -856,8 +868,8 @@ def _get_ppo_kernel(
         float(target_entropy_coef),
         float(fraction_entropy_coef),
         bool(norm_advantage),
-        float(spo_eps_low),
-        float(spo_eps_high),
+        float(clip_coef),
+        float(clip_coef_high),
         bool(include_value),
     )
     cache = _kernel_cache(model)
@@ -870,8 +882,8 @@ def _get_ppo_kernel(
         target_entropy_coef=target_entropy_coef,
         fraction_entropy_coef=fraction_entropy_coef,
         norm_advantage=norm_advantage,
-        spo_eps_low=spo_eps_low,
-        spo_eps_high=spo_eps_high,
+        clip_coef=clip_coef,
+        clip_coef_high=clip_coef_high,
         autocast_enabled=device.type == "cuda",
         include_value=include_value,
     )
@@ -907,7 +919,7 @@ class PPOLog:
     value_loss: float
     entropy: float
     approx_kl: float
-    spo_penalty: float
+    ratio_clip_frac_high: float
     pos_frac: float
     actor_grad_norm: float = 0.0
     critic_grad_norm: float = 0.0
@@ -933,7 +945,7 @@ class PPOLog:
     per_planet_approx_kl: float = 0.0
     log_ratio_abs_mean: float = 0.0
     log_ratio_abs_max: float = 0.0
-    spo_clip_frac: float = 0.0
+    ratio_clip_frac: float = 0.0
     owned_planets_mean: float = 0.0
     executed_launch_frac: float = 0.0
     source_non_action_frac: float = 0.0
@@ -995,8 +1007,8 @@ def ppo_update(
     fraction_entropy_coef: float,
     norm_advantage: bool,
     advantage_transform: str,
-    spo_eps_low: float,
-    spo_eps_high: float,
+    clip_coef: float,
+    clip_coef_high: float,
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
@@ -1016,8 +1028,8 @@ def ppo_update(
       optional `return_mtp` [B,H], `return_mtp_mask` [B,H],
       `owned_mask` [B,P], `target_legal_mask` [B,P,P].
 
-    The actor objective is SPO asym:
-      `-mean(ratio * advantage - |advantage| * (ratio - 1)^2 / (2 * eps))`.
+    The actor objective is asymmetric clip-higher:
+      `mean(max(-A*ratio, -A*clamp(ratio, 1-clip_coef, 1+clip_coef_high)))`.
 
     Distributional value loss: cross-entropy against HL-Gauss-encoded
     returns (`value_encoder.target_probs(returns)`). No value clipping.
@@ -1055,8 +1067,8 @@ def ppo_update(
         target_entropy_coef=target_entropy_coef,
         fraction_entropy_coef=fraction_entropy_coef,
         norm_advantage=norm_advantage,
-        spo_eps_low=spo_eps_low,
-        spo_eps_high=spo_eps_high,
+        clip_coef=clip_coef,
+        clip_coef_high=clip_coef_high,
         compile_mode=compile_mode,
         include_value=True,
     )
@@ -1186,7 +1198,7 @@ def ppo_update(
         value_loss=float(mean_logs[1]),
         entropy=float(mean_logs[2]),
         approx_kl=float(kl_logs[3]),
-        spo_penalty=float(mean_logs[4]),
+        ratio_clip_frac_high=float(mean_logs[4]),
         pos_frac=float(mean_logs[5]),
         actor_grad_norm=float(grad_logs[0]),
         critic_grad_norm=float(grad_logs[1]),
@@ -1212,7 +1224,7 @@ def ppo_update(
         per_planet_approx_kl=float(kl_logs[16]),
         log_ratio_abs_mean=float(mean_logs[17]),
         log_ratio_abs_max=float(mean_logs[18]),
-        spo_clip_frac=float(mean_logs[19]),
+        ratio_clip_frac=float(mean_logs[19]),
         owned_planets_mean=float(mean_logs[20]),
         executed_launch_frac=float(mean_logs[21]),
         source_non_action_frac=float(1.0 - mean_logs[21]),
