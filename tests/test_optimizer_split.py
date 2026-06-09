@@ -57,7 +57,13 @@ def test_optimizer_split_matches_parameter_golf_boundary():
     assert group["planet_embed.weight"] == "adamw_default"
     assert group["fleet_embed.weight"] == "adamw_default"
     assert group["target_q_gain"] == "adamw_control"
-    assert group["layers.0.attn.q_gain"] == "adamw_control"
+    # nGPT hypersphere controls (per-channel eigen LRs, QK `sqk`, MLP `suv`)
+    # share the control-LR group with the target-readout temperature.
+    assert group["layers.0.attn_alpha.alpha"] == "adamw_control"
+    assert group["layers.0.mlp_alpha.alpha"] == "adamw_control"
+    assert group["layers.0.attn.sqk_q"] == "adamw_control"
+    assert group["layers.0.attn.sqk_k"] == "adamw_control"
+    assert group["layers.0.suv"] == "adamw_control"
 
 
 def test_optimizer_group_lrs_follow_split():

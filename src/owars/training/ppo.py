@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 
 from ..policies.features import EncodedObs
-from ..policies.model import OrbitPolicy
+from ..policies.model import OrbitPolicy, normalize_matrices
 from ..policies.sampling import (
     _categorical_action_log_probs,
     _threshold_normal_launch_entropy,
@@ -1137,6 +1137,17 @@ def ppo_update(
             last_metrics = metrics_for_step
             n_steps += 1
 
+    # nGPT: re-project the encoder-trunk matrices onto the hypersphere ONCE per
+    # PPO update, not per minibatch. PPO freezes `old_log_prob` at the update
+    # start; re-projecting after every one of the ~epochs×minibatches optimizer
+    # steps bakes in each Muon tangential rotation and compounds undamped
+    # representation drift on the unit sphere, so by the last minibatch the
+    # policy output has moved far from `old_log_prob` → exploding within-update
+    # KL that SPO clipping can't constrain. One projection per update keeps the
+    # weights on the sphere across updates (the actual nGPT invariant) without
+    # injecting per-minibatch policy churn. Eager — outside the compiled kernel.
+    normalize_matrices(model)
+
     n_steps = max(1, n_steps)
     mean_logs = (
         [0.0] * 30
@@ -1272,6 +1283,9 @@ def value_only_update(
             total += metric
             n_steps += 1
 
+    # nGPT hypersphere re-projection once per value-pretrain update (see the
+    # rationale in `ppo_update`).
+    normalize_matrices(model)
     if total is None:
         return 0.0
     return float((total / max(1, n_steps)).detach().cpu())

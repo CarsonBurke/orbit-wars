@@ -37,7 +37,7 @@ import numpy as np
 import torch
 
 from ..policies.config import OrbitPolicyConfig
-from ..policies.model import OrbitPolicy, restore_fp32_params
+from ..policies.model import OrbitPolicy, normalize_matrices, restore_fp32_params
 from ..utils import TBLogger, set_seed
 from .config import OptimCfg, RunConfig, load_config
 from .elo import EloTracker
@@ -62,16 +62,20 @@ from .vec_env import VecEnv
 from .vec_rollout import alternating_learner_seats, rollout_episodes_batched
 
 # Subset of control tensors that route to the *fast* AdamW group at
-# `control_lr` (≈ `muon_lr`) — per-channel residual scales and the
-# attention-temperature gains (trunk `q_gain` + `target_q_gain`). The
-# summary tokens (`actor_token`, `critic_token`) intentionally stay in
-# the slow default group: they are learnable biases on the residual
+# `control_lr` (≈ `muon_lr`) — the nGPT hypersphere controls (per-channel
+# eigen LRs `attn_alpha`/`mlp_alpha`/`cross_alpha`, QK scale `sqk`, MLP scale
+# `suv`) and the target-readout attention temperature (`q_gain`/
+# `target_q_gain`). These need update magnitudes comparable to Muon's matrix
+# updates. The summary tokens (`actor_token`, `critic_token`) intentionally
+# stay in the slow default group: they are learnable biases on the residual
 # stream and moving them at scalar speed destabilizes early training.
 _CONTROL_LR_PATTERNS: tuple[str, ...] = (
-    "attn_scale",
-    "ff_scale",
-    "cross_scale",
-    "resid_mix",
+    "attn_alpha",
+    "mlp_alpha",
+    "cross_alpha",
+    "skip_alpha",  # optional per-channel U-net skip (block_skip)
+    "sqk",
+    "suv",
     "q_gain",  # also matches `target_q_gain` via substring
 )
 
@@ -179,7 +183,13 @@ def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
     adamw_opt = torch.optim.AdamW(
         [
             {"params": adamw_default, "lr": cfg.lr},
-            {"params": adamw_control, "lr": cfg.control_lr},
+            # The control group is the nGPT hypersphere scalars (eigen LRs,
+            # `sqk`, `suv`) plus the readout temperature — all of which directly
+            # set magnitudes that are NOT re-projected by `normalize_matrices`.
+            # Decaying them would slowly collapse the eigen-LR toward identity
+            # and flatten the QK/MLP scales, so they get weight_decay=0 (nGPT
+            # keeps decay off every ndim<2 param, `ngpt/model.py:305-306`).
+            {"params": adamw_control, "lr": cfg.control_lr, "weight_decay": 0.0},
             {"params": adamw_head, "lr": cfg.head_lr},
         ],
         lr=cfg.lr,
@@ -187,7 +197,9 @@ def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
         betas=(0.9, 0.95),
         fused=True,
     )
-    return MultiOptimizer([muon_opt, adamw_opt])
+    return MultiOptimizer(
+        [muon_opt, adamw_opt], lr_warmup_steps=cfg.lr_warmup_steps
+    )
 
 
 def _build_model(cfg: RunConfig) -> OrbitPolicy:
@@ -198,6 +210,9 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         n_heads=cfg.model.n_heads,
         n_kv_heads=cfg.model.n_kv_heads,
         dropout=cfg.model.dropout,
+        eigen_alpha_init=cfg.model.eigen_alpha_init,
+        qk_gain_init=cfg.model.qk_gain_init,
+        block_skip=cfg.model.block_skip,
         planet_rope_fraction=cfg.model.planet_rope_fraction,
         planet_rope_base=cfg.model.planet_rope_base,
         encoder_backend=cfg.model.encoder_backend,
@@ -548,10 +563,30 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         model.load_state_dict(state, strict=True)
         print(f"loaded weights from {load_weights}")
+    # Re-project the trunk matrices onto the hypersphere: the bf16 round-trip
+    # in `restore_fp32_params` (and any loaded checkpoint) can leave row norms
+    # a hair off 1.0. The training loop keeps them there after each step.
+    normalize_matrices(model)
+    # Value-pretrain AdamW. Split on ndim (nGPT `model.py:305-306`): the 1D
+    # hypersphere scalars (eigen LRs, `sqk`, `suv`) must NOT be decayed — they
+    # set magnitudes that aren't re-projected, so decay would collapse them.
+    # The 2D trunk matrices that DO get decayed here are re-projected every
+    # step by `normalize_matrices`, and decoupled decay is scale-only, so the
+    # renorm makes it an exact no-op for them — only the scalars needed
+    # protecting.
+    pretrain_params = _value_pretrain_params(model)
     pretrain_opt = torch.optim.AdamW(
-        _value_pretrain_params(model),
+        [
+            {
+                "params": [p for p in pretrain_params if p.ndim >= 2],
+                "weight_decay": cfg.optim.weight_decay,
+            },
+            {
+                "params": [p for p in pretrain_params if p.ndim < 2],
+                "weight_decay": 0.0,
+            },
+        ],
         lr=cfg.ppo.pretrain_lr,
-        weight_decay=cfg.optim.weight_decay,
     )
     optimizer = _build_optimizer(model, cfg.optim)
 

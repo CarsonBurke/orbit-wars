@@ -32,6 +32,13 @@ class ModelCfg:
     # set to `1` for MQA or another divisor of `n_heads` for GQA.
     n_kv_heads: int | None = None
     dropout: float = 0.0
+    # nGPT residual / attention init profile (see OrbitPolicyConfig). Defaults
+    # are faithful nGPT; the "old-block" profile (full-strength residual, sharp
+    # attention, U-net skip) is opt-in via eigen_alpha_init=0.5 / qk_gain_init=5
+    # / block_skip=true.
+    eigen_alpha_init: float = 0.05
+    qk_gain_init: float = 1.0
+    block_skip: bool = False
     planet_rope_fraction: float = 0.25
     planet_rope_base: float = 10000.0
     encoder_backend: Literal["dense", "fleet_latent"] = "fleet_latent"
@@ -56,8 +63,8 @@ class OptimCfg:
     We use a parameter-golf-style dual-optimizer setup: **Muon (with row
     normalization, "normuon")** for 2D matrix weights inside transformer
     blocks, and fused **AdamW** for everything else (input projections,
-    action/value readouts, biases, summary tokens, and control tensors like
-    `attn_scale`/`ff_scale`/`resid_mix`).
+    action/value readouts, biases, summary tokens, and the nGPT hypersphere
+    control tensors `attn_alpha`/`mlp_alpha`/`cross_alpha`/`sqk`/`suv`).
 
     Muon orthogonalizes the gradient via Newton-Schulz iteration, producing
     updates with bounded spectral norm regardless of the gradient's input
@@ -97,14 +104,25 @@ class OptimCfg:
     # fused AdamW here is both cheaper than Newton-Schulz on tiny matrices
     # and avoids turning a large readout gradient into a full spectral step.
     head_lr: float = 3e-4
-    # AdamW (control-tensor group: per-channel residual scales `attn_scale`,
-    # `ff_scale`, `resid_mix`, and per-head attention temperature `q_gain`).
+    # AdamW (control-tensor group: nGPT hypersphere controls — per-channel
+    # eigen LRs `attn_alpha`/`mlp_alpha`/`cross_alpha`, QK scale `sqk`, MLP
+    # scale `suv` — plus the target-readout temperature `q_gain`).
     # parameter-golf runs `scalar_lr ≈ matrix_lr` (0.02 vs 0.022) — equal
     # update magnitudes between Muon-driven matrices and AdamW-driven
     # scalars. With `lr=3e-4` the scalars move 67× slower than the matrices
     # and can't damp residual contribution fast enough to compensate for
     # actor drift, so KL accumulates. Match `muon_lr` to restore parity.
     control_lr: float = 0.02
+    # Linear LR warmup over the first `lr_warmup_steps` optimizer-step calls
+    # (ramping every group's lr from ~0 → configured value). The nGPT port
+    # needs this cold-start guard: a fresh policy has uncalibrated AdamW
+    # second moments, so the first ~tens of minibatch steps take near-full
+    # `lr`·sign() steps; at `control_lr≈0.02` the trunk-gating scalars swing by
+    # ~1 across the first PPO update and spike the policy KL far outside the
+    # frozen-`old_log_prob` trust region. ~2-3 PPO updates of ramp removes the
+    # update-0 KL spike. 0 disables. Counted in optimizer steps (≈ epochs ×
+    # minibatches per update), matching the Muon momentum warmup.
+    lr_warmup_steps: int = 100
     weight_decay: float = 1e-4
     # PPO clips actor and critic flows separately. Each flow includes its task
     # readout head plus the shared trunk, then clipped shared gradients are

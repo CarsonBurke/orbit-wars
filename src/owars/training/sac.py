@@ -61,6 +61,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch.utils.tensorboard import SummaryWriter
 
 from ..policies.config import OrbitPolicyConfig
+from ..policies.model import normalize_matrices
 from ..policies.features import (
     MAX_FLEETS,
     MAX_PLANETS,
@@ -1203,6 +1204,9 @@ def _build_policy_cfg(cfg: RunConfig) -> OrbitPolicyConfig:
         n_heads=m.n_heads,
         n_kv_heads=m.n_kv_heads,
         dropout=m.dropout,
+        eigen_alpha_init=m.eigen_alpha_init,
+        qk_gain_init=m.qk_gain_init,
+        block_skip=m.block_skip,
         planet_rope_fraction=m.planet_rope_fraction,
         planet_rope_base=m.planet_rope_base,
         encoder_backend=m.encoder_backend,
@@ -1578,6 +1582,11 @@ def _run_updates(
             batch=batch,
             grad_clip=sac.grad_clip,
         )
+        # nGPT: re-project each twin's encoder-trunk matrices onto the
+        # hypersphere after the critic step (`ngpt/train.py:499-500`). Eager,
+        # on the fp32 master weights — outside the compiled q_kernel.
+        normalize_matrices(state.qf1)
+        normalize_matrices(state.qf2)
 
         # Delayed actor+alpha: every policy_frequency-th critic step, run
         # policy_frequency updates (cleanrl compensation ⇒ net 1:1 actor:critic).
@@ -1596,6 +1605,8 @@ def _run_updates(
                     batch=batch,
                     grad_clip=sac.grad_clip,
                 )
+                # nGPT hypersphere re-projection after the actor step.
+                normalize_matrices(state.actor)
 
         # Target polyak per cleanrl cadence (once every target_network_frequency
         # critic updates, NOT once per tick).

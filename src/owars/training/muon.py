@@ -261,8 +261,25 @@ class MultiOptimizer:
     loop doesn't need to know there are two.
     """
 
-    def __init__(self, optimizers: list[torch.optim.Optimizer]):
+    def __init__(
+        self,
+        optimizers: list[torch.optim.Optimizer],
+        *,
+        lr_warmup_steps: int = 0,
+    ):
         self.optimizers = optimizers
+        # Linear LR warmup over the first `lr_warmup_steps` calls to `step()`,
+        # ramping every param group's lr from ~0 → its configured value. This
+        # is the cold-start guard the nGPT port needs: on a fresh policy AdamW's
+        # second-moment estimate is uncalibrated, so the first ~tens of steps
+        # would otherwise take near-full `lr`·sign() steps. At `control_lr≈0.02`
+        # that lets the trunk-gating scalars (`sqk`/`suv`/`alpha`) swing by ~1
+        # across the first PPO update, spiking the policy KL far outside the
+        # trust region (`old_log_prob` is frozen per update). Mirrors the Muon
+        # momentum warmup; counted in optimizer-step calls, not PPO updates.
+        self.lr_warmup_steps = int(lr_warmup_steps)
+        self._base_lrs = [group["lr"] for group in self.param_groups]
+        self._step_count = 0
 
     @property
     def param_groups(self) -> list[dict]:
@@ -276,12 +293,20 @@ class MultiOptimizer:
             opt.zero_grad(set_to_none=set_to_none)
 
     def step(self, closure=None):
+        if self.lr_warmup_steps > 0:
+            self._step_count += 1
+            frac = min(self._step_count / self.lr_warmup_steps, 1.0)
+            for group, base_lr in zip(self.param_groups, self._base_lrs):
+                group["lr"] = base_lr * frac
         for opt in self.optimizers:
             opt.step()
 
     def state_dict(self) -> dict:
-        return {f"opt_{i}": opt.state_dict() for i, opt in enumerate(self.optimizers)}
+        state = {f"opt_{i}": opt.state_dict() for i, opt in enumerate(self.optimizers)}
+        state["_lr_warmup_step"] = self._step_count
+        return state
 
     def load_state_dict(self, state: dict) -> None:
+        self._step_count = int(state.get("_lr_warmup_step", 0))
         for i, opt in enumerate(self.optimizers):
             opt.load_state_dict(state[f"opt_{i}"])
