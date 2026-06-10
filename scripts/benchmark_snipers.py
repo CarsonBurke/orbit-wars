@@ -215,15 +215,11 @@ def main() -> None:
         "--bots",
         nargs="+",
         default=[
-            "sniper_v2",
-            "sniper_v3",
-            "sniper_v4",
-            "sniper_v6",
-            "sniper_v7",
-            "sniper_v8",
-            "sniper_v9",
             "sniper_v10",
             "sniper_v11",
+            "sniper_v14",
+            "sniper_v15",
+            "sniper_v17",
         ],
         help="Native builtin bots to benchmark.",
     )

@@ -13,6 +13,12 @@ from .sniper import (
     sniper_v9_agent,
     sniper_v10_agent,
     sniper_v11_agent,
+    sniper_v12_agent,
+    sniper_v13_agent,
+    sniper_v14_agent,
+    sniper_v15_agent,
+    sniper_v16_agent,
+    sniper_v17_agent,
 )
 
 __all__ = [
@@ -33,6 +39,12 @@ __all__ = [
     "sniper_v9_agent",
     "sniper_v10_agent",
     "sniper_v11_agent",
+    "sniper_v12_agent",
+    "sniper_v13_agent",
+    "sniper_v14_agent",
+    "sniper_v15_agent",
+    "sniper_v16_agent",
+    "sniper_v17_agent",
 ]
 
 

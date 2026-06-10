@@ -94,6 +94,12 @@ class _SniperProfile:
     recapture_score_weight: float = 6.0
     recapture_gap_cost: float = 0.25
     source_order: str = "ships"
+    speed_bid: bool = False
+    speed_bid_max_factor: float = 1.5
+    speed_bid_tempo_weight: float = 0.45
+    global_assignment: bool = False
+    strict_defense: bool = False
+    shadow_capture: bool = False
 
 
 _SNIPER_V2 = _SniperProfile(
@@ -261,6 +267,149 @@ _SNIPER_V11 = _SniperProfile(
     recapture_gap_cost=0.25,
 )
 
+_SNIPER_V12 = _SniperProfile(
+    reserve_base=1,
+    reserve_production=0.35,
+    send_buffer=1,
+    enemy_growth=True,
+    enemy_value=3.55,
+    neutral_value=1.0,
+    production_weight=6.5,
+    ship_cost_weight=0.66,
+    time_cost_weight=0.34,
+    duplicate_penalty=0.20,
+    net_defense_reserve=True,
+    defense_horizon=42.0,
+    reinforce_owned=True,
+    defense_arrival_slack=1.0,
+    defense_score_weight=9.0,
+    comet_max_eta=8.0,
+    speed_bid=True,
+)
+
+_SNIPER_V13 = _SniperProfile(
+    reserve_base=1,
+    reserve_production=0.35,
+    send_buffer=1,
+    enemy_growth=True,
+    enemy_value=3.55,
+    neutral_value=1.0,
+    production_weight=6.5,
+    ship_cost_weight=0.66,
+    time_cost_weight=0.34,
+    duplicate_penalty=0.20,
+    net_defense_reserve=True,
+    defense_horizon=42.0,
+    reinforce_owned=True,
+    defense_arrival_slack=1.0,
+    defense_score_weight=9.0,
+    comet_max_eta=8.0,
+    global_assignment=True,
+)
+
+_SNIPER_V14 = _SniperProfile(
+    reserve_base=1,
+    reserve_production=0.35,
+    send_buffer=1,
+    enemy_growth=True,
+    enemy_value=3.55,
+    neutral_value=1.0,
+    production_weight=6.5,
+    ship_cost_weight=0.66,
+    time_cost_weight=0.34,
+    duplicate_penalty=0.20,
+    net_defense_reserve=True,
+    defense_horizon=42.0,
+    reinforce_owned=True,
+    defense_arrival_slack=1.0,
+    defense_score_weight=9.0,
+    chronological_forecast=True,
+    comet_max_eta=8.0,
+    counter_recapture=True,
+    recapture_min_gap=0.5,
+    recapture_max_gap=8.0,
+    recapture_score_weight=6.0,
+    recapture_gap_cost=0.25,
+)
+
+_SNIPER_V15 = _SniperProfile(
+    reserve_base=1,
+    reserve_production=0.35,
+    send_buffer=1,
+    enemy_growth=True,
+    enemy_value=3.55,
+    neutral_value=1.0,
+    production_weight=6.5,
+    ship_cost_weight=0.66,
+    time_cost_weight=0.34,
+    duplicate_penalty=0.20,
+    net_defense_reserve=True,
+    defense_horizon=42.0,
+    reinforce_owned=True,
+    defense_arrival_slack=1.0,
+    defense_score_weight=9.0,
+    comet_max_eta=8.0,
+    counter_recapture=True,
+    recapture_min_gap=0.5,
+    recapture_max_gap=8.0,
+    recapture_score_weight=6.0,
+    recapture_gap_cost=0.25,
+    strict_defense=True,
+)
+
+_SNIPER_V16 = _SniperProfile(
+    reserve_base=1,
+    reserve_production=0.35,
+    send_buffer=1,
+    enemy_growth=True,
+    enemy_value=3.55,
+    neutral_value=1.0,
+    production_weight=6.5,
+    ship_cost_weight=0.66,
+    time_cost_weight=0.34,
+    duplicate_penalty=0.20,
+    net_defense_reserve=True,
+    defense_horizon=42.0,
+    reinforce_owned=True,
+    defense_arrival_slack=1.0,
+    defense_score_weight=9.0,
+    comet_max_eta=8.0,
+    counter_recapture=True,
+    recapture_min_gap=0.5,
+    recapture_max_gap=8.0,
+    recapture_score_weight=6.0,
+    recapture_gap_cost=0.25,
+    shadow_capture=True,
+)
+
+_SNIPER_V17 = _SniperProfile(
+    reserve_base=0,
+    reserve_production=0.35,
+    send_buffer=1,
+    enemy_growth=True,
+    enemy_value=3.55,
+    neutral_value=1.45,
+    production_weight=4.7243564847164325,
+    ship_cost_weight=0.66,
+    time_cost_weight=0.34358831285363617,
+    duplicate_penalty=0.20,
+    net_defense_reserve=True,
+    defense_horizon=41.30069766848027,
+    reinforce_owned=True,
+    defense_arrival_slack=1.0,
+    defense_score_weight=13.0,
+    chronological_forecast=True,
+    comet_max_eta=5.067770406031305,
+    counter_recapture=True,
+    recapture_min_gap=0.5,
+    recapture_max_gap=14.0,
+    recapture_score_weight=8.52469036246334,
+    recapture_gap_cost=0.24472159101961058,
+    speed_bid=False,
+    speed_bid_max_factor=1.2770669321193258,
+    speed_bid_tempo_weight=0.47561154430408675,
+)
+
 
 def sniper_v2_agent(obs: Any) -> list[list]:
     """Production-aware value sniper.
@@ -327,6 +476,42 @@ def sniper_v11_agent(obs: Any) -> list[list]:
     return _scored_sniper(obs, _SNIPER_V11)
 
 
+def sniper_v12_agent(obs: Any) -> list[list]:
+    """Speed-bid sniper variant for benchmark sweeps."""
+
+    return _scored_sniper(obs, _SNIPER_V12)
+
+
+def sniper_v13_agent(obs: Any) -> list[list]:
+    """Global-assignment sniper variant for benchmark sweeps."""
+
+    return _scored_sniper(obs, _SNIPER_V13)
+
+
+def sniper_v14_agent(obs: Any) -> list[list]:
+    """Chronological counter-recapture sniper variant for benchmark sweeps."""
+
+    return _scored_sniper(obs, _SNIPER_V14)
+
+
+def sniper_v15_agent(obs: Any) -> list[list]:
+    """Strict-defense sniper variant for benchmark sweeps."""
+
+    return _scored_sniper(obs, _SNIPER_V15)
+
+
+def sniper_v16_agent(obs: Any) -> list[list]:
+    """Shadow-capture sniper variant for benchmark sweeps."""
+
+    return _scored_sniper(obs, _SNIPER_V16)
+
+
+def sniper_v17_agent(obs: Any) -> list[list]:
+    """GA-tuned chronological counter-recapture sniper variant."""
+
+    return _scored_sniper(obs, _SNIPER_V17)
+
+
 def _scored_sniper(obs: Any, profile: _SniperProfile) -> list[list]:
     o = parse_observation(obs)
     targets = o.enemy_planets() + o.neutral_planets()
@@ -340,11 +525,40 @@ def _scored_sniper(obs: Any, profile: _SniperProfile) -> list[list]:
     planned_by_target: dict[int, list[tuple[float, int]]] = {}
     pressure = _fleet_pressure(o)
     moves: list[list] = []
+    if profile.global_assignment:
+        used_sources: set[int] = set()
+        for _ in my_planets:
+            best: tuple[float, int, int, float, list] | None = None
+            for mine in my_planets:
+                if int(mine.id) in used_sources:
+                    continue
+                move = _best_scored_move(
+                    o,
+                    mine,
+                    targets,
+                    blockers,
+                    planned_by_target,
+                    pressure,
+                    profile,
+                )
+                if move is None:
+                    continue
+                target_id, eta, action, score = move
+                if best is None or score > best[0]:
+                    best = (score, int(mine.id), target_id, eta, action)
+            if best is None:
+                break
+            _score, source_id, target_id, eta, action = best
+            used_sources.add(source_id)
+            planned_by_target.setdefault(target_id, []).append((eta, int(action[2])))
+            moves.append(action)
+        return moves
+
     for mine in my_planets:
         move = _best_scored_move(o, mine, targets, blockers, planned_by_target, pressure, profile)
         if move is None:
             continue
-        target_id, eta, action = move
+        target_id, eta, action, _score = move
         planned_by_target.setdefault(target_id, []).append((eta, int(action[2])))
         moves.append(action)
     return moves
@@ -358,7 +572,7 @@ def _best_scored_move(
     planned_by_target: dict[int, list[tuple[float, int]]],
     pressure: dict[int, list[tuple[float, int, int]]],
     profile: _SniperProfile,
-) -> tuple[int, float, list] | None:
+) -> tuple[int, float, list, float] | None:
     reserve = int(math.ceil(profile.reserve_base + profile.reserve_production * mine.production))
     if profile.net_defense_reserve:
         reserve += _defensive_reserve(
@@ -412,6 +626,21 @@ def _best_scored_move(
 
     for target in targets:
         planned = planned_by_target.get(int(target.id), [])
+        if profile.shadow_capture:
+            candidate = _shadow_candidate_action(
+                o,
+                mine,
+                target,
+                blockers,
+                budget,
+                planned,
+                pressure,
+                profile,
+            )
+            if candidate is not None:
+                score, eta, action = candidate
+                if best is None or score > best[0]:
+                    best = (score, int(target.id), eta, action)
         candidate = _candidate_action(o, mine, target, blockers, budget, planned, pressure, profile)
         if candidate is None:
             continue
@@ -420,7 +649,7 @@ def _best_scored_move(
             best = (score, int(target.id), eta, action)
     if best is None:
         return None
-    return best[1], best[2], best[3]
+    return best[1], best[2], best[3], best[0]
 
 
 def _candidate_action(
@@ -477,6 +706,89 @@ def _candidate_action(
     if solution is None or ships_needed > budget:
         return None
 
+    candidate = _score_capture_candidate(
+        o,
+        mine,
+        target,
+        blockers,
+        budget,
+        planned,
+        profile,
+        ships_needed,
+        solution,
+        partial,
+        partial_required,
+        None,
+    )
+    if candidate is None:
+        return None
+
+    best_score, best_eta, best_action = candidate
+    if profile.speed_bid and not partial:
+        for factor in (1.25, profile.speed_bid_max_factor):
+            bid_ships = min(budget, max(ships_needed + 1, int(math.ceil(ships_needed * factor))))
+            if bid_ships <= ships_needed:
+                continue
+            bid_solution = _lead_solution(
+                mine.x,
+                mine.y,
+                mine.radius,
+                target.x,
+                target.y,
+                target.radius,
+                o.angular_velocity,
+                bid_ships,
+                target_is_comet=int(target.id) in o.comet_planet_ids,
+            )
+            if bid_solution is None:
+                continue
+            if (
+                profile.comet_max_eta is not None
+                and int(target.id) in o.comet_planet_ids
+                and bid_solution.time > profile.comet_max_eta
+            ):
+                continue
+            revised = _ships_needed_at_eta(o, target, bid_solution.time, planned, pressure, profile)
+            if revised <= 0 or revised > bid_ships:
+                continue
+            bid_candidate = _score_capture_candidate(
+                o,
+                mine,
+                target,
+                blockers,
+                budget,
+                planned,
+                profile,
+                bid_ships,
+                bid_solution,
+                False,
+                bid_ships,
+                solution.time,
+            )
+            if bid_candidate is None:
+                continue
+            score, eta, action = bid_candidate
+            if score > best_score:
+                best_score, best_eta, best_action = score, eta, action
+    return best_score, best_eta, best_action
+
+
+def _score_capture_candidate(
+    o,
+    mine: Planet,
+    target: Planet,
+    blockers,
+    budget: int,
+    planned: list[tuple[float, int]],
+    profile: _SniperProfile,
+    ships: int,
+    solution,
+    partial: bool,
+    partial_required: int,
+    base_eta: float | None,
+) -> tuple[float, float, list] | None:
+    if ships > budget:
+        return None
     if not _route_clear_to_solution(
         mine.id,
         target.id,
@@ -484,7 +796,7 @@ def _candidate_action(
         mine.y,
         mine.radius,
         solution,
-        ships_needed,
+        ships,
         blockers,
         o.angular_velocity,
     ):
@@ -496,13 +808,16 @@ def _candidate_action(
     already_planned = _planned_by(planned, solution.time)
     duplicate_scale = 1.0 / (1.0 + profile.duplicate_penalty * max(0, already_planned))
     cost = (
-        profile.ship_cost_weight * max(1, ships_needed)
+        profile.ship_cost_weight * max(1, ships)
         + profile.time_cost_weight * max(1.0, solution.time)
     )
     score = production_value * distance_bonus * duplicate_scale / max(1.0, cost)
+    if base_eta is not None and base_eta > solution.time:
+        saved = (base_eta - solution.time) / max(1.0, base_eta)
+        score *= 1.0 + profile.speed_bid_tempo_weight * saved
     if partial:
-        score *= profile.partial_score_scale * (ships_needed / max(1.0, float(partial_required)))
-    return score, solution.time, [mine.id, solution.angle, int(ships_needed)]
+        score *= profile.partial_score_scale * (ships / max(1.0, float(partial_required)))
+    return score, solution.time, [mine.id, solution.angle, int(ships)]
 
 
 def _defense_candidate_action(
@@ -519,6 +834,8 @@ def _defense_candidate_action(
     if threat is None:
         return None
     threat_eta, ships_needed = threat
+    if profile.strict_defense and ships_needed > budget:
+        return None
     ships_needed = min(ships_needed, budget)
     if ships_needed <= 0:
         return None
@@ -549,6 +866,91 @@ def _defense_candidate_action(
         return None
     urgency = 1.0 + max(0.0, profile.defense_horizon - threat_eta) / profile.defense_horizon
     value = profile.defense_score_weight * urgency * (2.0 + target.production)
+    cost = ships_needed + 0.35 * max(1.0, solution.time)
+    return value / max(1.0, cost), solution.time, [mine.id, solution.angle, int(ships_needed)]
+
+
+def _shadow_candidate_action(
+    o,
+    mine: Planet,
+    target: Planet,
+    blockers,
+    budget: int,
+    planned: list[tuple[float, int]],
+    pressure: dict[int, list[tuple[float, int, int]]],
+    profile: _SniperProfile,
+) -> tuple[float, float, list] | None:
+    if target.owner == o.player:
+        return None
+    capture = _project_hostile_capture(target, planned, pressure, profile.defense_horizon)
+    if capture is None:
+        return None
+    capture_eta, captor, surplus = capture
+    if captor == o.player:
+        return None
+    if _pressure_by(pressure, int(target.id), o.player, capture_eta) + _planned_by(planned, capture_eta) > 0:
+        return None
+    ships_needed = surplus + profile.send_buffer
+    solution = None
+    converged = False
+    for _ in range(4):
+        if ships_needed > budget:
+            return None
+        solution = _lead_solution(
+            mine.x,
+            mine.y,
+            mine.radius,
+            target.x,
+            target.y,
+            target.radius,
+            o.angular_velocity,
+            ships_needed,
+            target_is_comet=int(target.id) in o.comet_planet_ids,
+        )
+        if solution is None:
+            return None
+        gap = solution.time - capture_eta
+        if gap < profile.recapture_min_gap or gap > profile.recapture_max_gap:
+            return None
+        later_enemy = _pressure_between(pressure, int(target.id), captor, capture_eta, solution.time)
+        planned_recapture = _planned_between(planned, capture_eta, solution.time)
+        revised = max(
+            1,
+            surplus
+            + int(math.floor(max(0.0, gap) * target.production))
+            + later_enemy
+            + profile.send_buffer
+            - planned_recapture,
+        )
+        if revised == ships_needed:
+            converged = True
+            break
+        ships_needed = revised
+    if not converged or solution is None or ships_needed > budget:
+        return None
+    if not _route_clear_to_solution(
+        mine.id,
+        target.id,
+        mine.x,
+        mine.y,
+        mine.radius,
+        solution,
+        ships_needed,
+        blockers,
+        o.angular_velocity,
+    ):
+        return None
+    gap = solution.time - capture_eta
+    urgency = 1.0 + max(0.0, profile.defense_horizon - capture_eta) / profile.defense_horizon
+    gap_penalty = 1.0 / (1.0 + profile.recapture_gap_cost * gap)
+    owner_scale = 1.1 if target.owner == -1 else 0.85
+    value = (
+        owner_scale
+        * profile.recapture_score_weight
+        * urgency
+        * (2.0 + target.production)
+        * gap_penalty
+    )
     cost = ships_needed + 0.35 * max(1.0, solution.time)
     return value / max(1.0, cost), solution.time, [mine.id, solution.angle, int(ships_needed)]
 
@@ -589,6 +991,7 @@ def _recapture_candidate_action(
     capture_eta, captor, surplus = capture
     ships_needed = surplus + profile.send_buffer
     solution = None
+    converged = False
     for _ in range(4):
         if ships_needed > budget:
             return None
@@ -619,9 +1022,10 @@ def _recapture_candidate_action(
             - planned_recapture,
         )
         if revised == ships_needed:
+            converged = True
             break
         ships_needed = revised
-    if solution is None or ships_needed > budget:
+    if not converged or solution is None or ships_needed > budget:
         return None
     if not _route_clear_to_solution(
         mine.id,

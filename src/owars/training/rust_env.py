@@ -128,6 +128,12 @@ class RustVecEnv:
             "sniper_v9",
             "sniper_v10",
             "sniper_v11",
+            "sniper_v12",
+            "sniper_v13",
+            "sniper_v14",
+            "sniper_v15",
+            "sniper_v16",
+            "sniper_v17",
         }
     )
 
@@ -435,6 +441,19 @@ class RustVecEnv:
     ) -> list[Any]:
         return self._core.builtin_actions(
             str(name),
+            [(int(idx), int(player)) for idx, player in rows],
+            bool(native_actions),
+        )
+
+    def sniper_profile_actions(
+        self,
+        profile: dict[str, Any],
+        rows: list[tuple[int, int]],
+        *,
+        native_actions: bool = False,
+    ) -> list[Any]:
+        return self._core.sniper_profile_actions(
+            dict(profile),
             [(int(idx), int(player)) for idx, player in rows],
             bool(native_actions),
         )

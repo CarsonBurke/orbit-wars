@@ -358,6 +358,12 @@ def test_rust_vec_env_step_subset_fast_rejects_duplicate_indices():
         ("sniper_v9", "sniper_v9_agent"),
         ("sniper_v10", "sniper_v10_agent"),
         ("sniper_v11", "sniper_v11_agent"),
+        ("sniper_v12", "sniper_v12_agent"),
+        ("sniper_v13", "sniper_v13_agent"),
+        ("sniper_v14", "sniper_v14_agent"),
+        ("sniper_v15", "sniper_v15_agent"),
+        ("sniper_v16", "sniper_v16_agent"),
+        ("sniper_v17", "sniper_v17_agent"),
     ],
 )
 def test_rust_vec_env_native_sniper_matches_python_sniper(name: str, agent_name: str):
@@ -385,6 +391,52 @@ def test_rust_vec_env_native_sniper_matches_python_sniper(name: str, agent_name:
             assert int(got[0]) == int(want[0])
             assert math.isclose(float(got[1]), float(want[1]), rel_tol=0.0, abs_tol=1e-12)
             assert int(got[2]) == int(want[2])
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_sniper_profile_actions_match_builtin_v14():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    profile = {
+        "reserve_base": 1,
+        "reserve_production": 0.35,
+        "send_buffer": 1,
+        "enemy_growth": True,
+        "enemy_value": 3.55,
+        "neutral_value": 1.0,
+        "production_weight": 6.5,
+        "ship_cost_weight": 0.66,
+        "time_cost_weight": 0.34,
+        "duplicate_penalty": 0.20,
+        "net_defense_reserve": True,
+        "defense_horizon": 42.0,
+        "reinforce_owned": True,
+        "defense_arrival_slack": 1.0,
+        "defense_score_weight": 9.0,
+        "chronological_forecast": True,
+        "comet_max_eta": 8.0,
+        "counter_recapture": True,
+        "recapture_min_gap": 0.5,
+        "recapture_max_gap": 8.0,
+        "recapture_score_weight": 6.0,
+        "recapture_gap_cost": 0.25,
+    }
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust.reset()
+    rust.step_subset_fast([0, 1], [[[], []], [[], []]])
+    rows = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+    profiled = rust.sniper_profile_actions(profile, rows, native_actions=False)
+    builtin = rust.builtin_actions("sniper_v14", rows, native_actions=False)
+
+    assert profiled == builtin
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
@@ -730,6 +782,127 @@ def test_rust_vec_env_native_sampler_matches_context_sampler():
     assert torch.equal(got_records.target_idx, expected_records.target_idx)
     assert torch.allclose(got_records.log_prob, expected_records.log_prob)
     assert torch.equal(got_records.target_legal_mask, expected_records.target_legal_mask)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_native_sampler_matches_raw_python_sampler():
+    _build_rust_extension()
+    from owars.policies.model import PolicyOutput
+    from owars.policies.sampling import (
+        sample_batch_actions_raw,
+        sample_batch_with_records_raw,
+    )
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=4,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=3,
+    )
+    rust.reset()
+    noop = [[[], [], [], []], [[], [], [], []]]
+    for _ in range(55):
+        rust.step_subset_fast([0, 1], noop)
+
+    rows = [(0, 0), (1, 2), (0, 3), (1, 1)]
+    fast, _contexts = rust.policy_batch(rows, device="cpu")
+    raw_observations = rust.observations(rows)
+    b, p = fast.planet_ids.shape
+
+    source_rank = torch.arange(p, dtype=torch.float32).view(1, p, 1)
+    target_rank = torch.arange(p, dtype=torch.float32).view(1, 1, p)
+    target_logits = target_rank - 0.01 * source_rank
+    out = PolicyOutput(
+        launch_logits=torch.where(
+            fast.planet_owned_mask,
+            torch.full((b, p), 100.0),
+            torch.full((b, p), -100.0),
+        ),
+        target_logits=target_logits.expand(b, -1, -1).clone(),
+        value=torch.zeros(b),
+        value_logits=torch.zeros(b, 51),
+        planet_owned_mask=fast.planet_owned_mask,
+        planet_mask=fast.planet_mask,
+        planet_ids=fast.planet_ids,
+        action_logit_softcap=8.0,
+        fraction_alpha=torch.full((b, p), 12.0),
+        fraction_beta=torch.full((b, p), 3.0),
+    )
+
+    expected_actions, expected_records = sample_batch_with_records_raw(
+        out, raw_observations, deterministic=True, record_rows=list(range(b))
+    )
+    got_actions, got_records = rust.sample_batch_with_records(
+        out, rows, deterministic=True, record_rows=list(range(b))
+    )
+
+    assert got_actions == expected_actions
+    assert rust.sample_batch_actions(
+        out, rows, deterministic=True
+    ) == sample_batch_actions_raw(out, raw_observations, deterministic=True)
+    assert torch.equal(got_records.launch, expected_records.launch)
+    assert torch.equal(got_records.target_idx, expected_records.target_idx)
+    assert torch.allclose(got_records.fraction, expected_records.fraction)
+    assert torch.allclose(got_records.log_prob, expected_records.log_prob)
+    assert torch.equal(got_records.target_legal_mask, expected_records.target_legal_mask)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_vec_env_policy_inference_matches_raw_python_path():
+    _build_rust_extension()
+    from owars.policies.config import OrbitPolicyConfig
+    from owars.policies.model import OrbitPolicy
+    from owars.policies.sampling import sample_batch_actions_raw
+    from owars.training.rust_env import RustVecEnv
+
+    torch.manual_seed(123)
+    model = OrbitPolicy(
+        OrbitPolicyConfig(
+            dim=32,
+            ff_dim=64,
+            depth=1,
+            n_heads=2,
+            num_fleet_latents=8,
+            fleet_tokenizer_depth=1,
+            value_num_bins=51,
+            critic_mtp_horizon=1,
+        )
+    ).eval()
+
+    rust = RustVecEnv(
+        num_envs=2,
+        num_players=4,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=5,
+    )
+    rust.reset()
+    noop = [[[], [], [], []], [[], [], [], []]]
+    for _ in range(52):
+        rust.step_subset_fast([0, 1], noop)
+
+    rows = [(0, 0), (1, 2), (0, 3), (1, 1)]
+    fast, _contexts = rust.policy_batch(rows, device="cpu")
+    raw_observations = rust.observations(rows)
+    raw = encode_raw_observations(raw_observations, device="cpu")
+
+    with torch.inference_mode():
+        fast_out = model(fast, include_value=False)
+        raw_out = model(raw, include_value=False)
+
+    assert torch.allclose(fast_out.launch_logits, raw_out.launch_logits)
+    assert torch.allclose(fast_out.target_logits, raw_out.target_logits, equal_nan=True)
+    assert torch.allclose(fast_out.fraction_alpha, raw_out.fraction_alpha)
+    assert torch.allclose(fast_out.fraction_beta, raw_out.fraction_beta)
+    assert torch.equal(fast_out.planet_owned_mask, raw_out.planet_owned_mask)
+    assert torch.equal(fast_out.planet_mask, raw_out.planet_mask)
+    assert torch.equal(fast_out.planet_ids, raw_out.planet_ids)
+
+    assert rust.sample_batch_actions(
+        fast_out, rows, deterministic=True
+    ) == sample_batch_actions_raw(raw_out, raw_observations, deterministic=True)
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")

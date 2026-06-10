@@ -44,6 +44,12 @@ from ..agents.sniper import (
     sniper_v9_agent,
     sniper_v10_agent,
     sniper_v11_agent,
+    sniper_v12_agent,
+    sniper_v13_agent,
+    sniper_v14_agent,
+    sniper_v15_agent,
+    sniper_v16_agent,
+    sniper_v17_agent,
 )
 from ..policies.model import OrbitPolicy
 from .elo import EloTracker
@@ -65,6 +71,12 @@ BUILTIN: dict[str, AgentFn] = {
     "sniper_v9": sniper_v9_agent,
     "sniper_v10": sniper_v10_agent,
     "sniper_v11": sniper_v11_agent,
+    "sniper_v12": sniper_v12_agent,
+    "sniper_v13": sniper_v13_agent,
+    "sniper_v14": sniper_v14_agent,
+    "sniper_v15": sniper_v15_agent,
+    "sniper_v16": sniper_v16_agent,
+    "sniper_v17": sniper_v17_agent,
     "heuristic": heuristic_agent,
 }
 
