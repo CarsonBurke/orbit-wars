@@ -174,7 +174,7 @@ sac:
   # list), else self-play against the LIVE model (active actor only — no frozen
   # snapshot copies). Mixing fixed baselines in guards against self-play
   # strategy collapse.
-  builtin_opponents: [random, sniper, heuristic]
+  builtin_opponents: [random, sniper_v17, heuristic]
   builtin_prob: 0.5
 
 rollout:

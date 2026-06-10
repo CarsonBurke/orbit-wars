@@ -77,7 +77,7 @@ rollout:
 opponents:
   mode: fixed
   fixed_opponents:
-    - sniper
+    - sniper_v17
   snapshot_device: train
   initial_rating: 1500.0
   k_factor: 32.0

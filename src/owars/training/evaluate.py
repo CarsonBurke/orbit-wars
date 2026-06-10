@@ -31,7 +31,7 @@ def evaluate_ckpt(
     episode_steps: int = 500,
     ship_speed: float = 6.0,
     device: str = "cpu",
-    baselines: tuple[str, ...] = ("random", "sniper", "heuristic"),
+    baselines: tuple[str, ...] = ("random", "sniper_v17", "heuristic"),
     num_envs: int = 16,
     env_backend: str = "kaggle",
     num_workers: int = 0,
@@ -145,7 +145,7 @@ def main() -> None:
     p.add_argument("--num-players", type=int, default=2, choices=(2, 4))
     p.add_argument(
         "--baselines", nargs="+",
-        default=["random", "sniper", "heuristic"],
+        default=["random", "sniper_v17", "heuristic"],
         choices=list(BUILTIN.keys()),
     )
     p.add_argument("--device", default="cpu")

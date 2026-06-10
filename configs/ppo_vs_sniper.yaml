@@ -1,4 +1,4 @@
-# PPO fixed-opponent config: train only against the static sniper bot.
+# PPO fixed-opponent config: train only against the tuned sniper_v17 bot.
 #
 # 2-player PPO config.
 #
@@ -102,7 +102,7 @@ rollout:
 
 opponents:
   mode: fixed
-  fixed_opponents: [sniper]
+  fixed_opponents: [sniper_v17]
   snapshot_device: train
   snapshot_every: 1   # ignored in fixed mode
   top_k: 10           # ignored in fixed mode

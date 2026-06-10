@@ -11,6 +11,8 @@ def test_load_default():
     assert cfg.run.name == "default"
     assert cfg.game.num_players == 2
     assert cfg.model.depth == 3
+    assert cfg.opponents.fixed_opponents == ["sniper_v17"]
+    assert cfg.sac.builtin_opponents == ["random", "sniper_v17", "heuristic"]
 
 
 def test_unknown_key_raises():
@@ -195,11 +197,16 @@ def test_learned_configs_use_conventional_gae():
 
 
 def test_sniper_training_configs_load():
-    for path in ("configs/ppo_vs_sniper.yaml", "configs/sac_vs_sniper.yaml"):
+    for path in (
+        "configs/ppo_sniper.yaml",
+        "configs/ppo_sniper_oldblock.yaml",
+        "configs/ppo_vs_sniper.yaml",
+        "configs/sac_vs_sniper.yaml",
+    ):
         with open(path) as f:
             cfg = RunConfig.from_dict(yaml.safe_load(f))
         assert cfg.opponents.mode == "fixed"
-        assert cfg.opponents.fixed_opponents == ["sniper"]
+        assert cfg.opponents.fixed_opponents == ["sniper_v17"]
 
 
 def test_ablation_yaml_keys_load():
