@@ -27,6 +27,14 @@ def _obs():
 def test_encode_shapes():
     o = parse_observation(_obs())
     feats = encode_observation(o)
+    assert feats.global_feats is not None
+    assert feats.global_feats.shape == (27,)
+    assert torch.allclose(feats.global_feats[:2], torch.tensor([0.0, 1.0]))
+    # Self slot starts at offset 4: planet_count, production, planet_ships,
+    # fleet_count, fleet_ships. Enemy_0 follows at offset 9.
+    assert torch.allclose(feats.global_feats[4:6], torch.tensor([1.0 / 64.0, 3.0 / 320.0]))
+    assert torch.allclose(feats.global_feats[9:11], torch.tensor([1.0 / 64.0, 2.0 / 320.0]))
+    assert torch.allclose(feats.global_feats[24:26], torch.tensor([1.0 / 64.0, 1.0 / 320.0]))
     assert feats.planet_feats.shape == (64, 19)
     assert feats.fleet_feats.shape == (384, 20)
     assert int(feats.planet_mask.sum()) == 3
@@ -139,12 +147,12 @@ def test_fleet_latent_encoder_compresses_fleet_tokens():
         model._embed_tokens(feats)
     )
 
-    assert h.shape[1] == 2 + 64 + cfg.num_fleet_latents
+    assert h.shape[1] == 3 + 64 + cfg.num_fleet_latents
     assert full_mask.shape[1] == h.shape[1]
     assert planet_mask.shape[-1] == 64
     assert fleet_mask.shape[-1] == cfg.num_fleet_latents
     assert rope_cache is not None
-    assert planet_slice == slice(2, 66)
+    assert planet_slice == slice(3, 67)
     assert p == 64
     assert f == cfg.num_fleet_latents
 

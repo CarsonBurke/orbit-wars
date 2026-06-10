@@ -42,6 +42,7 @@ class ModelCfg:
     planet_rope_fraction: float = 0.25
     planet_rope_base: float = 10000.0
     encoder_backend: Literal["dense", "fleet_latent"] = "fleet_latent"
+    global_features: int = 27
     num_fleet_latents: int = 64
     fleet_tokenizer_depth: int = 1
     value_hidden: int = 64

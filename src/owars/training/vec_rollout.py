@@ -75,6 +75,7 @@ class _RolloutForwardKernel(torch.nn.Module):
 
     def forward(
         self,
+        global_feats: torch.Tensor,
         planet_feats: torch.Tensor,
         planet_mask: torch.Tensor,
         planet_owned_mask: torch.Tensor,
@@ -91,6 +92,7 @@ class _RolloutForwardKernel(torch.nn.Module):
             planet_garrison=planet_garrison,
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
+            global_feats=global_feats,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -152,7 +154,17 @@ def _pad_encoded_rows(feats: EncodedObs, rows: int) -> EncodedObs:
         planet_garrison=_pad_rows(feats.planet_garrison, rows),
         fleet_feats=_pad_rows(feats.fleet_feats, rows),
         fleet_mask=_pad_rows(feats.fleet_mask, rows, fill=False),
+        global_feats=None
+        if feats.global_feats is None
+        else _pad_rows(feats.global_feats, rows),
     )
+
+
+def _global_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
+    if feats.global_feats is not None:
+        return feats.global_feats
+    batch = feats.planet_feats.shape[0]
+    return feats.planet_feats.new_zeros(batch, 0)
 
 
 def _active_fleet_width(fleet_mask: torch.Tensor) -> int:
@@ -182,6 +194,7 @@ def _slice_fleet_width(feats: EncodedObs, width: int) -> EncodedObs:
         planet_garrison=feats.planet_garrison,
         fleet_feats=feats.fleet_feats[:, :width],
         fleet_mask=feats.fleet_mask[:, :width],
+        global_feats=feats.global_feats,
     )
 
 
@@ -748,6 +761,7 @@ def _step_learner_bucket(
         if graph_enabled:
             _mark_cuda_graph_step(target_device)
         out = kernel(
+            _global_feats_or_empty(graph_stacked),
             graph_stacked.planet_feats,
             graph_stacked.planet_mask,
             graph_stacked.planet_owned_mask,
@@ -833,6 +847,7 @@ def _step_learner_bucket(
                     planet_garrison=rec["planet_garrison"][j],
                     fleet_feats=rec["fleet_feats"][j],
                     fleet_mask=rec["fleet_mask"][j],
+                    global_feats=rec["global_feats"][j],
                 )
             )
             traj.launch.append(rec["launch"][j])
@@ -937,6 +952,10 @@ def _materialize_records_cpu(
         "fleet_mask": feature_source.fleet_mask.index_select(0, feature_rows)
         .detach()
         .cpu(),
+        "global_feats": _global_feats_or_empty(feature_source)
+        .index_select(0, feature_rows)
+        .detach()
+        .cpu(),
         "target_idx": target_idx_cpu,
         "launch": launch_cpu,
         "fraction": fraction_cpu,
@@ -966,4 +985,5 @@ def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
         planet_garrison=move(feats.planet_garrison),
         fleet_feats=move(feats.fleet_feats),
         fleet_mask=move(feats.fleet_mask),
+        global_feats=None if feats.global_feats is None else move(feats.global_feats),
     )

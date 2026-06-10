@@ -21,11 +21,13 @@ import torch
 from ..game import MAX_SHIP_SPEED
 from ..policies.features import (
     FLEET_FEAT_DIM,
+    GLOBAL_FEAT_DIM,
     MAX_FLEETS,
     MAX_OMEGA,
     MAX_PLANETS,
     PLANET_FEAT_DIM,
     EncodedObs,
+    _global_features,
 )
 from ..policies.sampling import ActionContext
 
@@ -1483,6 +1485,7 @@ class NumpyVecEnv:
     ) -> tuple[EncodedObs, list[ActionContext]]:
         """Encode policy rows directly from dense simulator arrays."""
         b = len(rows)
+        g_feats = np.zeros((b, GLOBAL_FEAT_DIM), dtype=np.float32)
         p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
         p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
         p_owned = np.zeros((b, MAX_PLANETS), dtype=bool)
@@ -1496,6 +1499,13 @@ class NumpyVecEnv:
             planets = self.planets[env_idx, self.planet_mask[env_idx]].copy()
             fleets = self.fleets[env_idx, self.fleet_mask[env_idx]].copy()
             env = self.envs[env_idx]
+            g_feats[row] = _global_features(
+                int(self.step_count[env_idx]),
+                int(player),
+                self.num_players,
+                planets,
+                fleets,
+            )
             self._fill_policy_planet_features(
                 row,
                 int(player),
@@ -1540,6 +1550,9 @@ class NumpyVecEnv:
                     f_feats, device, pin_memory=pin_memory
                 ),
                 fleet_mask=_tensor_from_numpy(f_mask, device, pin_memory=pin_memory),
+                global_feats=_tensor_from_numpy(
+                    g_feats, device, pin_memory=pin_memory
+                ),
             ),
             contexts,
         )

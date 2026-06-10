@@ -175,6 +175,7 @@ class _InferenceForwardKernel(nn.Module):
 
     def forward(
         self,
+        global_feats: torch.Tensor,
         planet_feats: torch.Tensor,
         planet_mask: torch.Tensor,
         planet_owned_mask: torch.Tensor,
@@ -191,6 +192,7 @@ class _InferenceForwardKernel(nn.Module):
             planet_garrison=planet_garrison,
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
+            global_feats=global_feats,
         )
         with torch.autocast(
             device_type="cuda",
@@ -229,7 +231,17 @@ def _pad_encoded(feats: EncodedObs, rows: int) -> EncodedObs:
         planet_garrison=_pad_rows(feats.planet_garrison, rows),
         fleet_feats=_pad_rows(feats.fleet_feats, rows),
         fleet_mask=_pad_rows(feats.fleet_mask, rows, fill=False),
+        global_feats=None
+        if feats.global_feats is None
+        else _pad_rows(feats.global_feats, rows),
     )
+
+
+def _global_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
+    if feats.global_feats is not None:
+        return feats.global_feats
+    batch = feats.planet_feats.shape[0]
+    return feats.planet_feats.new_zeros(batch, 0)
 
 
 def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
@@ -318,6 +330,11 @@ class LearnedAgent:
                 device=device,
             ),
             fleet_mask=torch.zeros(rows, MAX_FLEETS, dtype=torch.bool, device=device),
+            global_feats=torch.zeros(
+                rows,
+                self.model.cfg.global_features,
+                device=device,
+            ),
         )
         with torch.inference_mode():
             self._forward(feats, rows, include_value=False)
@@ -360,6 +377,7 @@ class LearnedAgent:
         if self.compile_mode is not None:
             _mark_cuda_graph_step(device)
         out = kernel(
+            _global_feats_or_empty(graph_feats),
             graph_feats.planet_feats,
             graph_feats.planet_mask,
             graph_feats.planet_owned_mask,

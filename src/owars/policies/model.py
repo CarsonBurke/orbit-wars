@@ -1,7 +1,7 @@
 """OrbitPolicy — set-transformer encoder + factored action heads.
 
 Architecture:
-  [ACTOR] [CRITIC] planet_tokens fleet_tokens
+  [ACTOR] [CRITIC] [GLOBAL] planet_tokens fleet_tokens
               │
               ▼
   [N × Transformer block] ─► token reps
@@ -9,16 +9,18 @@ Architecture:
               ├─► h_actor (broadcast)  ─► concat onto each planet rep ─►
               │                             launch/target/fraction heads
               ├─► h_critic             ─► distributional value head (HL-Gauss)
+              ├─► h_global             ─► observation-level context in trunk
               ├─► planet_h             ─► target_key (per-planet rep stays d-dim)
               └─► fleet_h              ─► (consumed only by encoder cross-attention)
 
-Two learnable summary tokens (Set-Transformer-style PMA) prepend the input
-set. The critic token gives the value head a *learned* aggregator instead
+Learnable prefix tokens (Set-Transformer-style PMA) prepend the input set.
+The critic token gives the value head a *learned* aggregator instead
 of a mean-pool over up to 64+384 tokens, where decision-relevant tokens
 otherwise drown in the average. The actor token is concatenated as global
 context onto each per-planet rep before the action heads — the per-planet
 target/fraction heads see "what's the joint plan look like" without us
-having to go autoregressive.
+having to go autoregressive. The global token carries scalar observation
+context such as game clock while remaining outside the planet action vocabulary.
 
 We deliberately do **not** down-project after the actor concat: target_query
 and the Beta fraction heads take 2d-wide inputs and project to their natural
@@ -214,6 +216,7 @@ _FP32_NAME_SUBSTRINGS: tuple[str, ...] = (
     "target_q_gain",
     "actor_token",
     "critic_token",
+    "global_token",
     "fleet_latents",
 )
 
@@ -1026,6 +1029,7 @@ class OrbitPolicy(nn.Module):
         if cfg.encoder_backend not in {"dense", "fleet_latent"}:
             raise ValueError(f"unknown encoder_backend: {cfg.encoder_backend!r}")
         self.cfg = cfg
+        self.global_embed = CastedLinear(cfg.global_features, cfg.dim)
         self.planet_embed = CastedLinear(cfg.planet_features, cfg.dim)
         self.fleet_embed = CastedLinear(cfg.fleet_features, cfg.dim)
         self.fleet_tokenizer = (
@@ -1044,17 +1048,19 @@ class OrbitPolicy(nn.Module):
             if cfg.encoder_backend == "fleet_latent"
             else None
         )
-        # Two learnable summary tokens (PMA-style). Initialized small so
+        # Learnable prefix tokens (PMA-style). Initialized small so
         # they don't dominate the encoder at step 0 — gradient flow alone
         # will scale them up as the heads start using their output.
-        # Store summary tokens flat. AOTAutograd can reduce broadcasted
+        # Store prefix tokens flat. AOTAutograd can reduce broadcasted
         # `[1, 1, d]` parameters to `[d]` gradients in compiled backward at
         # larger PPO batch sizes; making the parameter itself `[d]` keeps the
         # expected gradient shape aligned with the reduction.
         self.actor_token = nn.Parameter(torch.zeros(cfg.dim))
         self.critic_token = nn.Parameter(torch.zeros(cfg.dim))
+        self.global_token = nn.Parameter(torch.zeros(cfg.dim))
         nn.init.trunc_normal_(self.actor_token, std=0.02)
         nn.init.trunc_normal_(self.critic_token, std=0.02)
+        nn.init.trunc_normal_(self.global_token, std=0.02)
         head_dim = cfg.dim // cfg.n_heads
         self.planet_rope = Rotary2D(
             head_dim,
@@ -1192,14 +1198,31 @@ class OrbitPolicy(nn.Module):
             planet_mask = feats.planet_mask.unsqueeze(0)
             fleet_feats = feats.fleet_feats.unsqueeze(0)
             fleet_mask = feats.fleet_mask.unsqueeze(0)
+            if feats.global_feats is None:
+                global_feats = None
+            elif feats.global_feats.dim() == 1:
+                global_feats = feats.global_feats.unsqueeze(0)
+            else:
+                global_feats = feats.global_feats
         else:
             planet_feats = feats.planet_feats
             planet_mask = feats.planet_mask
             fleet_feats = feats.fleet_feats
             fleet_mask = feats.fleet_mask
+            global_feats = feats.global_feats
 
         b, p, _ = planet_feats.shape
         f = fleet_feats.shape[1]
+        if global_feats is None:
+            global_feats = planet_feats.new_zeros(b, self.global_embed.in_features)
+        elif global_feats.dim() == 1:
+            global_feats = global_feats.unsqueeze(0)
+        global_feats = global_feats.to(device=planet_feats.device, dtype=planet_feats.dtype)
+        if global_feats.shape[-1] != self.global_embed.in_features:
+            global_feats = _match_feature_width(
+                global_feats,
+                self.global_embed.in_features,
+            )
         if planet_feats.shape[-1] != self.planet_embed.in_features:
             planet_feats = _match_feature_width(
                 planet_feats, self.planet_embed.in_features
@@ -1207,6 +1230,7 @@ class OrbitPolicy(nn.Module):
         if fleet_feats.shape[-1] != self.fleet_embed.in_features:
             fleet_feats = _match_feature_width(fleet_feats, self.fleet_embed.in_features)
 
+        h_g = self.global_embed(global_feats)
         h_p = self.planet_embed(planet_feats)
         h_f = self.fleet_embed(fleet_feats)
         if self.fleet_tokenizer is not None:
@@ -1218,24 +1242,26 @@ class OrbitPolicy(nn.Module):
                 device=fleet_mask.device,
             )
             f = h_f.shape[1]
-        # Prepend the two summary tokens, broadcast to batch dim. Parameters
+        # Prepend the three prefix tokens, broadcast to batch dim. Parameters
         # are stored flat so compiled backward's broadcast reduction returns
         # `[d]`, matching the actual parameter shape.
         actor_t = self.actor_token.view(1, 1, -1).expand(b, 1, -1)
         critic_t = self.critic_token.view(1, 1, -1).expand(b, 1, -1)
-        h = torch.cat([actor_t, critic_t, h_p, h_f], dim=1)
+        global_t = self.global_token.view(1, 1, -1).expand(b, 1, -1)
+        global_t = global_t + h_g.unsqueeze(1)
+        h = torch.cat([actor_t, critic_t, global_t, h_p, h_f], dim=1)
         # Project the residual-stream entry point onto the unit hypersphere
         # (nGPT). Runs on padded `[B, T, D]` — padded slots are normed too
         # (eps-safe) but masks keep them inert in attention.
         h = justnorm(h)
-        summary_mask = torch.ones(b, 2, dtype=torch.bool, device=planet_mask.device)
+        summary_mask = torch.ones(b, 3, dtype=torch.bool, device=planet_mask.device)
         full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
         # Planet features store centered normalized coordinates:
         # ((x - 50) / 100, (y - 50) / 100). RoPE uses physical board
         # coordinates so the phase scale is meaningful on the 100x100 map.
         planet_xy = planet_feats[..., :2] * _PLANET_XY_SCALE + _PLANET_XY_OFFSET
         rope_cache = self.planet_rope.cache(planet_xy, h.dtype)
-        planet_slice = slice(2, 2 + p)
+        planet_slice = slice(3, 3 + p)
         return h, full_mask, planet_mask, fleet_mask, rope_cache, planet_slice, p, f
 
     def _split_encoded(
@@ -1248,8 +1274,8 @@ class OrbitPolicy(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         h_actor = h[:, 0]                   # [B, d]
         h_critic = h[:, 1]                  # [B, d]
-        planet_h = h[:, 2 : 2 + p]          # [B, P, d]
-        fleet_h = h[:, 2 + p : 2 + p + f]   # [B, F, d]
+        planet_h = h[:, 3 : 3 + p]          # [B, P, d]
+        fleet_h = h[:, 3 + p : 3 + p + f]   # [B, F, d]
         token_mask = torch.cat([planet_mask, fleet_mask], dim=1)
         return planet_h, fleet_h, h_actor, h_critic, token_mask
 
@@ -1289,7 +1315,7 @@ class OrbitPolicy(nn.Module):
     def encode(
         self, feats: EncodedObs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the transformer over [actor, critic, planets..., fleets...].
+        """Run the transformer over [actor, critic, global, planets..., fleets...].
 
         Returns `(planet_h, fleet_h, h_actor, h_critic, token_mask)` where
         `token_mask` is the planets+fleet-context mask. Dense padded CUDA is

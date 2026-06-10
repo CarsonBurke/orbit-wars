@@ -23,6 +23,15 @@ const MAX_PLANETS: usize = 64;
 const MAX_FLEETS: usize = 384;
 const PLANET_FEAT_DIM: usize = 19;
 const FLEET_FEAT_DIM: usize = 20;
+const GLOBAL_PLAYER_SLOTS: usize = 4;
+const GLOBAL_PLAYER_FEATS: usize = 5;
+const GLOBAL_NEUTRAL_FEATS: usize = 3;
+const GLOBAL_FEAT_DIM: usize = 4 + GLOBAL_PLAYER_SLOTS * GLOBAL_PLAYER_FEATS + GLOBAL_NEUTRAL_FEATS;
+const FEATURE_EPISODE_STEPS: f64 = 500.0;
+const COMET_PERIOD_STEPS: i32 = 100;
+const FIRST_COMET_STEP: i32 = 50;
+const GLOBAL_PRODUCTION_SCALE: f64 = (MAX_PLANETS * 5) as f64;
+const GLOBAL_SHIP_LOG_SCALE: f64 = 12.0;
 const LOG_1000: f64 = 6.907_755_278_982_137;
 const LEAD_T_HORIZON_STEPS: f64 = 600.0;
 const LEAD_MAX_TURNS: i32 = LEAD_T_HORIZON_STEPS as i32;
@@ -1130,6 +1139,7 @@ fn policy_batch_dict<'py>(
     include_contexts: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let batch = rows.len();
+    let mut global_feats = Array2::<f32>::zeros((batch, GLOBAL_FEAT_DIM));
     let mut planet_feats = Array3::<f32>::zeros((batch, MAX_PLANETS, PLANET_FEAT_DIM));
     let mut planet_mask = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
     let mut planet_owned = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
@@ -1141,6 +1151,7 @@ fn policy_batch_dict<'py>(
 
     for (row, (env_idx, player)) in rows.into_iter().enumerate() {
         let game = &games[env_idx];
+        fill_global_features(game, player, row, &mut global_feats);
         fill_planet_features(
             game,
             player,
@@ -1171,6 +1182,7 @@ fn policy_batch_dict<'py>(
     }
 
     let out = PyDict::new(py);
+    out.set_item("global_feats", global_feats.into_pyarray(py))?;
     out.set_item("planet_feats", planet_feats.into_pyarray(py))?;
     out.set_item("planet_mask", planet_mask.into_pyarray(py))?;
     out.set_item("planet_owned_mask", planet_owned.into_pyarray(py))?;
@@ -1180,6 +1192,73 @@ fn policy_batch_dict<'py>(
     out.set_item("fleet_mask", fleet_mask.into_pyarray(py))?;
     out.set_item("contexts", contexts)?;
     Ok(out)
+}
+
+fn global_player_slot(owner: i32, player: usize, num_players: usize) -> Option<usize> {
+    if owner < 0 {
+        return None;
+    }
+    if owner == player as i32 {
+        return Some(0);
+    }
+    let diff = (owner - player as i32).rem_euclid(num_players.max(2) as i32) as usize;
+    (1..GLOBAL_PLAYER_SLOTS).contains(&diff).then_some(diff)
+}
+
+fn clip01(x: f64) -> f32 {
+    x.clamp(0.0, 1.0) as f32
+}
+
+fn fill_global_features(game: &Game, player: usize, row: usize, global_feats: &mut Array2<f32>) {
+    let step = game.step;
+    let step_f = f64::from(step);
+    let step_norm = (step_f / FEATURE_EPISODE_STEPS).clamp(0.0, 1.0);
+    let remaining_norm = ((FEATURE_EPISODE_STEPS - step_f) / FEATURE_EPISODE_STEPS).clamp(0.0, 1.0);
+    let phase_step = (step - FIRST_COMET_STEP).rem_euclid(COMET_PERIOD_STEPS);
+    let phase = f64::from(phase_step) / f64::from(COMET_PERIOD_STEPS);
+    let angle = 2.0 * std::f64::consts::PI * phase;
+    let mut player_stats = [[0.0_f64; GLOBAL_PLAYER_FEATS]; GLOBAL_PLAYER_SLOTS];
+    let mut neutral_count = 0.0_f64;
+    let mut neutral_production = 0.0_f64;
+    let mut neutral_ships = 0.0_f64;
+
+    for planet in &game.planets {
+        if planet.owner < 0 {
+            neutral_count += 1.0;
+            neutral_production += f64::from(planet.production);
+            neutral_ships += f64::from(planet.ships);
+            continue;
+        }
+        if let Some(slot) = global_player_slot(planet.owner, player, game.num_players) {
+            player_stats[slot][0] += 1.0;
+            player_stats[slot][1] += f64::from(planet.production);
+            player_stats[slot][2] += f64::from(planet.ships);
+        }
+    }
+    for fleet in &game.fleets {
+        if let Some(slot) = global_player_slot(fleet.owner, player, game.num_players) {
+            player_stats[slot][3] += 1.0;
+            player_stats[slot][4] += f64::from(fleet.ships);
+        }
+    }
+
+    global_feats[[row, 0]] = step_norm as f32;
+    global_feats[[row, 1]] = remaining_norm as f32;
+    global_feats[[row, 2]] = angle.sin() as f32;
+    global_feats[[row, 3]] = angle.cos() as f32;
+    let mut offset = 4;
+    for stats in player_stats {
+        global_feats[[row, offset]] = clip01(stats[0] / MAX_PLANETS as f64);
+        global_feats[[row, offset + 1]] = clip01(stats[1] / GLOBAL_PRODUCTION_SCALE);
+        global_feats[[row, offset + 2]] = clip01(stats[2].max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
+        global_feats[[row, offset + 3]] = clip01(stats[3] / MAX_FLEETS as f64);
+        global_feats[[row, offset + 4]] = clip01(stats[4].max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
+        offset += GLOBAL_PLAYER_FEATS;
+    }
+    global_feats[[row, offset]] = clip01(neutral_count / MAX_PLANETS as f64);
+    global_feats[[row, offset + 1]] = clip01(neutral_production / GLOBAL_PRODUCTION_SCALE);
+    global_feats[[row, offset + 2]] =
+        clip01(neutral_ships.max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
 }
 
 fn game_from_observation(

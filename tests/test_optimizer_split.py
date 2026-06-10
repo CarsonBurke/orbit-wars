@@ -54,6 +54,7 @@ def test_optimizer_split_matches_parameter_golf_boundary():
     ):
         assert group[name] == "adamw_head"
 
+    assert group["global_embed.weight"] == "adamw_default"
     assert group["planet_embed.weight"] == "adamw_default"
     assert group["fleet_embed.weight"] == "adamw_default"
     assert group["target_q_gain"] == "adamw_control"
@@ -117,7 +118,9 @@ def test_grad_clip_groups_match_real_policy_roles():
 
     assert groups["value_head.0.weight"] == "critic"
     assert groups["value_head.2.weight"] == "critic"
+    assert groups["global_embed.weight"] == "shared"
     assert groups["planet_embed.weight"] == "shared"
     assert groups["actor_token"] == "shared"
     assert groups["critic_token"] == "shared"
+    assert groups["global_token"] == "shared"
     assert groups["layers.0.attn.c_q.weight"] == "shared"

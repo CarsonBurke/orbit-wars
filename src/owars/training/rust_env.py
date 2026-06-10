@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from ..policies.features import EncodedObs
+from ..policies.features import GLOBAL_FEAT_DIM, EncodedObs
 from ..policies.sampling import (
     ActionContext,
     _apply_target_legal_mask,
@@ -530,6 +530,17 @@ class RustVecEnv:
                 ),
                 fleet_mask=_tensor_from_numpy(
                     data["fleet_mask"], device, pin_memory=pin_memory
+                ),
+                global_feats=_tensor_from_numpy(
+                    data.get(
+                        "global_feats",
+                        np.zeros(
+                            (int(data["planet_feats"].shape[0]), GLOBAL_FEAT_DIM),
+                            dtype=np.float32,
+                        ),
+                    ),
+                    device,
+                    pin_memory=pin_memory,
                 ),
             ),
             contexts,

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -45,8 +46,19 @@ MAX_FLEETS: int = 384
 
 PLANET_FEAT_DIM: int = 19
 FLEET_FEAT_DIM: int = 20
+GLOBAL_PLAYER_SLOTS: int = 4
+GLOBAL_PLAYER_FEATS: int = 5
+GLOBAL_NEUTRAL_FEATS: int = 3
+GLOBAL_FEAT_DIM: int = (
+    4 + GLOBAL_PLAYER_SLOTS * GLOBAL_PLAYER_FEATS + GLOBAL_NEUTRAL_FEATS
+)
 
 MAX_OMEGA: float = 0.05  # spec: ω ∈ [0.025, 0.05]
+EPISODE_STEPS: int = 500
+COMET_PERIOD_STEPS: int = 100
+FIRST_COMET_STEP: int = 50
+GLOBAL_PRODUCTION_SCALE: float = float(MAX_PLANETS * 5)
+GLOBAL_SHIP_LOG_SCALE: float = 12.0
 
 
 def _owner_onehot(
@@ -172,6 +184,90 @@ def _fleet_features(
         s, n_, e0, e1, e2,
         0.0,  # planet-token marker (= fleet)
     ]
+
+
+def _global_player_slot(owner: int, player: int, num_players: int) -> int | None:
+    if owner < 0:
+        return None
+    if owner == player:
+        return 0
+    np_ = max(2, int(num_players))
+    diff = (owner - player) % np_
+    slot = diff
+    return slot if 1 <= slot < GLOBAL_PLAYER_SLOTS else None
+
+
+def _clip01(x: float) -> float:
+    return min(1.0, max(0.0, float(x)))
+
+
+def _global_features(
+    step: int,
+    player: int = 0,
+    num_players: int = 2,
+    planets: Sequence[Any] = (),
+    fleets: Sequence[Any] = (),
+) -> list[float]:
+    step_norm = min(1.0, max(0.0, float(step) / float(EPISODE_STEPS)))
+    remaining_norm = min(
+        1.0,
+        max(0.0, float(EPISODE_STEPS - int(step)) / float(EPISODE_STEPS)),
+    )
+    phase = ((int(step) - FIRST_COMET_STEP) % COMET_PERIOD_STEPS) / float(
+        COMET_PERIOD_STEPS
+    )
+    angle = 2.0 * math.pi * phase
+    player_stats = [[0.0, 0.0, 0.0, 0.0, 0.0] for _ in range(GLOBAL_PLAYER_SLOTS)]
+    neutral_count = 0.0
+    neutral_production = 0.0
+    neutral_ships = 0.0
+
+    for p in planets:
+        owner = int(p.owner if hasattr(p, "owner") else p[1])
+        ships = float(p.ships if hasattr(p, "ships") else p[5])
+        production = float(p.production if hasattr(p, "production") else p[6])
+        if owner < 0:
+            neutral_count += 1.0
+            neutral_production += production
+            neutral_ships += ships
+            continue
+        slot = _global_player_slot(owner, player, num_players)
+        if slot is None:
+            continue
+        player_stats[slot][0] += 1.0
+        player_stats[slot][1] += production
+        player_stats[slot][2] += ships
+
+    for f in fleets:
+        owner = int(f.owner if hasattr(f, "owner") else f[1])
+        if owner < 0:
+            continue
+        slot = _global_player_slot(owner, player, num_players)
+        if slot is None:
+            continue
+        ships = float(f.ships if hasattr(f, "ships") else f[6])
+        player_stats[slot][3] += 1.0
+        player_stats[slot][4] += ships
+
+    out = [step_norm, remaining_norm, math.sin(angle), math.cos(angle)]
+    for planet_count, production, planet_ships, fleet_count, fleet_ships in player_stats:
+        out.extend(
+            [
+                _clip01(planet_count / float(MAX_PLANETS)),
+                _clip01(production / GLOBAL_PRODUCTION_SCALE),
+                _clip01(math.log1p(max(0.0, planet_ships)) / GLOBAL_SHIP_LOG_SCALE),
+                _clip01(fleet_count / float(MAX_FLEETS)),
+                _clip01(math.log1p(max(0.0, fleet_ships)) / GLOBAL_SHIP_LOG_SCALE),
+            ]
+        )
+    out.extend(
+        [
+            _clip01(neutral_count / float(MAX_PLANETS)),
+            _clip01(neutral_production / GLOBAL_PRODUCTION_SCALE),
+            _clip01(math.log1p(max(0.0, neutral_ships)) / GLOBAL_SHIP_LOG_SCALE),
+        ]
+    )
+    return out
 
 
 def _comet_motion_by_id(o: Observation) -> dict[int, tuple[float, float] | None]:
@@ -420,6 +516,7 @@ class EncodedObs:
     planet_garrison: torch.Tensor   # [P_max] float — current ships
     fleet_feats: torch.Tensor       # [F_max, fleet_dim]
     fleet_mask: torch.Tensor        # [F_max] bool
+    global_feats: torch.Tensor | None = None  # [global_dim] or [B, global_dim]
 
     def to(self, device: str | torch.device) -> EncodedObs:
         return EncodedObs(
@@ -430,6 +527,9 @@ class EncodedObs:
             planet_garrison=self.planet_garrison.to(device),
             fleet_feats=self.fleet_feats.to(device),
             fleet_mask=self.fleet_mask.to(device),
+            global_feats=None
+            if self.global_feats is None
+            else self.global_feats.to(device),
         )
 
 
@@ -456,6 +556,7 @@ def _infer_num_players(o: Observation) -> int:
 
 def _fill_encoded_arrays(
     o: Observation,
+    g_feats: np.ndarray,
     p_feats: np.ndarray,
     p_mask: np.ndarray,
     p_owned: np.ndarray,
@@ -466,6 +567,7 @@ def _fill_encoded_arrays(
     row: int | None = None,
 ) -> None:
     if row is None:
+        g_feats_r = g_feats
         p_feats_r = p_feats
         p_mask_r = p_mask
         p_owned_r = p_owned
@@ -474,6 +576,7 @@ def _fill_encoded_arrays(
         f_feats_r = f_feats
         f_mask_r = f_mask
     else:
+        g_feats_r = g_feats[row]
         p_feats_r = p_feats[row]
         p_mask_r = p_mask[row]
         p_owned_r = p_owned[row]
@@ -485,6 +588,13 @@ def _fill_encoded_arrays(
     comet_motion = _comet_motion_by_id(o)
     planet_pos = {p.id: (p.x, p.y) for p in o.planets}
     num_players = _infer_num_players(o)
+    g_feats_r[:] = _global_features(
+        o.step,
+        o.player,
+        num_players,
+        o.planets,
+        o.fleets,
+    )
 
     for i, p in enumerate(o.planets[:MAX_PLANETS]):
         p_feats_r[i] = _planet_features(
@@ -502,6 +612,7 @@ def _fill_encoded_arrays(
 
 def _fill_encoded_arrays_raw(
     o: Any,
+    g_feats: np.ndarray,
     p_feats: np.ndarray,
     p_mask: np.ndarray,
     p_owned: np.ndarray,
@@ -512,6 +623,7 @@ def _fill_encoded_arrays_raw(
     row: int | None = None,
 ) -> None:
     if row is None:
+        g_feats_r = g_feats
         p_feats_r = p_feats
         p_mask_r = p_mask
         p_owned_r = p_owned
@@ -520,6 +632,7 @@ def _fill_encoded_arrays_raw(
         f_feats_r = f_feats
         f_mask_r = f_mask
     else:
+        g_feats_r = g_feats[row]
         p_feats_r = p_feats[row]
         p_mask_r = p_mask[row]
         p_owned_r = p_owned[row]
@@ -535,11 +648,19 @@ def _fill_encoded_arrays_raw(
     if fleets is None:
         fleets = []
     player = int(_get_raw(o, "player", 0) or 0)
+    step = int(_get_raw(o, "step", 0) or 0)
     angular_velocity = float(_get_raw(o, "angular_velocity", 0.0) or 0.0)
     comet_motion = _comet_motion_by_id_raw(o)
     planet_pos = {int(p[0]): (float(p[2]), float(p[3])) for p in planets}
     fleet_targets = _fleet_target_metadata_raw(o)
     num_players = _infer_num_players_raw(o)
+    g_feats_r[:] = _global_features(
+        step,
+        player,
+        num_players,
+        planets,
+        fleets,
+    )
 
     for i, p in enumerate(planets[:MAX_PLANETS]):
         p_feats_r[i] = _planet_features_raw(
@@ -582,6 +703,7 @@ def encode_observation(
     *,
     pin_memory: bool = False,
 ) -> EncodedObs:
+    g_feats = np.zeros(GLOBAL_FEAT_DIM, dtype=np.float32)
     p_feats = np.zeros((MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
     p_mask = np.zeros(MAX_PLANETS, dtype=bool)
     p_owned = np.zeros(MAX_PLANETS, dtype=bool)
@@ -590,9 +712,20 @@ def encode_observation(
     f_feats = np.zeros((MAX_FLEETS, FLEET_FEAT_DIM), dtype=np.float32)
     f_mask = np.zeros(MAX_FLEETS, dtype=bool)
 
-    _fill_encoded_arrays(o, p_feats, p_mask, p_owned, p_ids, p_gar, f_feats, f_mask)
+    _fill_encoded_arrays(
+        o,
+        g_feats,
+        p_feats,
+        p_mask,
+        p_owned,
+        p_ids,
+        p_gar,
+        f_feats,
+        f_mask,
+    )
 
     return EncodedObs(
+        global_feats=_tensor_from_numpy(g_feats, device, pin_memory=pin_memory),
         planet_feats=_tensor_from_numpy(p_feats, device, pin_memory=pin_memory),
         planet_mask=_tensor_from_numpy(p_mask, device, pin_memory=pin_memory),
         planet_owned_mask=_tensor_from_numpy(p_owned, device, pin_memory=pin_memory),
@@ -616,6 +749,7 @@ def encode_observations(
     still see stable shapes.
     """
     b = len(observations)
+    g_feats = np.zeros((b, GLOBAL_FEAT_DIM), dtype=np.float32)
     p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
     p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
     p_owned = np.zeros((b, MAX_PLANETS), dtype=bool)
@@ -626,10 +760,20 @@ def encode_observations(
 
     for row, o in enumerate(observations):
         _fill_encoded_arrays(
-            o, p_feats, p_mask, p_owned, p_ids, p_gar, f_feats, f_mask, row=row
+            o,
+            g_feats,
+            p_feats,
+            p_mask,
+            p_owned,
+            p_ids,
+            p_gar,
+            f_feats,
+            f_mask,
+            row=row,
         )
 
     return EncodedObs(
+        global_feats=_tensor_from_numpy(g_feats, device, pin_memory=pin_memory),
         planet_feats=_tensor_from_numpy(p_feats, device, pin_memory=pin_memory),
         planet_mask=_tensor_from_numpy(p_mask, device, pin_memory=pin_memory),
         planet_owned_mask=_tensor_from_numpy(p_owned, device, pin_memory=pin_memory),
@@ -653,6 +797,7 @@ def encode_raw_observations(
     tick while preserving the exact tensor contract of `encode_observations`.
     """
     b = len(observations)
+    g_feats = np.zeros((b, GLOBAL_FEAT_DIM), dtype=np.float32)
     p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
     p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
     p_owned = np.zeros((b, MAX_PLANETS), dtype=bool)
@@ -663,10 +808,20 @@ def encode_raw_observations(
 
     for row, o in enumerate(observations):
         _fill_encoded_arrays_raw(
-            o, p_feats, p_mask, p_owned, p_ids, p_gar, f_feats, f_mask, row=row
+            o,
+            g_feats,
+            p_feats,
+            p_mask,
+            p_owned,
+            p_ids,
+            p_gar,
+            f_feats,
+            f_mask,
+            row=row,
         )
 
     return EncodedObs(
+        global_feats=_tensor_from_numpy(g_feats, device, pin_memory=pin_memory),
         planet_feats=_tensor_from_numpy(p_feats, device, pin_memory=pin_memory),
         planet_mask=_tensor_from_numpy(p_mask, device, pin_memory=pin_memory),
         planet_owned_mask=_tensor_from_numpy(p_owned, device, pin_memory=pin_memory),
@@ -683,6 +838,7 @@ def unbind_encoded(feats: EncodedObs) -> list[EncodedObs]:
         return [feats]
     return [
         EncodedObs(
+            global_feats=None if feats.global_feats is None else feats.global_feats[i],
             planet_feats=feats.planet_feats[i],
             planet_mask=feats.planet_mask[i],
             planet_owned_mask=feats.planet_owned_mask[i],
@@ -705,6 +861,7 @@ def select_encoded(feats: EncodedObs, index: int, *, clone: bool = False) -> Enc
         return out.detach().clone() if clone else out
 
     return EncodedObs(
+        global_feats=None if feats.global_feats is None else row(feats.global_feats),
         planet_feats=row(feats.planet_feats),
         planet_mask=row(feats.planet_mask),
         planet_owned_mask=row(feats.planet_owned_mask),
@@ -722,8 +879,9 @@ def stack_encoded(feats_list: list[EncodedObs]) -> EncodedObs:
     output tensors gain a leading batch dim. Used by the vectorized
     rollout to produce one big batch per env-step.
     """
-    pf, pm, pom, pid, pg, ff, fm = [], [], [], [], [], [], []
+    gf, pf, pm, pom, pid, pg, ff, fm = [], [], [], [], [], [], [], []
     for f in feats_list:
+        gf.append(f.global_feats)
         pf.append(f.planet_feats)
         pm.append(f.planet_mask)
         pom.append(f.planet_owned_mask)
@@ -739,4 +897,5 @@ def stack_encoded(feats_list: list[EncodedObs]) -> EncodedObs:
         planet_garrison=torch.stack(pg),
         fleet_feats=torch.stack(ff),
         fleet_mask=torch.stack(fm),
+        global_feats=None if any(g is None for g in gf) else torch.stack(gf),
     )

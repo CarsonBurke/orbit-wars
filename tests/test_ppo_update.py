@@ -96,6 +96,7 @@ def _toy_batch(
     target_legal_mask = torch.stack([r.target_legal_mask for r in records])
 
     return {
+        "global_feats": feats.global_feats,
         "planet_feats": feats.planet_feats,
         "planet_mask": feats.planet_mask,
         "planet_owned_mask": feats.planet_owned_mask,
@@ -360,6 +361,7 @@ def test_log_prob_recompute_matches_sample_time():
         planet_owned_mask=batch["planet_owned_mask"], planet_ids=batch["planet_ids"],
         planet_garrison=batch["planet_garrison"],
         fleet_feats=batch["fleet_feats"], fleet_mask=batch["fleet_mask"],
+        global_feats=batch.get("global_feats"),
     )
     with torch.no_grad():
         out = model(feats)

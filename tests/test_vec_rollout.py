@@ -264,6 +264,8 @@ def test_numpy_fast_rollout_records_configured_learner_seats():
         assert any(mask.any() for mask in traj.owned_mask)
         for owned, obs in zip(traj.owned_mask, traj.encoded, strict=True):
             assert owned.equal(obs.planet_owned_mask)
+            assert obs.global_feats is not None
+            assert obs.global_feats.shape == (model.cfg.global_features,)
 
 
 def test_numpy_reward_potentials_match_materialized_observations():

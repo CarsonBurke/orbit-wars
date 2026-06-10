@@ -43,6 +43,9 @@ def _slice_feats(batch: dict[str, torch.Tensor], mb) -> EncodedObs:
         planet_garrison=batch["planet_garrison"][mb],
         fleet_feats=batch["fleet_feats"][mb],
         fleet_mask=batch["fleet_mask"][mb],
+        global_feats=None
+        if batch.get("global_feats") is None
+        else batch["global_feats"][mb],
     )
 
 
@@ -334,6 +337,13 @@ def _slice_to_device(
     return out.to(device, non_blocking=True)
 
 
+def _global_feats_or_empty(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    global_feats = batch.get("global_feats")
+    if global_feats is not None:
+        return global_feats
+    return batch["planet_feats"].new_zeros(batch["planet_feats"].shape[0], 0)
+
+
 def _stage_ppo_minibatch(
     batch: dict[str, torch.Tensor],
     policy_advantage: torch.Tensor,
@@ -350,6 +360,7 @@ def _stage_ppo_minibatch(
     stays outside the compiled fullgraph body.
     """
     return (
+        _slice_to_device(_global_feats_or_empty(batch), mb, device),
         _slice_to_device(batch["planet_feats"], mb, device),
         _slice_to_device(batch["planet_mask"], mb, device),
         _slice_to_device(batch["planet_owned_mask"], mb, device),
@@ -384,6 +395,7 @@ def _stage_value_minibatch(
 ) -> tuple[torch.Tensor, ...]:
     """Slice one value-pretrain minibatch and move it to the model device."""
     return (
+        _slice_to_device(_global_feats_or_empty(batch), mb, device),
         _slice_to_device(batch["planet_feats"], mb, device),
         _slice_to_device(batch["planet_mask"], mb, device),
         _slice_to_device(batch["planet_owned_mask"], mb, device),
@@ -569,6 +581,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
 
     def forward(
         self,
+        global_feats: torch.Tensor,
         planet_feats: torch.Tensor,
         planet_mask: torch.Tensor,
         planet_owned_mask: torch.Tensor,
@@ -595,6 +608,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
             planet_garrison=planet_garrison,
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
+            global_feats=global_feats,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -869,6 +883,7 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
 
     def forward(
         self,
+        global_feats: torch.Tensor,
         planet_feats: torch.Tensor,
         planet_mask: torch.Tensor,
         planet_owned_mask: torch.Tensor,
@@ -888,6 +903,7 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
             planet_garrison=planet_garrison,
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
+            global_feats=global_feats,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled

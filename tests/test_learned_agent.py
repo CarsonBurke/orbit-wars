@@ -52,11 +52,17 @@ def test_learned_agent_cpu_ignores_compile_mode(tmp_path):
     _write_ckpt(ckpt, cfg)
 
     agent = LearnedAgent(ckpt, device="cpu", compile_mode="reduce-overhead")
-    feats = encode_observation(parse_observation(_obs()))
+    obs = _obs()
+    obs["step"] = 175
+    feats = encode_observation(parse_observation(obs))
+    with torch.inference_mode():
+        direct = agent.model(feats)
     out = agent._forward(feats, 1)
 
     assert agent.compile_mode is None
     assert out.launch_logits.shape == (1, 64)
+    assert torch.allclose(out.launch_logits, direct.launch_logits)
+    assert torch.allclose(out.value, direct.value)
 
 
 def test_learned_agent_ignores_removed_config_keys(tmp_path):

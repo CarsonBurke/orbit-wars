@@ -254,6 +254,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         value_max=cfg.model.value_max,
         value_symlog=cfg.model.value_symlog,
         action_logit_softcap=cfg.model.action_logit_softcap,
+        global_features=cfg.model.global_features,
     )
     return OrbitPolicy(pcfg)
 
@@ -271,9 +272,10 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
     owned_mask) are added by `_stack_trajectories`, which lets
     `_pretrain_value_batch` skip them entirely.
     """
-    pf, pm, pom, pid, pg, ff, fm = [], [], [], [], [], [], []
+    gf, pf, pm, pom, pid, pg, ff, fm = [], [], [], [], [], [], [], []
     for t in trajs:
         for e in t.encoded:
+            gf.append(e.global_feats)
             pf.append(e.planet_feats)
             pm.append(e.planet_mask)
             pom.append(e.planet_owned_mask)
@@ -282,6 +284,7 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
             ff.append(e.fleet_feats)
             fm.append(e.fleet_mask)
     return {
+        "global_feats": None if any(g is None for g in gf) else torch.stack(gf),
         "planet_feats": torch.stack(pf),
         "planet_mask": torch.stack(pm),
         "planet_owned_mask": torch.stack(pom),
@@ -421,6 +424,9 @@ def _slice_encoded_obs_to_device(
         planet_garrison=batch["planet_garrison"][mb].to(device, non_blocking=True),
         fleet_feats=batch["fleet_feats"][mb].to(device, non_blocking=True),
         fleet_mask=batch["fleet_mask"][mb].to(device, non_blocking=True),
+        global_feats=None
+        if batch.get("global_feats") is None
+        else batch["global_feats"][mb].to(device, non_blocking=True),
     )
 
 
@@ -598,7 +604,7 @@ def _save_ppo_checkpoint(model: OrbitPolicy, path: Path) -> None:
 def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     """Params that *actually* get gradient from value-only loss.
 
-    Includes the encoder (shared backbone), both summary tokens (actor_token
+    Includes the encoder (shared backbone), prefix tokens (actor_token
     feeds the encoder self-attention so h_critic depends on it; critic_token
     feeds the value head directly), and the value head. Excludes the actor
     heads (target_query/key, categorical action heads, fraction alpha/beta heads) — they receive zero
@@ -606,11 +612,15 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     weight-decay pull them toward zero with no learning signal, leaving PPO
     to start from a worse-than-init policy.
     """
-    encoder = [model.planet_embed, model.fleet_embed, *model.layers]
+    encoder = [model.global_embed, model.planet_embed, model.fleet_embed, *model.layers]
     if model.fleet_tokenizer is not None:
         encoder.append(model.fleet_tokenizer)
     value = [model.value_head]
-    params: list[torch.nn.Parameter] = [model.actor_token, model.critic_token]
+    params: list[torch.nn.Parameter] = [
+        model.actor_token,
+        model.critic_token,
+        model.global_token,
+    ]
     for m in encoder + value:
         params.extend(m.parameters())
     return params
