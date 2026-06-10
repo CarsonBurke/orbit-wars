@@ -158,9 +158,26 @@ def _deterministic_beta_fraction(
     fraction_alpha: torch.Tensor,
     fraction_beta: torch.Tensor,
 ) -> torch.Tensor:
-    return (
-        fraction_alpha.float() / (fraction_alpha.float() + fraction_beta.float())
-    ).clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
+    alpha = fraction_alpha.float()
+    beta = fraction_beta.float()
+    interior_mode = (alpha - 1.0) / (alpha + beta - 2.0).clamp_min(BETA_SAMPLE_EPS)
+    lower_mode = torch.full_like(alpha, BETA_SAMPLE_EPS)
+    upper_mode = torch.full_like(alpha, 1.0 - BETA_SAMPLE_EPS)
+    uniform_fallback = torch.full_like(alpha, 0.5)
+    mode = torch.where(
+        (alpha > 1.0) & (beta > 1.0),
+        interior_mode,
+        torch.where(
+            (alpha <= 1.0) & (beta > 1.0),
+            lower_mode,
+            torch.where(
+                (alpha > 1.0) & (beta <= 1.0),
+                upper_mode,
+                uniform_fallback,
+            ),
+        ),
+    )
+    return mode.clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
 
 
 def _deterministic_fraction(
@@ -1371,10 +1388,9 @@ def _sample_categorical_action(
         deterministic=deterministic,
     )
     if deterministic:
-        target_log_probs = log_probs[..., 1:]
-        target_idx = target_log_probs.argmax(dim=-1)
-        move_log_prob = torch.logsumexp(target_log_probs, dim=-1)
-        launch = (move_log_prob > log_probs[..., 0]).to(noop_logits.dtype)
+        action_idx = log_probs.argmax(dim=-1)
+        target_idx = (action_idx - 1).clamp_min(0)
+        launch = (action_idx > 0).to(noop_logits.dtype)
         launch = launch * source.to(dtype=launch.dtype)
         return launch, target_idx
     else:

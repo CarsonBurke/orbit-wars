@@ -3,7 +3,7 @@ import torch
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
 from owars.policies.model import HLGaussLoss
-from owars.policies.sampling import _deterministic_fraction
+from owars.policies.sampling import BETA_SAMPLE_EPS, _deterministic_fraction
 
 
 def _obs():
@@ -190,13 +190,22 @@ def test_fraction_beta_concentrations_are_unimodal():
     assert torch.all(out.fraction_beta >= 1.0)
 
 
-def test_deterministic_fraction_uses_beta_mean():
-    alpha = torch.tensor([1.0, 9.0])
-    beta = torch.tensor([9.0, 1.0])
+def test_deterministic_fraction_uses_beta_mode():
+    alpha = torch.tensor([2.0, 9.0, 1.0, 9.0, 1.0])
+    beta = torch.tensor([9.0, 2.0, 9.0, 1.0, 1.0])
 
     got = _deterministic_fraction(alpha, beta)
 
-    assert torch.allclose(got, torch.tensor([0.1, 0.9]), atol=1e-6)
+    expected = torch.tensor(
+        [
+            1.0 / 9.0,
+            8.0 / 9.0,
+            BETA_SAMPLE_EPS,
+            1.0 - BETA_SAMPLE_EPS,
+            0.5,
+        ]
+    )
+    assert torch.allclose(got, expected, atol=1e-6)
 
 
 def test_policy_accepts_legacy_fleet_feature_width():

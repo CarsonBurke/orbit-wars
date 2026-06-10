@@ -174,8 +174,8 @@ def _duplicate_source_output() -> PolicyOutput:
         planet_owned_mask=torch.tensor([[True, True, False]]),
         planet_mask=torch.tensor([[True, True, True]]),
         planet_ids=torch.tensor([[0, 0, 1]]),
-        fraction_alpha=torch.full((1, 3), 19.0),
-        fraction_beta=torch.full((1, 3), 1.0),
+        fraction_alpha=torch.full((1, 3), 20.0),
+        fraction_beta=torch.full((1, 3), 2.0),
     )
 
 
@@ -280,7 +280,7 @@ def test_batched_matches_single_under_fixed_seed():
     assert torch.allclose(single_rec.log_prob, batched_recs[0].log_prob, atol=1e-6)
 
 
-def test_batched_deterministic_uses_move_mass_then_best_target():
+def test_batched_deterministic_uses_categorical_mode():
     o = parse_observation(_obs())
     feats = encode_observation(o)
     stacked = stack_encoded([feats, feats])
@@ -295,11 +295,9 @@ def test_batched_deterministic_uses_move_mass_then_best_target():
         out.action_logit_softcap,
         deterministic=True,
     )
-    target_log_probs = action_log_probs[..., 1:]
-    expected_launch = (
-        torch.logsumexp(target_log_probs, dim=-1) > action_log_probs[..., 0]
-    ).to(records[0].launch.dtype)
-    expected_target = target_log_probs.argmax(dim=-1)
+    action_idx = action_log_probs.argmax(dim=-1)
+    expected_launch = (action_idx > 0).to(records[0].launch.dtype)
+    expected_target = (action_idx - 1).clamp_min(0)
     source = out.planet_owned_mask & out.planet_mask
     expected_launch = expected_launch * source.to(dtype=expected_launch.dtype)
     assert torch.equal(records[0].launch, expected_launch[0])
@@ -308,7 +306,7 @@ def test_batched_deterministic_uses_move_mass_then_best_target():
     assert torch.equal(records[1].target_idx[source[1]], expected_target[1][source[1]])
 
 
-def test_categorical_deterministic_launches_when_move_mass_beats_noop_atom():
+def test_categorical_deterministic_stays_idle_when_only_move_mass_beats_noop():
     obs = _obs()
     obs["angular_velocity"] = 0.0
     o = parse_observation(obs)
@@ -334,9 +332,9 @@ def test_categorical_deterministic_launches_when_move_mass_beats_noop_atom():
         out, [obs], deterministic=True
     )
 
-    assert actions[0]
-    assert records[0].launch[0].item() == 1.0
-    assert records[0].target_idx[0].item() in {1, 2}
+    assert actions[0] == []
+    assert records[0].launch[0].item() == 0.0
+    assert records[0].target_idx[0].item() == 0
 
 
 def test_categorical_record_keeps_sampled_launch_when_materialization_fails():
