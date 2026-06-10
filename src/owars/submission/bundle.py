@@ -4,7 +4,7 @@ Layout produced (matches the rules — `main.py` at the root):
 
     submission_<name>.tar.gz/
       main.py                       # imports owars + loads weights/policy.pt
-      weights/policy.pt
+      weights/policy.pt              # optional, for learned-agent bundles
       owars/                        # vendored package (no network ingress)
         ...
 
@@ -23,7 +23,7 @@ from pathlib import Path
 
 
 def build_submission(
-    ckpt_path: str | Path,
+    ckpt_path: str | Path | None,
     out_path: str | Path,
     *,
     package_root: str | Path = "src/owars",
@@ -46,8 +46,9 @@ def build_submission(
     staging.mkdir(parents=True)
 
     shutil.copy(main_py, staging / "main.py")
-    (staging / "weights").mkdir()
-    shutil.copy(ckpt_path, staging / "weights" / "policy.pt")
+    if ckpt_path is not None:
+        (staging / "weights").mkdir()
+        shutil.copy(ckpt_path, staging / "weights" / "policy.pt")
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
     shutil.copytree(package_root, staging / "owars", ignore=ignore)
     for package in runtime_packages:
@@ -73,7 +74,7 @@ def _copy_runtime_package(package: str, staging: Path) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True)
+    p.add_argument("--ckpt", default=None)
     p.add_argument("--out", default="submission.tar.gz")
     p.add_argument("--package-root", default="src/owars")
     p.add_argument("--main", default="submission/main.py")
