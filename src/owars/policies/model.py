@@ -264,6 +264,61 @@ def normalize_matrices(model: nn.Module) -> None:
             normalize()
 
 
+@torch.no_grad()
+def ngpt_control_stats(model: nn.Module) -> dict[str, float]:
+    """Effective magnitudes of the nGPT control scalars, for TensorBoard.
+
+    These are the parameters that set the model's function-space sensitivity
+    to a given trunk rotation: the eigen LRs (`alpha`, expected to *grow* over
+    training — nGPT's design — which on a fixed optimizer lr means growing
+    KL per PPO update), the QK scales (`sqk`, attention sharpness), the MLP
+    pre-activation scale (`suv`), and the target-readout temperature.
+
+    Units: `eigen_alpha_*` and `sqk_*` are *effective* values (post
+    stored/effective rescale — init is `eigen_alpha_init` for alphas,
+    `qk_gain_init` / 1.0 for sqk_q / sqk_k). `suv_mean` is the stored
+    parameter (init 1.0); the forward's `×√dim` is a fixed constant, so
+    drift reads identically either way.
+    """
+    eigen: list[torch.Tensor] = []
+    sqk_q: list[torch.Tensor] = []
+    sqk_k: list[torch.Tensor] = []
+    suv: list[torch.Tensor] = []
+    for module in model.modules():
+        if isinstance(module, _EigenAlpha):
+            eigen.append(module().flatten())
+        elif isinstance(module, (SelfAttention, CrossAttention)):
+            inv = 1.0 / module.base_scale
+            sqk_q.append((module.sqk_q * inv).flatten())
+            sqk_k.append((module.sqk_k * inv).flatten())
+        elif isinstance(module, TransformerBlock):
+            suv.append(module.suv.flatten())
+    stats: dict[str, float] = {}
+    values: list[torch.Tensor] = []
+    names: list[str] = []
+    if eigen:
+        eig = torch.cat(eigen).float()
+        names.extend(("eigen_alpha_mean", "eigen_alpha_max"))
+        values.extend((eig.mean(), eig.max()))
+    if sqk_q:
+        names.append("sqk_q_eff_mean")
+        values.append(torch.cat(sqk_q).float().mean())
+    if sqk_k:
+        names.append("sqk_k_eff_mean")
+        values.append(torch.cat(sqk_k).float().mean())
+    if suv:
+        names.append("suv_mean")
+        values.append(torch.cat(suv).float().mean())
+    q_gain = getattr(model, "target_q_gain", None)
+    if isinstance(q_gain, torch.Tensor):
+        names.append("target_q_gain")
+        values.append(q_gain.float().mean())
+    if values:
+        host_values = torch.stack(values).detach().cpu().tolist()
+        stats.update(zip(names, (float(v) for v in host_values), strict=True))
+    return stats
+
+
 class Rotary2D(nn.Module):
     """Shared partial 2D RoPE for physical board tokens.
 

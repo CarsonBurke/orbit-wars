@@ -61,6 +61,10 @@ optim:
   # AdamW (input projections, task heads, biases, tokens).
   lr: 3.0e-4
   head_lr: 3.0e-4
+  kl_lr_target: 0.025
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
   weight_decay: 1.0e-4
   grad_clip: 1.0   # actor and critic flows are clipped separately, including
                    # each flow's task head plus shared-trunk components.

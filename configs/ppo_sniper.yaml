@@ -55,6 +55,16 @@ optim:
                         # Knob: raise toward lr×2-3 if the scalars learn too slow.
   lr_warmup_steps: 200   # ramp all LRs over ~3-6 updates — kills the update-0
                          # cold-start KL spike (uncalibrated AdamW × control_lr).
+  # KL-adaptive LR. The hypersphere has no implicit effective-LR decay
+  # (re-projection pins trunk rows to unit norm ⇒ constant muon_lr = constant
+  # angular velocity, while learned eigen-LRs grow). PPO still runs every
+  # configured epoch; per-planet approx KL controls the next update's optimizer
+  # scale so trust-region explosions remain visible instead of being hidden by
+  # an early stop.
+  kl_lr_target: 0.025
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
   weight_decay: 1.0e-4
   grad_clip: 1.0
   minibatch_size: 4096

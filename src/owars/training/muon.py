@@ -339,6 +339,18 @@ class MultiOptimizer:
         self.lr_warmup_steps = int(lr_warmup_steps)
         self._base_lrs = [group["lr"] for group in self.param_groups]
         self._step_count = 0
+        self._last_applied_lr_scale: float | None = None
+        # Multiplicative LR scale on top of the warmup ramp, set per PPO update
+        # by the training loop's KL-feedback controller. The hypersphere needs
+        # an external schedule: re-projection pins every trunk row to unit norm,
+        # so a constant `muon_lr` is a constant *angular* velocity — the
+        # implicit effective-LR decay that weight-norm growth provides under
+        # RMSNorm+weight-decay is gone by design.
+        self._lr_scale = 1.0
+
+    def set_lr_scale(self, scale: float) -> None:
+        """Set the schedule multiplier applied to every group's base lr."""
+        self._lr_scale = float(scale)
 
     @property
     def param_groups(self) -> list[dict]:
@@ -352,17 +364,19 @@ class MultiOptimizer:
             opt.zero_grad(set_to_none=set_to_none)
 
     def step(self, closure=None):
-        # Linear LR warmup, active only until `_step_count` reaches
-        # `lr_warmup_steps`; afterwards every lr is left at its base value and we
-        # skip the loop (rather than re-assigning `base_lr * 1.0` forever). Read
-        # `param_groups` fresh inside the warmup window instead of caching it:
-        # torch's `load_state_dict` rebinds the group dicts, so a cached list
-        # would go stale across an optimizer-state resume.
-        if self.lr_warmup_steps > 0 and self._step_count < self.lr_warmup_steps:
-            self._step_count += 1
-            frac = self._step_count / self.lr_warmup_steps
+        # Effective lr = base · warmup ramp · schedule scale, reassigned every
+        # step. Read `param_groups` fresh instead of caching the group dicts:
+        # torch's `load_state_dict` rebinds them, so a cached list would go
+        # stale across an optimizer-state resume.
+        self._step_count += 1
+        warmup_frac = 1.0
+        if self.lr_warmup_steps > 0 and self._step_count <= self.lr_warmup_steps:
+            warmup_frac = self._step_count / self.lr_warmup_steps
+        scale = warmup_frac * self._lr_scale
+        if self._last_applied_lr_scale != scale:
             for group, base_lr in zip(self.param_groups, self._base_lrs):
-                group["lr"] = base_lr * frac
+                group["lr"] = base_lr * scale
+            self._last_applied_lr_scale = scale
         for opt in self.optimizers:
             opt.step()
 
@@ -375,3 +389,4 @@ class MultiOptimizer:
         self._step_count = int(state.get("_lr_warmup_step", 0))
         for i, opt in enumerate(self.optimizers):
             opt.load_state_dict(state[f"opt_{i}"])
+        self._last_applied_lr_scale = None

@@ -893,3 +893,45 @@ def test_value_only_update_ignores_zero_weight_padding_rows():
     got = value_only_update(model, optim, batch, epochs=1, minibatch_size=5, grad_clip=1.0)
 
     assert math.isclose(got, expected, rel_tol=1e-6)
+
+
+def test_ppo_update_runs_all_configured_epochs():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=8)
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    log = ppo_update(
+        model, optim, batch,
+        value_coef=0.5,
+        target_entropy_coef=0.01,
+        fraction_entropy_coef=0.0,
+        norm_advantage=True,
+        advantage_transform="rankgauss",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        epochs=3, minibatch_size=4, grad_clip=0.5,
+    )
+    assert log.epochs_run == 3.0
+
+
+def test_ppo_update_runs_all_epochs_when_kl_is_large():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=8)
+    batch["old_log_prob"] = batch["old_log_prob"] - 5.0
+    optim = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    log = ppo_update(
+        model, optim, batch,
+        value_coef=0.5,
+        target_entropy_coef=0.01,
+        fraction_entropy_coef=0.0,
+        norm_advantage=True,
+        advantage_transform="rankgauss",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        epochs=3, minibatch_size=4, grad_clip=0.5,
+    )
+
+    assert log.approx_kl > 1.0
+    assert log.epochs_run == 3.0

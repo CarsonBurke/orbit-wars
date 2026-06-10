@@ -65,6 +65,8 @@ def _fixed_minibatches(
     n: int,
     minibatch_size: int,
     device: torch.device,
+    *,
+    weight_device: torch.device | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Return shuffled fixed-size minibatches plus per-row loss weights.
 
@@ -78,14 +80,15 @@ def _fixed_minibatches(
     if n <= 0:
         return []
     size = max(1, int(minibatch_size))
+    weight_device = device if weight_device is None else weight_device
     idx = torch.randperm(n, device=device)
     if n < size:
         extra = idx[torch.randint(n, (size - n,), device=device)]
         mb = torch.cat((idx, extra), dim=0)
         weight = torch.cat(
             (
-                torch.ones(n, device=device, dtype=torch.float32),
-                torch.zeros(size - n, device=device, dtype=torch.float32),
+                torch.ones(n, device=weight_device, dtype=torch.float32),
+                torch.zeros(size - n, device=weight_device, dtype=torch.float32),
             ),
             dim=0,
         )
@@ -95,13 +98,13 @@ def _fixed_minibatches(
     for start in range(0, n, size):
         mb = idx[start : start + size]
         real = mb.shape[0]
-        weight = torch.ones(real, device=device, dtype=torch.float32)
+        weight = torch.ones(real, device=weight_device, dtype=torch.float32)
         if mb.shape[0] < size:
             mb = torch.cat((mb, idx[: size - mb.shape[0]]), dim=0)
             weight = torch.cat(
                 (
                     weight,
-                    torch.zeros(size - real, device=device, dtype=torch.float32),
+                    torch.zeros(size - real, device=weight_device, dtype=torch.float32),
                 ),
                 dim=0,
             )
@@ -113,6 +116,8 @@ def _fixed_minibatches_by_count(
     n: int,
     minibatch_count: int,
     device: torch.device,
+    *,
+    weight_device: torch.device | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Return exactly `minibatch_count` shuffled equal-shape minibatches.
 
@@ -125,6 +130,7 @@ def _fixed_minibatches_by_count(
         return []
     count = max(1, int(minibatch_count))
     size = math.ceil(n / count)
+    weight_device = device if weight_device is None else weight_device
     idx = torch.randperm(n, device=device)
     batches: list[tuple[torch.Tensor, torch.Tensor]] = []
     cursor = 0
@@ -132,14 +138,14 @@ def _fixed_minibatches_by_count(
         real = max(0, min(size, n - cursor))
         mb = idx[cursor : cursor + real]
         cursor += real
-        weight = torch.ones(real, device=device, dtype=torch.float32)
+        weight = torch.ones(real, device=weight_device, dtype=torch.float32)
         if real < size:
             extra = idx[torch.randint(n, (size - real,), device=device)]
             mb = torch.cat((mb, extra), dim=0)
             weight = torch.cat(
                 (
                     weight,
-                    torch.zeros(size - real, device=device, dtype=torch.float32),
+                    torch.zeros(size - real, device=weight_device, dtype=torch.float32),
                 ),
                 dim=0,
             )
@@ -315,6 +321,84 @@ def _module_device(model: torch.nn.Module) -> torch.device:
         return next(model.parameters()).device
     except StopIteration:
         return torch.device("cpu")
+
+
+def _slice_to_device(
+    tensor: torch.Tensor,
+    mb: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    out = tensor[mb]
+    if out.device == device:
+        return out
+    return out.to(device, non_blocking=True)
+
+
+def _stage_ppo_minibatch(
+    batch: dict[str, torch.Tensor],
+    policy_advantage: torch.Tensor,
+    return_mtp: torch.Tensor,
+    return_mtp_mask: torch.Tensor,
+    mb: torch.Tensor,
+    row_weight: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    """Slice one logical minibatch and move it to the model device.
+
+    The full PPO rollout batch may live on CPU to keep VRAM bounded. The compiled
+    CUDA kernel still receives static-shape CUDA tensors; host-to-device staging
+    stays outside the compiled fullgraph body.
+    """
+    return (
+        _slice_to_device(batch["planet_feats"], mb, device),
+        _slice_to_device(batch["planet_mask"], mb, device),
+        _slice_to_device(batch["planet_owned_mask"], mb, device),
+        _slice_to_device(batch["planet_ids"], mb, device),
+        _slice_to_device(batch["planet_garrison"], mb, device),
+        _slice_to_device(batch["fleet_feats"], mb, device),
+        _slice_to_device(batch["fleet_mask"], mb, device),
+        (
+            row_weight
+            if row_weight.device == device
+            else row_weight.to(device, non_blocking=True)
+        ),
+        _slice_to_device(batch["launch"], mb, device),
+        _slice_to_device(batch["target_idx"], mb, device),
+        _slice_to_device(batch["fraction"], mb, device),
+        _slice_to_device(batch["old_log_prob"], mb, device),
+        _slice_to_device(policy_advantage, mb, device),
+        _slice_to_device(return_mtp, mb, device),
+        _slice_to_device(return_mtp_mask, mb, device),
+        _slice_to_device(batch["owned_mask"], mb, device),
+        _slice_to_device(batch["target_legal_mask"], mb, device),
+    )
+
+
+def _stage_value_minibatch(
+    batch: dict[str, torch.Tensor],
+    return_mtp: torch.Tensor,
+    return_mtp_mask: torch.Tensor,
+    mb: torch.Tensor,
+    row_weight: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    """Slice one value-pretrain minibatch and move it to the model device."""
+    return (
+        _slice_to_device(batch["planet_feats"], mb, device),
+        _slice_to_device(batch["planet_mask"], mb, device),
+        _slice_to_device(batch["planet_owned_mask"], mb, device),
+        _slice_to_device(batch["planet_ids"], mb, device),
+        _slice_to_device(batch["planet_garrison"], mb, device),
+        _slice_to_device(batch["fleet_feats"], mb, device),
+        _slice_to_device(batch["fleet_mask"], mb, device),
+        (
+            row_weight
+            if row_weight.device == device
+            else row_weight.to(device, non_blocking=True)
+        ),
+        _slice_to_device(return_mtp, mb, device),
+        _slice_to_device(return_mtp_mask, mb, device),
+    )
 
 
 _ACTOR_CLIP_PATTERNS: tuple[str, ...] = (
@@ -957,6 +1041,8 @@ class PPOLog:
     action_logit_softcap: float = 0.0
     legal_target_count_mean: float = 0.0
     uniform_move_prior: float = 0.0
+    # Number of PPO epochs actually run.
+    epochs_run: float = 0.0
 
 
 def compute_gae(
@@ -1035,7 +1121,8 @@ def ppo_update(
     returns (`value_encoder.target_probs(returns)`). No value clipping.
     """
     n = batch["planet_feats"].shape[0]
-    device = batch["planet_feats"].device
+    batch_device = batch["planet_feats"].device
+    device = _module_device(model)
     policy_advantage = _shape_policy_advantage(
         batch["advantage"],
         transform=advantage_transform,
@@ -1072,39 +1159,34 @@ def ppo_update(
         compile_mode=compile_mode,
         include_value=True,
     )
+    epochs_run = 0
     for _ in range(epochs):
         if minibatch_count is not None:
             logical_minibatch_size = math.ceil(n / max(1, int(minibatch_count)))
             minibatches = _fixed_minibatches_by_count(
                 n,
                 minibatch_count,
-                device,
+                batch_device,
+                weight_device=device,
             )
         else:
             logical_minibatch_size = None
-            minibatches = _fixed_minibatches(n, minibatch_size, device)
+            minibatches = _fixed_minibatches(
+                n, minibatch_size, batch_device, weight_device=device
+            )
         for mb, row_weight in minibatches:
             if compile_mode is not None:
                 _mark_cuda_graph_step(device)
-            actor_loss, critic_loss, metrics = kernel(
-                batch["planet_feats"][mb],
-                batch["planet_mask"][mb],
-                batch["planet_owned_mask"][mb],
-                batch["planet_ids"][mb],
-                batch["planet_garrison"][mb],
-                batch["fleet_feats"][mb],
-                batch["fleet_mask"][mb],
+            staged = _stage_ppo_minibatch(
+                batch,
+                policy_advantage,
+                return_mtp,
+                return_mtp_mask,
+                mb,
                 row_weight,
-                batch["launch"][mb],
-                batch["target_idx"][mb],
-                batch["fraction"][mb],
-                batch["old_log_prob"][mb],
-                policy_advantage[mb],
-                return_mtp[mb],
-                return_mtp_mask[mb],
-                batch["owned_mask"][mb],
-                batch["target_legal_mask"][mb],
+                device,
             )
+            actor_loss, critic_loss, metrics = kernel(*staged)
             metrics_for_step = metrics.detach().clone()
 
             optimizer.zero_grad(set_to_none=True)
@@ -1158,23 +1240,24 @@ def ppo_update(
             metric_sum += metrics_for_step
             last_metrics = metrics_for_step
             n_steps += 1
+        epochs_run += 1
 
     n_steps = max(1, n_steps)
-    mean_logs = (
-        [0.0] * 30
+    mean_logs_t = (
+        torch.zeros(30, device=device)
         if metric_sum is None
-        else (metric_sum / n_steps).detach().cpu().tolist()
+        else metric_sum / n_steps
     )
     # Match CleanRL's PPO KL logging: `approx_kl` is the latest minibatch's
     # estimate after the PPO epoch loop, not an epoch mean. The surrounding
     # diagnostics stay averaged to preserve their lower-noise TensorBoard
     # behavior.
-    kl_logs = (
-        [0.0] * 30
+    kl_logs_t = (
+        torch.zeros(30, device=device)
         if last_metrics is None
-        else last_metrics.detach().cpu().tolist()
+        else last_metrics
     )
-    grad_logs = (
+    grad_logs_t = (
         torch.stack(
             [
                 actor_grad_norm_sum,
@@ -1191,7 +1274,11 @@ def ppo_update(
             ]
         )
         / n_steps
-    ).detach().cpu().tolist()
+    )
+    logs = torch.cat((mean_logs_t, kl_logs_t, grad_logs_t)).detach().cpu().tolist()
+    mean_logs = logs[:30]
+    kl_logs = logs[30:60]
+    grad_logs = logs[60:]
     return PPOLog(
         policy_loss=float(mean_logs[0]),
         value_loss=float(mean_logs[1]),
@@ -1235,6 +1322,7 @@ def ppo_update(
         action_logit_softcap=float(mean_logs[26]),
         legal_target_count_mean=float(mean_logs[28]),
         uniform_move_prior=float(mean_logs[29]),
+        epochs_run=float(epochs_run),
     )
 
 
@@ -1258,7 +1346,8 @@ def value_only_update(
     Reports mean value loss over the pass.
     """
     n = batch["planet_feats"].shape[0]
-    device = batch["planet_feats"].device
+    batch_device = batch["planet_feats"].device
+    device = _module_device(model)
     total: torch.Tensor | None = None
     n_steps = 0
     kernel = _get_value_only_kernel(model, compile_mode=compile_mode)
@@ -1268,21 +1357,23 @@ def value_only_update(
         torch.ones_like(return_mtp, dtype=torch.bool),
     )
     for _ in range(epochs):
-        for mb, row_weight in _fixed_minibatches(n, minibatch_size, device):
+        for mb, row_weight in _fixed_minibatches(
+            n,
+            minibatch_size,
+            batch_device,
+            weight_device=device,
+        ):
             if compile_mode is not None:
                 _mark_cuda_graph_step(device)
-            value_loss, metric = kernel(
-                batch["planet_feats"][mb],
-                batch["planet_mask"][mb],
-                batch["planet_owned_mask"][mb],
-                batch["planet_ids"][mb],
-                batch["planet_garrison"][mb],
-                batch["fleet_feats"][mb],
-                batch["fleet_mask"][mb],
+            staged = _stage_value_minibatch(
+                batch,
+                return_mtp,
+                return_mtp_mask,
+                mb,
                 row_weight,
-                return_mtp[mb],
-                return_mtp_mask[mb],
+                device,
             )
+            value_loss, metric = kernel(*staged)
 
             optimizer.zero_grad(set_to_none=True)
             (value_loss * _minibatch_loss_scale(row_weight)).backward()

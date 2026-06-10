@@ -131,6 +131,15 @@ class OptimCfg:
     # update-0 KL spike. 0 disables. Counted in optimizer steps (≈ epochs ×
     # minibatches per update), matching the Muon momentum warmup.
     lr_warmup_steps: int = 100
+    # KL-feedback LR controller. PPO always runs the configured epoch count;
+    # KL is used only to adapt the next update's LR and to expose explosions in
+    # the logs. The signal is `PPOLog.per_planet_approx_kl`, smoothed by an EMA
+    # with this half-life in PPO updates. The persistent LR scale is multiplied
+    # by `kl_lr_target / kl_ema` after each update, then clamped.
+    kl_lr_target: float = 0.025
+    kl_lr_ema_half_life: float = 20.0
+    kl_lr_min_scale: float = 0.1
+    kl_lr_max_scale: float = 10.0
     weight_decay: float = 1e-4
     # PPO clips actor and critic flows separately. Each flow includes its task
     # readout head plus the shared trunk, then clipped shared gradients are
@@ -468,6 +477,16 @@ class RunConfig:
             raise ValueError("optim.minibatch_size must be positive")
         if cfg.optim.epochs_per_update <= 0:
             raise ValueError("optim.epochs_per_update must be positive")
+        if cfg.optim.kl_lr_target <= 0.0:
+            raise ValueError("optim.kl_lr_target must be positive")
+        if cfg.optim.kl_lr_ema_half_life <= 0.0:
+            raise ValueError("optim.kl_lr_ema_half_life must be positive")
+        if cfg.optim.kl_lr_min_scale <= 0.0:
+            raise ValueError("optim.kl_lr_min_scale must be positive")
+        if cfg.optim.kl_lr_max_scale < cfg.optim.kl_lr_min_scale:
+            raise ValueError(
+                "optim.kl_lr_max_scale must be >= optim.kl_lr_min_scale"
+            )
         if cfg.rollout.num_envs <= 0:
             raise ValueError("rollout.num_envs must be positive")
         if cfg.rollout.games_per_env_per_update <= 0:

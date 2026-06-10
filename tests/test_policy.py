@@ -250,3 +250,24 @@ def test_sample_actions_returns_legal_moves():
     for m in moves:
         assert m.from_planet_id in owned_ids
         assert 1 <= m.num_ships < 50  # less than current garrison
+
+
+def test_ngpt_control_stats_reports_effective_init_values():
+    from owars.policies.model import ngpt_control_stats
+
+    cfg = OrbitPolicyConfig(
+        dim=32, ff_dim=64, depth=2, n_heads=2,
+        eigen_alpha_init=0.05, qk_gain_init=1.0,
+        encoder_backend="fleet_latent", num_fleet_latents=4,
+        fleet_tokenizer_depth=1,
+    )
+    model = OrbitPolicy(cfg)
+    stats = ngpt_control_stats(model)
+
+    # Effective units: a fresh model sits exactly at its configured inits.
+    assert abs(stats["eigen_alpha_mean"] - 0.05) < 1e-6
+    assert abs(stats["eigen_alpha_max"] - 0.05) < 1e-6
+    assert abs(stats["sqk_q_eff_mean"] - 1.0) < 1e-6
+    assert abs(stats["sqk_k_eff_mean"] - 1.0) < 1e-6
+    assert abs(stats["suv_mean"] - 1.0) < 1e-6
+    assert abs(stats["target_q_gain"] - 1.0) < 1e-6

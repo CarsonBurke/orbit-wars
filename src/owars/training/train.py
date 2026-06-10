@@ -37,7 +37,13 @@ import numpy as np
 import torch
 
 from ..policies.config import OrbitPolicyConfig
-from ..policies.model import OrbitPolicy, normalize_matrices, restore_fp32_params
+from ..policies.features import EncodedObs
+from ..policies.model import (
+    OrbitPolicy,
+    ngpt_control_stats,
+    normalize_matrices,
+    restore_fp32_params,
+)
 from ..utils import TBLogger, set_seed
 from .config import OptimCfg, RunConfig, load_config
 from .elo import EloTracker
@@ -51,7 +57,6 @@ from .league import (
 from .muon import MultiOptimizer, Muon
 from .numpy_env import NumpyVecEnv
 from .ppo import (
-    _slice_feats,
     compute_gae,
     ppo_update,
     value_only_update,
@@ -98,6 +103,29 @@ _HEAD_LR_PATTERNS: tuple[str, ...] = (
     "fraction_beta_head",
     "value_head",
 )
+
+
+def kl_lr_ema_alpha(half_life: float) -> float:
+    """Return EMA alpha for a half-life measured in PPO updates."""
+    if half_life <= 0.0:
+        raise ValueError("half_life must be positive")
+    return 1.0 - 0.5 ** (1.0 / half_life)
+
+
+def update_kl_lr_controller(
+    *,
+    kl_ema: float,
+    lr_scale: float,
+    observed_kl: float,
+    cfg: OptimCfg,
+) -> tuple[float, float]:
+    """Update the KL EMA and persistent LR scale for the next PPO update."""
+    alpha = kl_lr_ema_alpha(cfg.kl_lr_ema_half_life)
+    signal = max(0.0, float(observed_kl))
+    next_ema = alpha * signal + (1.0 - alpha) * float(kl_ema)
+    next_scale = float(lr_scale) * (cfg.kl_lr_target / max(next_ema, 1e-12))
+    next_scale = min(cfg.kl_lr_max_scale, max(cfg.kl_lr_min_scale, next_scale))
+    return next_ema, next_scale
 
 
 def _split_params(
@@ -338,6 +366,64 @@ def _stack_trajectories(
     return batch
 
 
+_PPO_FLEET_WIDTH_BUCKETS: tuple[int, ...] = (64, 128, 256, 384)
+
+
+def _bucketed_fleet_width(used: int, current: int) -> int:
+    used = max(1, int(used))
+    current = max(1, int(current))
+    for bucket in _PPO_FLEET_WIDTH_BUCKETS:
+        if used <= bucket:
+            return min(current, bucket)
+    return current
+
+
+def _trim_ppo_batch_fleet_width(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Trim fleet tensors to a stable compile bucket before PPO staging.
+
+    `MAX_FLEETS=384` dominates PPO batch storage. Keeping the full rollout batch
+    on CPU avoids the large persistent VRAM allocation; trimming to a small set
+    of widths also bounds the number of `torch.compile(dynamic=False)` graph
+    specializations while reducing both staged minibatch memory and compute.
+    """
+    fleet_mask = batch.get("fleet_mask")
+    fleet_feats = batch.get("fleet_feats")
+    if fleet_mask is None or fleet_feats is None or fleet_mask.dim() != 2:
+        return batch
+    current = int(fleet_mask.shape[1])
+    if current <= 1:
+        return batch
+    if bool(fleet_mask.any()):
+        cols = torch.nonzero(fleet_mask.any(dim=0), as_tuple=False)
+        used = int(cols[-1].item()) + 1
+    else:
+        used = 1
+    width = _bucketed_fleet_width(used, current)
+    if width >= current:
+        return batch
+    batch = dict(batch)
+    batch["fleet_feats"] = fleet_feats[:, :width].contiguous()
+    batch["fleet_mask"] = fleet_mask[:, :width].contiguous()
+    return batch
+
+
+def _slice_encoded_obs_to_device(
+    batch: dict[str, torch.Tensor],
+    mb,
+    device: torch.device,
+) -> EncodedObs:
+    """Build one model-device minibatch view for non-training diagnostics."""
+    return EncodedObs(
+        planet_feats=batch["planet_feats"][mb].to(device, non_blocking=True),
+        planet_mask=batch["planet_mask"][mb].to(device, non_blocking=True),
+        planet_owned_mask=batch["planet_owned_mask"][mb].to(device, non_blocking=True),
+        planet_ids=batch["planet_ids"][mb].to(device, non_blocking=True),
+        planet_garrison=batch["planet_garrison"][mb].to(device, non_blocking=True),
+        fleet_feats=batch["fleet_feats"][mb].to(device, non_blocking=True),
+        fleet_mask=batch["fleet_mask"][mb].to(device, non_blocking=True),
+    )
+
+
 def _explained_variance(pred: torch.Tensor, target: torch.Tensor) -> float:
     """CleanRL-style EV: 1 - Var[target - pred] / Var[target]."""
     with torch.no_grad():
@@ -438,9 +524,8 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                 compile_mode=_compile_mode_for_model(model, cfg),
                 policy_graph_rows=cfg.rollout.num_envs,
             ))
-        batch = {
-            k: v.to(device)
-            for k, v in _pretrain_value_batch(
+        batch = _trim_ppo_batch_fleet_width(
+            _pretrain_value_batch(
                 trajs,
                 gamma=cfg.ppo.gamma,
                 gae_lambda=(
@@ -449,8 +534,8 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                     else cfg.ppo.value_gae_lambda
                 ),
                 critic_mtp_horizon=cfg.model.critic_mtp_horizon,
-            ).items()
-        }
+            )
+        )
         loss = value_only_update(
             model, optimizer, batch,
             epochs=1,
@@ -475,7 +560,9 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
             ),
         ):
             chunks = [
-                model(_slice_feats(batch, slice(s, s + mb))).value
+                model(
+                    _slice_encoded_obs_to_device(batch, slice(s, s + mb), device)
+                ).value
                 for s in range(0, n, mb)
             ]
             preds = torch.cat(chunks).float().cpu().numpy()
@@ -706,6 +793,11 @@ def _ppo_loop(
     replays_dir = logger.path / "replays"
     replays_dir.mkdir(parents=True, exist_ok=True)
 
+    # KL-feedback LR controller state. PPO still runs every configured epoch;
+    # the smoothed per-planet KL only adapts the next update's LR.
+    kl_lr_ema = cfg.optim.kl_lr_target
+    kl_lr_scale = 1.0
+
     for update in range(cfg.run.total_updates):
         update_t0 = perf_counter()
         phase_t0 = update_t0
@@ -768,10 +860,16 @@ def _ppo_loop(
         stack_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
-        batch = {k: v.to(device) for k, v in batch.items()}
-        batch_to_device_s = perf_counter() - phase_t0
+        batch = _trim_ppo_batch_fleet_width(batch)
+        batch_prepare_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
+        # Apply the KL-adapted scale chosen by previous updates. The current
+        # update's KL is folded into the controller after the PPO pass so every
+        # minibatch in this PPO update uses one fixed optimizer scale.
+        lr_scale = kl_lr_scale
+        if hasattr(optimizer, "set_lr_scale"):
+            optimizer.set_lr_scale(lr_scale)
         compile_mode = _compile_mode_for_model(model, cfg)
         log = ppo_update(
             model,
@@ -789,6 +887,13 @@ def _ppo_loop(
             grad_clip=cfg.optim.grad_clip,
             minibatch_count=cfg.optim.minibatch_count,
             compile_mode=compile_mode,
+        )
+        kl_lr_signal = log.per_planet_approx_kl
+        kl_lr_ema, kl_lr_scale = update_kl_lr_controller(
+            kl_ema=kl_lr_ema,
+            lr_scale=kl_lr_scale,
+            observed_kl=kl_lr_signal,
+            cfg=cfg.optim,
         )
         ppo_s = perf_counter() - phase_t0
         value_ev = _explained_variance(batch["value"], batch["return"])
@@ -848,10 +953,25 @@ def _ppo_loop(
                 "log_ratio_abs_max": log.log_ratio_abs_max,
                 "row_log_ratio_abs_mean": log.row_log_ratio_abs_mean,
                 "raw_advantage_abs_mean": float(batch["raw_advantage_abs_mean"]),
+                "epochs_run": log.epochs_run,
             },
             update,
         )
+        logger.scalars(
+            "optim",
+            {
+                "lr_scale": lr_scale,
+                "kl_lr_scale_next": kl_lr_scale,
+                "kl_lr_ema": kl_lr_ema,
+                "kl_lr_signal": kl_lr_signal,
+            },
+            update,
+        )
+        control_stats = ngpt_control_stats(model)
+        if control_stats:
+            logger.scalars("ngpt", control_stats, update)
         batch_rows = int(batch["planet_feats"].shape[0])
+        fleet_width = int(batch["fleet_feats"].shape[1])
         logical_minibatch_size = (
             math.ceil(batch_rows / cfg.optim.minibatch_count)
             if cfg.optim.minibatch_count is not None
@@ -861,6 +981,7 @@ def _ppo_loop(
             "batch",
             {
                 "rows": batch_rows,
+                "fleet_width": fleet_width,
                 "logical_minibatch_size": logical_minibatch_size,
                 "minibatch_size": logical_minibatch_size,
             },
@@ -1009,7 +1130,7 @@ def _ppo_loop(
                 "rollout_s": rollout_s,
                 "bookkeeping_s": bookkeeping_s,
                 "stack_s": stack_s,
-                "batch_to_device_s": batch_to_device_s,
+                "batch_prepare_s": batch_prepare_s,
                 "ppo_s": ppo_s,
                 "metrics_s": metrics_s,
                 "logging_s": logging_s,
