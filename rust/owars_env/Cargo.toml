@@ -11,6 +11,13 @@ path = "src/lib.rs"
 name = "bench_env"
 path = "src/bin/bench_env.rs"
 
+[[bin]]
+name = "bench_oracle"
+path = "src/bin/bench_oracle.rs"
+
+[dependencies]
+rayon = "1.10"
+
 [profile.release]
 codegen-units = 1
 lto = "thin"

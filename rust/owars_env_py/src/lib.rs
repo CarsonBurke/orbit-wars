@@ -5,9 +5,12 @@ use std::{
 
 use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{IntoPyArray, PyReadonlyArray2, PyReadonlyArray3, PyUntypedArrayMethods};
-use owars_env::{Action, Game, GameConfig, Planet, PlayerAction};
+use owars_env::oracle::{self, FleetDestination};
+use owars_env::{
+    Action, CometGroup, Fleet, Game, GameConfig, GameState, Planet, PlayerAction, Point,
+};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PySequence};
 use rayon::prelude::*;
 
 const BOARD_SIZE: f64 = 100.0;
@@ -262,6 +265,10 @@ struct NativeActionList {
 struct RustCoreVecEnv {
     games: Vec<Game>,
     legal_mask_cache: Vec<Option<LegalMaskCacheEntry>>,
+    /// Per-env destination-oracle output, keyed implicitly by env state:
+    /// every state mutation (reset, reset_subset, load_observation,
+    /// step_subset_fast) must clear the slot explicitly.
+    oracle_cache: Vec<Option<Arc<Vec<FleetDestination>>>>,
     num_envs: usize,
     num_players: usize,
     episode_steps: i32,
@@ -283,6 +290,7 @@ impl RustCoreVecEnv {
         let mut env = Self {
             games: Vec::new(),
             legal_mask_cache: Vec::new(),
+            oracle_cache: Vec::new(),
             num_envs,
             num_players,
             episode_steps,
@@ -318,7 +326,21 @@ impl RustCoreVecEnv {
             );
             self.reset_counts[env_idx] += 1;
             self.legal_mask_cache[env_idx] = None;
+            self.oracle_cache[env_idx] = None;
         }
+        Ok(())
+    }
+
+    fn load_observation(&mut self, idx: usize, obs: Bound<'_, PyDict>) -> PyResult<()> {
+        if idx >= self.games.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(
+                "env index out of range",
+            ));
+        }
+        self.games[idx] =
+            game_from_observation(&obs, self.num_players, self.episode_steps, self.ship_speed)?;
+        self.legal_mask_cache[idx] = None;
+        self.oracle_cache[idx] = None;
         Ok(())
     }
 
@@ -353,6 +375,9 @@ impl RustCoreVecEnv {
         for &env_idx in &indices {
             if env_idx < self.legal_mask_cache.len() {
                 self.legal_mask_cache[env_idx] = None;
+            }
+            if env_idx < self.oracle_cache.len() {
+                self.oracle_cache[env_idx] = None;
             }
         }
         let mut results = py.detach(|| {
@@ -441,6 +466,30 @@ impl RustCoreVecEnv {
             .map(|(idx, player)| production_margin(&self.games[idx], player))
             .collect::<Vec<_>>();
         Ok(Array1::from_vec(values).into_pyarray(py))
+    }
+
+    /// Exact fleet-destination oracle for a batch of (env_idx, player) rows.
+    ///
+    /// Output is player-independent (all fleets on the board are resolved),
+    /// so duplicate env rows share one computation via the per-env cache.
+    /// The cache is invalidated by every state mutation (reset, reset_subset,
+    /// load_observation, step_subset_fast).
+    fn fleet_destination_oracle<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.fleet_destination_oracle_impl(py, rows, false)
+    }
+
+    /// Same contract as `fleet_destination_oracle`, but runs the literal
+    /// simulator-mirror rollout. Slow; exists for parity testing only.
+    fn fleet_destination_oracle_reference<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.fleet_destination_oracle_impl(py, rows, true)
     }
 
     fn legal_target_mask<'py>(
@@ -955,6 +1004,94 @@ impl RustCoreVecEnv {
         }
         self.games = games;
         self.legal_mask_cache = vec![None; self.games.len()];
+        self.oracle_cache = vec![None; self.games.len()];
+    }
+
+    fn fleet_destination_oracle_impl<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        use_reference: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        for &(env_idx, player) in &rows {
+            if env_idx >= self.games.len() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "env index out of range",
+                ));
+            }
+            if player >= self.num_players {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "player index out of range",
+                ));
+            }
+        }
+        if self.oracle_cache.len() < self.games.len() {
+            self.oracle_cache.resize(self.games.len(), None);
+        }
+        // Dedup by env: oracle output is per-board, so duplicate player rows
+        // resolve to the same Arc. The reference path bypasses the cache to
+        // keep parity tests honest.
+        let mut pending: Vec<usize> = Vec::new();
+        for &(env_idx, _) in &rows {
+            if (use_reference || self.oracle_cache[env_idx].is_none())
+                && !pending.contains(&env_idx)
+            {
+                pending.push(env_idx);
+            }
+        }
+        let games = &self.games;
+        let computed = py.detach(|| {
+            pending
+                .par_iter()
+                .map(|&env_idx| {
+                    let game = &games[env_idx];
+                    let dests = if use_reference {
+                        oracle::infer_fleet_destinations_reference(game, MAX_FLEETS)
+                    } else {
+                        oracle::infer_fleet_destinations(game, MAX_FLEETS)
+                    };
+                    (env_idx, Arc::new(dests))
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut reference_results: Vec<Option<Arc<Vec<FleetDestination>>>> = if use_reference {
+            vec![None; self.games.len()]
+        } else {
+            Vec::new()
+        };
+        for (env_idx, dests) in computed {
+            if use_reference {
+                reference_results[env_idx] = Some(dests);
+            } else {
+                self.oracle_cache[env_idx] = Some(dests);
+            }
+        }
+
+        let batch = rows.len();
+        let mut dest_idx = Array2::<i64>::from_elem((batch, MAX_FLEETS), -1);
+        let mut eta = Array2::<f64>::zeros((batch, MAX_FLEETS));
+        let mut status = Array2::<i64>::from_elem((batch, MAX_FLEETS), oracle::STATUS_NONE);
+        for (row, &(env_idx, _)) in rows.iter().enumerate() {
+            let entries = if use_reference {
+                reference_results[env_idx]
+                    .as_ref()
+                    .expect("reference oracle output missing for requested env")
+            } else {
+                self.oracle_cache[env_idx]
+                    .as_ref()
+                    .expect("oracle cache entry missing for requested env")
+            };
+            for (col, entry) in entries.iter().enumerate().take(MAX_FLEETS) {
+                dest_idx[[row, col]] = entry.dest_idx;
+                eta[[row, col]] = entry.eta;
+                status[[row, col]] = entry.status;
+            }
+        }
+        let out = PyDict::new(py);
+        out.set_item("dest_idx", dest_idx.into_pyarray(py))?;
+        out.set_item("eta", eta.into_pyarray(py))?;
+        out.set_item("status", status.into_pyarray(py))?;
+        Ok(out)
     }
 
     fn legal_mask_state_cached(
@@ -1042,6 +1179,155 @@ fn policy_batch_dict<'py>(
     out.set_item("fleet_feats", fleet_feats.into_pyarray(py))?;
     out.set_item("fleet_mask", fleet_mask.into_pyarray(py))?;
     out.set_item("contexts", contexts)?;
+    Ok(out)
+}
+
+fn game_from_observation(
+    obs: &Bound<'_, PyDict>,
+    num_players: usize,
+    episode_steps: i32,
+    ship_speed: f64,
+) -> PyResult<Game> {
+    let step = dict_get_i32(obs, "step", 0)?;
+    let angular_velocity = dict_get_f64(obs, "angular_velocity", 0.0)?;
+    let planets = parse_planets_from_dict(obs, "planets")?;
+    let mut initial_planets = parse_planets_from_dict(obs, "initial_planets")?;
+    if initial_planets.is_empty() {
+        initial_planets = planets.clone();
+    }
+    let fleets = parse_fleets_from_dict(obs, "fleets")?;
+    let comets = parse_comets_from_dict(obs)?;
+    let next_fleet_id = dict_get_i32(obs, "next_fleet_id", 0)?;
+    Ok(Game::from_state(
+        GameConfig::new(num_players, episode_steps, ship_speed),
+        GameState::new(
+            step,
+            angular_velocity,
+            planets,
+            initial_planets,
+            fleets,
+            comets,
+            next_fleet_id,
+        ),
+    ))
+}
+
+fn dict_get_f64(obs: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<f64> {
+    Ok(match obs.get_item(key)? {
+        Some(value) if !value.is_none() => value.extract::<f64>()?,
+        _ => default,
+    })
+}
+
+fn dict_get_i32(obs: &Bound<'_, PyDict>, key: &str, default: i32) -> PyResult<i32> {
+    Ok(match obs.get_item(key)? {
+        Some(value) if !value.is_none() => value.extract::<i32>()?,
+        _ => default,
+    })
+}
+
+fn parse_planets_from_dict(obs: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<Planet>> {
+    let Some(obj) = obs.get_item(key)? else {
+        return Ok(Vec::new());
+    };
+    if obj.is_none() {
+        return Ok(Vec::new());
+    }
+    let rows = obj.cast::<PyList>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row_obj in rows.iter() {
+        let row = row_obj.cast::<PySequence>()?;
+        if row.len()? < 7 {
+            continue;
+        }
+        out.push(Planet {
+            id: row.get_item(0)?.extract::<i32>()?,
+            owner: row.get_item(1)?.extract::<i32>()?,
+            x: row.get_item(2)?.extract::<f64>()?,
+            y: row.get_item(3)?.extract::<f64>()?,
+            radius: row.get_item(4)?.extract::<f64>()?,
+            ships: row.get_item(5)?.extract::<i32>()?,
+            production: row.get_item(6)?.extract::<i32>()?,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_fleets_from_dict(obs: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<Fleet>> {
+    let Some(obj) = obs.get_item(key)? else {
+        return Ok(Vec::new());
+    };
+    if obj.is_none() {
+        return Ok(Vec::new());
+    }
+    let rows = obj.cast::<PyList>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row_obj in rows.iter() {
+        let row = row_obj.cast::<PySequence>()?;
+        if row.len()? < 7 {
+            continue;
+        }
+        out.push(Fleet {
+            id: row.get_item(0)?.extract::<i32>()?,
+            owner: row.get_item(1)?.extract::<i32>()?,
+            x: row.get_item(2)?.extract::<f64>()?,
+            y: row.get_item(3)?.extract::<f64>()?,
+            angle: row.get_item(4)?.extract::<f64>()?,
+            from_planet_id: row.get_item(5)?.extract::<i32>()?,
+            ships: row.get_item(6)?.extract::<i32>()?,
+            target_id: get_seq_or(&row, 7, -1)?,
+            eta: get_seq_or(&row, 8, 0.0)?,
+            target_x: get_seq_or(&row, 9, 0.0)?,
+            target_y: get_seq_or(&row, 10, 0.0)?,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_comets_from_dict(obs: &Bound<'_, PyDict>) -> PyResult<Vec<CometGroup>> {
+    let Some(obj) = obs.get_item("comets")? else {
+        return Ok(Vec::new());
+    };
+    if obj.is_none() {
+        return Ok(Vec::new());
+    }
+    let rows = obj.cast::<PyList>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for group_obj in rows.iter() {
+        let group = group_obj.cast::<PyDict>()?;
+        let planet_ids = match group.get_item("planet_ids")? {
+            Some(value) if !value.is_none() => value.extract::<Vec<i32>>()?,
+            _ => Vec::new(),
+        };
+        let path_index = match group.get_item("path_index")? {
+            Some(value) if !value.is_none() => value.extract::<i32>()?,
+            _ => -1,
+        };
+        let mut paths = Vec::new();
+        if let Some(paths_obj) = group.get_item("paths")? {
+            let path_rows = paths_obj.cast::<PyList>()?;
+            for path_obj in path_rows.iter() {
+                let point_rows = path_obj.cast::<PyList>()?;
+                let mut path = Vec::with_capacity(point_rows.len());
+                for point_obj in point_rows.iter() {
+                    let point = point_obj.cast::<PySequence>()?;
+                    if point.len()? < 2 {
+                        continue;
+                    }
+                    path.push(Point::new(
+                        point.get_item(0)?.extract::<f64>()?,
+                        point.get_item(1)?.extract::<f64>()?,
+                    ));
+                }
+                paths.push(path);
+            }
+        }
+        out.push(CometGroup {
+            planet_ids,
+            paths,
+            path_index,
+        });
+    }
     Ok(out)
 }
 
@@ -2825,6 +3111,16 @@ where
     T: for<'py> FromPyObject<'py, 'py, Error = PyErr> + Clone,
 {
     if idx >= row.len() {
+        return Ok(default);
+    }
+    row.get_item(idx)?.extract::<T>()
+}
+
+fn get_seq_or<T>(row: &Bound<'_, PySequence>, idx: usize, default: T) -> PyResult<T>
+where
+    T: for<'py> FromPyObject<'py, 'py, Error = PyErr> + Clone,
+{
+    if idx >= row.len()? {
         return Ok(default);
     }
     row.get_item(idx)?.extract::<T>()

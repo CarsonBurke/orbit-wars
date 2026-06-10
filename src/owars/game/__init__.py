@@ -1,3 +1,4 @@
+from .destination_oracle import infer_fleet_destinations
 from .geometry import (
     angle_to,
     distance,
@@ -41,6 +42,7 @@ __all__ = [
     "angle_to",
     "distance",
     "fleet_speed",
+    "infer_fleet_destinations",
     "line_circle_intersects",
     "parse_observation",
     "predicted_position",

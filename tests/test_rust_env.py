@@ -101,6 +101,252 @@ def _round_rows(rows: list[list[Any]]) -> list[list[Any]]:
     return rounded
 
 
+def _oracle_obs(
+    *,
+    planets: list[list[Any]],
+    fleets: list[list[Any]],
+    step: int = 1,
+    angular_velocity: float = 0.0,
+) -> dict[str, Any]:
+    return {
+        "player": 0,
+        "step": step,
+        "planets": [row.copy() for row in planets],
+        "fleets": [row.copy() for row in fleets],
+        "angular_velocity": angular_velocity,
+        "initial_planets": [row.copy() for row in planets],
+        "next_fleet_id": len(fleets),
+        "comets": [],
+        "comet_planet_ids": [],
+    }
+
+
+def _fleet_destination_oracle(
+    obs: dict[str, Any],
+    *,
+    ship_speed: float = 6.0,
+) -> dict[str, np.ndarray]:
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=ship_speed,
+        random_seed=0,
+    )
+    rust._core.load_observation(0, obs)
+    return rust._core.fleet_destination_oracle([(0, 0)])
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_static_direct_hit():
+    _build_rust_extension()
+    obs = _oracle_obs(
+        planets=[
+            [0, 0, 5.0, 10.0, 1.0, 10, 1],
+            [1, 1, 20.0, 10.0, 1.0, 10, 1],
+        ],
+        fleets=[[0, 0, 15.0, 10.0, 0.0, 0, 1]],
+    )
+
+    oracle = _fleet_destination_oracle(obs)
+
+    assert int(oracle["status"][0, 0]) == 1
+    assert int(oracle["dest_idx"][0, 0]) == 1
+    assert float(oracle["eta"][0, 0]) == 5.0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_board_before_sun():
+    _build_rust_extension()
+    obs = _oracle_obs(
+        planets=[
+            [0, 0, 95.0, 80.0, 1.0, 10, 1],
+            [1, 1, 70.0, 50.0, 3.0, 10, 1],
+        ],
+        fleets=[[0, 0, 95.0, 50.0, math.pi, 0, 1000]],
+    )
+
+    oracle = _fleet_destination_oracle(obs, ship_speed=100.0)
+
+    assert int(oracle["status"][0, 0]) == 2
+    assert int(oracle["dest_idx"][0, 0]) == -1
+    assert float(oracle["eta"][0, 0]) == 1.0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_sun_before_planet():
+    _build_rust_extension()
+    obs = _oracle_obs(
+        planets=[
+            [0, 0, 20.0, 80.0, 1.0, 10, 1],
+            [1, 1, 70.0, 50.0, 3.0, 10, 1],
+        ],
+        fleets=[[0, 0, 20.0, 50.0, 0.0, 0, 100]],
+    )
+
+    oracle = _fleet_destination_oracle(obs, ship_speed=100.0)
+
+    assert int(oracle["status"][0, 0]) == 3
+    assert int(oracle["dest_idx"][0, 0]) == -1
+    assert float(oracle["eta"][0, 0]) == 1.0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_uses_planet_vector_order_for_ties():
+    _build_rust_extension()
+    obs = _oracle_obs(
+        planets=[
+            [5, 1, 30.0, 10.0, 2.0, 10, 1],
+            [3, 1, 30.0, 10.0, 2.0, 10, 1],
+            [0, 0, 10.0, 10.0, 1.0, 10, 1],
+        ],
+        fleets=[[0, 0, 25.0, 10.0, 0.0, 0, 1]],
+    )
+
+    oracle = _fleet_destination_oracle(obs)
+
+    assert int(oracle["status"][0, 0]) == 1
+    assert int(oracle["dest_idx"][0, 0]) == 0
+    assert float(oracle["eta"][0, 0]) == 4.0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_strict_tangent_is_not_hit():
+    _build_rust_extension()
+    obs = _oracle_obs(
+        planets=[
+            [0, 0, 90.0, 10.0, 1.0, 10, 1],
+            [1, 1, 96.0, 11.0, 1.0, 10, 1],
+        ],
+        fleets=[[0, 0, 95.0, 10.0, 0.0, 0, 1]],
+        step=450,
+    )
+
+    oracle = _fleet_destination_oracle(obs)
+
+    assert int(oracle["status"][0, 0]) == 2
+    assert int(oracle["dest_idx"][0, 0]) == -1
+    assert float(oracle["eta"][0, 0]) == 6.0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_moving_sweep_hit():
+    _build_rust_extension()
+    obs = _oracle_obs(
+        planets=[
+            [1, 1, 70.0, 50.0, 1.0, 10, 1],
+            [0, 0, 20.0, 80.0, 1.0, 10, 1],
+        ],
+        fleets=[[0, 0, 70.0, 52.0, -math.pi / 2.0, 0, 1]],
+        angular_velocity=0.1,
+    )
+
+    oracle = _fleet_destination_oracle(obs)
+
+    assert int(oracle["status"][0, 0]) == 1
+    assert int(oracle["dest_idx"][0, 0]) == 0
+    assert float(oracle["eta"][0, 0]) == 1.0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_ignores_bogus_fleet_metadata():
+    _build_rust_extension()
+    obs = _oracle_obs(
+        planets=[
+            [0, 0, 5.0, 10.0, 1.0, 10, 1],
+            [1, 1, 20.0, 10.0, 1.0, 10, 1],
+            [2, 1, 80.0, 80.0, 5.0, 10, 1],
+        ],
+        fleets=[[0, 0, 15.0, 10.0, 0.0, 0, 1, 2, 999.0, 80.0, 80.0]],
+    )
+
+    oracle = _fleet_destination_oracle(obs)
+
+    assert int(oracle["status"][0, 0]) == 1
+    assert int(oracle["dest_idx"][0, 0]) == 1
+    assert float(oracle["eta"][0, 0]) == 5.0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_marks_future_comet_spawn_unknown():
+    _build_rust_extension()
+    obs = _oracle_obs(
+        planets=[
+            [0, 0, 5.0, 20.0, 1.0, 10, 1],
+            [1, 1, 80.0, 80.0, 1.0, 10, 1],
+        ],
+        fleets=[[0, 0, 20.0, 20.0, 0.0, 0, 1]],
+        step=48,
+    )
+
+    oracle = _fleet_destination_oracle(obs)
+
+    assert int(oracle["status"][0, 0]) == 5
+    assert int(oracle["dest_idx"][0, 0]) == -1
+    assert float(oracle["eta"][0, 0]) == 3.0
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_fleet_destination_oracle_returns_all_fleets_with_owner_features():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    obs = _oracle_obs(
+        planets=[
+            [0, 0, 20.0, 10.0, 1.0, 10, 1],
+            [1, 1, 80.0, 10.0, 1.0, 10, 1],
+        ],
+        fleets=[
+            [0, 0, 15.0, 10.0, 0.0, 0, 1],
+            [1, 1, 85.0, 10.0, math.pi, 1, 1],
+        ],
+    )
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust._core.load_observation(0, obs)
+
+    rows = [(0, 0), (0, 1)]
+    oracle = rust._core.fleet_destination_oracle(rows)
+    encoded, _ = rust.policy_batch_no_context(rows, device="cpu")
+
+    assert oracle["status"][:, :2].tolist() == [[1, 1], [1, 1]]
+    assert oracle["dest_idx"][:, :2].tolist() == [[0, 1], [0, 1]]
+    assert encoded.fleet_mask[:, :2].tolist() == [[True, True], [True, True]]
+    assert float(encoded.fleet_feats[0, 0, 14]) == 1.0  # player 0 self
+    assert float(encoded.fleet_feats[0, 1, 16]) == 1.0  # player 0 enemy
+    assert float(encoded.fleet_feats[1, 0, 16]) == 1.0  # player 1 enemy
+    assert float(encoded.fleet_feats[1, 1, 14]) == 1.0  # player 1 self
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_load_observation_round_trips_rust_observation_rows():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust.reset()
+    rust.step_subset_fast([0], [[[], []]])
+    obs = rust.observation(0, 0)
+
+    rust._core.load_observation(0, obs)
+    encoded, _ = rust.policy_batch_no_context([(0, 0)], device="cpu")
+
+    assert bool(encoded.planet_mask[0].any())
+
+
 @pytest.mark.parametrize(("workload", "steps"), [("noop", 40), ("simple", 40)])
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
 def test_rust_fixture_trace_matches_numpy_loaded_state(workload: str, steps: int):

@@ -2,18 +2,18 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f64::consts::PI;
 
-const BOARD_SIZE: f64 = 100.0;
-const CENTER: f64 = 50.0;
-const SUN_RADIUS: f64 = 10.0;
-const ROTATION_RADIUS_LIMIT: f64 = 50.0;
+pub const BOARD_SIZE: f64 = 100.0;
+pub const CENTER: f64 = 50.0;
+pub const SUN_RADIUS: f64 = 10.0;
+pub const ROTATION_RADIUS_LIMIT: f64 = 50.0;
 const COMET_RADIUS: f64 = 1.0;
 const COMET_PRODUCTION: i32 = 1;
 const PLANET_CLEARANCE: f64 = 7.0;
 const MIN_PLANET_GROUPS: i32 = 5;
 const MAX_PLANET_GROUPS: i32 = 10;
 const MIN_STATIC_GROUPS: i32 = 3;
-const COMET_SPAWN_STEPS: [i32; 5] = [50, 150, 250, 350, 450];
-const LOG_1000: f64 = 6.907_755_278_982_137;
+pub const COMET_SPAWN_STEPS: [i32; 5] = [50, 150, 250, 350, 450];
+pub const LOG_1000: f64 = 6.907_755_278_982_137;
 
 type MovingPlanet = (i32, f64, (f64, f64), (f64, f64));
 
@@ -300,9 +300,7 @@ impl Game {
         let mut keep = Vec::with_capacity(self.fleets.len());
         for mut fleet in self.fleets.drain(..) {
             let old = (fleet.x, fleet.y);
-            let ships = fleet.ships.max(1) as f64;
-            let normalized = (ships.ln() / LOG_1000).max(0.0);
-            let speed = (1.0 + (ship_speed - 1.0) * normalized.powf(1.5)).min(ship_speed);
+            let speed = fleet_step_speed(fleet.ships, ship_speed);
             fleet.x += fleet.angle.cos() * speed;
             fleet.y += fleet.angle.sin() * speed;
             if fleet.target_id >= 0 {
@@ -903,6 +901,16 @@ impl Game {
             .fold(0.0, f64::max);
         (own - enemy) as f32
     }
+}
+
+/// Per-turn fleet step length, exactly as `move_fleets` computes it.
+///
+/// The oracle relies on this sharing the simulator's floating-point
+/// expression tree, so any change here must keep the operation order.
+pub fn fleet_step_speed(ships: i32, ship_speed: f64) -> f64 {
+    let ships = ships.max(1) as f64;
+    let normalized = (ships.ln() / LOG_1000).max(0.0);
+    (1.0 + (ship_speed - 1.0) * normalized.powf(1.5)).min(ship_speed)
 }
 
 pub fn point_to_segment_distance(point: (f64, f64), start: (f64, f64), end: (f64, f64)) -> f64 {
