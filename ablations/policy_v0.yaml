@@ -7,6 +7,9 @@ base: configs/ppo_base.yaml
 name: policy_v0
 
 cells:
+  # encoder backend
+  - { run.name: fleet_latent, model.encoder_backend: fleet_latent }
+
   # depth
   - { run.name: depth_2, model.depth: 2 }
   - { run.name: depth_3, model.depth: 3 }

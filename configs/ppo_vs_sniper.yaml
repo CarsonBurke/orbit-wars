@@ -40,7 +40,7 @@ model:
   dropout: 0.0
   planet_rope_fraction: 0.25   # partial 2D RoPE over 8/32 dims per head, planets only
   planet_rope_base: 10000.0
-  encoder_backend: fleet_latent
+  encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
   value_min: -100000.0
