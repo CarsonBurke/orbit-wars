@@ -18,10 +18,11 @@ import torch
 import torch.nn as nn
 
 from ..policies.features import (
-    MAX_FLEETS,
     MAX_PLANETS,
     EncodedObs,
+    bucket_encoded_fleet_width,
     encode_raw_observations,
+    fleet_target_planet_idx_or_empty,
 )
 from ..policies.model import (
     OrbitPolicy,
@@ -183,6 +184,7 @@ class _InferenceForwardKernel(nn.Module):
         planet_garrison: torch.Tensor,
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -193,6 +195,7 @@ class _InferenceForwardKernel(nn.Module):
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
             global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
         )
         with torch.autocast(
             device_type="cuda",
@@ -234,6 +237,9 @@ def _pad_encoded(feats: EncodedObs, rows: int) -> EncodedObs:
         global_feats=None
         if feats.global_feats is None
         else _pad_rows(feats.global_feats, rows),
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else _pad_rows(feats.fleet_target_planet_idx, rows, fill=-1),
     )
 
 
@@ -293,7 +299,7 @@ class LearnedAgent:
             if self.compile_mode is not None and compile_graph_rows is not None
             else None
         )
-        self._forward_kernels: dict[tuple[int, bool], nn.Module] = {}
+        self._forward_kernels: dict[tuple[int, int, bool], nn.Module] = {}
         self._tracker = _FleetTargetTracker()
         self._batch_trackers: dict[tuple[Any, ...], _FleetTargetTracker] = {}
         if self.compile_graph_rows is not None:
@@ -325,11 +331,17 @@ class LearnedAgent:
             planet_garrison=torch.zeros(rows, MAX_PLANETS, device=device),
             fleet_feats=torch.zeros(
                 rows,
-                MAX_FLEETS,
+                1,
                 self.model.cfg.fleet_features,
                 device=device,
             ),
-            fleet_mask=torch.zeros(rows, MAX_FLEETS, dtype=torch.bool, device=device),
+            fleet_mask=torch.zeros(rows, 1, dtype=torch.bool, device=device),
+            fleet_target_planet_idx=torch.full(
+                (rows, 1),
+                -1,
+                dtype=torch.long,
+                device=device,
+            ),
             global_feats=torch.zeros(
                 rows,
                 self.model.cfg.global_features,
@@ -357,8 +369,9 @@ class LearnedAgent:
             graph_rows = _next_power_of_two(rows)
         else:
             graph_rows = rows
+        feats = bucket_encoded_fleet_width(feats) if self.compile_mode is not None else feats
         graph_feats = _pad_encoded(feats, graph_rows) if graph_rows != rows else feats
-        kernel_key = (graph_rows, bool(include_value))
+        kernel_key = (graph_rows, int(graph_feats.fleet_feats.shape[1]), bool(include_value))
         kernel = self._forward_kernels.get(kernel_key)
         if kernel is None:
             kernel = _InferenceForwardKernel(
@@ -385,13 +398,19 @@ class LearnedAgent:
             graph_feats.planet_garrison,
             graph_feats.fleet_feats,
             graph_feats.fleet_mask,
+            fleet_target_planet_idx_or_empty(graph_feats),
         )
         return _slice_policy_output(out, rows) if graph_rows != rows else out
 
     @torch.inference_mode()
     def __call__(self, obs: Any) -> list[list]:
         annotated = self._tracker.annotate(obs)
-        feats = encode_raw_observations([annotated], device=self.device)
+        feats = encode_raw_observations(
+            [annotated],
+            device=self.device,
+            include_fleet_targets=self.model.cfg.encoder_backend
+            == "destination_conditioned",
+        )
         out = self._forward(feats, 1, include_value=False)
         actions = sample_batch_actions_raw(
             out,
@@ -416,6 +435,8 @@ class LearnedAgent:
             annotated,
             device=self.device,
             pin_memory=torch.device(self.device).type == "cuda",
+            include_fleet_targets=self.model.cfg.encoder_backend
+            == "destination_conditioned",
         )
         out = self._forward(feats, len(annotated), include_value=False)
         actions_list = sample_batch_actions_raw(

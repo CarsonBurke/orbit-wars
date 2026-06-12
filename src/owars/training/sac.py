@@ -63,9 +63,9 @@ from torch.utils.tensorboard import SummaryWriter
 from ..policies.config import OrbitPolicyConfig
 from ..policies.model import normalize_matrices
 from ..policies.features import (
-    MAX_FLEETS,
     MAX_PLANETS,
     EncodedObs,
+    bucket_fleet_width,
     encode_raw_observations,
 )
 from ..policies.sac_model import (
@@ -142,10 +142,10 @@ class ReplayBuffer:
     `fraction`) and the legal-target mask for BOTH s and s'. The next-state mask
     is needed because the soft Bellman target samples a'~π(·|s') and must mask
     the target categorical to s' legal support. Footprint is ~83 KB/transition,
-    dominated by `fleet_feats [MAX_FLEETS=384, 20] f32` for s and s' (≈61 KB);
-    the two `[64, 64]` bool masks add 8 KB. So capacity × 83 KB (50k ≈ 4.2 GB
-    of RAM). At large `batch_size × UTD` the per-update H2D move of these obs is
-    the dominant learn-phase cost, so `sample` supports a pinned `non_blocking`
+    dominated by fleet features for s and s'. Fleet storage grows to the
+    maximum width inserted into the buffer instead of imposing a policy-level
+    cap. At large `batch_size × UTD` the per-update H2D move of these obs is the
+    dominant learn-phase cost, so `sample` supports a pinned `non_blocking`
     transfer that `_ReplayPrefetcher` overlaps with compute on a side stream.
     """
 
@@ -161,6 +161,8 @@ class ReplayBuffer:
             raise ValueError("capacity must be positive")
         self.capacity = int(capacity)
         self.device = torch.device(device)
+        self.fleet_cap = 1
+        self.has_fleet_targets = False
         f32 = torch.float32
         i64 = torch.int64
 
@@ -182,10 +184,13 @@ class ReplayBuffer:
                     (capacity, MAX_PLANETS), dtype=f32, device=self.device
                 ),
                 "fleet_feats": torch.zeros(
-                    (capacity, MAX_FLEETS, fleet_features), dtype=f32, device=self.device
+                    (capacity, self.fleet_cap, fleet_features), dtype=f32, device=self.device
                 ),
                 "fleet_mask": torch.zeros(
-                    (capacity, MAX_FLEETS), dtype=torch.bool, device=self.device
+                    (capacity, self.fleet_cap), dtype=torch.bool, device=self.device
+                ),
+                "fleet_target_planet_idx": torch.full(
+                    (capacity, self.fleet_cap), -1, dtype=i64, device=self.device
                 ),
             }
 
@@ -217,6 +222,30 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return self.size
 
+    def _ensure_fleet_capacity(self, width: int) -> None:
+        width = max(1, int(width))
+        if width <= self.fleet_cap:
+            return
+        old = self.fleet_cap
+        self.fleet_cap = bucket_fleet_width(width)
+        for block in (self.state, self.next_state):
+            old_feats = block["fleet_feats"]
+            old_mask = block["fleet_mask"]
+            block["fleet_feats"] = old_feats.new_zeros(
+                self.capacity,
+                self.fleet_cap,
+                old_feats.shape[-1],
+            )
+            block["fleet_feats"][:, :old].copy_(old_feats)
+            block["fleet_mask"] = old_mask.new_zeros(self.capacity, self.fleet_cap)
+            block["fleet_mask"][:, :old].copy_(old_mask)
+            old_targets = block["fleet_target_planet_idx"]
+            block["fleet_target_planet_idx"] = old_targets.new_full(
+                (self.capacity, self.fleet_cap),
+                -1,
+            )
+            block["fleet_target_planet_idx"][:, :old].copy_(old_targets)
+
     def add(
         self,
         feats: EncodedObs,
@@ -240,6 +269,23 @@ class ReplayBuffer:
             if t.dim() != want_dim:
                 raise ValueError(f"{name} expected {want_dim}D, got {tuple(t.shape)}")
             return t
+
+        self._ensure_fleet_capacity(
+            max(
+                int(_check_unbatched(feats.fleet_feats, "fleet_feats", 2).shape[0]),
+                int(
+                    _check_unbatched(
+                        next_feats.fleet_feats,
+                        "next_fleet_feats",
+                        2,
+                    ).shape[0]
+                ),
+            )
+        )
+        self.has_fleet_targets |= (
+            feats.fleet_target_planet_idx is not None
+            or next_feats.fleet_target_planet_idx is not None
+        )
 
         def _write_state(block: dict[str, torch.Tensor], s: EncodedObs) -> None:
             block["planet_feats"][idx].copy_(
@@ -265,14 +311,30 @@ class ReplayBuffer:
                     self.device, dtype=torch.float32
                 )
             )
-            block["fleet_feats"][idx].copy_(
-                _check_unbatched(s.fleet_feats, "fleet_feats", 2).to(
-                    self.device, dtype=torch.float32
-                )
+            fleet_feats = _check_unbatched(s.fleet_feats, "fleet_feats", 2).to(
+                self.device, dtype=torch.float32
             )
-            block["fleet_mask"][idx].copy_(
-                _check_unbatched(s.fleet_mask, "fleet_mask", 1).to(self.device)
+            fleet_mask = _check_unbatched(s.fleet_mask, "fleet_mask", 1).to(
+                self.device
             )
+            fleet_width = int(fleet_feats.shape[0])
+            block["fleet_feats"][idx].zero_()
+            block["fleet_mask"][idx].zero_()
+            block["fleet_target_planet_idx"][idx].fill_(-1)
+            if fleet_width:
+                block["fleet_feats"][idx, :fleet_width].copy_(fleet_feats)
+                block["fleet_mask"][idx, :fleet_width].copy_(fleet_mask)
+                if s.fleet_target_planet_idx is not None:
+                    targets = _check_unbatched(
+                        s.fleet_target_planet_idx,
+                        "fleet_target_planet_idx",
+                        1,
+                    ).to(self.device, dtype=torch.int64)
+                    target_width = min(fleet_width, int(targets.shape[0]))
+                    if target_width:
+                        block["fleet_target_planet_idx"][idx, :target_width].copy_(
+                            targets[:target_width]
+                        )
 
         _write_state(self.state, feats)
         _write_state(self.next_state, next_feats)
@@ -345,6 +407,9 @@ class ReplayBuffer:
                 planet_garrison=_move(block["planet_garrison"]),
                 fleet_feats=_move(block["fleet_feats"]),
                 fleet_mask=_move(block["fleet_mask"]),
+                fleet_target_planet_idx=_move(block["fleet_target_planet_idx"])
+                if self.has_fleet_targets
+                else None,
             )
 
         return SACBatch(
@@ -381,6 +446,8 @@ def _record_batch_stream(batch: SACBatch, stream: torch.cuda.Stream) -> None:
         _rec(obs.planet_garrison)
         _rec(obs.fleet_feats)
         _rec(obs.fleet_mask)
+        if obs.fleet_target_planet_idx is not None:
+            _rec(obs.fleet_target_planet_idx)
     for t in (
         batch.launch,
         batch.target_idx,
@@ -520,7 +587,12 @@ class SACUpdateOutput:
 
 
 def _encoded_args(feats: EncodedObs) -> tuple[torch.Tensor, ...]:
-    """EncodedObs → its seven tensors in field order (flat kernel inputs)."""
+    """EncodedObs → flat kernel inputs in field order."""
+    fleet_targets = (
+        feats.fleet_target_planet_idx
+        if feats.fleet_target_planet_idx is not None
+        else feats.fleet_mask.new_empty(feats.fleet_mask.shape[0], 0, dtype=torch.long)
+    )
     return (
         feats.planet_feats,
         feats.planet_mask,
@@ -529,6 +601,7 @@ def _encoded_args(feats: EncodedObs) -> tuple[torch.Tensor, ...]:
         feats.planet_garrison,
         feats.fleet_feats,
         feats.fleet_mask,
+        fleet_targets,
     )
 
 
@@ -542,6 +615,9 @@ def _encoded_row(feats: EncodedObs, i: int) -> EncodedObs:
         planet_garrison=feats.planet_garrison[i],
         fleet_feats=feats.fleet_feats[i],
         fleet_mask=feats.fleet_mask[i],
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else feats.fleet_target_planet_idx[i],
     )
 
 
@@ -553,6 +629,7 @@ def _encoded_from_args(
     planet_garrison: torch.Tensor,
     fleet_feats: torch.Tensor,
     fleet_mask: torch.Tensor,
+    fleet_target_planet_idx: torch.Tensor,
 ) -> EncodedObs:
     return EncodedObs(
         planet_feats=planet_feats,
@@ -562,6 +639,7 @@ def _encoded_from_args(
         planet_garrison=planet_garrison,
         fleet_feats=fleet_feats,
         fleet_mask=fleet_mask,
+        fleet_target_planet_idx=fleet_target_planet_idx,
     )
 
 
@@ -646,6 +724,7 @@ class _SACQKernel(torch.nn.Module):
         pg: torch.Tensor,
         ff: torch.Tensor,
         fm: torch.Tensor,
+        fti: torch.Tensor,
         npf: torch.Tensor,
         npm: torch.Tensor,
         npom: torch.Tensor,
@@ -653,6 +732,7 @@ class _SACQKernel(torch.nn.Module):
         npg: torch.Tensor,
         nff: torch.Tensor,
         nfm: torch.Tensor,
+        nfti: torch.Tensor,
         launch: torch.Tensor,
         target_idx: torch.Tensor,
         fraction: torch.Tensor,
@@ -665,8 +745,8 @@ class _SACQKernel(torch.nn.Module):
         alpha_d: torch.Tensor,
         alpha_c: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm)
-        next_feats = _encoded_from_args(npf, npm, npom, npid, npg, nff, nfm)
+        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm, fti)
+        next_feats = _encoded_from_args(npf, npm, npom, npid, npg, nff, nfm, nfti)
         gate = (feats.planet_owned_mask & feats.planet_mask).float()
         next_gate = (next_feats.planet_owned_mask & next_feats.planet_mask).float()
 
@@ -824,12 +904,13 @@ class _SACActorKernel(torch.nn.Module):
         pg: torch.Tensor,
         ff: torch.Tensor,
         fm: torch.Tensor,
+        fti: torch.Tensor,
         legal: torch.Tensor,
         time: torch.Tensor,
         alpha_d: torch.Tensor,
         alpha_c: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm)
+        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm, fti)
         gate = (feats.planet_owned_mask & feats.planet_mask).float()
 
         with torch.autocast(
@@ -1284,6 +1365,9 @@ def _encoded_to(feats: EncodedObs, device: torch.device | str) -> EncodedObs:
         planet_garrison=feats.planet_garrison.to(device),
         fleet_feats=feats.fleet_feats.to(device),
         fleet_mask=feats.fleet_mask.to(device),
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else feats.fleet_target_planet_idx.to(device),
     )
 
 
@@ -1294,14 +1378,24 @@ def _policy_inputs_for_rows(
     *,
     episode_steps: int,
     device: torch.device,
+    include_fleet_targets: bool,
 ) -> tuple[list[Any], EncodedObs, list[Any] | None, torch.Tensor]:
     obs = _observations_for_rows(vec, states, rows)
     policy_batch = getattr(vec, "policy_batch", None)
     if callable(policy_batch):
-        enc, contexts = policy_batch(rows, device=str(device), pin_memory=True)
+        enc, contexts = policy_batch(
+            rows,
+            device=str(device),
+            pin_memory=True,
+            include_fleet_targets=include_fleet_targets,
+        )
         enc = _encoded_to(enc, device)
         return obs, enc, contexts, _time_feat_from_obs(obs, episode_steps, device)
-    enc = encode_raw_observations(obs, device=device)
+    enc = encode_raw_observations(
+        obs,
+        device=device,
+        include_fleet_targets=include_fleet_targets,
+    )
     return obs, enc, None, _time_feat_from_obs(obs, episode_steps, device)
 
 
@@ -1669,6 +1763,9 @@ def train(cfg: RunConfig) -> None:
     heads_kernel = get_sac_heads_kernel(
         state.actor, device=device, compile_mode=compile_mode
     )
+    include_fleet_targets = (
+        state.actor.cfg.encoder_backend == "destination_conditioned"
+    )
 
     def production_margin(obs: Any, seat: int) -> float:
         return _obs_production_margin(obs, seat, num_players)
@@ -1732,6 +1829,7 @@ def train(cfg: RunConfig) -> None:
                     learner_rows,
                     episode_steps=cfg.game.episode_steps,
                     device=device,
+                    include_fleet_targets=include_fleet_targets,
                 )
             )
             learner_out = run_sac_heads(
@@ -1788,6 +1886,7 @@ def train(cfg: RunConfig) -> None:
                     opp_rows,
                     episode_steps=cfg.game.episode_steps,
                     device=device,
+                    include_fleet_targets=include_fleet_targets,
                 )
                 opp_out = run_sac_heads(
                     heads_kernel, opp_enc, device=device, time_feat=opp_time
@@ -1836,6 +1935,7 @@ def train(cfg: RunConfig) -> None:
                     learner_rows,
                     episode_steps=cfg.game.episode_steps,
                     device=device,
+                    include_fleet_targets=include_fleet_targets,
                 )
             )
             next_out = run_sac_heads(

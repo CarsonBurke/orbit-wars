@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
@@ -36,7 +37,8 @@ def test_encode_shapes():
     assert torch.allclose(feats.global_feats[9:11], torch.tensor([1.0 / 64.0, 2.0 / 320.0]))
     assert torch.allclose(feats.global_feats[24:26], torch.tensor([1.0 / 64.0, 1.0 / 320.0]))
     assert feats.planet_feats.shape == (64, 19)
-    assert feats.fleet_feats.shape == (384, 20)
+    assert feats.fleet_feats.shape == (1, 20)
+    assert feats.fleet_target_planet_idx is None
     assert int(feats.planet_mask.sum()) == 3
     assert int(feats.fleet_mask.sum()) == 1
     assert bool(feats.planet_owned_mask[0]) and not bool(feats.planet_owned_mask[1])
@@ -155,6 +157,128 @@ def test_fleet_latent_encoder_compresses_fleet_tokens():
     assert planet_slice == slice(3, 67)
     assert p == 64
     assert f == cfg.num_fleet_latents
+
+
+def test_destination_conditioned_encoder_scopes_fleets_before_trunk():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(
+        parse_observation(_obs()), include_fleet_targets=True
+    )
+
+    h, full_mask, planet_mask, fleet_mask, rope_cache, planet_slice, p, f = (
+        model._embed_tokens(feats)
+    )
+    out = model(feats)
+
+    assert model.fleet_tokenizer is None
+    assert model.destination_fleet_conditioner is not None
+    assert h.shape[1] == 3 + 64
+    assert full_mask.shape[1] == h.shape[1]
+    assert planet_mask.shape[-1] == 64
+    assert fleet_mask.shape[-1] == 0
+    assert rope_cache is not None
+    assert planet_slice == slice(3, 67)
+    assert p == 64
+    assert f == 0
+    assert out.launch_logits.shape == (1, 64)
+    assert out.target_logits.shape == (1, 64, 64)
+
+
+def test_destination_conditioned_encoder_is_identity_without_inbound_fleets():
+    from owars.policies.model import justnorm
+
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(
+        parse_observation(_obs()), include_fleet_targets=True
+    )
+    feats.fleet_target_planet_idx.fill_(-1)
+
+    h, _full_mask, _planet_mask, _fleet_mask, _rope_cache, planet_slice, _p, _f = (
+        model._embed_tokens(feats)
+    )
+    expected_planets = justnorm(model.planet_embed(feats.planet_feats.unsqueeze(0)))
+
+    assert torch.allclose(h[:, planet_slice], expected_planets, atol=1e-6)
+
+
+def test_destination_conditioned_encoder_is_zero_init_identity_with_inbound_fleets():
+    from owars.policies.model import justnorm
+
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(
+        parse_observation(_obs()), include_fleet_targets=True
+    )
+    feats.fleet_target_planet_idx.fill_(-1)
+    feats.fleet_target_planet_idx[0] = 0
+
+    assert model.destination_fleet_conditioner is not None
+    assert torch.count_nonzero(model.destination_fleet_conditioner.mod.weight) == 0
+    assert torch.count_nonzero(model.destination_fleet_conditioner.mod.bias) == 0
+
+    h, _full_mask, _planet_mask, _fleet_mask, _rope_cache, planet_slice, _p, _f = (
+        model._embed_tokens(feats)
+    )
+    expected_planets = justnorm(model.planet_embed(feats.planet_feats.unsqueeze(0)))
+
+    assert torch.allclose(h[:, planet_slice], expected_planets, atol=1e-6)
+
+
+def test_destination_conditioned_encoder_requires_sidecar():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(parse_observation(_obs()))
+
+    with pytest.raises(ValueError, match="fleet_target_planet_idx"):
+        model(feats)
+
+
+def test_destination_fleet_cross_attention_only_reads_matching_destination():
+    from owars.policies.model import DestinationFleetCrossAttention
+
+    torch.manual_seed(0)
+    attn = DestinationFleetCrossAttention(dim=32, n_heads=2).eval()
+    planets = torch.randn(1, 3, 32)
+    fleets = torch.randn(1, 4, 32)
+    planet_mask = torch.ones(1, 3, dtype=torch.bool)
+    fleet_mask = torch.tensor([[True, True, False, True]])
+    target_idx = torch.tensor([[0, 1, 0, -1]])
+
+    with torch.no_grad():
+        base = attn(planets, fleets, planet_mask, fleet_mask, target_idx)
+        changed_fleets = fleets.clone()
+        changed_fleets[:, 0] += 10.0
+        changed = attn(planets, changed_fleets, planet_mask, fleet_mask, target_idx)
+
+    assert not torch.allclose(base[:, 0], changed[:, 0])
+    assert torch.allclose(base[:, 1], changed[:, 1], atol=1e-6)
+    assert torch.allclose(base[:, 2], changed[:, 2], atol=1e-6)
 
 
 def test_noop_column_is_stable_across_planet_counts():

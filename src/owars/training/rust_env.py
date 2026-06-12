@@ -464,9 +464,13 @@ class RustVecEnv:
         *,
         device: str = "cpu",
         pin_memory: bool = False,
+        include_fleet_targets: bool = False,
     ) -> tuple[EncodedObs, list[ActionContext]]:
         return self._policy_batch_from_core(
-            self._core.policy_batch([(int(idx), int(player)) for idx, player in rows]),
+            self._core.policy_batch(
+                [(int(idx), int(player)) for idx, player in rows],
+                bool(include_fleet_targets),
+            ),
             device=device,
             pin_memory=pin_memory,
             include_contexts=True,
@@ -478,10 +482,12 @@ class RustVecEnv:
         *,
         device: str = "cpu",
         pin_memory: bool = False,
+        include_fleet_targets: bool = False,
     ) -> tuple[EncodedObs, list[ActionContext]]:
         return self._policy_batch_from_core(
             self._core.policy_batch_no_context(
-                [(int(idx), int(player)) for idx, player in rows]
+                [(int(idx), int(player)) for idx, player in rows],
+                bool(include_fleet_targets),
             ),
             device=device,
             pin_memory=pin_memory,
@@ -508,6 +514,7 @@ class RustVecEnv:
             if include_contexts
             else []
         )
+        fleet_targets = data.get("fleet_target_planet_idx")
         return (
             EncodedObs(
                 planet_feats=_tensor_from_numpy(
@@ -531,6 +538,9 @@ class RustVecEnv:
                 fleet_mask=_tensor_from_numpy(
                     data["fleet_mask"], device, pin_memory=pin_memory
                 ),
+                fleet_target_planet_idx=None
+                if fleet_targets is None
+                else _tensor_from_numpy(fleet_targets, device, pin_memory=pin_memory),
                 global_feats=_tensor_from_numpy(
                     data.get(
                         "global_feats",

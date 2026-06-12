@@ -19,10 +19,11 @@ import numpy as np
 import torch
 
 from ..game import MAX_SHIP_SPEED
+from ..game.destination_oracle import infer_fleet_destinations
+from ..game.observation import parse_observation
 from ..policies.features import (
     FLEET_FEAT_DIM,
     GLOBAL_FEAT_DIM,
-    MAX_FLEETS,
     MAX_OMEGA,
     MAX_PLANETS,
     PLANET_FEAT_DIM,
@@ -1482,18 +1483,32 @@ class NumpyVecEnv:
         *,
         device: str = "cpu",
         pin_memory: bool = False,
+        include_fleet_targets: bool = False,
     ) -> tuple[EncodedObs, list[ActionContext]]:
         """Encode policy rows directly from dense simulator arrays."""
         b = len(rows)
+        fleet_width = max(
+            1,
+            *(
+                int(np.count_nonzero(self.fleet_mask[int(env_idx)]))
+                for env_idx, _player in rows
+            ),
+        )
         g_feats = np.zeros((b, GLOBAL_FEAT_DIM), dtype=np.float32)
         p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
         p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
         p_owned = np.zeros((b, MAX_PLANETS), dtype=bool)
         p_ids = -np.ones((b, MAX_PLANETS), dtype=np.int64)
         p_gar = np.zeros((b, MAX_PLANETS), dtype=np.float32)
-        f_feats = np.zeros((b, MAX_FLEETS, FLEET_FEAT_DIM), dtype=np.float32)
-        f_mask = np.zeros((b, MAX_FLEETS), dtype=bool)
+        f_feats = np.zeros((b, fleet_width, FLEET_FEAT_DIM), dtype=np.float32)
+        f_mask = np.zeros((b, fleet_width), dtype=bool)
+        f_target = (
+            -np.ones((b, fleet_width), dtype=np.int64)
+            if include_fleet_targets
+            else None
+        )
         contexts: list[ActionContext] = []
+        target_cache: dict[int, np.ndarray] = {}
 
         for row, (env_idx, player) in enumerate(rows):
             planets = self.planets[env_idx, self.planet_mask[env_idx]].copy()
@@ -1521,11 +1536,27 @@ class NumpyVecEnv:
             self._fill_policy_fleet_features(
                 row,
                 int(player),
-                fleets[:MAX_FLEETS],
+                fleets[:fleet_width],
                 planets,
                 f_feats,
                 f_mask,
             )
+            if f_target is not None and env_idx not in target_cache:
+                base = self._observation_base(env_idx)
+                parsed = parse_observation(self._observation(env_idx, 0, base))
+                dest_idx, _eta, status = infer_fleet_destinations(
+                    parsed,
+                    max_fleets=len(parsed.fleets),
+                )
+                target_cache[env_idx] = np.where(status == 1, dest_idx, -1).astype(
+                    np.int64,
+                    copy=False,
+                )
+            if f_target is not None:
+                targets = target_cache[env_idx]
+                n_targets = min(len(targets), fleet_width)
+                if n_targets:
+                    f_target[row, :n_targets] = targets[:n_targets]
             contexts.append(
                 ActionContext(
                     planets=planets,
@@ -1553,6 +1584,9 @@ class NumpyVecEnv:
                 global_feats=_tensor_from_numpy(
                     g_feats, device, pin_memory=pin_memory
                 ),
+                fleet_target_planet_idx=None
+                if f_target is None
+                else _tensor_from_numpy(f_target, device, pin_memory=pin_memory),
             ),
             contexts,
         )

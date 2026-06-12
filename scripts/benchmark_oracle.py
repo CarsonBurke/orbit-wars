@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Benchmark the fleet-destination oracle through the Python binding.
 
-Measures, per spec acceptance scenario (static 40p/384f, orbiting 40p/384f,
-mixed with active comets):
+Measures configurable fleet-count scenarios (static planets, orbiting planets,
+and mixed active comets):
 
 - cold call: per-env cache invalidated before every call (worst case)
 - warm call: repeated query of an unchanged env (cache hit)
@@ -32,7 +32,10 @@ from owars.game.observation import parse_observation
 
 EPISODE_STEPS = 2000  # long synthetic episode: no horizon or comet-spawn cutoff
 STEP = 460  # past the last comet spawn, so lookahead is fully known
-NUM_FLEETS = 384
+DEFAULT_NUM_FLEETS = 512
+BASELINE_NUM_FLEETS = 384
+STATIC_LIMIT_US_384 = 250.0
+MOVING_LIMIT_US_384 = 500.0
 
 
 def _fleets(rng: np.random.Generator, count: int) -> list[list[Any]]:
@@ -114,22 +117,26 @@ def _obs_dict(
     planets: list[list[Any]],
     comets: list[dict[str, Any]],
     fleet_seed: int,
+    num_fleets: int,
 ) -> dict[str, Any]:
     rng = np.random.default_rng(fleet_seed)
     return {
         "player": 0,
         "step": STEP,
         "planets": [row.copy() for row in planets],
-        "fleets": _fleets(rng, NUM_FLEETS),
+        "fleets": _fleets(rng, num_fleets),
         "angular_velocity": 0.04,
         "initial_planets": [row.copy() for row in planets],
-        "next_fleet_id": NUM_FLEETS,
+        "next_fleet_id": num_fleets,
         "comets": comets,
         "comet_planet_ids": [pid for group in comets for pid in group["planet_ids"]],
     }
 
 
-def _scenarios() -> list[tuple[str, dict[str, Any], float]]:
+def _scenarios(num_fleets: int) -> list[tuple[str, dict[str, Any], float]]:
+    scale = max(1, num_fleets) / BASELINE_NUM_FLEETS
+    static_limit = STATIC_LIMIT_US_384 * scale
+    moving_limit = MOVING_LIMIT_US_384 * scale
     mixed_planets = _static_planets(20)
     for row in _orbiting_planets(16):
         row[0] += 100
@@ -141,9 +148,21 @@ def _scenarios() -> list[tuple[str, dict[str, Any], float]]:
         row[0] = i
     group["planet_ids"] = [old_to_new[pid] for pid in group["planet_ids"]]
     return [
-        ("static 40p / 384f", _obs_dict(_static_planets(40), [], 1), 250.0),
-        ("orbiting 40p / 384f", _obs_dict(_orbiting_planets(40), [], 2), 500.0),
-        ("mixed + active comets", _obs_dict(mixed_planets, [group], 3), 500.0),
+        (
+            f"static 40p / {num_fleets}f",
+            _obs_dict(_static_planets(40), [], 1, num_fleets),
+            static_limit,
+        ),
+        (
+            f"orbiting 40p / {num_fleets}f",
+            _obs_dict(_orbiting_planets(40), [], 2, num_fleets),
+            moving_limit,
+        ),
+        (
+            f"mixed + active comets / {num_fleets}f",
+            _obs_dict(mixed_planets, [group], 3, num_fleets),
+            moving_limit,
+        ),
     ]
 
 
@@ -181,6 +200,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--python-iters", type=int, default=5)
+    parser.add_argument("--fleets", type=int, default=DEFAULT_NUM_FLEETS)
     parser.add_argument("--dup-ratio-limit", type=float, default=1.1)
     parser.add_argument("--no-check", action="store_true", help="report only, never fail")
     args = parser.parse_args()
@@ -197,7 +217,7 @@ def main() -> int:
     core = rust._core
 
     ok = True
-    for name, obs, limit_us in _scenarios():
+    for name, obs, limit_us in _scenarios(args.fleets):
         core.load_observation(0, obs)
         for _ in range(20):  # warmup: JIT-free, but settles allocator/threads
             core.load_observation(0, obs)

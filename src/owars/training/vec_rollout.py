@@ -28,7 +28,12 @@ from typing import Any
 
 import torch
 
-from ..policies.features import EncodedObs, encode_raw_observations
+from ..policies.features import (
+    EncodedObs,
+    bucket_encoded_fleet_width,
+    encode_raw_observations,
+    fleet_target_planet_idx_or_empty,
+)
 from ..policies.model import OrbitPolicy, PolicyOutput
 from ..policies.sampling import (
     ActionContext,
@@ -83,6 +88,7 @@ class _RolloutForwardKernel(torch.nn.Module):
         planet_garrison: torch.Tensor,
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -93,6 +99,7 @@ class _RolloutForwardKernel(torch.nn.Module):
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
             global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -157,6 +164,9 @@ def _pad_encoded_rows(feats: EncodedObs, rows: int) -> EncodedObs:
         global_feats=None
         if feats.global_feats is None
         else _pad_rows(feats.global_feats, rows),
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else _pad_rows(feats.fleet_target_planet_idx, rows, fill=-1),
     )
 
 
@@ -167,39 +177,8 @@ def _global_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
     return feats.planet_feats.new_zeros(batch, 0)
 
 
-def _active_fleet_width(fleet_mask: torch.Tensor) -> int:
-    if fleet_mask.device.type != "cpu":
-        return int(fleet_mask.shape[1])
-    if fleet_mask.shape[1] == 0 or not bool(fleet_mask.any()):
-        return 1
-    cols = torch.nonzero(fleet_mask.any(dim=0), as_tuple=False)
-    return int(cols[-1].item()) + 1
-
-
-def _select_fleet_width(feats: EncodedObs) -> int:
-    current = int(feats.fleet_feats.shape[1])
-    used = _active_fleet_width(feats.fleet_mask)
-    return max(1, min(current, used))
-
-
-def _slice_fleet_width(feats: EncodedObs, width: int) -> EncodedObs:
-    current = int(feats.fleet_feats.shape[1])
-    if width >= current:
-        return feats
-    return EncodedObs(
-        planet_feats=feats.planet_feats,
-        planet_mask=feats.planet_mask,
-        planet_owned_mask=feats.planet_owned_mask,
-        planet_ids=feats.planet_ids,
-        planet_garrison=feats.planet_garrison,
-        fleet_feats=feats.fleet_feats[:, :width],
-        fleet_mask=feats.fleet_mask[:, :width],
-        global_feats=feats.global_feats,
-    )
-
-
 def _trim_fleets_for_forward(feats: EncodedObs) -> EncodedObs:
-    return _slice_fleet_width(feats, _select_fleet_width(feats))
+    return bucket_encoded_fleet_width(feats)
 
 
 def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
@@ -674,6 +653,10 @@ def _step_learner_bucket(
     record_on_cpu = record_trajectories and target_device.type == "cuda"
     graph_enabled = target_device.type == "cuda" and compile_mode is not None
     graph_rows = max(int(graph_rows or len(bucket)), len(bucket))
+    include_fleet_targets = (
+        getattr(getattr(model, "cfg", None), "encoder_backend", None)
+        == "destination_conditioned"
+    )
     action_contexts: list[ActionContext] | None = None
     policy_rows: list[tuple[int, int]] | None = None
     fast_sampler = getattr(getattr(policy_batch, "__self__", None), "sample_batch_with_records", None)
@@ -682,7 +665,10 @@ def _step_learner_bucket(
         policy_rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
         if target_device.type == "cuda":
             cpu_stacked, action_contexts = policy_batch(
-                policy_rows, device="cpu", pin_memory=False
+                policy_rows,
+                device="cpu",
+                pin_memory=False,
+                include_fleet_targets=include_fleet_targets,
             )
             device_source = (
                 cpu_stacked
@@ -699,6 +685,7 @@ def _step_learner_bucket(
                 policy_rows,
                 device=device,
                 pin_memory=target_device.type == "cuda",
+                include_fleet_targets=include_fleet_targets,
             )
             if stacked.planet_feats.device != target_device:
                 stacked = _encoded_to_device(stacked, target_device)
@@ -707,7 +694,11 @@ def _step_learner_bucket(
                 stacked = _trim_fleets_for_forward(stacked)
     else:
         cpu_stacked = (
-            encode_raw_observations(raw_obs_list, device="cpu")
+            encode_raw_observations(
+                raw_obs_list,
+                device="cpu",
+                include_fleet_targets=include_fleet_targets,
+            )
             if record_on_cpu
             else None
         )
@@ -725,6 +716,7 @@ def _step_learner_bucket(
                 raw_obs_list,
                 device=device,
                 pin_memory=target_device.type == "cuda",
+                include_fleet_targets=include_fleet_targets,
             )
             cpu_stacked = (
                 stacked
@@ -769,6 +761,7 @@ def _step_learner_bucket(
             graph_stacked.planet_garrison,
             graph_stacked.fleet_feats,
             graph_stacked.fleet_mask,
+            fleet_target_planet_idx_or_empty(graph_stacked),
         )
     out = _slice_policy_output(out, real_rows)
 
@@ -848,6 +841,9 @@ def _step_learner_bucket(
                     fleet_feats=rec["fleet_feats"][j],
                     fleet_mask=rec["fleet_mask"][j],
                     global_feats=rec["global_feats"][j],
+                    fleet_target_planet_idx=None
+                    if rec["fleet_target_planet_idx"] is None
+                    else rec["fleet_target_planet_idx"][j],
                 )
             )
             traj.launch.append(rec["launch"][j])
@@ -952,6 +948,11 @@ def _materialize_records_cpu(
         "fleet_mask": feature_source.fleet_mask.index_select(0, feature_rows)
         .detach()
         .cpu(),
+        "fleet_target_planet_idx": None
+        if feature_source.fleet_target_planet_idx is None
+        else feature_source.fleet_target_planet_idx.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
         "global_feats": _global_feats_or_empty(feature_source)
         .index_select(0, feature_rows)
         .detach()
@@ -986,4 +987,7 @@ def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
         fleet_feats=move(feats.fleet_feats),
         fleet_mask=move(feats.fleet_mask),
         global_feats=None if feats.global_feats is None else move(feats.global_feats),
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else move(feats.fleet_target_planet_idx),
     )

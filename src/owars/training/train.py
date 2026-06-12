@@ -37,7 +37,7 @@ import numpy as np
 import torch
 
 from ..policies.config import OrbitPolicyConfig
-from ..policies.features import EncodedObs
+from ..policies.features import EncodedObs, active_fleet_width, bucket_fleet_width
 from ..policies.model import (
     OrbitPolicy,
     ngpt_control_stats,
@@ -90,6 +90,7 @@ _CONTROL_LR_PATTERNS: tuple[str, ...] = (
 _MUON_BLOCK_PREFIXES: tuple[str, ...] = (
     "layers.",
     "fleet_tokenizer.layers.",
+    "destination_fleet_conditioner.cross_attn.",
 )
 
 # Task-specific readouts stay out of Muon. They are small enough that fused
@@ -272,9 +273,11 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
     owned_mask) are added by `_stack_trajectories`, which lets
     `_pretrain_value_batch` skip them entirely.
     """
-    gf, pf, pm, pom, pid, pg, ff, fm = [], [], [], [], [], [], [], []
+    gf, pf, pm, pom, pid, pg, ff, fm, ft = [], [], [], [], [], [], [], [], []
+    fleet_width = 1
     for t in trajs:
         for e in t.encoded:
+            fleet_width = max(fleet_width, int(e.fleet_feats.shape[0]))
             gf.append(e.global_feats)
             pf.append(e.planet_feats)
             pm.append(e.planet_mask)
@@ -283,6 +286,16 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
             pg.append(e.planet_garrison)
             ff.append(e.fleet_feats)
             fm.append(e.fleet_mask)
+            ft.append(e.fleet_target_planet_idx)
+
+    def pad_fleet(t: torch.Tensor, fill: float | bool | int = 0) -> torch.Tensor:
+        current = int(t.shape[0])
+        if current == fleet_width:
+            return t
+        out = t.new_full((fleet_width, *t.shape[1:]), fill)
+        out[:current] = t
+        return out
+
     return {
         "global_feats": None if any(g is None for g in gf) else torch.stack(gf),
         "planet_feats": torch.stack(pf),
@@ -290,8 +303,11 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
         "planet_owned_mask": torch.stack(pom),
         "planet_ids": torch.stack(pid),
         "planet_garrison": torch.stack(pg),
-        "fleet_feats": torch.stack(ff),
-        "fleet_mask": torch.stack(fm),
+        "fleet_feats": torch.stack([pad_fleet(t) for t in ff]),
+        "fleet_mask": torch.stack([pad_fleet(t, fill=False) for t in fm]),
+        "fleet_target_planet_idx": None
+        if any(t is None for t in ft)
+        else torch.stack([pad_fleet(t, fill=-1) for t in ft]),
     }
 
 
@@ -369,23 +385,11 @@ def _stack_trajectories(
     return batch
 
 
-_PPO_FLEET_WIDTH_BUCKETS: tuple[int, ...] = (64, 128, 256, 384)
-
-
-def _bucketed_fleet_width(used: int, current: int) -> int:
-    used = max(1, int(used))
-    current = max(1, int(current))
-    for bucket in _PPO_FLEET_WIDTH_BUCKETS:
-        if used <= bucket:
-            return min(current, bucket)
-    return current
-
-
 def _trim_ppo_batch_fleet_width(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Trim fleet tensors to a stable compile bucket before PPO staging.
 
-    `MAX_FLEETS=384` dominates PPO batch storage. Keeping the full rollout batch
-    on CPU avoids the large persistent VRAM allocation; trimming to a small set
+    Fleet tensors can dominate PPO batch storage. Keeping the full rollout batch
+    on CPU avoids persistent VRAM allocation; trimming to a small set
     of widths also bounds the number of `torch.compile(dynamic=False)` graph
     specializations while reducing both staged minibatch memory and compute.
     """
@@ -396,17 +400,16 @@ def _trim_ppo_batch_fleet_width(batch: dict[str, torch.Tensor]) -> dict[str, tor
     current = int(fleet_mask.shape[1])
     if current <= 1:
         return batch
-    if bool(fleet_mask.any()):
-        cols = torch.nonzero(fleet_mask.any(dim=0), as_tuple=False)
-        used = int(cols[-1].item()) + 1
-    else:
-        used = 1
-    width = _bucketed_fleet_width(used, current)
+    width = bucket_fleet_width(active_fleet_width(fleet_mask), current)
     if width >= current:
         return batch
     batch = dict(batch)
     batch["fleet_feats"] = fleet_feats[:, :width].contiguous()
     batch["fleet_mask"] = fleet_mask[:, :width].contiguous()
+    if batch.get("fleet_target_planet_idx") is not None:
+        batch["fleet_target_planet_idx"] = batch["fleet_target_planet_idx"][
+            :, :width
+        ].contiguous()
     return batch
 
 
@@ -427,6 +430,9 @@ def _slice_encoded_obs_to_device(
         global_feats=None
         if batch.get("global_feats") is None
         else batch["global_feats"][mb].to(device, non_blocking=True),
+        fleet_target_planet_idx=None
+        if batch.get("fleet_target_planet_idx") is None
+        else batch["fleet_target_planet_idx"][mb].to(device, non_blocking=True),
     )
 
 
@@ -555,7 +561,7 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
         # distribution shifts (e.g., as the behavior policy gets crushed).
         # Minibatched: a full-batch forward over `pretrain_episodes ×
         # episode_steps` samples blows up the [B, heads, tokens, tokens]
-        # attention tensor (tokens ≈ 64 planets + 384 fleets + 2 summary).
+        # attention tensor (tokens ≈ planets + active fleets + summary tokens).
         n = batch["planet_feats"].shape[0]
         mb = cfg.optim.minibatch_size
         autocast_enabled = device.type == "cuda"
@@ -615,6 +621,8 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     encoder = [model.global_embed, model.planet_embed, model.fleet_embed, *model.layers]
     if model.fleet_tokenizer is not None:
         encoder.append(model.fleet_tokenizer)
+    if model.destination_fleet_conditioner is not None:
+        encoder.append(model.destination_fleet_conditioner)
     value = [model.value_head]
     params: list[torch.nn.Parameter] = [
         model.actor_token,

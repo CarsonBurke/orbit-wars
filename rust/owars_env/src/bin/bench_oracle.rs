@@ -1,9 +1,9 @@
 //! Destination-oracle microbenchmark for the spec acceptance scenarios:
 //!
 //! ```text
-//! static 40p/384f:        <= 0.25 ms per unique env state
-//! moving-heavy 40p/384f:  <= 0.50 ms per unique env state
-//! mixed w/ active comets: <= 0.50 ms per unique env state
+//! static 40p/default fleets:        <= linearly scaled 384-fleet gate
+//! moving-heavy 40p/default fleets:  <= linearly scaled 384-fleet gate
+//! mixed w/ active comets:           <= linearly scaled 384-fleet gate
 //! ```
 //!
 //! Run with `cargo run --release --bin bench_oracle`. Exits non-zero when a
@@ -14,6 +14,11 @@ use std::time::Instant;
 
 use owars_env::core::{CometGroup, Fleet, Game, GameConfig, GameState, Planet, Point};
 use owars_env::oracle;
+
+const NUM_FLEETS: usize = 512;
+const BASELINE_NUM_FLEETS: f64 = 384.0;
+const STATIC_LIMIT_US_384: f64 = 250.0;
+const MOVING_LIMIT_US_384: f64 = 500.0;
 
 struct Lcg(u64);
 
@@ -136,7 +141,7 @@ fn comet_group(next_id: i32, path_index: i32) -> (Vec<Planet>, CometGroup) {
 
 fn build_game(planets: Vec<Planet>, comets: Vec<CometGroup>, fleet_seed: u64, step: i32) -> Game {
     let mut rng = Lcg(fleet_seed);
-    let fleets = fleets(&mut rng, 384);
+    let fleets = fleets(&mut rng, NUM_FLEETS);
     let initial = planets.clone();
     Game::from_state(
         GameConfig::new(2, 2000, 6.0),
@@ -145,23 +150,24 @@ fn build_game(planets: Vec<Planet>, comets: Vec<CometGroup>, fleet_seed: u64, st
 }
 
 fn bench(name: &str, game: &Game, threshold_us: f64) -> bool {
-    let reference = oracle::infer_fleet_destinations_reference(game, 384);
-    let fast = oracle::infer_fleet_destinations(game, 384);
+    let fleet_limit = game.fleets.len();
+    let reference = oracle::infer_fleet_destinations_reference(game, fleet_limit);
+    let fast = oracle::infer_fleet_destinations(game, fleet_limit);
     assert_eq!(fast, reference, "{name}: optimized diverged from reference");
 
     for _ in 0..20 {
-        std::hint::black_box(oracle::infer_fleet_destinations(game, 384));
+        std::hint::black_box(oracle::infer_fleet_destinations(game, fleet_limit));
     }
     let iters = 200;
     let start = Instant::now();
     for _ in 0..iters {
-        std::hint::black_box(oracle::infer_fleet_destinations(game, 384));
+        std::hint::black_box(oracle::infer_fleet_destinations(game, fleet_limit));
     }
     let per_call_us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
 
     let ref_start = Instant::now();
     for _ in 0..5 {
-        std::hint::black_box(oracle::infer_fleet_destinations_reference(game, 384));
+        std::hint::black_box(oracle::infer_fleet_destinations_reference(game, fleet_limit));
     }
     let ref_us = ref_start.elapsed().as_secs_f64() * 1e6 / 5.0;
 
@@ -199,11 +205,26 @@ fn main() {
         ..group
     };
     let mixed_game = build_game(mixed_planets, vec![group], 3, 460);
+    let scale = NUM_FLEETS as f64 / BASELINE_NUM_FLEETS;
+    let static_limit = STATIC_LIMIT_US_384 * scale;
+    let moving_limit = MOVING_LIMIT_US_384 * scale;
 
     let mut ok = true;
-    ok &= bench("static 40p / 384f", &static_game, 250.0);
-    ok &= bench("orbiting 40p / 384f", &orbit_game, 500.0);
-    ok &= bench("mixed + active comets", &mixed_game, 500.0);
+    ok &= bench(
+        &format!("static 40p / {NUM_FLEETS}f"),
+        &static_game,
+        static_limit,
+    );
+    ok &= bench(
+        &format!("orbiting 40p / {NUM_FLEETS}f"),
+        &orbit_game,
+        moving_limit,
+    );
+    ok &= bench(
+        &format!("mixed + active comets / {NUM_FLEETS}f"),
+        &mixed_game,
+        moving_limit,
+    );
 
     if !ok {
         std::process::exit(1);

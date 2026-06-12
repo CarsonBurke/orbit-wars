@@ -66,7 +66,7 @@ class OrbitPolicyConfig:
     planet_rope_base: float = 10000.0
     # Encoder dispatch. `fleet_latent` is the default: raw planet tokens are
     # preserved for the action vocabulary, while raw fleets are compressed.
-    encoder_backend: Literal["dense", "fleet_latent"] = "fleet_latent"
+    encoder_backend: Literal["dense", "fleet_latent", "destination_conditioned"] = "fleet_latent"
     # Perceiver-style fleet tokenizer. Raw planet tokens are preserved because
     # they define the source/target action vocabulary; raw fleet tokens are
     # compressed into this fixed latent set before the main policy encoder.

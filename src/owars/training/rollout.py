@@ -152,8 +152,11 @@ def _policy_step(
     device: str,
     deterministic: bool,
 ) -> tuple[list[list], dict]:
+    include_fleet_targets = model.cfg.encoder_backend == "destination_conditioned"
     if isinstance(obs, dict):
-        feats = encode_raw_observations([obs], device=device)
+        feats = encode_raw_observations(
+            [obs], device=device, include_fleet_targets=include_fleet_targets
+        )
         autocast_enabled = torch.device(device).type == "cuda"
         with (
             torch.no_grad(),
@@ -177,7 +180,9 @@ def _policy_step(
         }
 
     parsed = parse_observation(obs)
-    feats = encode_observation(parsed, device=device)
+    feats = encode_observation(
+        parsed, device=device, include_fleet_targets=include_fleet_targets
+    )
     autocast_enabled = torch.device(device).type == "cuda"
     with (
         torch.no_grad(),

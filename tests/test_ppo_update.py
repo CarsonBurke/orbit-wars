@@ -81,7 +81,10 @@ def _toy_batch(
             comet_planet_ids=set(), comets=[], remaining_overage_time=60.0,
         ) for _ in range(batch_size)
     ]
-    feats = encode_observations(obs)
+    feats = encode_observations(
+        obs,
+        include_fleet_targets=model.cfg.encoder_backend == "destination_conditioned",
+    )
     with torch.no_grad():
         out = model(feats)
     _, records = sample_batch_with_records(
@@ -104,6 +107,7 @@ def _toy_batch(
         "planet_garrison": feats.planet_garrison,
         "fleet_feats": feats.fleet_feats,
         "fleet_mask": feats.fleet_mask,
+        "fleet_target_planet_idx": feats.fleet_target_planet_idx,
         "launch": launch,
         "target_idx": target_idx,
         "fraction": fraction,
@@ -159,6 +163,49 @@ def test_ppo_update_runs_and_returns_finite_metrics():
     assert 0.0 <= log.ratio_clip_frac_high <= 1.0, log.ratio_clip_frac_high
     assert 0.0 <= log.pos_frac <= 1.0, log.pos_frac
     assert log.value_loss >= 0.0, log.value_loss
+
+
+def test_trim_ppo_batch_fleet_width_keeps_destination_sidecar_aligned():
+    batch = {
+        "fleet_feats": torch.zeros(2, 513, 20),
+        "fleet_mask": torch.zeros(2, 513, dtype=torch.bool),
+        "fleet_target_planet_idx": torch.full((2, 513), -1, dtype=torch.long),
+    }
+    batch["fleet_mask"][0, 3] = True
+    batch["fleet_mask"][1, 18] = True
+    batch["fleet_target_planet_idx"][0, 3] = 2
+    batch["fleet_target_planet_idx"][1, 18] = 5
+
+    trimmed = train_mod._trim_ppo_batch_fleet_width(batch)
+
+    assert trimmed["fleet_feats"].shape == (2, 64, 20)
+    assert trimmed["fleet_mask"].shape == (2, 64)
+    assert trimmed["fleet_target_planet_idx"].shape == (2, 64)
+    assert int(trimmed["fleet_target_planet_idx"][0, 3]) == 2
+    assert int(trimmed["fleet_target_planet_idx"][1, 18]) == 5
+
+
+def test_destination_conditioned_value_only_update_after_fleet_trim_smoke():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=4)
+    batch["fleet_feats"] = torch.zeros(4, 32, 20)
+    batch["fleet_mask"] = torch.zeros(4, 32, dtype=torch.bool)
+    batch["fleet_target_planet_idx"] = torch.full((4, 32), -1, dtype=torch.long)
+    batch["fleet_mask"][:, 18] = True
+    batch["fleet_target_planet_idx"][:, 18] = 0
+    batch = train_mod._trim_ppo_batch_fleet_width(batch)
+    optim = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    got = value_only_update(model, optim, batch, epochs=1, minibatch_size=2, grad_clip=1.0)
+
+    assert math.isfinite(got)
 
 
 def test_pretrain_value_batch_uses_configured_lambda_return(monkeypatch):

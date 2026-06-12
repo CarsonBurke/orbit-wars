@@ -47,8 +47,9 @@ fn game(
 }
 
 fn both(game: &Game) -> (Vec<FleetDestination>, Vec<FleetDestination>) {
-    let fast = infer_fleet_destinations(game, 384);
-    let reference = infer_fleet_destinations_reference(game, 384);
+    let fleet_limit = game.fleets.len();
+    let fast = infer_fleet_destinations(game, fleet_limit);
+    let reference = infer_fleet_destinations_reference(game, fleet_limit);
     assert_eq!(fast, reference, "optimized oracle diverged from reference");
     (fast, reference)
 }
@@ -593,8 +594,9 @@ fn differential_optimized_matches_reference_on_generated_states() {
             }
             let mut rng = Lcg(u64::from(seed) * 7919 + steps as u64);
             inject_fleets(&mut g, &mut rng, 48);
-            let fast = infer_fleet_destinations(&g, 384);
-            let reference = infer_fleet_destinations_reference(&g, 384);
+            let fleet_limit = g.fleets.len();
+            let fast = infer_fleet_destinations(&g, fleet_limit);
+            let reference = infer_fleet_destinations_reference(&g, fleet_limit);
             assert_eq!(
                 fast.len(),
                 reference.len(),
@@ -697,8 +699,9 @@ fn differential_edge_states_match_reference() {
             g.fleets.push(fleet(x, y, angle, 40));
         }
 
-        let fast = infer_fleet_destinations(&g, 384);
-        let reference = infer_fleet_destinations_reference(&g, 384);
+        let fleet_limit = g.fleets.len();
+        let fast = infer_fleet_destinations(&g, fleet_limit);
+        let reference = infer_fleet_destinations_reference(&g, fleet_limit);
         for (idx, (a, b)) in fast.iter().zip(reference.iter()).enumerate() {
             assert_eq!(
                 a, b,
@@ -727,7 +730,7 @@ fn property_single_fleet_rollout_matches_simulator() {
                 with_fleet.fleets = vec![probe];
                 let mut without_fleet = base.clone();
                 without_fleet.fleets.clear();
-                let oracle = infer_fleet_destinations(&with_fleet, 384)[0];
+                let oracle = infer_fleet_destinations(&with_fleet, with_fleet.fleets.len())[0];
                 let row_ids: Vec<i32> = with_fleet.planets.iter().map(|p| p.id).collect();
                 let horizon = inference_horizon(&with_fleet);
                 let empty: Vec<crate::core::PlayerAction> = vec![vec![], vec![]];

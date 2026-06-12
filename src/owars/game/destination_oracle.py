@@ -49,7 +49,6 @@ STATUS_HORIZON = 4
 STATUS_UNKNOWN = 5
 
 HORIZON_CAP = 600
-MAX_FLEETS = 384
 
 # Same literal as `LOG_1000` in rust/owars_env/src/core.rs.
 _LOG_1000 = 6.907755278982137
@@ -165,17 +164,17 @@ def infer_fleet_destinations(
     *,
     episode_steps: int = 500,
     ship_speed: float = MAX_SHIP_SPEED,
-    max_fleets: int = MAX_FLEETS,
+    max_fleets: int | None = None,
     done: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Resolve every fleet's destination exactly.
 
     Returns `(dest_idx, eta, status)` arrays of length
-    `min(len(obs.fleets), max_fleets)`; `dest_idx` is the row index into
+    `len(obs.fleets)` unless `max_fleets` is provided; `dest_idx` is the row index into
     `obs.planets` (`-1` for non-planet outcomes), `eta` the number of future
     turns until the event, `status` one of the `STATUS_*` constants.
     """
-    n_fleets = min(len(obs.fleets), max_fleets)
+    n_fleets = len(obs.fleets) if max_fleets is None else min(len(obs.fleets), max_fleets)
     dest = np.full(n_fleets, -1, dtype=np.int64)
     eta = np.zeros(n_fleets, dtype=np.float64)
     status = np.full(n_fleets, STATUS_NONE, dtype=np.int64)

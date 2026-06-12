@@ -15,7 +15,7 @@ Architecture:
 
 Learnable prefix tokens (Set-Transformer-style PMA) prepend the input set.
 The critic token gives the value head a *learned* aggregator instead
-of a mean-pool over up to 64+384 tokens, where decision-relevant tokens
+of a mean-pool over many planet/fleet tokens, where decision-relevant tokens
 otherwise drown in the average. The actor token is concatenated as global
 context onto each per-planet rep before the action heads — the per-planet
 target/fraction heads see "what's the joint plan look like" without us
@@ -80,6 +80,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from hl_gauss_pytorch import HLGaussLoss as _LibraryHLGaussLoss
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except Exception:  # pragma: no cover - optional on older torch builds
+    create_block_mask = None
+    flex_attention = None
 
 from .config import OrbitPolicyConfig, normalize_attention_config
 from .features import EncodedObs
@@ -290,7 +295,7 @@ def ngpt_control_stats(model: nn.Module) -> dict[str, float]:
     for module in model.modules():
         if isinstance(module, _EigenAlpha):
             eigen.append(module().flatten())
-        elif isinstance(module, (SelfAttention, CrossAttention)):
+        elif isinstance(module, (SelfAttention, CrossAttention, DestinationFleetCrossAttention)):
             inv = 1.0 / module.base_scale
             sqk_q.append((module.sqk_q * inv).flatten())
             sqk_k.append((module.sqk_k * inv).flatten())
@@ -683,6 +688,216 @@ class CrossAttention(nn.Module):
         return self.out_proj(o)
 
 
+class DestinationFleetCrossAttention(nn.Module):
+    """Planet-query cross-attention over fleets scoped by exact destination.
+
+    Query rows are planets and key/value rows are all current fleet tokens. The
+    destination mask is arbitrary at element granularity, so the CUDA path uses
+    FlexAttention. There is no per-planet fleet cap: batching remains `[B,P,F]`
+    and `dest_idx == p` decides membership.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        *,
+        n_kv_heads: int | None = None,
+        qk_gain_init: float = 1.0,
+    ):
+        super().__init__()
+        n_kv_heads, head_dim, kv_dim = normalize_attention_config(
+            dim, n_heads, n_kv_heads
+        )
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.base_scale = dim**-0.5
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.out_proj = CastedLinear(dim, dim, bias=False)
+        self.sqk_q = nn.Parameter(
+            torch.full((dim,), float(self.base_scale * qk_gain_init))
+        )
+        self.sqk_k = nn.Parameter(torch.full((kv_dim,), float(self.base_scale)))
+
+        nn.init.orthogonal_(self.c_q.weight)
+        nn.init.orthogonal_(self.c_k.weight)
+        nn.init.orthogonal_(self.c_v.weight)
+        nn.init.orthogonal_(self.out_proj.weight)
+
+    def normalize_weights(self) -> None:
+        with torch.no_grad():
+            self.c_q.weight.copy_(justnorm(self.c_q.weight, dim=1))
+            self.c_k.weight.copy_(justnorm(self.c_k.weight, dim=1))
+            self.c_v.weight.copy_(justnorm(self.c_v.weight, dim=1))
+            self.out_proj.weight.copy_(justnorm(self.out_proj.weight, dim=0))
+
+    def forward(
+        self,
+        planets: torch.Tensor,
+        fleets: torch.Tensor,
+        planet_mask: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        b, p, _ = planets.shape
+        f = fleets.shape[1]
+        if f == 0:
+            return torch.zeros_like(planets)
+
+        valid_dest = (
+            fleet_mask
+            & (fleet_target_planet_idx >= 0)
+            & (fleet_target_planet_idx < p)
+        )
+        dest_idx = torch.where(
+            valid_dest,
+            fleet_target_planet_idx,
+            torch.full_like(fleet_target_planet_idx, -1),
+        )
+
+        q = self.c_q(planets).unflatten(-1, (self.n_heads, self.head_dim))
+        k = self.c_k(fleets).unflatten(-1, (self.n_kv_heads, self.head_dim))
+        v = self.c_v(fleets).unflatten(-1, (self.n_kv_heads, self.head_dim))
+        sqk_q = (self.sqk_q * (1.0 / self.base_scale)).to(q.dtype).view(
+            1, 1, self.n_heads, self.head_dim
+        )
+        sqk_k = (self.sqk_k * (1.0 / self.base_scale)).to(k.dtype).view(
+            1, 1, self.n_kv_heads, self.head_dim
+        )
+        q = sqk_q * justnorm(q)
+        k = sqk_k * justnorm(k)
+        v = v.masked_fill(~fleet_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if q.is_cuda and flex_attention is not None and create_block_mask is not None:
+            def mask_mod(batch, _head, q_idx, kv_idx):  # type: ignore[no-untyped-def]
+                return planet_mask[batch, q_idx] & (dest_idx[batch, kv_idx] == q_idx)
+
+            block_mask = create_block_mask(
+                mask_mod,
+                b,
+                None,
+                p,
+                f,
+                device=q.device,
+                BLOCK_SIZE=(64, 64),
+            )
+            o = flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=self.head_dim**0.5,
+                enable_gqa=self.n_kv_heads != self.n_heads,
+            )
+        else:
+            arange_p = torch.arange(p, device=planets.device)
+            attn_mask = (
+                planet_mask[:, :, None]
+                & (dest_idx[:, None, :] == arange_p[None, :, None])
+            )
+            o = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask[:, None],
+                scale=self.head_dim**0.5,
+                enable_gqa=self.n_kv_heads != self.n_heads,
+            )
+        o = o.transpose(1, 2).flatten(-2)
+        return self.out_proj(o)
+
+
+class DestinationFleetConditioner(nn.Module):
+    """Apply exact-destination fleet conditioning to planet tokens.
+
+    The destination-conditioned backend has a hard contract: callers must pass
+    `fleet_target_planet_idx` with the same shape as `fleet_mask`. Missing or
+    mismatched sidecars are integration bugs, not a no-op fallback.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        *,
+        n_kv_heads: int | None = None,
+        qk_gain_init: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.cross_attn = DestinationFleetCrossAttention(
+            dim,
+            n_heads,
+            n_kv_heads=n_kv_heads,
+            qk_gain_init=qk_gain_init,
+        )
+        self.mod = CastedLinear(dim, 2 * dim)
+        nn.init.zeros_(self.mod.weight)
+        nn.init.zeros_(self.mod.bias)
+
+    def forward(
+        self,
+        planets: torch.Tensor,
+        fleets: torch.Tensor,
+        planet_mask: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if fleet_target_planet_idx is None:
+            raise ValueError(
+                "destination_conditioned encoder requires fleet_target_planet_idx"
+            )
+        fleet_target_planet_idx = fleet_target_planet_idx.to(
+            device=fleet_mask.device,
+            dtype=torch.long,
+        )
+        if tuple(fleet_target_planet_idx.shape) != tuple(fleet_mask.shape):
+            raise ValueError(
+                "fleet_target_planet_idx shape must match fleet_mask shape; "
+                f"got {tuple(fleet_target_planet_idx.shape)} vs {tuple(fleet_mask.shape)}"
+            )
+
+        b, p, _ = planets.shape
+        h_p = justnorm(planets)
+        h_f = justnorm(fleets).masked_fill(~fleet_mask.unsqueeze(-1), 0.0)
+        fleet_ctx = self.cross_attn(
+            h_p,
+            h_f,
+            planet_mask,
+            fleet_mask,
+            fleet_target_planet_idx,
+        )
+        valid_dest = (
+            fleet_mask
+            & (fleet_target_planet_idx >= 0)
+            & (fleet_target_planet_idx < p)
+        )
+        has_inbound_i = torch.zeros(
+            b,
+            p,
+            dtype=torch.int8,
+            device=fleet_target_planet_idx.device,
+        )
+        has_inbound_i.scatter_reduce_(
+            1,
+            fleet_target_planet_idx.masked_fill(~valid_dest, 0),
+            valid_dest.to(torch.int8),
+            reduce="amax",
+            include_self=True,
+        )
+        gamma, beta = self.mod(fleet_ctx).chunk(2, dim=-1)
+        conditioned = justnorm(h_p * (1.0 + gamma) + beta)
+        h_p = torch.where(has_inbound_i.bool().unsqueeze(-1), conditioned, h_p)
+        h_f = h_p.new_zeros(b, 0, h_p.shape[-1])
+        fleet_mask = torch.zeros(b, 0, dtype=torch.bool, device=fleet_mask.device)
+        return h_p, h_f, fleet_mask
+
+
 class TransformerBlock(nn.Module):
     """nGPT normalized-transformer block (`ngpt/model.py:108-179`).
 
@@ -1026,7 +1241,7 @@ def _match_feature_width(x: torch.Tensor, expected: int) -> torch.Tensor:
 class OrbitPolicy(nn.Module):
     def __init__(self, cfg: OrbitPolicyConfig):
         super().__init__()
-        if cfg.encoder_backend not in {"dense", "fleet_latent"}:
+        if cfg.encoder_backend not in {"dense", "fleet_latent", "destination_conditioned"}:
             raise ValueError(f"unknown encoder_backend: {cfg.encoder_backend!r}")
         self.cfg = cfg
         self.global_embed = CastedLinear(cfg.global_features, cfg.dim)
@@ -1046,6 +1261,16 @@ class OrbitPolicy(nn.Module):
                 block_skip=cfg.block_skip,
             )
             if cfg.encoder_backend == "fleet_latent"
+            else None
+        )
+        self.destination_fleet_conditioner = (
+            DestinationFleetConditioner(
+                cfg.dim,
+                cfg.n_heads,
+                n_kv_heads=cfg.n_kv_heads,
+                qk_gain_init=cfg.qk_gain_init,
+            )
+            if cfg.encoder_backend == "destination_conditioned"
             else None
         )
         # Learnable prefix tokens (PMA-style). Initialized small so
@@ -1198,6 +1423,11 @@ class OrbitPolicy(nn.Module):
             planet_mask = feats.planet_mask.unsqueeze(0)
             fleet_feats = feats.fleet_feats.unsqueeze(0)
             fleet_mask = feats.fleet_mask.unsqueeze(0)
+            fleet_target_planet_idx = (
+                None
+                if feats.fleet_target_planet_idx is None
+                else feats.fleet_target_planet_idx.unsqueeze(0)
+            )
             if feats.global_feats is None:
                 global_feats = None
             elif feats.global_feats.dim() == 1:
@@ -1209,10 +1439,16 @@ class OrbitPolicy(nn.Module):
             planet_mask = feats.planet_mask
             fleet_feats = feats.fleet_feats
             fleet_mask = feats.fleet_mask
+            fleet_target_planet_idx = feats.fleet_target_planet_idx
             global_feats = feats.global_feats
 
         b, p, _ = planet_feats.shape
         f = fleet_feats.shape[1]
+        if fleet_target_planet_idx is not None:
+            fleet_target_planet_idx = fleet_target_planet_idx.to(
+                device=fleet_mask.device,
+                dtype=torch.long,
+            )
         if global_feats is None:
             global_feats = planet_feats.new_zeros(b, self.global_embed.in_features)
         elif global_feats.dim() == 1:
@@ -1233,7 +1469,16 @@ class OrbitPolicy(nn.Module):
         h_g = self.global_embed(global_feats)
         h_p = self.planet_embed(planet_feats)
         h_f = self.fleet_embed(fleet_feats)
-        if self.fleet_tokenizer is not None:
+        if self.destination_fleet_conditioner is not None:
+            h_p, h_f, fleet_mask = self.destination_fleet_conditioner(
+                h_p,
+                h_f,
+                planet_mask,
+                fleet_mask,
+                fleet_target_planet_idx,
+            )
+            f = 0
+        elif self.fleet_tokenizer is not None:
             h_f = self.fleet_tokenizer(h_f, fleet_mask)
             fleet_mask = torch.ones(
                 b,

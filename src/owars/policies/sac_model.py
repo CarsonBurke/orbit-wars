@@ -64,6 +64,7 @@ from .config import OrbitPolicyConfig
 from .features import EncodedObs, MAX_PLANETS
 from .model import (
     CastedLinear,
+    DestinationFleetConditioner,
     FleetLatentTokenizer,
     HLGaussLoss,
     Rotary2D,
@@ -141,7 +142,7 @@ class SACEncoder(nn.Module):
 
     def __init__(self, cfg: OrbitPolicyConfig, *, extra_planet_dim: int = 0):
         super().__init__()
-        if cfg.encoder_backend not in {"dense", "fleet_latent"}:
+        if cfg.encoder_backend not in {"dense", "fleet_latent", "destination_conditioned"}:
             raise ValueError(f"unknown encoder_backend: {cfg.encoder_backend!r}")
         self.cfg = cfg
         self.extra_planet_dim = int(extra_planet_dim)
@@ -163,6 +164,16 @@ class SACEncoder(nn.Module):
                 block_skip=cfg.block_skip,
             )
             if cfg.encoder_backend == "fleet_latent"
+            else None
+        )
+        self.destination_fleet_conditioner = (
+            DestinationFleetConditioner(
+                cfg.dim,
+                cfg.n_heads,
+                n_kv_heads=cfg.n_kv_heads,
+                qk_gain_init=cfg.qk_gain_init,
+            )
+            if cfg.encoder_backend == "destination_conditioned"
             else None
         )
         self.summary_token = nn.Parameter(torch.zeros(cfg.dim))
@@ -221,13 +232,25 @@ class SACEncoder(nn.Module):
             planet_mask = feats.planet_mask.unsqueeze(0)
             fleet_feats = feats.fleet_feats.unsqueeze(0)
             fleet_mask = feats.fleet_mask.unsqueeze(0)
+            fleet_target_planet_idx = (
+                None
+                if feats.fleet_target_planet_idx is None
+                else feats.fleet_target_planet_idx.unsqueeze(0)
+            )
         else:
             planet_feats = feats.planet_feats
             planet_mask = feats.planet_mask
             fleet_feats = feats.fleet_feats
             fleet_mask = feats.fleet_mask
+            fleet_target_planet_idx = feats.fleet_target_planet_idx
 
         b, p, _ = planet_feats.shape
+        f = fleet_feats.shape[1]
+        if fleet_target_planet_idx is not None:
+            fleet_target_planet_idx = fleet_target_planet_idx.to(
+                device=fleet_mask.device,
+                dtype=torch.long,
+            )
 
         if planet_feats.shape[-1] != self.cfg.planet_features:
             planet_feats = _match_feature_width(planet_feats, self.cfg.planet_features)
@@ -247,6 +270,14 @@ class SACEncoder(nn.Module):
 
         h_p = self.planet_embed(planet_feats)
         h_f = self.fleet_embed(fleet_feats)
+        if self.destination_fleet_conditioner is not None:
+            h_p, h_f, fleet_mask = self.destination_fleet_conditioner(
+                h_p,
+                h_f,
+                planet_mask,
+                fleet_mask,
+                fleet_target_planet_idx,
+            )
         if self.fleet_tokenizer is not None:
             h_f = self.fleet_tokenizer(h_f, fleet_mask)
             fleet_mask = torch.ones(

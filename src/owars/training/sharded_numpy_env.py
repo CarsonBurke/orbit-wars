@@ -98,10 +98,20 @@ def _numpy_shard_worker(
                     ("ok", [vec.observation(idx, player) for idx, player in rows])
                 )
             elif cmd == _POLICY_BATCH:
-                rows = [(int(idx), int(player)) for idx, player in payload]
+                rows_payload, include_fleet_targets = payload
+                rows = [(int(idx), int(player)) for idx, player in rows_payload]
                 # Keep tensors on CPU across process boundaries. The parent
                 # process performs the single pinned CPU -> CUDA transfer.
-                remote.send(("ok", vec.policy_batch(rows, device="cpu")))
+                remote.send(
+                    (
+                        "ok",
+                        vec.policy_batch(
+                            rows,
+                            device="cpu",
+                            include_fleet_targets=bool(include_fleet_targets),
+                        ),
+                    )
+                )
             elif cmd == _REWARD_POTENTIALS:
                 rows, production_weight = payload
                 rows = [(int(idx), int(player)) for idx, player in rows]
@@ -322,6 +332,7 @@ class ShardedNumpyVecEnv:
         *,
         device: str = "cpu",
         pin_memory: bool = False,
+        include_fleet_targets: bool = False,
     ) -> tuple[EncodedObs, list[ActionContext]]:
         del device, pin_memory
         if not rows:
@@ -338,7 +349,9 @@ class ShardedNumpyVecEnv:
         for shard_idx, local_rows in enumerate(grouped_rows):
             if not local_rows:
                 continue
-            self._remotes[shard_idx].send((_POLICY_BATCH, local_rows))
+            self._remotes[shard_idx].send(
+                (_POLICY_BATCH, (local_rows, include_fleet_targets))
+            )
             active_shards.append(shard_idx)
 
         encoded_by_pos: list[EncodedObs | None] = [None] * len(rows)

@@ -20,7 +20,6 @@ const ROTATION_RADIUS_LIMIT: f64 = 50.0;
 const MAX_SHIP_SPEED: f64 = 6.0;
 const MAX_OMEGA: f64 = 0.05;
 const MAX_PLANETS: usize = 64;
-const MAX_FLEETS: usize = 384;
 const PLANET_FEAT_DIM: usize = 19;
 const FLEET_FEAT_DIM: usize = 20;
 const GLOBAL_PLAYER_SLOTS: usize = 4;
@@ -781,19 +780,31 @@ impl RustCoreVecEnv {
     }
 
     fn policy_batch<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         rows: Vec<(usize, usize)>,
+        include_fleet_targets: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        policy_batch_dict(py, &self.games, rows, true)
+        let fleet_dests_by_row = if include_fleet_targets {
+            Some(self.fleet_destinations_for_rows(py, &rows)?)
+        } else {
+            None
+        };
+        policy_batch_dict(py, &self.games, rows, true, fleet_dests_by_row.as_deref())
     }
 
     fn policy_batch_no_context<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         rows: Vec<(usize, usize)>,
+        include_fleet_targets: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        policy_batch_dict(py, &self.games, rows, false)
+        let fleet_dests_by_row = if include_fleet_targets {
+            Some(self.fleet_destinations_for_rows(py, &rows)?)
+        } else {
+            None
+        };
+        policy_batch_dict(py, &self.games, rows, false, fleet_dests_by_row.as_deref())
     }
 
     fn builtin_actions<'py>(
@@ -921,6 +932,59 @@ impl RustCoreVecEnv {
 }
 
 impl RustCoreVecEnv {
+    fn fleet_destinations_for_rows(
+        &mut self,
+        py: Python<'_>,
+        rows: &[(usize, usize)],
+    ) -> PyResult<Vec<Arc<Vec<FleetDestination>>>> {
+        for &(env_idx, player) in rows {
+            if env_idx >= self.games.len() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "env index out of range",
+                ));
+            }
+            if player >= self.num_players {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "player index out of range",
+                ));
+            }
+        }
+        if self.oracle_cache.len() < self.games.len() {
+            self.oracle_cache.resize(self.games.len(), None);
+        }
+        let mut pending: Vec<usize> = Vec::new();
+        let mut seen = vec![false; self.games.len()];
+        for &(env_idx, _) in rows {
+            if self.oracle_cache[env_idx].is_none() && !seen[env_idx] {
+                seen[env_idx] = true;
+                pending.push(env_idx);
+            }
+        }
+        let games = &self.games;
+        let computed = py.detach(|| {
+            pending
+                .par_iter()
+                .map(|&env_idx| {
+                    let game = &games[env_idx];
+                    let dests = oracle::infer_fleet_destinations(game, game.fleets.len());
+                    (env_idx, Arc::new(dests))
+                })
+                .collect::<Vec<_>>()
+        });
+        for (env_idx, dests) in computed {
+            self.oracle_cache[env_idx] = Some(dests);
+        }
+        Ok(rows
+            .iter()
+            .map(|(env_idx, _)| {
+                self.oracle_cache[*env_idx]
+                    .as_ref()
+                    .expect("oracle cache entry missing for requested env")
+                    .clone()
+            })
+            .collect())
+    }
+
     fn legal_target_mask_from_state_arrays<'py>(
         &mut self,
         py: Python<'py>,
@@ -1041,10 +1105,10 @@ impl RustCoreVecEnv {
         // resolve to the same Arc. The reference path bypasses the cache to
         // keep parity tests honest.
         let mut pending: Vec<usize> = Vec::new();
+        let mut seen = vec![false; self.games.len()];
         for &(env_idx, _) in &rows {
-            if (use_reference || self.oracle_cache[env_idx].is_none())
-                && !pending.contains(&env_idx)
-            {
+            if (use_reference || self.oracle_cache[env_idx].is_none()) && !seen[env_idx] {
+                seen[env_idx] = true;
                 pending.push(env_idx);
             }
         }
@@ -1055,9 +1119,9 @@ impl RustCoreVecEnv {
                 .map(|&env_idx| {
                     let game = &games[env_idx];
                     let dests = if use_reference {
-                        oracle::infer_fleet_destinations_reference(game, MAX_FLEETS)
+                        oracle::infer_fleet_destinations_reference(game, game.fleets.len())
                     } else {
-                        oracle::infer_fleet_destinations(game, MAX_FLEETS)
+                        oracle::infer_fleet_destinations(game, game.fleets.len())
                     };
                     (env_idx, Arc::new(dests))
                 })
@@ -1077,9 +1141,15 @@ impl RustCoreVecEnv {
         }
 
         let batch = rows.len();
-        let mut dest_idx = Array2::<i64>::from_elem((batch, MAX_FLEETS), -1);
-        let mut eta = Array2::<f64>::zeros((batch, MAX_FLEETS));
-        let mut status = Array2::<i64>::from_elem((batch, MAX_FLEETS), oracle::STATUS_NONE);
+        let fleet_width = rows
+            .iter()
+            .map(|&(env_idx, _)| games[env_idx].fleets.len())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mut dest_idx = Array2::<i64>::from_elem((batch, fleet_width), -1);
+        let mut eta = Array2::<f64>::zeros((batch, fleet_width));
+        let mut status = Array2::<i64>::from_elem((batch, fleet_width), oracle::STATUS_NONE);
         for (row, &(env_idx, _)) in rows.iter().enumerate() {
             let entries = if use_reference {
                 reference_results[env_idx]
@@ -1090,7 +1160,7 @@ impl RustCoreVecEnv {
                     .as_ref()
                     .expect("oracle cache entry missing for requested env")
             };
-            for (col, entry) in entries.iter().enumerate().take(MAX_FLEETS) {
+            for (col, entry) in entries.iter().enumerate().take(fleet_width) {
                 dest_idx[[row, col]] = entry.dest_idx;
                 eta[[row, col]] = entry.eta;
                 status[[row, col]] = entry.status;
@@ -1137,16 +1207,28 @@ fn policy_batch_dict<'py>(
     games: &[Game],
     rows: Vec<(usize, usize)>,
     include_contexts: bool,
+    fleet_dests_by_row: Option<&[Arc<Vec<FleetDestination>>]>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let batch = rows.len();
+    if let Some(dests) = fleet_dests_by_row {
+        debug_assert_eq!(dests.len(), batch);
+    }
+    let fleet_width = rows
+        .iter()
+        .map(|&(env_idx, _)| games[env_idx].fleets.len())
+        .max()
+        .unwrap_or(0)
+        .max(1);
     let mut global_feats = Array2::<f32>::zeros((batch, GLOBAL_FEAT_DIM));
     let mut planet_feats = Array3::<f32>::zeros((batch, MAX_PLANETS, PLANET_FEAT_DIM));
     let mut planet_mask = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
     let mut planet_owned = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
     let mut planet_ids = Array2::<i64>::from_elem((batch, MAX_PLANETS), -1);
     let mut planet_garrison = Array2::<f32>::zeros((batch, MAX_PLANETS));
-    let mut fleet_feats = Array3::<f32>::zeros((batch, MAX_FLEETS, FLEET_FEAT_DIM));
-    let mut fleet_mask = Array2::<bool>::from_elem((batch, MAX_FLEETS), false);
+    let mut fleet_feats = Array3::<f32>::zeros((batch, fleet_width, FLEET_FEAT_DIM));
+    let mut fleet_mask = Array2::<bool>::from_elem((batch, fleet_width), false);
+    let mut fleet_target_planet_idx = fleet_dests_by_row
+        .map(|_| Array2::<i64>::from_elem((batch, fleet_width), -1));
     let contexts = PyList::empty(py);
 
     for (row, (env_idx, player)) in rows.into_iter().enumerate() {
@@ -1165,6 +1247,15 @@ fn policy_batch_dict<'py>(
             },
         );
         fill_fleet_features(game, player, row, &mut fleet_feats, &mut fleet_mask);
+        if let (Some(dests_by_row), Some(targets)) =
+            (fleet_dests_by_row, fleet_target_planet_idx.as_mut())
+        {
+            for (col, dest) in dests_by_row[row].iter().enumerate().take(fleet_width) {
+                if dest.status == oracle::STATUS_PLANET {
+                    targets[[row, col]] = dest.dest_idx;
+                }
+            }
+        }
         if include_contexts {
             let planet_rows = planet_rows_array(game);
             let comet_ids = game
@@ -1190,6 +1281,9 @@ fn policy_batch_dict<'py>(
     out.set_item("planet_garrison", planet_garrison.into_pyarray(py))?;
     out.set_item("fleet_feats", fleet_feats.into_pyarray(py))?;
     out.set_item("fleet_mask", fleet_mask.into_pyarray(py))?;
+    if let Some(targets) = fleet_target_planet_idx {
+        out.set_item("fleet_target_planet_idx", targets.into_pyarray(py))?;
+    }
     out.set_item("contexts", contexts)?;
     Ok(out)
 }
@@ -1251,7 +1345,7 @@ fn fill_global_features(game: &Game, player: usize, row: usize, global_feats: &m
         global_feats[[row, offset]] = clip01(stats[0] / MAX_PLANETS as f64);
         global_feats[[row, offset + 1]] = clip01(stats[1] / GLOBAL_PRODUCTION_SCALE);
         global_feats[[row, offset + 2]] = clip01(stats[2].max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
-        global_feats[[row, offset + 3]] = clip01(stats[3] / MAX_FLEETS as f64);
+        global_feats[[row, offset + 3]] = clip01(stats[3].max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
         global_feats[[row, offset + 4]] = clip01(stats[4].max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
         offset += GLOBAL_PLAYER_FEATS;
     }
@@ -3378,7 +3472,8 @@ fn fill_fleet_features(
         .iter()
         .map(|p| (p.id, (p.x, p.y)))
         .collect::<HashMap<_, _>>();
-    for (col, f) in game.fleets.iter().take(MAX_FLEETS).enumerate() {
+    let fleet_width = feats.shape()[1];
+    for (col, f) in game.fleets.iter().take(fleet_width).enumerate() {
         feats[[row, col, 0]] = ((f.x - CENTER) / BOARD_SIZE) as f32;
         feats[[row, col, 1]] = ((f.y - CENTER) / BOARD_SIZE) as f32;
         feats[[row, col, 2]] = f.angle.cos() as f32;

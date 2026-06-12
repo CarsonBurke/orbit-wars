@@ -18,7 +18,9 @@ def _sync() -> None:
     torch.cuda.synchronize()
 
 
-def _make_features(batch_size: int, env_step: int) -> object:
+def _make_features(
+    batch_size: int, env_step: int, *, include_fleet_targets: bool
+) -> object:
     vec = NumpyVecEnv(
         num_envs=batch_size,
         num_players=2,
@@ -32,7 +34,12 @@ def _make_features(batch_size: int, env_step: int) -> object:
         result = vec.step_subset(active, [[[], []] for _ in active])
         states = [result[i][0] for i in active]
     raw = [state[0]["observation"] for state in states]
-    return encode_raw_observations(raw, device="cuda", pin_memory=False)
+    return encode_raw_observations(
+        raw,
+        device="cuda",
+        pin_memory=False,
+        include_fleet_targets=include_fleet_targets,
+    )
 
 
 def _bench(
@@ -98,22 +105,26 @@ def main() -> None:
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
         "--backend",
-        choices=("dense", "fleet_latent", "all"),
+        choices=("dense", "fleet_latent", "destination_conditioned", "all"),
         default="all",
     )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("benchmark_policy.py requires CUDA")
-    feats = _make_features(args.batch_size, args.env_step)
-    real_tokens = (
-        feats.planet_mask.sum(dim=1) + feats.fleet_mask.sum(dim=1) + 2
-    ).float()
     backends = (
-        ("dense", "fleet_latent")
+        ("dense", "fleet_latent", "destination_conditioned")
         if args.backend == "all"
         else (args.backend,)
     )
+    feats = _make_features(
+        args.batch_size,
+        args.env_step,
+        include_fleet_targets="destination_conditioned" in backends,
+    )
+    real_tokens = (
+        feats.planet_mask.sum(dim=1) + feats.fleet_mask.sum(dim=1) + 2
+    ).float()
     print(
         f"batch={args.batch_size} env_step={args.env_step} "
         f"tokens_mean={real_tokens.mean().item():.1f} "

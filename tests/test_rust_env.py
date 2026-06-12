@@ -314,15 +314,54 @@ def test_rust_fleet_destination_oracle_returns_all_fleets_with_owner_features():
 
     rows = [(0, 0), (0, 1)]
     oracle = rust._core.fleet_destination_oracle(rows)
-    encoded, _ = rust.policy_batch_no_context(rows, device="cpu")
+    encoded, _ = rust.policy_batch_no_context(
+        rows, device="cpu", include_fleet_targets=True
+    )
 
     assert oracle["status"][:, :2].tolist() == [[1, 1], [1, 1]]
     assert oracle["dest_idx"][:, :2].tolist() == [[0, 1], [0, 1]]
     assert encoded.fleet_mask[:, :2].tolist() == [[True, True], [True, True]]
+    assert encoded.fleet_target_planet_idx is not None
+    assert encoded.fleet_target_planet_idx[:, :2].tolist() == [[0, 1], [0, 1]]
+    assert encoded.fleet_target_planet_idx[:, 2:].eq(-1).all()
     assert float(encoded.fleet_feats[0, 0, 14]) == 1.0  # player 0 self
     assert float(encoded.fleet_feats[0, 1, 16]) == 1.0  # player 0 enemy
     assert float(encoded.fleet_feats[1, 0, 16]) == 1.0  # player 1 enemy
     assert float(encoded.fleet_feats[1, 1, 14]) == 1.0  # player 1 self
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_policy_batch_supports_large_fleet_count():
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    obs = _oracle_obs(
+        planets=[
+            [0, 0, 20.0, 10.0, 1.0, 10, 1],
+            [1, 1, 80.0, 10.0, 1.0, 10, 1],
+        ],
+        fleets=[
+            [1000 + i, i % 2, 15.0, 10.0, 0.0, 0, 20]
+            for i in range(400)
+        ],
+    )
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust._core.load_observation(0, obs)
+
+    encoded, _ = rust.policy_batch_no_context(
+        [(0, 0), (0, 1)], device="cpu", include_fleet_targets=True
+    )
+
+    assert encoded.fleet_feats.shape == (2, 400, 20)
+    assert encoded.fleet_mask[:, :400].all()
+    assert encoded.fleet_target_planet_idx is not None
+    assert encoded.fleet_target_planet_idx.shape == (2, 400)
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
@@ -549,6 +588,8 @@ def test_rust_vec_env_policy_batch_matches_numpy_vec_env():
     assert torch.equal(fast.planet_ids, expected.planet_ids)
     assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
     assert torch.equal(fast.fleet_mask, expected.fleet_mask)
+    assert fast.fleet_target_planet_idx is None
+    assert expected.fleet_target_planet_idx is None
     assert len(contexts) == 2
 
     obs = numpy_states[0][0]["observation"]
@@ -570,6 +611,8 @@ def test_rust_vec_env_policy_batch_matches_numpy_vec_env():
     assert torch.equal(fast.planet_ids, expected.planet_ids)
     assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
     assert torch.equal(fast.fleet_mask, expected.fleet_mask)
+    assert fast.fleet_target_planet_idx is None
+    assert expected.fleet_target_planet_idx is None
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
@@ -734,6 +777,8 @@ def test_rust_vec_env_policy_batch_no_context_matches_features():
     assert torch.equal(without_context.planet_garrison, with_context.planet_garrison)
     assert torch.equal(without_context.fleet_feats, with_context.fleet_feats)
     assert torch.equal(without_context.fleet_mask, with_context.fleet_mask)
+    assert without_context.fleet_target_planet_idx is None
+    assert with_context.fleet_target_planet_idx is None
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")

@@ -2,7 +2,7 @@ from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
 from owars.training.config import OptimCfg
 from owars.training.ppo import _grad_clip_groups
-from owars.training.train import _build_optimizer, _split_params
+from owars.training.train import _build_optimizer, _split_params, _value_pretrain_params
 
 
 def _group_by_name(model: OrbitPolicy) -> dict[str, str]:
@@ -65,6 +65,48 @@ def test_optimizer_split_matches_parameter_golf_boundary():
     assert group["layers.0.attn.sqk_q"] == "adamw_control"
     assert group["layers.0.attn.sqk_k"] == "adamw_control"
     assert group["layers.0.suv"] == "adamw_control"
+
+
+def test_destination_conditioned_optimizer_split_matches_attention_roles():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+
+    group = _group_by_name(model)
+
+    for name in (
+        "destination_fleet_conditioner.cross_attn.c_q.weight",
+        "destination_fleet_conditioner.cross_attn.c_k.weight",
+        "destination_fleet_conditioner.cross_attn.c_v.weight",
+        "destination_fleet_conditioner.cross_attn.out_proj.weight",
+    ):
+        assert group[name] == "muon_blocks"
+    assert group["destination_fleet_conditioner.cross_attn.sqk_q"] == "adamw_control"
+    assert group["destination_fleet_conditioner.cross_attn.sqk_k"] == "adamw_control"
+    assert group["destination_fleet_conditioner.mod.weight"] == "adamw_default"
+    assert group["destination_fleet_conditioner.mod.bias"] == "adamw_default"
+
+
+def test_destination_conditioned_value_pretrain_steps_active_conditioner_params():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+
+    pretrain_ids = {id(param) for param in _value_pretrain_params(model)}
+
+    assert model.destination_fleet_conditioner is not None
+    for param in model.destination_fleet_conditioner.parameters():
+        assert id(param) in pretrain_ids
 
 
 def test_optimizer_group_lrs_follow_split():

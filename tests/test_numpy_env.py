@@ -189,6 +189,8 @@ def test_numpy_vec_fast_policy_batch_matches_raw_observations():
     assert torch.equal(fast.planet_ids, expected.planet_ids)
     assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
     assert torch.equal(fast.fleet_mask, expected.fleet_mask)
+    assert fast.fleet_target_planet_idx is None
+    assert expected.fleet_target_planet_idx is None
     assert len(contexts) == 2
 
     b, p = fast.planet_ids.shape
@@ -246,9 +248,14 @@ def test_numpy_vec_fleet_target_metadata_matches_raw_observation_features():
     assert obs["fleet_targets"] == {"0": [1, 2.0, 90.0, 90.0]}
     assert enemy_obs["fleet_targets"] == {}
 
-    fast, _ = vec.policy_batch([(0, 0), (0, 1)], device="cpu")
-    expected = encode_raw_observations([obs, enemy_obs], device="cpu")
+    fast, _ = vec.policy_batch(
+        [(0, 0), (0, 1)], device="cpu", include_fleet_targets=True
+    )
+    expected = encode_raw_observations(
+        [obs, enemy_obs], device="cpu", include_fleet_targets=True
+    )
     assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
+    assert torch.equal(fast.fleet_target_planet_idx, expected.fleet_target_planet_idx)
     row = fast.fleet_feats[0, 0].tolist()
     assert math.isclose(row[9], 1 / 128.0, abs_tol=1e-6)
     assert math.isclose(row[10], 2 / 500.0, abs_tol=1e-6)

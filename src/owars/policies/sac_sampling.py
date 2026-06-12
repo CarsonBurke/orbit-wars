@@ -27,7 +27,7 @@ from typing import Any
 
 import torch
 
-from .features import EncodedObs
+from .features import EncodedObs, fleet_target_planet_idx_or_empty
 from .model import PolicyOutput
 from .sac_model import SACActor
 from .sampling import (
@@ -203,6 +203,7 @@ class _SACHeadsKernel(torch.nn.Module):
         planet_garrison: torch.Tensor,
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
         time_feat: torch.Tensor,
     ) -> PolicyOutput:
         feats = EncodedObs(
@@ -213,6 +214,7 @@ class _SACHeadsKernel(torch.nn.Module):
             planet_garrison=planet_garrison,
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
+            fleet_target_planet_idx=fleet_target_planet_idx,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -276,6 +278,7 @@ def run_sac_heads(
             feats.planet_garrison,
             feats.fleet_feats,
             feats.fleet_mask,
+            fleet_target_planet_idx_or_empty(feats),
             time_feat,
         )
 

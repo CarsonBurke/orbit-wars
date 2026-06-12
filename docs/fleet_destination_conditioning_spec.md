@@ -28,13 +28,15 @@ Hard constraints:
 
 ## Current State
 
-`src/owars/policies/features.py` encodes up to `MAX_FLEETS = 384` raw fleet
-rows, but active configs use `encoder_backend: fleet_latent`. In
-`OrbitPolicy._embed_tokens`, raw fleet embeddings are compressed through
-`FleetLatentTokenizer`, then the main encoder sees:
+`src/owars/policies/features.py` encodes all raw fleet rows present in the
+batch, padding fleet tensors only to the maximum active fleet count in that
+batch. Before destination conditioning, active PPO configs used
+`encoder_backend: fleet_latent`; in that path, `OrbitPolicy._embed_tokens`
+compresses raw fleet embeddings through `FleetLatentTokenizer`, then the main
+encoder sees:
 
 ```text
-[actor, critic, planet tokens, fleet latent tokens]
+[actor, critic, global, planet tokens, fleet latent tokens]
 ```
 
 The existing Rust helper `inferred_fleet_target` in
@@ -126,9 +128,9 @@ Where:
 
 ```text
 rows: list[(env_idx, player)] or env_idx-only batch
-dest_idx: int64[B, MAX_FLEETS]       # planet row index, -1 if no destination
-eta: float32[B, MAX_FLEETS]          # turns until hit, 0 for no destination
-status: int8[B, MAX_FLEETS]          # hit / board_exit / sun / horizon / unknown / pad
+dest_idx: int64[B, F_max]       # planet row index, -1 if no destination
+eta: float32[B, F_max]          # turns until hit, 0 for no destination
+status: int8[B, F_max]          # hit / board_exit / sun / horizon / unknown / pad
 ```
 
 For policy conditioning, only `dest_idx` is required. `eta/status` exist for
@@ -263,7 +265,7 @@ O(H * P_moving) scene build
 Measured baseline before this rewrite:
 
 ```text
-40 planets / 384 fleets
+40 planets / synthetic fleet batch
 static planets:       ~5 ms per env row
 all planets moving:  ~56 ms per env row
 ```
@@ -271,7 +273,7 @@ all planets moving:  ~56 ms per env row
 Target after this rewrite:
 
 ```text
-40 planets / 384 fleets, moving-heavy: <= 0.5-1.0 ms per unique env state
+40 planets / synthetic fleet batch, moving-heavy: <= 0.5-1.0 ms per unique env state
 ```
 
 This is an exactness target, not an approximation target. The spatial index is
@@ -554,12 +556,14 @@ preprocessing step.
 For Orbit Wars, the condition is:
 
 ```text
-c_full = [zero_actor, zero_critic, fleet_ctx_by_planet]
-c_full: [B, 2 + P, D]
+c_full = [zero_actor, zero_critic, zero_global, fleet_ctx_by_planet]
+c_full: [B, 3 + P, D]
 ```
 
-Actor and critic tokens receive zero condition. Each planet token receives the
-context derived from exactly the fleet tokens assigned to that planet.
+Actor, critic, and global tokens receive zero condition. Each planet token
+receives the context derived from exactly the fleet tokens assigned to that
+planet. If a future config removes the global token, the condition simply drops
+the corresponding zero row.
 
 Each destination-conditioned transformer block should therefore accept
 `x_full` and `c_full`:
@@ -603,11 +607,11 @@ gate_* = 0
 The main encoder input becomes:
 
 ```text
-[actor, critic, conditioned_planets]
+[actor, critic, global, conditioned_planets]
 ```
 
 Planet RoPE still applies to the planet token slice. There are no fleet tokens
-in the main transformer for this backend.
+or fleet latent tokens in the main transformer for this backend.
 
 ## nGPT / Optimizer Requirements
 
@@ -707,16 +711,18 @@ easy to invoke before training with the destination backend.
 
 Benchmark scenarios:
 
-- `40` static planets, `384` fleets, no comets.
-- `40` orbiting planets, `384` fleets, no comets.
-- mixed static/orbiting/active-comet state, `384` fleets.
+- `40` static planets, configurable synthetic fleet count, no comets.
+- `40` orbiting planets, configurable synthetic fleet count, no comets.
+- mixed static/orbiting/active-comet state, configurable synthetic fleet count.
 - duplicate policy rows for the same env: `(env, player0)`, `(env, player1)`.
 
 Acceptance targets on the development machine used for current measurements:
 
 ```text
 static 40p/384f:           <= 0.25 ms per unique env state
-moving-heavy 40p/384f:     <= 1.00 ms per unique env state
+moving-heavy 40p/384f:     <= 0.50 ms per unique env state
+mixed active-comet 40p/384f: <= 0.50 ms per unique env state
+default synthetic fleet count: linearly scaled from the 384-fleet gates
 duplicate player rows:     <= 1.10x one-row wall time
 ```
 
@@ -811,8 +817,8 @@ statics, orbiters, and comets.
 
 ```text
 cargo run --release --bin bench_oracle   (rust/owars_env)
-static 40p/384f:        ~0.06 ms   (reference ~0.48 ms)
-orbiting 40p/384f:      ~0.18 ms   (reference ~0.59 ms)
+static 40p/default synthetic fleet count:        ~0.06 ms   (reference ~0.48 ms)
+orbiting 40p/default synthetic fleet count:      ~0.18 ms   (reference ~0.59 ms)
 mixed + active comets:  ~0.14 ms   (reference ~0.48 ms)
 
 PYTHONPATH=src python scripts/benchmark_oracle.py   (through the binding)

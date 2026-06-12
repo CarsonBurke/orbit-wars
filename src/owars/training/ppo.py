@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 
-from ..policies.features import EncodedObs
+from ..policies.features import EncodedObs, fleet_target_planet_idx_or_empty
 from ..policies.model import OrbitPolicy, normalize_matrices
 from ..policies.sampling import (
     _categorical_action_log_probs,
@@ -46,6 +46,9 @@ def _slice_feats(batch: dict[str, torch.Tensor], mb) -> EncodedObs:
         global_feats=None
         if batch.get("global_feats") is None
         else batch["global_feats"][mb],
+        fleet_target_planet_idx=None
+        if batch.get("fleet_target_planet_idx") is None
+        else batch["fleet_target_planet_idx"][mb],
     )
 
 
@@ -368,6 +371,22 @@ def _stage_ppo_minibatch(
         _slice_to_device(batch["planet_garrison"], mb, device),
         _slice_to_device(batch["fleet_feats"], mb, device),
         _slice_to_device(batch["fleet_mask"], mb, device),
+        _slice_to_device(
+            fleet_target_planet_idx_or_empty(
+                EncodedObs(
+                    planet_feats=batch["planet_feats"],
+                    planet_mask=batch["planet_mask"],
+                    planet_owned_mask=batch["planet_owned_mask"],
+                    planet_ids=batch["planet_ids"],
+                    planet_garrison=batch["planet_garrison"],
+                    fleet_feats=batch["fleet_feats"],
+                    fleet_mask=batch["fleet_mask"],
+                    fleet_target_planet_idx=batch.get("fleet_target_planet_idx"),
+                )
+            ),
+            mb,
+            device,
+        ),
         (
             row_weight
             if row_weight.device == device
@@ -403,6 +422,22 @@ def _stage_value_minibatch(
         _slice_to_device(batch["planet_garrison"], mb, device),
         _slice_to_device(batch["fleet_feats"], mb, device),
         _slice_to_device(batch["fleet_mask"], mb, device),
+        _slice_to_device(
+            fleet_target_planet_idx_or_empty(
+                EncodedObs(
+                    planet_feats=batch["planet_feats"],
+                    planet_mask=batch["planet_mask"],
+                    planet_owned_mask=batch["planet_owned_mask"],
+                    planet_ids=batch["planet_ids"],
+                    planet_garrison=batch["planet_garrison"],
+                    fleet_feats=batch["fleet_feats"],
+                    fleet_mask=batch["fleet_mask"],
+                    fleet_target_planet_idx=batch.get("fleet_target_planet_idx"),
+                )
+            ),
+            mb,
+            device,
+        ),
         (
             row_weight
             if row_weight.device == device
@@ -589,6 +624,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         planet_garrison: torch.Tensor,
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
         row_weight: torch.Tensor,
         launch: torch.Tensor,
         target_idx: torch.Tensor,
@@ -609,6 +645,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
             global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -891,6 +928,7 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
         planet_garrison: torch.Tensor,
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
         row_weight: torch.Tensor,
         ret_mtp: torch.Tensor,
         ret_mtp_mask: torch.Tensor,
@@ -904,6 +942,7 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
             global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
