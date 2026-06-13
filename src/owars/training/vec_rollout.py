@@ -184,8 +184,15 @@ def _trim_fleets_for_forward(feats: EncodedObs) -> EncodedObs:
     return bucket_encoded_fleet_width(feats)
 
 
-def _bucket_fleets_for_graph(feats: EncodedObs) -> EncodedObs:
-    width = bucket_fleet_width(active_fleet_width(feats.fleet_mask))
+def _bucket_fleets_for_graph(
+    feats: EncodedObs,
+    *,
+    fixed_width: int | None = None,
+) -> EncodedObs:
+    used = active_fleet_width(feats.fleet_mask)
+    width = max(used, int(fixed_width)) if fixed_width is not None else (
+        bucket_fleet_width(used)
+    )
     return slice_encoded_fleet_width(feats, width)
 
 
@@ -408,6 +415,7 @@ def rollout_episodes_batched(
     reward_cfg: RewardCfg | None = None,
     record_trajectories: bool = True,
     compile_mode: str | None = None,
+    compile_fleet_width: int | None = None,
     policy_graph_rows: int | None = None,
     learner_action_agent: Callable[[Any], list[list]] | None = None,
 ) -> list[Trajectory]:
@@ -565,6 +573,7 @@ def rollout_episodes_batched(
                     else fast_policy_batch if use_fast_numpy_path else None
                 ),
                 compile_mode,
+                compile_fleet_width,
                 policy_graph_rows or max_policy_rows,
                 learner_action_agent,
             )
@@ -611,6 +620,7 @@ def rollout_episodes_batched(
                     False,
                     fast_policy_batch_no_context,
                     getattr(agent, "compile_mode", None),
+                    None,
                     policy_graph_rows or max_policy_rows,
                 )
                 continue
@@ -677,6 +687,7 @@ def _step_learner_bucket(
     record_trajectories: bool,
     policy_batch: Any | None = None,
     compile_mode: str | None = None,
+    compile_fleet_width: int | None = None,
     graph_rows: int | None = None,
     learner_action_agent: Callable[[Any], list[list]] | None = None,
 ) -> None:
@@ -690,6 +701,11 @@ def _step_learner_bucket(
     target_device = torch.device(device)
     record_on_cpu = record_trajectories and target_device.type == "cuda"
     graph_enabled = target_device.type == "cuda" and compile_mode is not None
+    fixed_graph_fleet_width = (
+        int(compile_fleet_width)
+        if graph_enabled and compile_fleet_width is not None
+        else None
+    )
     graph_rows = max(int(graph_rows or len(bucket)), len(bucket))
     include_fleet_targets = (
         getattr(getattr(model, "cfg", None), "encoder_backend", None)
@@ -709,7 +725,7 @@ def _step_learner_bucket(
                 include_fleet_targets=include_fleet_targets,
             )
             device_source = (
-                _bucket_fleets_for_graph(cpu_stacked)
+                _bucket_fleets_for_graph(cpu_stacked, fixed_width=fixed_graph_fleet_width)
                 if graph_enabled
                 else _trim_fleets_for_forward(cpu_stacked)
             )
@@ -742,7 +758,7 @@ def _step_learner_bucket(
         )
         if cpu_stacked is not None:
             device_source = (
-                _bucket_fleets_for_graph(cpu_stacked)
+                _bucket_fleets_for_graph(cpu_stacked, fixed_width=fixed_graph_fleet_width)
                 if graph_enabled
                 else _trim_fleets_for_forward(cpu_stacked)
             )
@@ -761,7 +777,13 @@ def _step_learner_bucket(
                 if record_trajectories and target_device.type == "cpu"
                 else None
             )
-            if not graph_enabled:
+            if graph_enabled:
+                stacked = _bucket_fleets_for_graph(
+                    stacked,
+                    fixed_width=fixed_graph_fleet_width,
+                )
+                stacked = _pad_encoded_rows(stacked, graph_rows)
+            else:
                 stacked = _trim_fleets_for_forward(stacked)
     if cpu_stacked is not None:
         real_rows = cpu_stacked.planet_feats.shape[0]

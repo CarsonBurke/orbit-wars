@@ -274,25 +274,96 @@ def test_no_builtin_historical_archive_uses_log_eviction_and_notable_buckets(
     )
 
 
-def test_no_builtin_log_archive_retains_candidates_until_capacity(tmp_path: Path):
+def test_no_builtin_log_archive_retains_log_spaced_candidates(tmp_path: Path):
     pool = NoBuiltinTrainingPool(
         active_pool_size=1,
-        historical_training_archive_size=6,
+        historical_training_archive_size=64,
         recent_eviction_archive_size=0,
         notable_archive_size=0,
         min_games_before_eviction=0,
         rng=random.Random(0),
     )
     model = _tiny_model()
-    created: list[str] = []
-    for update in range(5):
+    for update in range(65):
         pool.set_current_update(update)
-        created.append(pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt"))
+        pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
 
-    historical = set(pool.historical_snapshot_names("log"))
+    historical = pool.historical_snapshot_names("log")
+    ages = sorted(
+        pool.current_update - pool.snapshot_stats(name).created_update
+        for name in historical
+    )
 
-    assert set(created[:-1]).issubset(historical)
-    assert all((tmp_path / f"u{idx}.pt").exists() for idx in range(4))
+    assert len(historical) <= 7
+    assert ages == [1, 2, 4, 8, 16, 32, 64]
+
+
+def test_no_builtin_historical_archive_size_is_logarithmic(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=128,
+        min_games_before_eviction=0,
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    for update in range(80):
+        pool.set_current_update(update)
+        pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
+
+    historical = pool.historical_snapshot_names()
+
+    assert len(historical) <= 16
+
+
+def test_no_builtin_recent_eviction_bucket_keeps_newest_representative(
+    tmp_path: Path,
+):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=16,
+        recent_eviction_archive_size=3,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    for update in range(8):
+        pool.set_current_update(update)
+        pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
+
+    recent = pool.historical_snapshot_names("recent_eviction")
+    evicted_updates = [
+        pool.snapshot_stats(name).evicted_update
+        for name in recent
+    ]
+
+    assert max(update for update in evicted_updates if update is not None) == 7
+    assert len(recent) <= 3
+
+
+def test_no_builtin_recent_eviction_age_handles_update_zero(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=16,
+        recent_eviction_archive_size=16,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    pool.set_current_update(0)
+    pool.add_snapshot("u0a", model, tmp_path / "u0a.pt")
+    pool.add_snapshot("u0b", model, tmp_path / "u0b.pt")
+    evicted_at_zero = [
+        name
+        for name in pool.all_snapshot_names()
+        if pool.snapshot_stats(name).evicted_update == 0
+    ]
+    pool.set_current_update(8)
+    pool.rebuild_historical_archive()
+
+    assert len(evicted_at_zero) == 1
+    assert evicted_at_zero[0] in pool.historical_snapshot_names("recent_eviction")
 
 
 def test_no_builtin_evicted_historical_snapshot_uses_lazy_agent(tmp_path: Path):

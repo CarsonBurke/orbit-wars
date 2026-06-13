@@ -216,6 +216,18 @@ def test_invalid_no_builtins_pool_config_raises(opponents_cfg):
         RunConfig.from_dict({"opponents": {"mode": "no_builtins", **opponents_cfg}})
 
 
+def test_invalid_rollout_compile_width_raises():
+    with pytest.raises(ValueError, match="compile_fleet_width"):
+        RunConfig.from_dict({"rollout": {"compile_fleet_width": 0}})
+
+
+def test_rollout_compile_defaults_enabled():
+    cfg = RunConfig.from_dict({})
+
+    assert cfg.rollout.compile_policy is True
+    assert cfg.rollout.compile_fleet_width == 1024
+
+
 @pytest.mark.parametrize(
     "ppo_cfg",
     [

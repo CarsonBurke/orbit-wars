@@ -644,50 +644,116 @@ class NoBuiltinTrainingPool:
             for name in names
             if self.current_update - self._snapshots[name].created_update >= 1
         ]
-        if not candidates:
-            return set()
-        archive = self._log_archive & set(candidates)
-        for name in sorted(candidates, key=lambda n: self._snapshots[n].created_update):
-            archive.add(name)
-            if len(archive) > cap:
-                self._trim_log_archive(archive, cap)
-        return archive
+        return self._select_log_spaced_by_age(
+            candidates,
+            cap,
+            age_fn=lambda n: self.current_update - self._snapshots[n].created_update,
+            tie_fn=lambda n: self._snapshots[n].created_update,
+        )
 
     def _log_age_bucket(self, name: str) -> int:
         age = max(1, self.current_update - self._snapshots[name].created_update)
         return int(math.log2(age))
 
-    def _trim_log_archive(self, archive: set[str], cap: int) -> None:
-        while len(archive) > cap:
-            by_bucket: dict[int, list[str]] = {}
-            for name in archive:
-                by_bucket.setdefault(self._log_age_bucket(name), []).append(name)
-            bucket = max(
-                by_bucket,
-                key=lambda b: (
-                    len(by_bucket[b]),
-                    -b,  # when all buckets are singletons, sacrifice youngest first
-                ),
-            )
-            victim = max(
-                by_bucket[bucket],
-                key=lambda n: self._snapshots[n].created_update,
-            )
-            archive.remove(victim)
+    def _select_log_spaced_by_age(
+        self,
+        names: Sequence[str],
+        cap: int,
+        *,
+        age_fn: Callable[[str], int],
+        tie_fn: Callable[[str], int],
+        prefer_oldest_in_bucket: bool = True,
+    ) -> set[str]:
+        """Pick one online representative per logarithmic age bucket.
+
+        Retained snapshots are deleted from disk, so this selector must preserve
+        the oldest member of each bucket; otherwise a snapshot can be discarded
+        at age 3 and never survive to represent age 4/8/16 later.
+        """
+        if cap <= 0:
+            return set()
+        by_bucket: dict[int, list[str]] = {}
+        for name in names:
+            age = max(0, int(age_fn(name)))
+            bucket = 0 if age <= 1 else int(math.log2(age))
+            by_bucket.setdefault(bucket, []).append(name)
+        bucket_ids = sorted(by_bucket)
+        selected_by_bucket: dict[int, str] = {}
+        for bucket in bucket_ids:
+            if prefer_oldest_in_bucket:
+                selected_by_bucket[bucket] = max(
+                    by_bucket[bucket],
+                    key=lambda n: (
+                        max(0, int(age_fn(n))),
+                        tie_fn(n),
+                    ),
+                )
+            else:
+                selected_by_bucket[bucket] = min(
+                    by_bucket[bucket],
+                    key=lambda n: (
+                        max(0, int(age_fn(n))),
+                        -tie_fn(n),
+                    ),
+                )
+        if len(bucket_ids) <= cap:
+            return set(selected_by_bucket.values())
+        keep_buckets = self._evenly_spaced_values(bucket_ids, cap)
+        return {selected_by_bucket[bucket] for bucket in keep_buckets}
+
+    @staticmethod
+    def _evenly_spaced_values(values: Sequence[int], count: int) -> list[int]:
+        if count <= 0:
+            return []
+        if len(values) <= count:
+            return list(values)
+        if count == 1:
+            return [values[-1]]
+        last = len(values) - 1
+        indexes = sorted(
+            {
+                round(i * last / (count - 1))
+                for i in range(count)
+            }
+        )
+        return [values[i] for i in indexes]
 
     def _select_recent_evictions(self, names: Sequence[str]) -> list[str]:
         if self.recent_eviction_archive_size <= 0:
             return []
         allowed = set(names)
-        selected: list[str] = []
-        seen: set[str] = set()
-        for name in reversed(self._recent_evictions):
-            if name in allowed and name not in seen and name in self._snapshots:
-                selected.append(name)
-                seen.add(name)
-                if len(selected) >= self.recent_eviction_archive_size:
-                    break
-        return selected
+        candidates = [
+            name
+            for name in dict.fromkeys(reversed(self._recent_evictions))
+            if name in allowed
+            and name in self._snapshots
+            and self._snapshots[name].evicted_update is not None
+        ]
+        selected = self._select_log_spaced_by_age(
+            candidates,
+            self.recent_eviction_archive_size,
+            age_fn=lambda n: self.current_update
+            - int(
+                self._snapshots[n].evicted_update
+                if self._snapshots[n].evicted_update is not None
+                else self.current_update
+            ),
+            tie_fn=lambda n: int(
+                self._snapshots[n].evicted_update
+                if self._snapshots[n].evicted_update is not None
+                else 0
+            ),
+            prefer_oldest_in_bucket=False,
+        )
+        return sorted(
+            selected,
+            key=lambda n: int(
+                self._snapshots[n].evicted_update
+                if self._snapshots[n].evicted_update is not None
+                else 0
+            ),
+            reverse=True,
+        )
 
     def _select_notables(self, names: Sequence[str]) -> list[str]:
         allowed = set(names)

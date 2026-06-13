@@ -278,12 +278,10 @@ def _compile_mode_for_model(model: OrbitPolicy, cfg: RunConfig) -> str | None:
     return cfg.run.compile_mode or None
 
 
-def _rollout_compile_mode_for_model(_model: OrbitPolicy, _cfg: RunConfig) -> str | None:
-    # Rollout inference sees fleet-width buckets change throughout each game.
-    # Dynamo's recompile limit is per compiled forward code object, so bucket
-    # caching still hits the limit over a full 500-turn episode. PPO minibatches
-    # are static and remain compiled; rollout stays eager.
-    return None
+def _rollout_compile_mode_for_model(_model: OrbitPolicy, cfg: RunConfig) -> str | None:
+    if not cfg.rollout.compile_policy:
+        return None
+    return cfg.run.compile_mode or None
 
 
 def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
@@ -573,6 +571,7 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                 deterministic=False,
                 reward_cfg=cfg.reward,
                 compile_mode=_rollout_compile_mode_for_model(model, cfg),
+                compile_fleet_width=cfg.rollout.compile_fleet_width,
                 policy_graph_rows=cfg.rollout.num_envs,
                 learner_action_agent=behavior,
             ))
@@ -1015,6 +1014,7 @@ def _ppo_loop(
                     device=str(device),
                     reward_cfg=cfg.reward,
                     compile_mode=_rollout_compile_mode_for_model(model, cfg),
+                    compile_fleet_width=cfg.rollout.compile_fleet_width,
                     policy_graph_rows=vec.num_envs * num_players,
                 )
                 rollout_s += perf_counter() - phase_t0
@@ -1275,6 +1275,9 @@ def _ppo_loop(
         if cfg.opponents.mode == "no_builtins":
             active_names = pool.active_snapshot_names()
             historical_names = pool.historical_snapshot_names()
+            historical_log_names = pool.historical_snapshot_names("log")
+            historical_recent_names = pool.historical_snapshot_names("recent_eviction")
+            historical_notable_names = pool.historical_snapshot_names("notable")
             active_stats = [pool.snapshot_stats(name) for name in active_names]
             learner_win_rates = [stats.learner_win_rate() for stats in active_stats]
             games_vs_current = [stats.games_vs_current for stats in active_stats]
@@ -1283,6 +1286,11 @@ def _ppo_loop(
                     "pool_size": float(len(active_names)),
                     "active_pool_size": float(len(active_names)),
                     "historical_archive_size": float(len(historical_names)),
+                    "historical_log_archive_size": float(len(historical_log_names)),
+                    "historical_recent_eviction_size": float(
+                        len(historical_recent_names)
+                    ),
+                    "historical_notable_size": float(len(historical_notable_names)),
                     "all_snapshot_count": float(len(pool.all_snapshot_names())),
                     "active_games_vs_current_mean": (
                         float(np.mean(games_vs_current))

@@ -70,6 +70,8 @@ rollout:
   num_envs: 128
   num_workers: 0
   env_backend: rust
+  compile_policy: true
+  compile_fleet_width: 1024
 
 opponents:
   mode: no_builtins

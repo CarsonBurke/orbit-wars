@@ -98,6 +98,8 @@ rollout:
   num_envs: 128             # parallel envs (= episodes per update)
   num_workers: 0            # only used by numpy_mp
   env_backend: rust
+  compile_policy: true
+  compile_fleet_width: 1024
 
 opponents:
   mode: no_builtins

@@ -327,6 +327,8 @@ class RolloutCfg:
     games_per_env_per_update: int = 1
     num_workers: int = 0  # 0 => backend default; set to physical cores for rollout-heavy runs
     env_backend: str = "rust"  # "rust", "numpy", "numpy_mp", or "kaggle"
+    compile_policy: bool = True
+    compile_fleet_width: int = 1024
 
 
 @dataclass
@@ -536,6 +538,8 @@ class RunConfig:
             raise ValueError("rollout.num_envs must be positive")
         if cfg.rollout.games_per_env_per_update <= 0:
             raise ValueError("rollout.games_per_env_per_update must be positive")
+        if cfg.rollout.compile_fleet_width <= 0:
+            raise ValueError("rollout.compile_fleet_width must be positive")
         if not 0.0 <= cfg.model.planet_rope_fraction <= 1.0:
             raise ValueError("model.planet_rope_fraction must be in [0, 1]")
         if cfg.model.planet_rope_base <= 0.0:
