@@ -81,17 +81,12 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from hl_gauss_pytorch import HLGaussLoss as _LibraryHLGaussLoss
 
-try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-except Exception:  # pragma: no cover - optional on older torch builds
-    create_block_mask = None
-    flex_attention = None
-
 from .config import OrbitPolicyConfig, normalize_attention_config
 from .features import EncodedObs
 
 _PLANET_XY_SCALE: float = 100.0
 _PLANET_XY_OFFSET: float = 50.0
+_DEST_FLEET_STATS_DIM: int = 13
 
 # Hypersphere-normalization epsilon. nGPT's `justnorm` divides by the raw L2
 # norm with no floor (model.py:103-106), which is safe for a dense LM where
@@ -692,10 +687,11 @@ class CrossAttention(nn.Module):
 class DestinationFleetCrossAttention(nn.Module):
     """Planet-query cross-attention over fleets scoped by exact destination.
 
-    Query rows are planets and key/value rows are all current fleet tokens. The
-    destination mask is arbitrary at element granularity, so the CUDA path uses
-    FlexAttention. There is no per-planet fleet cap: batching remains `[B,P,F]`
-    and `dest_idx == p` decides membership.
+    Query rows are planets and key/value rows are all current fleet tokens.
+    Each fleet belongs to exactly one destination planet, so this uses a
+    segmented softmax over fleets grouped by destination instead of materializing
+    dense `[B,H,P,F]` scores. That keeps the conditioner exact and O(F) before
+    the main trunk consumes only summary + planet tokens.
     """
 
     def __init__(
@@ -775,43 +771,139 @@ class DestinationFleetCrossAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        if q.is_cuda and flex_attention is not None and create_block_mask is not None:
-            def mask_mod(batch, _head, q_idx, kv_idx):  # type: ignore[no-untyped-def]
-                return planet_mask[batch, q_idx] & (dest_idx[batch, kv_idx] == q_idx)
 
-            block_mask = create_block_mask(
-                mask_mod,
-                b,
-                None,
-                p,
-                f,
-                device=q.device,
-                BLOCK_SIZE=(64, 64),
-            )
-            o = flex_attention(
-                q,
-                k,
-                v,
-                block_mask=block_mask,
-                scale=self.head_dim**0.5,
-                enable_gqa=self.n_kv_heads != self.n_heads,
-            )
-        else:
-            arange_p = torch.arange(p, device=planets.device)
-            attn_mask = (
-                planet_mask[:, :, None]
-                & (dest_idx[:, None, :] == arange_p[None, :, None])
-            )
-            o = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask[:, None],
-                scale=self.head_dim**0.5,
-                enable_gqa=self.n_kv_heads != self.n_heads,
-            )
+        group_size = self.n_heads // self.n_kv_heads
+        q = q.unflatten(1, (self.n_kv_heads, group_size))
+        dest_safe = dest_idx.clamp_min(0)
+        scatter_idx = dest_safe[:, None, None, :].expand(
+            b,
+            self.n_kv_heads,
+            group_size,
+            f,
+        )
+        gather_idx = scatter_idx.unsqueeze(-1).expand(
+            b,
+            self.n_kv_heads,
+            group_size,
+            f,
+            self.head_dim,
+        )
+        q_for_fleet = q.gather(3, gather_idx)
+
+        valid = valid_dest[:, None, None, :]
+        scores = (q_for_fleet.float() * k[:, :, None].float()).sum(dim=-1)
+        scores = scores * float(self.head_dim**0.5)
+        scores = scores.masked_fill(~valid, float("-inf"))
+
+        max_scores = scores.new_full(
+            (b, self.n_kv_heads, group_size, p),
+            float("-inf"),
+        )
+        max_scores.scatter_reduce_(
+            3,
+            scatter_idx,
+            scores,
+            reduce="amax",
+            include_self=True,
+        )
+        row_max = max_scores.gather(3, scatter_idx)
+        finite_row = torch.isfinite(row_max) & valid
+        safe_scores = scores.masked_fill(~finite_row, 0.0)
+        safe_row_max = row_max.masked_fill(~finite_row, 0.0)
+        shifted = safe_scores - safe_row_max
+        weights = torch.exp(shifted).masked_fill(~finite_row, 0.0)
+
+        denom = scores.new_zeros(b, self.n_kv_heads, group_size, p)
+        denom.scatter_add_(3, scatter_idx, weights)
+        o = scores.new_zeros(b, self.n_kv_heads, group_size, p, self.head_dim)
+        o.scatter_add_(
+            3,
+            gather_idx,
+            weights.unsqueeze(-1) * v[:, :, None].float(),
+        )
+        o = o / denom.clamp_min(1e-9).unsqueeze(-1)
+        o = o.flatten(1, 2)
+        o = o.masked_fill(~planet_mask[:, None, :, None], 0.0).to(planets.dtype)
         o = o.transpose(1, 2).flatten(-2)
         return self.out_proj(o)
+
+
+def _destination_fleet_stats(
+    fleet_feats: torch.Tensor,
+    fleet_mask: torch.Tensor,
+    fleet_target_planet_idx: torch.Tensor,
+    num_planets: int,
+) -> torch.Tensor:
+    """Per-destination inbound fleet mass/count summaries.
+
+    Attention gives a content-weighted average. Combat and timing also care
+    about additive quantities, so expose pooled counts, ship mass, and speed
+    summaries explicitly to the destination FiLM conditioner.
+    """
+    b, f, _ = fleet_feats.shape
+    p = int(num_planets)
+    valid = (
+        fleet_mask
+        & (fleet_target_planet_idx >= 0)
+        & (fleet_target_planet_idx < p)
+    )
+    dest = fleet_target_planet_idx.clamp_min(0)
+    f32 = fleet_feats.float()
+    valid_f = valid.float()
+    self_f = f32[..., 14].clamp(0.0, 1.0) * valid_f
+    enemy_f = f32[..., 16:19].sum(dim=-1).clamp(0.0, 1.0) * valid_f
+    count_f = valid_f
+    ship_log = f32[..., 4].clamp_min(0.0)
+    # Recover a monotone estimate of raw ship mass from the encoded log feature
+    # before re-log-scaling pooled sums. This preserves additive combat signal
+    # better than averaging per-fleet log masses.
+    ship_mass = torch.expm1((ship_log * 8.0).clamp(max=20.0))
+    speed = f32[..., 8].clamp(0.0, 1.0)
+    has_eta = (f32[..., 13] > 0.5) & valid
+    eta = f32[..., 10].clamp(0.0, 1.0)
+
+    def dest_sum(values: torch.Tensor) -> torch.Tensor:
+        out = values.new_zeros(b, p)
+        return out.scatter_add(1, dest, values.masked_fill(~valid, 0.0))
+
+    def dest_sum_masked(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        out = values.new_zeros(b, p)
+        return out.scatter_add(1, dest, values.masked_fill(~mask, 0.0))
+
+    def dest_max(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        out = values.new_full((b, p), float("-inf"))
+        vals = values.masked_fill(~mask, float("-inf"))
+        out.scatter_reduce_(1, dest, vals, reduce="amax", include_self=True)
+        return torch.where(torch.isfinite(out), out, torch.zeros_like(out))
+
+    total_count = dest_sum(count_f)
+    self_count = dest_sum(self_f)
+    enemy_count = dest_sum(enemy_f)
+    total_ship = dest_sum(ship_mass)
+    self_ship = dest_sum(ship_mass * self_f)
+    enemy_ship = dest_sum(ship_mass * enemy_f)
+    known_eta_count = dest_sum_masked(torch.ones_like(eta), has_eta)
+    eta_sum = dest_sum_masked(eta, has_eta)
+
+    stats = torch.stack(
+        [
+            (total_count / 64.0).clamp(0.0, 1.0),
+            (self_count / 64.0).clamp(0.0, 1.0),
+            (enemy_count / 64.0).clamp(0.0, 1.0),
+            (torch.log1p(total_ship) / 8.0).clamp(0.0, 1.0),
+            (torch.log1p(self_ship) / 8.0).clamp(0.0, 1.0),
+            (torch.log1p(enemy_ship) / 8.0).clamp(0.0, 1.0),
+            dest_max(ship_log, valid),
+            dest_max(ship_log, self_f > 0.0),
+            dest_max(ship_log, enemy_f > 0.0),
+            dest_sum(speed * count_f) / total_count.clamp_min(1.0),
+            dest_max(speed, valid),
+            eta_sum / known_eta_count.clamp_min(1.0),
+            (known_eta_count / 64.0).clamp(0.0, 1.0),
+        ],
+        dim=-1,
+    )
+    return stats.to(fleet_feats.dtype)
 
 
 class DestinationFleetConditioner(nn.Module):
@@ -837,7 +929,7 @@ class DestinationFleetConditioner(nn.Module):
             n_kv_heads=n_kv_heads,
             qk_gain_init=qk_gain_init,
         )
-        self.mod = CastedLinear(dim, 2 * dim)
+        self.mod = CastedLinear(dim + _DEST_FLEET_STATS_DIM, 2 * dim)
         nn.init.zeros_(self.mod.weight)
         nn.init.zeros_(self.mod.bias)
 
@@ -848,6 +940,7 @@ class DestinationFleetConditioner(nn.Module):
         planet_mask: torch.Tensor,
         fleet_mask: torch.Tensor,
         fleet_target_planet_idx: torch.Tensor | None,
+        fleet_feats: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if fleet_target_planet_idx is None:
             raise ValueError(
@@ -873,6 +966,12 @@ class DestinationFleetConditioner(nn.Module):
             fleet_mask,
             fleet_target_planet_idx,
         )
+        fleet_stats = _destination_fleet_stats(
+            fleet_feats,
+            fleet_mask,
+            fleet_target_planet_idx,
+            p,
+        )
         valid_dest = (
             fleet_mask
             & (fleet_target_planet_idx >= 0)
@@ -891,7 +990,10 @@ class DestinationFleetConditioner(nn.Module):
             reduce="amax",
             include_self=True,
         )
-        gamma, beta = self.mod(fleet_ctx).chunk(2, dim=-1)
+        gamma, beta = self.mod(torch.cat([fleet_ctx, fleet_stats], dim=-1)).chunk(
+            2,
+            dim=-1,
+        )
         conditioned = justnorm(h_p * (1.0 + gamma) + beta)
         h_p = torch.where(has_inbound_i.bool().unsqueeze(-1), conditioned, h_p)
         h_f = h_p.new_zeros(b, 0, h_p.shape[-1])
@@ -1483,6 +1585,7 @@ class OrbitPolicy(nn.Module):
                 planet_mask,
                 fleet_mask,
                 fleet_target_planet_idx,
+                fleet_feats,
             )
             f = 0
         elif self.fleet_tokenizer is not None:

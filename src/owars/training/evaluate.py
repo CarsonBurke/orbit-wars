@@ -33,9 +33,10 @@ def evaluate_ckpt(
     device: str = "cpu",
     baselines: tuple[str, ...] = ("random", "sniper_v17", "heuristic"),
     num_envs: int = 16,
-    env_backend: str = "kaggle",
+    env_backend: str = "rust",
     num_workers: int = 0,
     compile_mode: str | None = "reduce-overhead",
+    deterministic: bool = True,
 ) -> dict:
     state = torch.load(ckpt_path, map_location=device)
     cfg = OrbitPolicyConfig(**state["config"])
@@ -69,7 +70,7 @@ def evaluate_ckpt(
                 traj = rollout_episode(
                     model, opps,
                     num_players=num_players, episode_steps=episode_steps,
-                    ship_speed=ship_speed, device=device, deterministic=False,
+                    ship_speed=ship_speed, device=device, deterministic=deterministic,
                     learner_seat=game_idx % num_players,
                 )
                 wins += int(traj.won)
@@ -118,7 +119,7 @@ def evaluate_ckpt(
                     num_players=num_players,
                     learner_seat=learner_seats,
                     device=device,
-                    deterministic=False,
+                    deterministic=deterministic,
                     record_trajectories=False,
                     compile_mode=compile_mode,
                     policy_graph_rows=envs,
@@ -151,9 +152,14 @@ def main() -> None:
     p.add_argument("--device", default="cpu")
     p.add_argument("--num-envs", type=int, default=16)
     p.add_argument(
-        "--env-backend", choices=("kaggle", "numpy", "numpy_mp", "rust"), default="kaggle"
+        "--env-backend", choices=("kaggle", "numpy", "numpy_mp", "rust"), default="rust"
     )
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument(
+        "--stochastic",
+        action="store_true",
+        help="Evaluate with rollout-style stochastic sampling instead of deterministic deployment actions.",
+    )
     p.add_argument(
         "--compile-mode",
         default="reduce-overhead",
@@ -170,6 +176,7 @@ def main() -> None:
         env_backend=args.env_backend,
         num_workers=args.num_workers,
         compile_mode=compile_mode,
+        deterministic=not args.stochastic,
     )
     for k, v in results.items():
         print(f"{k}: {v}")

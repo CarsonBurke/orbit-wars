@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from owars.policies.features import EncodedObs
 from owars.agents.learned import _FleetTargetTracker
 from owars.policies.config import OrbitPolicyConfig
+from owars.policies.features import EncodedObs
 from owars.policies.model import OrbitPolicy
 from owars.training.config import RewardCfg
 from owars.training.league import LEARNER_NAME, OpponentSlot
@@ -19,14 +19,15 @@ from owars.training.vec_env import (
     _strip_action_sidecars,
 )
 from owars.training.vec_rollout import (
+    _bucket_fleets_for_graph,
     _empty_traj,
     _finalize_trajectory,
     _normalize_learner_seats,
     _obs_reward_potential,
-    _reward_potentials,
     _resolve_seat_agents,
-    _trim_fleets_for_forward,
+    _reward_potentials,
     _state_reward_potential,
+    _trim_fleets_for_forward,
     alternating_learner_seats,
     rollout_episodes_batched,
 )
@@ -83,6 +84,30 @@ def test_trim_fleets_for_forward_keeps_planet_tensors_and_buckets_fleets():
     assert trimmed.fleet_feats.shape[1] == 64
     assert trimmed.planet_feats.data_ptr() == feats.planet_feats.data_ptr()
     assert trimmed.planet_mask.data_ptr() == feats.planet_mask.data_ptr()
+
+
+def test_bucket_fleets_for_graph_pads_to_static_bucket():
+    feats = EncodedObs(
+        planet_feats=torch.zeros(2, 64, 19),
+        planet_mask=torch.ones(2, 64, dtype=torch.bool),
+        planet_owned_mask=torch.zeros(2, 64, dtype=torch.bool),
+        planet_ids=torch.arange(64).expand(2, -1),
+        planet_garrison=torch.zeros(2, 64),
+        fleet_feats=torch.zeros(2, 20, 20),
+        fleet_mask=torch.zeros(2, 20, dtype=torch.bool),
+        fleet_target_planet_idx=torch.full((2, 20), -1, dtype=torch.long),
+    )
+    feats.fleet_mask[0, 19] = True
+    feats.fleet_target_planet_idx[0, 19] = 3
+
+    padded = _bucket_fleets_for_graph(feats)
+
+    assert padded.fleet_feats.shape[1] == 64
+    assert padded.fleet_mask[0, 19]
+    assert int(padded.fleet_target_planet_idx[0, 19]) == 3
+    assert not bool(padded.fleet_mask[:, 20:].any())
+    assert torch.all(padded.fleet_target_planet_idx[:, 20:] == -1)
+    assert padded.planet_feats.data_ptr() == feats.planet_feats.data_ptr()
 
 
 def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():
@@ -266,6 +291,45 @@ def test_numpy_fast_rollout_records_configured_learner_seats():
             assert owned.equal(obs.planet_owned_mask)
             assert obs.global_feats is not None
             assert obs.global_feats.shape == (model.cfg.global_features,)
+
+
+def test_numpy_fast_rollout_behavior_override_records_value_only_sidecars():
+    model = OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
+    opponent = OpponentSlot("noop", agent=lambda _obs: [])
+    seen_steps: list[int] = []
+
+    def behavior(obs):
+        seen_steps.append(int(obs["step"]))
+        return []
+
+    vec = NumpyVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=4,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+
+    with vec:
+        [traj] = rollout_episodes_batched(
+            model,
+            vec,
+            [[opponent]],
+            num_players=2,
+            learner_seat=0,
+            device="cpu",
+            learner_action_agent=behavior,
+        )
+
+    assert seen_steps
+    assert len(traj.encoded) == len(traj.value) == len(traj.reward)
+    assert traj.encoded
+    assert traj.launch == []
+    assert traj.target_idx == []
+    assert traj.fraction == []
+    assert traj.log_prob == []
+    assert traj.owned_mask == []
+    assert traj.target_legal_mask == []
 
 
 def test_numpy_reward_potentials_match_materialized_observations():

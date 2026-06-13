@@ -1,0 +1,18 @@
+version: val_archive_v1
+created_update: 0
+members:
+  - name: run_a_u0001
+    path: ../checkpoints/archive/run_a_u0001.pt
+    weight: 1.0
+    bucket: early
+    rating: 1000.0
+  - name: run_a_u0016
+    path: ../checkpoints/archive/run_a_u0016.pt
+    weight: 1.0
+    bucket: mid
+    rating: 1125.0
+  - name: submission_candidate_2026_06_01
+    path: ../checkpoints/archive/submission_candidate_2026_06_01.pt
+    weight: 1.5
+    bucket: submissions
+    rating: 1250.0

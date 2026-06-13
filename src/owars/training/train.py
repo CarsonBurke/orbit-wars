@@ -29,7 +29,7 @@ import argparse
 import json
 import math
 import random
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from time import perf_counter
 
@@ -51,6 +51,7 @@ from .league import (
     BUILTIN,
     LEARNER_NAME,
     FixedOpponentPool,
+    NoBuiltinTrainingPool,
     OpponentPool,
     OpponentSlot,
 )
@@ -121,12 +122,24 @@ def update_kl_lr_controller(
     cfg: OptimCfg,
 ) -> tuple[float, float]:
     """Update the KL EMA and persistent LR scale for the next PPO update."""
+    if not math.isfinite(observed_kl):
+        return kl_ema, lr_scale
     alpha = kl_lr_ema_alpha(cfg.kl_lr_ema_half_life)
     signal = max(0.0, float(observed_kl))
     next_ema = alpha * signal + (1.0 - alpha) * float(kl_ema)
-    next_scale = float(lr_scale) * (cfg.kl_lr_target / max(next_ema, 1e-12))
+    next_scale = float(lr_scale) * math.sqrt(cfg.kl_lr_target / max(next_ema, 1e-12))
     next_scale = min(cfg.kl_lr_max_scale, max(cfg.kl_lr_min_scale, next_scale))
     return next_ema, next_scale
+
+
+def kl_lr_signal_from_log(log) -> float:
+    """Return the KL signal used for adaptive LR.
+
+    Orbit Wars has a factorized action per owned source planet. The adaptive
+    LR controller should track the latest-minibatch per-planet KL, not the
+    joint row KL reported by `approx_kl`.
+    """
+    return float(log.per_planet_approx_kl)
 
 
 def _split_params(
@@ -265,6 +278,14 @@ def _compile_mode_for_model(model: OrbitPolicy, cfg: RunConfig) -> str | None:
     return cfg.run.compile_mode or None
 
 
+def _rollout_compile_mode_for_model(_model: OrbitPolicy, _cfg: RunConfig) -> str | None:
+    # Rollout inference sees fleet-width buckets change throughout each game.
+    # Dynamo's recompile limit is per compiled forward code object, so bucket
+    # caching still hits the limit over a full 500-turn episode. PPO minibatches
+    # are static and remain compiled; rollout stays eager.
+    return None
+
+
 def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
     """Walk every (traj, step) once and emit stacked EncodedObs tensors.
 
@@ -386,7 +407,11 @@ def _stack_trajectories(
     return batch
 
 
-def _trim_ppo_batch_fleet_width(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _trim_ppo_batch_fleet_width(
+    batch: dict[str, torch.Tensor],
+    *,
+    pad_to_bucket: bool = False,
+) -> dict[str, torch.Tensor]:
     """Trim fleet tensors to a stable compile bucket before PPO staging.
 
     Fleet tensors can dominate PPO batch storage. Keeping the full rollout batch
@@ -401,16 +426,29 @@ def _trim_ppo_batch_fleet_width(batch: dict[str, torch.Tensor]) -> dict[str, tor
     current = int(fleet_mask.shape[1])
     if current <= 1:
         return batch
-    width = bucket_fleet_width(active_fleet_width(fleet_mask), current)
-    if width >= current:
+    width = (
+        bucket_fleet_width(active_fleet_width(fleet_mask))
+        if pad_to_bucket
+        else bucket_fleet_width(active_fleet_width(fleet_mask), current)
+    )
+    if width == current:
         return batch
+
+    def resize_fleet(t: torch.Tensor, *, fill: int | float | bool = 0) -> torch.Tensor:
+        if width < current:
+            return t[:, :width].contiguous()
+        out = t.new_full((t.shape[0], width, *t.shape[2:]), fill)
+        out[:, :current] = t
+        return out.contiguous()
+
     batch = dict(batch)
-    batch["fleet_feats"] = fleet_feats[:, :width].contiguous()
-    batch["fleet_mask"] = fleet_mask[:, :width].contiguous()
+    batch["fleet_feats"] = resize_fleet(fleet_feats)
+    batch["fleet_mask"] = resize_fleet(fleet_mask, fill=False)
     if batch.get("fleet_target_planet_idx") is not None:
-        batch["fleet_target_planet_idx"] = batch["fleet_target_planet_idx"][
-            :, :width
-        ].contiguous()
+        batch["fleet_target_planet_idx"] = resize_fleet(
+            batch["fleet_target_planet_idx"],
+            fill=-1,
+        )
     return batch
 
 
@@ -517,7 +555,7 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
 
     for step in range(cfg.ppo.pretrain_updates):
         # Round episode count up to the nearest num_envs batch.
-        batches = max(1, cfg.ppo.pretrain_episodes // cfg.rollout.num_envs)
+        batches = max(1, math.ceil(cfg.ppo.pretrain_episodes / cfg.rollout.num_envs))
         trajs: list[Trajectory] = []
         for batch_idx in range(batches):
             learner_seats = alternating_learner_seats(
@@ -534,9 +572,11 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                 device=str(device),
                 deterministic=False,
                 reward_cfg=cfg.reward,
-                compile_mode=_compile_mode_for_model(model, cfg),
+                compile_mode=_rollout_compile_mode_for_model(model, cfg),
                 policy_graph_rows=cfg.rollout.num_envs,
+                learner_action_agent=behavior,
             ))
+        compile_mode = _compile_mode_for_model(model, cfg)
         batch = _trim_ppo_batch_fleet_width(
             _pretrain_value_batch(
                 trajs,
@@ -547,14 +587,15 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                     else cfg.ppo.value_gae_lambda
                 ),
                 critic_mtp_horizon=cfg.model.critic_mtp_horizon,
-            )
+            ),
+            pad_to_bucket=compile_mode is not None and device.type == "cuda",
         )
         loss = value_only_update(
             model, optimizer, batch,
             epochs=1,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
-            compile_mode=_compile_mode_for_model(model, cfg),
+            compile_mode=compile_mode,
         )
         rets = batch["return"].cpu().numpy()
         # Explained variance: 1 - Var(target - pred)/Var(target). Tracked
@@ -635,6 +676,86 @@ def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
     return params
 
 
+def _build_training_vec(cfg: RunConfig, num_players: int, num_envs: int) -> VecEnv:
+    if cfg.rollout.env_backend not in {"kaggle", "numpy", "numpy_mp", "rust"}:
+        raise ValueError(f"unknown rollout.env_backend: {cfg.rollout.env_backend!r}")
+    if num_envs <= 0:
+        raise ValueError("num_envs must be positive")
+    vec_kwargs = dict(
+        num_envs=num_envs,
+        num_players=num_players,
+        episode_steps=cfg.game.episode_steps,
+        ship_speed=cfg.game.ship_speed,
+    )
+    if cfg.rollout.env_backend == "numpy":
+        return NumpyVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
+            random_seed=cfg.run.seed,
+        )
+    if cfg.rollout.env_backend == "numpy_mp":
+        return ShardedNumpyVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
+            num_workers=cfg.rollout.num_workers,
+            random_seed=cfg.run.seed,
+        )
+    if cfg.rollout.env_backend == "rust":
+        from .rust_env import RustVecEnv
+
+        return RustVecEnv(
+            **vec_kwargs,
+            replay_env_idx=None,
+            random_seed=cfg.run.seed,
+        )
+    return VecEnv(**vec_kwargs, replay_env_idx=0)
+
+
+def _train_num_players(cfg: RunConfig) -> tuple[int, ...]:
+    return tuple(cfg.game.train_num_players or [cfg.game.num_players])
+
+
+def _format_episode_counts(
+    total_games: int,
+    train_num_players: tuple[int, ...],
+    rng: random.Random,
+) -> dict[int, int]:
+    """Split one PPO update's games uniformly across training formats."""
+    if total_games <= 0:
+        return {players: 0 for players in train_num_players}
+    if not train_num_players:
+        raise ValueError("train_num_players must be non-empty")
+    formats = list(train_num_players)
+    rng.shuffle(formats)
+    base, extra = divmod(int(total_games), len(formats))
+    return {
+        players: base + (1 if idx < extra else 0)
+        for idx, players in enumerate(formats)
+    }
+
+
+def _training_vec_counts(cfg: RunConfig) -> dict[int, int]:
+    counts = _format_episode_counts(
+        cfg.rollout.num_envs,
+        _train_num_players(cfg),
+        random.Random(cfg.run.seed + 0x5E1F),
+    )
+    if cfg.ppo.pretrain_updates > 0:
+        counts[cfg.game.num_players] = max(
+            cfg.rollout.num_envs,
+            counts.get(cfg.game.num_players, 0),
+        )
+    return counts
+
+
+def _ppo_minibatch_size_for_fleet_width(cfg: RunConfig, fleet_width: int) -> int:
+    """Keep high-fleet compiled PPO batches under the VRAM cliff."""
+    size = int(cfg.optim.minibatch_size)
+    if fleet_width > 1024:
+        size = min(size, 2048)
+    return max(1, size)
+
+
 def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     set_seed(cfg.run.seed)
     if cfg.run.torch_num_threads > 0:
@@ -713,6 +834,33 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             cfg.opponents.fixed_opponents,
             rng=random.Random(cfg.run.seed),
         )
+    elif cfg.opponents.mode == "no_builtins":
+        pool = NoBuiltinTrainingPool(
+            active_pool_size=cfg.opponents.active_pool_size,
+            historical_training_archive_size=(
+                cfg.opponents.historical_training_archive_size
+            ),
+            current_learner_prob=cfg.opponents.current_learner_prob,
+            active_pool_prob=cfg.opponents.active_pool_prob,
+            historical_archive_prob=cfg.opponents.historical_archive_prob,
+            difficulty_weight=cfg.opponents.active_difficulty_weight,
+            uncertainty_weight=cfg.opponents.active_uncertainty_weight,
+            recency_weight=cfg.opponents.active_recency_weight,
+            hardness_weight=cfg.opponents.active_hardness_weight,
+            recency_half_life_updates=(
+                cfg.opponents.active_recency_half_life_updates
+            ),
+            min_games_before_eviction=(
+                cfg.opponents.min_games_before_active_eviction
+            ),
+            stats_ema_decay=cfg.opponents.active_stats_ema_decay,
+            historical_sample_panel_size=cfg.opponents.historical_sample_panel_size,
+            historical_agent_cache_size=cfg.opponents.historical_agent_cache_size,
+            recent_eviction_archive_size=cfg.opponents.recent_eviction_archive_size,
+            notable_archive_size=cfg.opponents.notable_archive_size,
+            device=snapshot_device,
+            rng=random.Random(cfg.run.seed),
+        )
     else:
         pool = OpponentPool(
             elo=elo,
@@ -723,49 +871,28 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
         )
     logger = TBLogger(cfg.run.name, root=cfg.run.log_root)
 
-    # One subprocess pool reused across pretraining + every PPO update.
-    # Spawning per-call cost ~16-32 s of pure interpreter startup × every
-    # rollout (cumulative ~1 h on a full run); `vec.reset()` is cheap.
-    # `replay_env_idx=0` keeps env 0's full step history so the PPO loop
-    # can dump one rendered game per update; the other workers trim
-    # `env.steps` to save memory.
-    if cfg.rollout.env_backend not in {"kaggle", "numpy", "numpy_mp", "rust"}:
-        raise ValueError(f"unknown rollout.env_backend: {cfg.rollout.env_backend!r}")
-    vec_kwargs = dict(
-        num_envs=cfg.rollout.num_envs,
-        num_players=cfg.game.num_players,
-        episode_steps=cfg.game.episode_steps,
-        ship_speed=cfg.game.ship_speed,
-    )
-    if cfg.rollout.env_backend == "numpy":
-        vec = NumpyVecEnv(
-            **vec_kwargs,
-            replay_env_idx=None,
-            random_seed=cfg.run.seed,
-        )
-    elif cfg.rollout.env_backend == "numpy_mp":
-        vec = ShardedNumpyVecEnv(
-            **vec_kwargs,
-            replay_env_idx=None,
-            num_workers=cfg.rollout.num_workers,
-            random_seed=cfg.run.seed,
-        )
-    elif cfg.rollout.env_backend == "rust":
-        from .rust_env import RustVecEnv
-
-        vec = RustVecEnv(
-            **vec_kwargs,
-            replay_env_idx=None,
-            random_seed=cfg.run.seed,
-        )
-    else:
-        vec = VecEnv(**vec_kwargs, replay_env_idx=0)
-    with vec:
+    vec_counts = _training_vec_counts(cfg)
+    with ExitStack() as stack:
+        vecs = {
+            num_players: stack.enter_context(
+                _build_training_vec(cfg, num_players, num_envs)
+            )
+            for num_players, num_envs in vec_counts.items()
+            if num_envs > 0
+        }
         # Pretrain doesn't write replays — skip the per-episode render +
         # pipe-transfer cost. _ppo_loop re-enables before the first update.
-        vec.set_recording(False)
-        pretrain_value(cfg, model, pretrain_opt, logger, device, vec)
-        return _ppo_loop(cfg, model, optimizer, elo, pool, logger, device, vec)
+        for vec in vecs.values():
+            vec.set_recording(False)
+        pretrain_value(
+            cfg,
+            model,
+            pretrain_opt,
+            logger,
+            device,
+            vecs[cfg.game.num_players],
+        )
+        return _ppo_loop(cfg, model, optimizer, elo, pool, logger, device, vecs)
 
 
 def _ppo_loop(
@@ -773,10 +900,10 @@ def _ppo_loop(
     model: OrbitPolicy,
     optimizer: torch.optim.Optimizer,
     elo: EloTracker,
-    pool: OpponentPool | FixedOpponentPool,
+    pool: OpponentPool | FixedOpponentPool | NoBuiltinTrainingPool,
     logger: TBLogger,
     device: torch.device,
-    vec: VecEnv,
+    vecs: dict[int, VecEnv],
 ) -> dict:
     summary: dict = {"updates": []}
     cumulative_margin = 0.0
@@ -796,18 +923,23 @@ def _ppo_loop(
         # rating and UCB-eviction will cull it like any other weak snapshot.
         init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
         pool.add_snapshot("init", model, init_ckpt)
+    elif cfg.opponents.mode == "no_builtins":
+        init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
+        pool.set_current_update(0)
+        pool.add_snapshot("init", model, init_ckpt, created_update=0)
 
     # `ppo_update` owns minibatch-level compile/capture. Keeping compilation
     # there lets Inductor see the policy forward, PPO loss, metrics, and
     # compiled backward as one fixed-shape training kernel.
 
-    # One rendered game per update lands here (env 0 is the recording
-    # worker; see VecEnv(replay_env_idx=0) above). Pretrain disabled
-    # recording; turn it back on for the PPO loop.
-    if getattr(vec, "supports_replay", True):
-        vec.set_recording(True)
-    else:
-        vec.set_recording(False)
+    # One rendered game per update lands here for replay-capable backends.
+    # Pretrain disabled recording; turn it back on for the PPO loop.
+    for vec in vecs.values():
+        if getattr(vec, "supports_replay", True):
+            vec.set_recording(True)
+        else:
+            vec.set_recording(False)
+    if not any(getattr(vec, "supports_replay", True) for vec in vecs.values()):
         print("rust env backend does not render HTML replays; skipping per-update replay dumps")
     replays_dir = logger.path / "replays"
     replays_dir.mkdir(parents=True, exist_ok=True)
@@ -816,57 +948,90 @@ def _ppo_loop(
     # the smoothed per-planet KL only adapts the next update's LR.
     kl_lr_ema = cfg.optim.kl_lr_target
     kl_lr_scale = 1.0
+    train_num_players = _train_num_players(cfg)
+    format_rng = random.Random(cfg.run.seed + 0x5E1F)
 
     for update in range(cfg.run.total_updates):
+        if cfg.opponents.mode == "no_builtins":
+            pool.set_current_update(update)
         update_t0 = perf_counter()
         phase_t0 = update_t0
         trajs = []
         rollout_s = 0.0
         bookkeeping_s = 0.0
-        for game_batch in range(cfg.rollout.games_per_env_per_update):
-            # Sample opponents once per env for this wave, then play all envs
-            # in parallel. Each env's seat assignment is fixed for the episode;
-            # the rollout batches the policy forward across all alive envs.
-            opponents_per_env = [
-                pool.sample(cfg.game.num_players - 1)
-                for _ in range(cfg.rollout.num_envs)
-            ]
-            seat_offset = update * cfg.rollout.games_per_env_per_update + game_batch
-            learner_seats = alternating_learner_seats(
-                cfg.rollout.num_envs, cfg.game.num_players, offset=seat_offset
-            )
-            phase_t0 = perf_counter()
-            batch_trajs = rollout_episodes_batched(
-                model,
-                vec,
-                opponents_per_env,
-                num_players=cfg.game.num_players,
-                learner_seat=learner_seats,
-                device=str(device),
-                reward_cfg=cfg.reward,
-                compile_mode=_compile_mode_for_model(model, cfg),
-            )
-            rollout_s += perf_counter() - phase_t0
+        format_counts = {num_players: 0 for num_players in train_num_players}
+        total_games = cfg.rollout.num_envs * cfg.rollout.games_per_env_per_update
+        episode_counts = _format_episode_counts(
+            total_games,
+            train_num_players,
+            format_rng,
+        )
+        episode_cursor = 0
+        format_order = list(train_num_players)
+        format_rng.shuffle(format_order)
+        for num_players in format_order:
+            remaining_format_games = episode_counts.get(num_players, 0)
+            if remaining_format_games <= 0:
+                continue
+            vec = vecs[num_players]
+            format_chunk_idx = 0
+            while remaining_format_games > 0:
+                rollout_envs = min(vec.num_envs, remaining_format_games)
+                remaining_format_games -= rollout_envs
+                format_counts[num_players] += rollout_envs
+                # Sample opponents once per env for this wave, then play all
+                # envs in parallel. Each env's seat assignment is fixed for the
+                # episode; the rollout batches policy forwards across all
+                # alive envs.
+                opponents_per_env = [
+                    (
+                        pool.sample(num_players - 1, current_update=update)
+                        if cfg.opponents.mode == "no_builtins"
+                        else pool.sample(num_players - 1)
+                    )
+                    for _ in range(rollout_envs)
+                ]
+                seat_offset = update * total_games + episode_cursor
+                learner_seats = alternating_learner_seats(
+                    rollout_envs, num_players, offset=seat_offset
+                )
+                phase_t0 = perf_counter()
+                batch_trajs = rollout_episodes_batched(
+                    model,
+                    vec,
+                    opponents_per_env,
+                    num_players=num_players,
+                    learner_seat=learner_seats,
+                    device=str(device),
+                    reward_cfg=cfg.reward,
+                    compile_mode=_rollout_compile_mode_for_model(model, cfg),
+                    policy_graph_rows=vec.num_envs * num_players,
+                )
+                rollout_s += perf_counter() - phase_t0
 
-            phase_t0 = perf_counter()
-            if vec.last_replay_html is not None:
-                suffix = (
-                    ""
-                    if cfg.rollout.games_per_env_per_update == 1
-                    else f"_gamebatch_{game_batch:02d}"
-                )
-                (replays_dir / f"update_{update:04d}{suffix}.html").write_text(
-                    vec.last_replay_html
-                )
+                phase_t0 = perf_counter()
+                if vec.last_replay_html is not None:
+                    suffix = (
+                        ""
+                        if len(train_num_players) == 1
+                        else f"_{num_players}p_{format_chunk_idx:02d}"
+                    )
+                    (replays_dir / f"update_{update:04d}{suffix}.html").write_text(
+                        vec.last_replay_html
+                    )
 
-            for env_idx, traj in enumerate(batch_trajs):
-                slots = opponents_per_env[env_idx]
-                seat_names = _seat_names(traj.learner_seat, slots)
-                elo.update_from_game(
-                    list(zip(seat_names, traj.seat_rewards, strict=True))
-                )
-            trajs.extend(batch_trajs)
-            bookkeeping_s += perf_counter() - phase_t0
+                for env_idx, traj in enumerate(batch_trajs):
+                    slots = opponents_per_env[env_idx]
+                    seat_names = _seat_names(traj.learner_seat, slots)
+                    seats = list(zip(seat_names, traj.seat_rewards, strict=True))
+                    if cfg.opponents.mode == "no_builtins":
+                        pool.record_game(seats, current_update=update)
+                    else:
+                        elo.update_from_game(seats)
+                trajs.extend(batch_trajs)
+                bookkeeping_s += perf_counter() - phase_t0
+                episode_cursor += rollout_envs
+                format_chunk_idx += 1
 
         phase_t0 = perf_counter()
         batch = _stack_trajectories(
@@ -879,7 +1044,11 @@ def _ppo_loop(
         stack_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
-        batch = _trim_ppo_batch_fleet_width(batch)
+        compile_mode = _compile_mode_for_model(model, cfg)
+        batch = _trim_ppo_batch_fleet_width(
+            batch,
+            pad_to_bucket=compile_mode is not None and device.type == "cuda",
+        )
         batch_prepare_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
@@ -889,7 +1058,10 @@ def _ppo_loop(
         lr_scale = kl_lr_scale
         if hasattr(optimizer, "set_lr_scale"):
             optimizer.set_lr_scale(lr_scale)
-        compile_mode = _compile_mode_for_model(model, cfg)
+        ppo_minibatch_size = _ppo_minibatch_size_for_fleet_width(
+            cfg,
+            int(batch["fleet_feats"].shape[1]),
+        )
         log = ppo_update(
             model,
             optimizer,
@@ -902,12 +1074,12 @@ def _ppo_loop(
             clip_coef=cfg.ppo.clip_coef,
             clip_coef_high=cfg.ppo.clip_coef_high,
             epochs=cfg.optim.epochs_per_update,
-            minibatch_size=cfg.optim.minibatch_size,
+            minibatch_size=ppo_minibatch_size,
             grad_clip=cfg.optim.grad_clip,
             minibatch_count=cfg.optim.minibatch_count,
             compile_mode=compile_mode,
         )
-        kl_lr_signal = log.per_planet_approx_kl
+        kl_lr_signal = kl_lr_signal_from_log(log)
         kl_lr_ema, kl_lr_scale = update_kl_lr_controller(
             kl_ema=kl_lr_ema,
             lr_scale=kl_lr_scale,
@@ -934,7 +1106,11 @@ def _ppo_loop(
         cumulative_loss_margin += update_loss_margin
         cumulative_games += len(margins)
         cumulative_mean_margin = cumulative_margin / max(1, cumulative_games)
-        snapshot_elos = [elo.get(n) for n in pool.snapshot_names()]
+        snapshot_elos = (
+            []
+            if cfg.opponents.mode == "no_builtins"
+            else [elo.get(n) for n in pool.snapshot_names()]
+        )
         metrics_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
@@ -994,7 +1170,7 @@ def _ppo_loop(
         logical_minibatch_size = (
             math.ceil(batch_rows / cfg.optim.minibatch_count)
             if cfg.optim.minibatch_count is not None
-            else cfg.optim.minibatch_size
+            else ppo_minibatch_size
         )
         logger.scalars(
             "batch",
@@ -1003,6 +1179,7 @@ def _ppo_loop(
                 "fleet_width": fleet_width,
                 "logical_minibatch_size": logical_minibatch_size,
                 "minibatch_size": logical_minibatch_size,
+                "configured_minibatch_size": cfg.optim.minibatch_size,
             },
             update,
         )
@@ -1060,6 +1237,11 @@ def _ppo_loop(
             {
                 "win_rate": win_rate,
                 "margin": margin,
+                "games_2p": float(format_counts.get(2, 0)),
+                "games_4p": float(format_counts.get(4, 0)),
+                "games_4p_frac": (
+                    format_counts.get(4, 0) / max(1, sum(format_counts.values()))
+                ),
                 "cumulative_margin": cumulative_margin,
                 "cumulative_win_margin": cumulative_win_margin,
                 "cumulative_loss_margin": cumulative_loss_margin,
@@ -1074,16 +1256,42 @@ def _ppo_loop(
             },
             update,
         )
-        logger.scalars(
-            "league",
-            {
-                "elo_learner": elo.get(LEARNER_NAME),
-                "pool_size": float(len(snapshot_elos)),
-                "pool_elo_max": max(snapshot_elos) if snapshot_elos else float("nan"),
-                "pool_elo_min": min(snapshot_elos) if snapshot_elos else float("nan"),
-            },
-            update,
-        )
+        league_metrics = {
+            "elo_learner": elo.get(LEARNER_NAME),
+            "pool_size": float(len(snapshot_elos)),
+            "pool_elo_max": max(snapshot_elos) if snapshot_elos else float("nan"),
+            "pool_elo_min": min(snapshot_elos) if snapshot_elos else float("nan"),
+        }
+        if cfg.opponents.mode == "no_builtins":
+            active_names = pool.active_snapshot_names()
+            historical_names = pool.historical_snapshot_names()
+            active_stats = [pool.snapshot_stats(name) for name in active_names]
+            learner_win_rates = [stats.learner_win_rate() for stats in active_stats]
+            games_vs_current = [stats.games_vs_current for stats in active_stats]
+            league_metrics.update(
+                {
+                    "pool_size": float(len(active_names)),
+                    "active_pool_size": float(len(active_names)),
+                    "historical_archive_size": float(len(historical_names)),
+                    "all_snapshot_count": float(len(pool.all_snapshot_names())),
+                    "active_games_vs_current_mean": (
+                        float(np.mean(games_vs_current))
+                        if games_vs_current
+                        else 0.0
+                    ),
+                    "active_learner_win_rate_mean": (
+                        float(np.mean(learner_win_rates))
+                        if learner_win_rates
+                        else float("nan")
+                    ),
+                    "active_learner_win_rate_abs_dist_from_half": (
+                        float(np.mean([abs(wr - 0.5) for wr in learner_win_rates]))
+                        if learner_win_rates
+                        else float("nan")
+                    ),
+                }
+            )
+        logger.scalars("league", league_metrics, update)
         logging_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
@@ -1127,6 +1335,13 @@ def _ppo_loop(
         ):
             ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / f"snapshot_{update:04d}.pt"
             pool.add_snapshot(f"{update:04d}", model, ckpt)
+        elif (
+            cfg.opponents.mode == "no_builtins"
+            and (update + 1) % cfg.opponents.snapshot_every == 0
+        ):
+            pool.set_current_update(update + 1)
+            ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / f"snapshot_{update:04d}.pt"
+            pool.add_snapshot(f"{update:04d}", model, ckpt, created_update=update + 1)
         elif (
             cfg.opponents.mode == "fixed"
             and (update + 1) % cfg.opponents.snapshot_every == 0
@@ -1203,6 +1418,11 @@ def main() -> None:
         default=None,
     )
     p.add_argument(
+        "--compile-mode",
+        default=None,
+        help="Override run.compile_mode; use 'none' to disable torch.compile.",
+    )
+    p.add_argument(
         "--load",
         default=None,
         help="Path to a .pt checkpoint whose `model` state_dict should be "
@@ -1223,6 +1443,10 @@ def main() -> None:
         cfg.game.episode_steps = args.episode_steps
     if args.env_backend is not None:
         cfg.rollout.env_backend = args.env_backend
+    if args.compile_mode is not None:
+        cfg.run.compile_mode = (
+            "" if args.compile_mode.lower() == "none" else args.compile_mode
+        )
     summary = train_one_run(cfg, load_weights=args.load)
     print({k: v for k, v in summary.items() if k != "updates"})
 

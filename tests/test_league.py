@@ -5,13 +5,16 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
-import torch
-
+from owars.agents.sniper import sniper_agent
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
 from owars.training.elo import EloTracker
-from owars.agents.sniper import sniper_agent
-from owars.training.league import FixedOpponentPool, LEARNER_NAME, OpponentPool
+from owars.training.league import (
+    LEARNER_NAME,
+    FixedOpponentPool,
+    NoBuiltinTrainingPool,
+    OpponentPool,
+)
 
 
 def _tiny_model() -> OrbitPolicy:
@@ -22,7 +25,6 @@ def test_empty_pool_samples_only_self():
     """No snapshots in the pool → every slot must be the learner."""
     elo = EloTracker()
     pool = OpponentPool(elo=elo, top_k=8, self_play_prob=0.0, rng=random.Random(0))
-    model = _tiny_model()
     slots = pool.sample(8)
     assert all(s.name == LEARNER_NAME for s in slots)
 
@@ -118,3 +120,329 @@ def test_fixed_opponent_pool_rejects_unknown_builtin():
         assert "unknown fixed opponents" in str(exc)
     else:
         raise AssertionError("unknown fixed opponent should raise")
+
+
+def test_no_builtin_pool_empty_samples_current_learner():
+    pool = NoBuiltinTrainingPool(
+        current_learner_prob=0.0,
+        active_pool_prob=0.5,
+        historical_archive_prob=0.5,
+        rng=random.Random(0),
+    )
+
+    slots = pool.sample(16)
+
+    assert all(slot.name == LEARNER_NAME for slot in slots)
+    assert all(slot.agent is None for slot in slots)
+
+
+def test_no_builtin_pool_redistributes_when_historical_empty(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=4,
+        current_learner_prob=0.4,
+        active_pool_prob=0.3,
+        historical_archive_prob=0.3,
+        rng=random.Random(0),
+    )
+    pool.add_snapshot("a", _tiny_model(), tmp_path / "a.pt", created_update=0)
+
+    slots = pool.sample(4000)
+    current = sum(1 for slot in slots if slot.name == LEARNER_NAME)
+    active = sum(1 for slot in slots if slot.name == "frozen:a")
+
+    # Historical is empty, so 40/30/30 normalizes to 40/30 over current+active.
+    assert 0.54 * len(slots) <= current <= 0.60 * len(slots)
+    assert 0.40 * len(slots) <= active <= 0.46 * len(slots)
+
+
+def test_no_builtin_pool_samples_40_30_30_when_all_sources_exist(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=4,
+        min_games_before_eviction=0,
+        current_learner_prob=0.4,
+        active_pool_prob=0.3,
+        historical_archive_prob=0.3,
+        rng=random.Random(1),
+    )
+    model = _tiny_model()
+    pool.add_snapshot("hist", model, tmp_path / "hist.pt", created_update=0)
+    pool.set_current_update(1)
+    pool.add_snapshot("active", model, tmp_path / "active.pt", created_update=1)
+
+    assert pool.active_snapshot_names() == ["frozen:active"]
+    assert pool.historical_snapshot_names()
+
+    slots = pool.sample(6000)
+    current = sum(1 for slot in slots if slot.name == LEARNER_NAME)
+    active = sum(1 for slot in slots if slot.name in pool.active_snapshot_names())
+    historical = sum(
+        1 for slot in slots if slot.name in pool.historical_snapshot_names()
+    )
+
+    assert 0.37 * len(slots) <= current <= 0.43 * len(slots)
+    assert 0.27 * len(slots) <= active <= 0.33 * len(slots)
+    assert 0.27 * len(slots) <= historical <= 0.33 * len(slots)
+
+
+def test_no_builtin_pool_updates_active_stats_only_vs_current(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(rng=random.Random(0))
+    name = pool.add_snapshot("a", _tiny_model(), tmp_path / "a.pt")
+
+    pool.record_game([(name, 10.0), ("frozen:other", 1.0)])
+    assert pool.snapshot_stats(name).games_vs_current == 0
+
+    pool.record_game([(LEARNER_NAME, 5.0), (name, 7.0)])
+    stats = pool.snapshot_stats(name)
+    assert stats.games_vs_current == 1
+    assert stats.wins_vs_current == 1
+    assert stats.mean_margin_vs_current == 2.0
+
+    pool.record_game([(LEARNER_NAME, 9.0), ("frozen:not_active", 20.0)])
+    assert stats.games_vs_current == 1
+
+
+def test_no_builtin_active_retention_uses_utility_not_top_k_elo(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=2,
+        min_games_before_eviction=0,
+        recency_half_life_updates=1000.0,
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    near = pool.add_snapshot("near_50", model, tmp_path / "near.pt", created_update=0)
+    weak = pool.add_snapshot("weak", model, tmp_path / "weak.pt", created_update=0)
+
+    for _ in range(20):
+        pool.record_result_vs_current(near, learner_score=10.0, snapshot_score=10.0)
+        pool.record_result_vs_current(weak, learner_score=20.0, snapshot_score=1.0)
+
+    pool.add_snapshot("new", model, tmp_path / "new.pt", created_update=0)
+
+    alive = set(pool.active_snapshot_names())
+    assert near in alive
+    assert "frozen:new" in alive
+    assert weak not in alive
+
+
+def test_no_builtin_active_min_exposure_evicts_oldest_underexposed(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=2,
+        min_games_before_eviction=16,
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    pool.set_current_update(0)
+    oldest = pool.add_snapshot("oldest", model, tmp_path / "oldest.pt")
+    pool.set_current_update(1)
+    pool.add_snapshot("middle", model, tmp_path / "middle.pt")
+    pool.set_current_update(2)
+    pool.add_snapshot("newest", model, tmp_path / "newest.pt")
+
+    assert oldest not in set(pool.active_snapshot_names())
+    assert set(pool.active_snapshot_names()) == {"frozen:middle", "frozen:newest"}
+
+
+def test_no_builtin_historical_archive_uses_log_eviction_and_notable_buckets(
+    tmp_path: Path,
+):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=8,
+        recent_eviction_archive_size=2,
+        notable_archive_size=2,
+        min_games_before_eviction=0,
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    pool.set_current_update(0)
+    first = pool.add_snapshot("u0", model, tmp_path / "u0.pt", notable=True)
+    pool.set_current_update(1)
+    pool.add_snapshot("u1", model, tmp_path / "u1.pt")
+    pool.set_current_update(2)
+    pool.add_snapshot("u2", model, tmp_path / "u2.pt")
+    pool.set_current_update(4)
+    pool.add_snapshot("u4", model, tmp_path / "u4.pt")
+    pool.set_current_update(8)
+    pool.rebuild_historical_archive()
+
+    assert first in pool.historical_snapshot_names("notable")
+    assert pool.historical_snapshot_names("recent_eviction")
+    assert pool.historical_snapshot_names("log")
+    assert set(pool.historical_snapshot_names()).issuperset(
+        pool.historical_snapshot_names("recent_eviction")
+    )
+
+
+def test_no_builtin_log_archive_retains_candidates_until_capacity(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=6,
+        recent_eviction_archive_size=0,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    created: list[str] = []
+    for update in range(5):
+        pool.set_current_update(update)
+        created.append(pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt"))
+
+    historical = set(pool.historical_snapshot_names("log"))
+
+    assert set(created[:-1]).issubset(historical)
+    assert all((tmp_path / f"u{idx}.pt").exists() for idx in range(4))
+
+
+def test_no_builtin_evicted_historical_snapshot_uses_lazy_agent(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=8,
+        recent_eviction_archive_size=0,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        current_learner_prob=0.0,
+        active_pool_prob=0.0,
+        historical_archive_prob=1.0,
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    pool.add_snapshot("u0", model, tmp_path / "u0.pt")
+    pool.set_current_update(1)
+    pool.add_snapshot("u1", model, tmp_path / "u1.pt")
+
+    historical = pool.historical_snapshot_names("log")
+    assert historical == ["frozen:u0"]
+
+    slot = pool.sample(1)[0]
+    assert type(slot.agent).__name__ == "LazyLearnedAgent"
+    assert slot.agent.model is not None
+
+
+def test_no_builtin_historical_sampling_uses_per_update_panel(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=16,
+        historical_sample_panel_size=2,
+        recent_eviction_archive_size=0,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        current_learner_prob=0.0,
+        active_pool_prob=0.0,
+        historical_archive_prob=1.0,
+        rng=random.Random(2),
+    )
+    model = _tiny_model()
+    for update in range(8):
+        pool.set_current_update(update)
+        pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
+
+    slots = pool.sample(200, current_update=8)
+    assert len({slot.name for slot in slots}) <= 2
+
+    pool.set_current_update(9)
+    slots_after_update = pool.sample(200, current_update=9)
+    assert len({slot.name for slot in slots_after_update}) <= 2
+    assert pool.current_update == 9
+
+
+def test_no_builtin_sample_current_update_rotates_panel_clock(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=12,
+        historical_sample_panel_size=2,
+        recent_eviction_archive_size=0,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        current_learner_prob=0.0,
+        active_pool_prob=0.0,
+        historical_archive_prob=1.0,
+        rng=random.Random(5),
+    )
+    model = _tiny_model()
+    for update in range(5):
+        pool.set_current_update(update)
+        pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
+
+    pool.sample(10, current_update=10)
+
+    assert pool.current_update == 10
+    assert len({slot.name for slot in pool.sample(100, current_update=10)}) <= 2
+
+
+def test_no_builtin_sample_diversifies_all_same_non_current_when_possible(
+    tmp_path: Path,
+):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=4,
+        current_learner_prob=0.0,
+        active_pool_prob=1.0,
+        historical_archive_prob=0.0,
+        rng=random.Random(4),
+    )
+    model = _tiny_model()
+    pool.add_snapshot("a", model, tmp_path / "a.pt")
+    pool.add_snapshot("b", model, tmp_path / "b.pt")
+
+    for _ in range(100):
+        slots = pool.sample(3)
+        assert len({slot.name for slot in slots}) > 1
+
+
+def test_no_builtin_sample_diversifies_within_sampled_source_when_possible(
+    tmp_path: Path,
+):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=8,
+        recent_eviction_archive_size=0,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        current_learner_prob=0.0,
+        active_pool_prob=0.0,
+        historical_archive_prob=1.0,
+        rng=random.Random(3),
+    )
+    model = _tiny_model()
+    for update in range(3):
+        pool.set_current_update(update)
+        pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
+
+    active_name = pool.active_snapshot_names()[0]
+    historical = set(pool.historical_snapshot_names())
+    assert len(historical) >= 2
+
+    for _ in range(200):
+        slots = pool.sample(3)
+        names = {slot.name for slot in slots}
+        assert active_name not in names
+        assert names <= historical
+
+
+def test_no_builtin_diversify_does_not_cross_sources(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=2,
+        historical_training_archive_size=8,
+        recent_eviction_archive_size=0,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        current_learner_prob=0.0,
+        active_pool_prob=0.0,
+        historical_archive_prob=1.0,
+        rng=random.Random(6),
+    )
+    model = _tiny_model()
+    pool.add_snapshot("active", model, tmp_path / "active.pt")
+    pool.set_current_update(1)
+    pool.add_snapshot(
+        "historical",
+        model,
+        tmp_path / "historical.pt",
+        created_update=0,
+        enter_active=False,
+    )
+
+    slots = pool.sample(3)
+
+    assert [slot.name for slot in slots] == ["frozen:historical"] * 3

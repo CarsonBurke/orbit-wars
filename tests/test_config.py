@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ def test_load_default():
     cfg = RunConfig.from_dict({})
     assert cfg.run.name == "default"
     assert cfg.game.num_players == 2
+    assert cfg.game.train_num_players == [2]
     assert cfg.model.depth == 3
     assert cfg.opponents.fixed_opponents == ["sniper_v17"]
     assert cfg.sac.builtin_opponents == ["random", "sniper_v17", "heuristic"]
@@ -30,9 +32,38 @@ def test_invalid_gamma_raises():
         RunConfig.from_dict({"ppo": {"gamma": 1.01}})
 
 
+def test_train_num_players_loads_2p_4p_mix():
+    cfg = RunConfig.from_dict({"game": {"num_players": 2, "train_num_players": [2, 4]}})
+
+    assert cfg.game.train_num_players == [2, 4]
+
+
+def test_train_num_players_rejects_invalid_format():
+    with pytest.raises(ValueError, match="train_num_players"):
+        RunConfig.from_dict({"game": {"train_num_players": [3]}})
+
+
 def test_invalid_advantage_transform_raises():
     with pytest.raises(ValueError):
         RunConfig.from_dict({"ppo": {"advantage_transform": "zscoreish"}})
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("kl_lr_target", math.nan),
+        ("kl_lr_target", math.inf),
+        ("kl_lr_ema_half_life", math.nan),
+        ("kl_lr_ema_half_life", math.inf),
+        ("kl_lr_min_scale", math.nan),
+        ("kl_lr_min_scale", math.inf),
+        ("kl_lr_max_scale", math.nan),
+        ("kl_lr_max_scale", math.inf),
+    ],
+)
+def test_non_finite_kl_lr_config_raises(key: str, value: float):
+    with pytest.raises(ValueError, match=key):
+        RunConfig.from_dict({"optim": {key: value}})
 
 
 def test_invalid_reward_signal_raises():
@@ -115,6 +146,71 @@ def test_fixed_opponent_mode_requires_non_empty_opponents():
         RunConfig.from_dict(
             {"opponents": {"mode": "fixed", "fixed_opponents": []}}
         )
+
+
+def test_no_builtins_opponent_mode_loads():
+    cfg = RunConfig.from_dict(
+        {
+            "opponents": {
+                "mode": "no_builtins",
+                "snapshot_every": 1,
+                "active_pool_size": 12,
+                "historical_training_archive_size": 64,
+            }
+        }
+    )
+
+    assert cfg.opponents.mode == "no_builtins"
+    assert cfg.opponents.current_learner_prob == 0.4
+    assert cfg.opponents.active_pool_prob == 0.3
+    assert cfg.opponents.historical_archive_prob == 0.3
+    assert cfg.opponents.fixed_opponents == ["sniper_v17"]
+
+
+def test_no_builtins_opponent_mode_rejects_builtin_value_pretraining():
+    with pytest.raises(ValueError, match="pretrain_updates=0"):
+        RunConfig.from_dict(
+            {
+                "opponents": {"mode": "no_builtins"},
+                "ppo": {"pretrain_updates": 1},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "opponents_cfg",
+    [
+        {"current_learner_prob": -0.1},
+        {"current_learner_prob": math.nan},
+        {"active_difficulty_weight": math.inf},
+        {
+            "current_learner_prob": 0.0,
+            "active_pool_prob": 0.0,
+            "historical_archive_prob": 0.0,
+        },
+        {"active_pool_size": 0},
+        {"historical_training_archive_size": 0},
+        {"active_recency_half_life_updates": 0.0},
+        {"min_games_before_active_eviction": -1},
+        {"active_stats_ema_decay": 1.0},
+        {"historical_sample_panel_size": 0},
+        {"historical_agent_cache_size": 0},
+        {"recent_eviction_archive_size": -1},
+        {"notable_archive_size": -1},
+        {
+            "historical_training_archive_size": 4,
+            "recent_eviction_archive_size": 3,
+            "notable_archive_size": 2,
+        },
+        {
+            "historical_training_archive_size": 8,
+            "recent_eviction_archive_size": 7,
+        },
+    ],
+)
+def test_invalid_no_builtins_pool_config_raises(opponents_cfg):
+    with pytest.raises(ValueError):
+        RunConfig.from_dict({"opponents": {"mode": "no_builtins", **opponents_cfg}})
 
 
 @pytest.mark.parametrize(

@@ -125,16 +125,17 @@ def _fixed_minibatches_by_count(
     *,
     weight_device: torch.device | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Return exactly `minibatch_count` shuffled equal-shape minibatches.
+    """Return shuffled equal-shape minibatches, capped to non-empty batches.
 
     The final logical minibatch is padded with repeated rows and zero weights
     when `n` is not divisible by `minibatch_count`, so every real rollout row
     contributes once per epoch and every optimizer step sees the same leading
-    dimension within that rollout update.
+    dimension within that rollout update. If `minibatch_count > n`, cap the
+    count at `n` to avoid zero-real-row optimizer steps.
     """
     if n <= 0:
         return []
-    count = max(1, int(minibatch_count))
+    count = min(max(1, int(minibatch_count)), n)
     size = math.ceil(n / count)
     weight_device = device if weight_device is None else weight_device
     idx = torch.randperm(n, device=device)
@@ -997,6 +998,7 @@ def _get_ppo_kernel(
     clip_coef_high: float,
     compile_mode: str | None,
     include_value: bool,
+    shape_key: tuple[int, int, int, int, int],
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
@@ -1010,6 +1012,7 @@ def _get_ppo_kernel(
         float(clip_coef),
         float(clip_coef_high),
         bool(include_value),
+        shape_key,
     )
     cache = _kernel_cache(model)
     cached = cache.get(key)
@@ -1035,10 +1038,11 @@ def _get_value_only_kernel(
     model: torch.nn.Module,
     *,
     compile_mode: str | None,
+    shape_key: tuple[int, int, int, int],
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
-    key = ("value_only", mode)
+    key = ("value_only", mode, shape_key)
     cache = _kernel_cache(model)
     cached = cache.get(key)
     if cached is not None:
@@ -1158,8 +1162,9 @@ def ppo_update(
 ) -> PPOLog:
     """Run PPO minibatch updates on `batch`.
 
-    If `minibatch_count` is set, each epoch runs exactly that many equal-shape
-    minibatches. Otherwise each epoch runs `ceil(N / minibatch_size)` batches.
+    If `minibatch_count` is set, each epoch runs up to that many equal-shape
+    minibatches, capped by `N` to avoid zero-sample optimizer steps. Otherwise
+    each epoch runs `ceil(N / minibatch_size)` batches.
 
     Expected keys:
       `planet_feats`, `planet_mask`, `planet_owned_mask`, `planet_ids`,
@@ -1203,6 +1208,10 @@ def ppo_update(
     critic_clip_frac_sum = torch.zeros((), device=device)
     n_steps = 0
 
+    if minibatch_count is not None:
+        static_minibatch_rows = math.ceil(n / max(1, min(int(minibatch_count), n)))
+    else:
+        static_minibatch_rows = max(1, int(minibatch_size))
     kernel = _get_ppo_kernel(
         model,
         value_coef=value_coef,
@@ -1213,6 +1222,13 @@ def ppo_update(
         clip_coef_high=clip_coef_high,
         compile_mode=compile_mode,
         include_value=True,
+        shape_key=(
+            static_minibatch_rows,
+            int(batch["planet_feats"].shape[1]),
+            int(batch["fleet_feats"].shape[1]),
+            int(_global_feats_or_empty(batch).shape[1]),
+            int(return_mtp.shape[1]),
+        ),
     )
     epochs_run = 0
     for _ in range(epochs):
@@ -1405,11 +1421,21 @@ def value_only_update(
     device = _module_device(model)
     total: torch.Tensor | None = None
     n_steps = 0
-    kernel = _get_value_only_kernel(model, compile_mode=compile_mode)
     return_mtp = batch.get("return_mtp", batch["return"].unsqueeze(-1))
     return_mtp_mask = batch.get(
         "return_mtp_mask",
         torch.ones_like(return_mtp, dtype=torch.bool),
+    )
+    static_minibatch_rows = max(1, int(minibatch_size))
+    kernel = _get_value_only_kernel(
+        model,
+        compile_mode=compile_mode,
+        shape_key=(
+            static_minibatch_rows,
+            int(batch["planet_feats"].shape[1]),
+            int(batch["fleet_feats"].shape[1]),
+            int(_global_feats_or_empty(batch).shape[1]),
+        ),
     )
     for _ in range(epochs):
         for mb, row_weight in _fixed_minibatches(
@@ -1434,15 +1460,13 @@ def value_only_update(
             (value_loss * _minibatch_loss_scale(row_weight)).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            normalize_matrices(model)
 
             if total is None:
                 total = metric.new_zeros(())
             total += metric
             n_steps += 1
 
-    # nGPT hypersphere re-projection once per value-pretrain update (see the
-    # rationale in `ppo_update`).
-    normalize_matrices(model)
     if total is None:
         return 0.0
     return float((total / max(1, n_steps)).detach().cpu())

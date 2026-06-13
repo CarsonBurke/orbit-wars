@@ -9,9 +9,9 @@ Also keeps a regression guard on the log_prob recompute invariant
 from __future__ import annotations
 
 import math
-import numpy as np
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn.functional as nn_functional
 
@@ -26,21 +26,21 @@ from owars.policies.sampling import (
     _threshold_normal_launch_prob,
     sample_batch_with_records,
 )
+from owars.training import train as train_mod
+from owars.training.config import RunConfig
 from owars.training.ppo import (
+    _backward_actor_critic_with_group_clips,
     _beta_log_prob,
     _conditional_action_entropy,
+    _distributional_value_loss,
     _fixed_minibatches,
     _fixed_minibatches_by_count,
-    _backward_actor_critic_with_group_clips,
-    _distributional_value_loss,
     _minibatch_loss_scale,
     _rank_gaussian_advantage,
     compute_gae,
     ppo_update,
     value_only_update,
 )
-from owars.training import train as train_mod
-
 
 # A non-degenerate 8-planet position. Player 0 owns the first three; the rest
 # are enemy/neutral so owned planets have legal targets. Every planet sits in
@@ -183,6 +183,91 @@ def test_trim_ppo_batch_fleet_width_keeps_destination_sidecar_aligned():
     assert trimmed["fleet_target_planet_idx"].shape == (2, 64)
     assert int(trimmed["fleet_target_planet_idx"][0, 3]) == 2
     assert int(trimmed["fleet_target_planet_idx"][1, 18]) == 5
+
+
+def test_trim_ppo_batch_fleet_width_can_pad_for_compile_bucket():
+    batch = {
+        "fleet_feats": torch.zeros(3, 25, 20),
+        "fleet_mask": torch.zeros(3, 25, dtype=torch.bool),
+        "fleet_target_planet_idx": torch.full((3, 25), -1, dtype=torch.long),
+    }
+    batch["fleet_mask"][1, 24] = True
+    batch["fleet_target_planet_idx"][1, 24] = 7
+
+    padded = train_mod._trim_ppo_batch_fleet_width(batch, pad_to_bucket=True)
+
+    assert padded["fleet_feats"].shape[1] == 64
+    assert padded["fleet_mask"][1, 24]
+    assert int(padded["fleet_target_planet_idx"][1, 24]) == 7
+    assert not bool(padded["fleet_mask"][:, 25:].any())
+    assert torch.all(padded["fleet_target_planet_idx"][:, 25:] == -1)
+
+
+def test_train_num_players_helper_uses_configured_mix():
+    cfg = RunConfig.from_dict({"game": {"num_players": 2, "train_num_players": [2, 4]}})
+
+    assert train_mod._train_num_players(cfg) == (2, 4)
+
+
+def test_format_episode_counts_keeps_sniper_update_game_count_with_even_mix():
+    counts = train_mod._format_episode_counts(
+        128,
+        (2, 4),
+        train_mod.random.Random(0),
+    )
+
+    assert counts[2] == 64
+    assert counts[4] == 64
+    assert sum(counts.values()) == 128
+
+
+def test_format_episode_counts_distributes_odd_remainder():
+    counts = train_mod._format_episode_counts(
+        129,
+        (2, 4),
+        train_mod.random.Random(0),
+    )
+
+    assert sorted(counts.values()) == [64, 65]
+    assert sum(counts.values()) == 129
+
+
+def test_training_vec_counts_split_mixed_formats_without_multiplying_envs():
+    cfg = RunConfig.from_dict(
+        {
+            "game": {"train_num_players": [2, 4]},
+            "rollout": {"num_envs": 128},
+            "ppo": {"pretrain_updates": 0},
+        }
+    )
+
+    assert train_mod._training_vec_counts(cfg) == {2: 64, 4: 64}
+
+
+def test_training_vec_counts_keep_full_pretrain_vec_when_needed():
+    cfg = RunConfig.from_dict(
+        {
+            "game": {"num_players": 2, "train_num_players": [2, 4]},
+            "rollout": {"num_envs": 128},
+            "ppo": {"pretrain_updates": 1},
+        }
+    )
+
+    assert train_mod._training_vec_counts(cfg)[2] == 128
+    assert train_mod._training_vec_counts(cfg)[4] == 64
+
+
+def test_ppo_minibatch_size_caps_only_high_fleet_bucket():
+    cfg = RunConfig.from_dict({"optim": {"minibatch_size": 4096}})
+
+    assert train_mod._ppo_minibatch_size_for_fleet_width(cfg, 1024) == 4096
+    assert train_mod._ppo_minibatch_size_for_fleet_width(cfg, 2048) == 2048
+
+
+def test_ppo_minibatch_size_respects_smaller_configured_size():
+    cfg = RunConfig.from_dict({"optim": {"minibatch_size": 1024}})
+
+    assert train_mod._ppo_minibatch_size_for_fleet_width(cfg, 2048) == 1024
 
 
 def test_destination_conditioned_value_only_update_after_fleet_trim_smoke():
@@ -362,6 +447,28 @@ def test_ppo_update_minibatch_count_runs_exact_count():
     assert 0.0 <= log.critic_clip_frac <= 1.0
 
 
+def test_ppo_update_minibatch_count_above_batch_size_runs_real_steps_only():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=3)
+    optim = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    log = ppo_update(
+        model, optim, batch,
+        value_coef=0.5,
+        target_entropy_coef=0.01,
+        fraction_entropy_coef=0.0,
+        norm_advantage=True,
+        advantage_transform="rankgauss",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        epochs=1, minibatch_size=2, minibatch_count=8, grad_clip=0.5,
+    )
+
+    assert math.isfinite(log.policy_loss)
+    assert log.epochs_run == 1.0
+
+
 def test_fixed_minibatches_by_count_cover_rows_once_with_equal_shapes():
     torch.manual_seed(3)
     batches = _fixed_minibatches_by_count(10, 4, torch.device("cpu"))
@@ -375,6 +482,18 @@ def test_fixed_minibatches_by_count_cover_rows_once_with_equal_shapes():
         real_rows.extend(mb[weight.bool()].tolist())
     assert sorted(real_rows) == list(range(10))
     assert sum(float(weight.sum()) for _, weight in batches) == 10.0
+
+
+def test_fixed_minibatches_by_count_caps_count_to_real_rows():
+    torch.manual_seed(3)
+    batches = _fixed_minibatches_by_count(3, 8, torch.device("cpu"))
+
+    assert len(batches) == 3
+    assert all(float(weight.sum()) > 0.0 for _mb, weight in batches)
+    real_rows = []
+    for mb, weight in batches:
+        real_rows.extend(mb[weight.bool()].tolist())
+    assert sorted(real_rows) == [0, 1, 2]
 
 
 def test_log_prob_recompute_matches_sample_time():
@@ -797,7 +916,13 @@ def test_approx_kl_sums_owned_planet_log_probs_cleanrl_style():
 
     joint_ratio = 1.5 * 1.2
     expected_kl = (joint_ratio - 1.0) - math.log(joint_ratio)
+    expected_per_planet_kl = (
+        ((1.5 - 1.0) - math.log(1.5))
+        + ((1.2 - 1.0) - math.log(1.2))
+    ) / 2.0
     assert math.isclose(log.approx_kl, expected_kl, rel_tol=1e-6)
+    assert math.isclose(log.per_planet_approx_kl, expected_per_planet_kl, rel_tol=1e-6)
+    assert not math.isclose(log.per_planet_approx_kl, log.approx_kl, rel_tol=1e-6)
 
 
 def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
@@ -854,7 +979,9 @@ def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
     latest_kl = (expected_ratio - 1.0) - math.log(expected_ratio)
     mean_kl = torch.mean((ratios - 1.0) - torch.log(ratios)).item()
     assert math.isclose(log.approx_kl, latest_kl, rel_tol=1e-6, abs_tol=1e-7)
+    assert math.isclose(log.per_planet_approx_kl, latest_kl, rel_tol=1e-6, abs_tol=1e-7)
     assert not math.isclose(log.approx_kl, mean_kl, rel_tol=1e-6)
+    assert not math.isclose(log.per_planet_approx_kl, mean_kl, rel_tol=1e-6)
 
 
 def test_clip_clamps_ratio_below_lower_bound_with_negative_advantage():
@@ -942,6 +1069,93 @@ def test_value_only_update_ignores_zero_weight_padding_rows():
     got = value_only_update(model, optim, batch, epochs=1, minibatch_size=5, grad_clip=1.0)
 
     assert math.isclose(got, expected, rel_tol=1e-6)
+
+
+def test_value_only_update_normalizes_after_each_optimizer_step(monkeypatch):
+    model = _ValueOnlyPolicy()
+    batch = {
+        "planet_feats": torch.zeros(3, 1, 19),
+        "planet_mask": torch.ones(3, 1, dtype=torch.bool),
+        "planet_owned_mask": torch.ones(3, 1, dtype=torch.bool),
+        "planet_ids": torch.zeros(3, 1, dtype=torch.long),
+        "planet_garrison": torch.ones(3, 1),
+        "fleet_feats": torch.zeros(3, 1, 20),
+        "fleet_mask": torch.zeros(3, 1, dtype=torch.bool),
+        "return": torch.tensor([-1.0, 0.0, 1.0]),
+    }
+    calls = []
+    monkeypatch.setattr(
+        "owars.training.ppo.normalize_matrices",
+        lambda seen_model: calls.append(seen_model),
+    )
+
+    optim = torch.optim.AdamW(model.parameters(), lr=0.0)
+    value_only_update(model, optim, batch, epochs=1, minibatch_size=2, grad_clip=1.0)
+
+    assert calls == [model, model]
+
+
+def test_pretrain_value_rounds_episode_batches_up_and_uses_behavior(monkeypatch):
+    cfg = RunConfig.from_dict(
+        {
+            "ppo": {"pretrain_updates": 1, "pretrain_episodes": 129},
+            "rollout": {"num_envs": 128},
+        }
+    )
+    behavior_seen = []
+
+    def behavior(_obs):
+        return []
+
+    monkeypatch.setitem(train_mod.BUILTIN, "unit_behavior", behavior)
+    cfg.ppo.pretrain_behavior = "unit_behavior"
+
+    def fake_rollout(*_args, **kwargs):
+        behavior_seen.append(kwargs.get("learner_action_agent"))
+        return [SimpleNamespace(reward=[0.0], value=[torch.tensor(0.0)])]
+
+    monkeypatch.setattr(train_mod, "rollout_episodes_batched", fake_rollout)
+    monkeypatch.setattr(
+        train_mod,
+        "_pretrain_value_batch",
+        lambda *_args, **_kwargs: {
+            "planet_feats": torch.zeros(1, 1, 19),
+            "planet_mask": torch.ones(1, 1, dtype=torch.bool),
+            "planet_owned_mask": torch.ones(1, 1, dtype=torch.bool),
+            "planet_ids": torch.zeros(1, 1, dtype=torch.long),
+            "planet_garrison": torch.ones(1, 1),
+            "fleet_feats": torch.zeros(1, 1, 20),
+            "fleet_mask": torch.zeros(1, 1, dtype=torch.bool),
+            "return": torch.zeros(1),
+        },
+    )
+    monkeypatch.setattr(train_mod, "value_only_update", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(
+        train_mod,
+        "_slice_encoded_obs_to_device",
+        lambda batch, _mb, _device: SimpleNamespace(
+            planet_feats=batch["planet_feats"]
+        ),
+    )
+
+    class Logger:
+        def scalars(self, *_args, **_kwargs):
+            return None
+
+    class PretrainModel:
+        def __call__(self, feats):
+            return SimpleNamespace(value=torch.zeros(feats.planet_feats.shape[0]))
+
+    train_mod.pretrain_value(
+        cfg,
+        PretrainModel(),
+        torch.optim.AdamW([torch.nn.Parameter(torch.zeros(()))]),
+        Logger(),
+        torch.device("cpu"),
+        SimpleNamespace(),
+    )
+
+    assert behavior_seen == [behavior, behavior]
 
 
 def test_ppo_update_runs_all_configured_epochs():

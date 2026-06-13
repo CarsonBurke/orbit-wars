@@ -34,6 +34,7 @@ kaggle = [
 [project.scripts]
 owars-train = "owars.training.train:main"
 owars-eval = "owars.training.evaluate:main"
+owars-eval-archive = "owars.training.evaluate_archive:main"
 owars-ablate = "owars.training.ablate:main"
 owars-bundle = "owars.submission.bundle:main"
 

@@ -23,16 +23,19 @@ Per env-step the orchestrator does:
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
 
 from ..policies.features import (
     EncodedObs,
+    active_fleet_width,
     bucket_encoded_fleet_width,
+    bucket_fleet_width,
     encode_raw_observations,
     fleet_target_planet_idx_or_empty,
+    slice_encoded_fleet_width,
 )
 from ..policies.model import OrbitPolicy, PolicyOutput
 from ..policies.sampling import (
@@ -44,8 +47,7 @@ from ..policies.sampling import (
 )
 from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
-from .rollout import _obs_production_margin
-from .rollout import Trajectory
+from .rollout import Trajectory, _obs_production_margin
 from .vec_env import VecEnv
 
 
@@ -113,9 +115,10 @@ def _get_rollout_kernel(
     compile_mode: str | None,
     *,
     include_value: bool,
+    shape_key: tuple[int, int, int, int],
 ) -> torch.nn.Module:
     mode = compile_mode if device.type == "cuda" else None
-    key = ("rollout", mode, bool(include_value))
+    key = ("rollout", mode, bool(include_value), shape_key)
     cache = _kernel_cache(model)
     cached = cache.get(key)
     if cached is not None:
@@ -179,6 +182,11 @@ def _global_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
 
 def _trim_fleets_for_forward(feats: EncodedObs) -> EncodedObs:
     return bucket_encoded_fleet_width(feats)
+
+
+def _bucket_fleets_for_graph(feats: EncodedObs) -> EncodedObs:
+    width = bucket_fleet_width(active_fleet_width(feats.fleet_mask))
+    return slice_encoded_fleet_width(feats, width)
 
 
 def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
@@ -401,6 +409,7 @@ def rollout_episodes_batched(
     record_trajectories: bool = True,
     compile_mode: str | None = None,
     policy_graph_rows: int | None = None,
+    learner_action_agent: Callable[[Any], list[list]] | None = None,
 ) -> list[Trajectory]:
     """Play `len(opponents_per_env)` episodes in parallel; one Trajectory per env.
 
@@ -413,10 +422,12 @@ def rollout_episodes_batched(
     env `i` (the seat order skips that env's learner seat). `learner_seat`
     can be a scalar for legacy single-seat rollouts or a per-env list. The
     opponent assignment is fixed for the whole episode — sampled once by the
-    caller before the rollout.
+    caller before the rollout. `learner_action_agent` is for value pretraining:
+    the model still records learner-seat values/actions, but the env executes
+    the configured behavior policy's actions for those learner seats.
     """
     num_envs = len(opponents_per_env)
-    assert num_envs == vec.num_envs, (
+    assert 0 < num_envs <= vec.num_envs, (
         f"opponents_per_env has {num_envs} entries but vec has {vec.num_envs} workers"
     )
     if reward_cfg is None:
@@ -459,6 +470,7 @@ def rollout_episodes_batched(
     while not all(dones):
         # 1. Bucket (env, seat, obs) tuples by agent identity.
         learner_bucket: list[tuple[int, int, Any]] = []
+        learner_obs_requests: list[tuple[int, tuple[int, int]]] = []
         opp_buckets: dict[str, list[tuple[int, int, Any, OpponentSlot]]] = (
             defaultdict(list)
         )
@@ -471,7 +483,18 @@ def rollout_episodes_batched(
             for seat in range(num_players):
                 slot = seat_agents[env_idx][seat]
                 if slot is None or slot.name == LEARNER_NAME:
-                    obs = None if use_fast_numpy_path else state[seat]["observation"]
+                    needs_behavior_obs = (
+                        learner_action_agent is not None
+                        and seat == learner_seats[env_idx]
+                    )
+                    if use_fast_numpy_path:
+                        obs = None
+                        if needs_behavior_obs:
+                            learner_obs_requests.append(
+                                (len(learner_bucket), (env_idx, seat))
+                            )
+                    else:
+                        obs = state[seat]["observation"]
                     learner_bucket.append((env_idx, seat, obs))
                 else:
                     can_fast_snapshot = (
@@ -480,9 +503,7 @@ def rollout_episodes_batched(
                         and callable(getattr(vec, "sample_batch_actions", None))
                         and getattr(slot.agent, "model", None) is not None
                     )
-                    if can_fast_snapshot:
-                        opp_buckets[slot.name].append((env_idx, seat, None, slot))
-                    elif (
+                    if can_fast_snapshot or (
                         use_fast_numpy_path
                         and callable(fast_builtin_actions)
                         and slot.name in native_builtin_opponents
@@ -508,6 +529,21 @@ def rollout_episodes_batched(
             ):
                 opp_buckets[slot.name].append((env_idx, seat, obs, slot))
 
+        if learner_obs_requests:
+            rows = [row for _bucket_idx, row in learner_obs_requests]
+            if callable(fast_observations):
+                learner_obs = fast_observations(rows)
+            else:
+                learner_obs = [
+                    fast_observation(env_idx, seat)
+                    for env_idx, seat in rows
+                ]
+            for (bucket_idx, _row), obs in zip(
+                learner_obs_requests, learner_obs, strict=True
+            ):
+                env_idx, seat, _old_obs = learner_bucket[bucket_idx]
+                learner_bucket[bucket_idx] = (env_idx, seat, obs)
+
         actions_per_env: dict[int, list[Any]] = {
             i: [None] * num_players for i in range(num_envs) if not dones[i]
         }
@@ -530,6 +566,7 @@ def rollout_episodes_batched(
                 ),
                 compile_mode,
                 policy_graph_rows or max_policy_rows,
+                learner_action_agent,
             )
 
         # 3. Per-snapshot inference. Learned snapshots expose `act_batch`;
@@ -641,6 +678,7 @@ def _step_learner_bucket(
     policy_batch: Any | None = None,
     compile_mode: str | None = None,
     graph_rows: int | None = None,
+    learner_action_agent: Callable[[Any], list[list]] | None = None,
 ) -> None:
     """Encode + batch-forward the learner identity across (env, seat) pairs.
 
@@ -671,7 +709,7 @@ def _step_learner_bucket(
                 include_fleet_targets=include_fleet_targets,
             )
             device_source = (
-                cpu_stacked
+                _bucket_fleets_for_graph(cpu_stacked)
                 if graph_enabled
                 else _trim_fleets_for_forward(cpu_stacked)
             )
@@ -704,7 +742,7 @@ def _step_learner_bucket(
         )
         if cpu_stacked is not None:
             device_source = (
-                cpu_stacked
+                _bucket_fleets_for_graph(cpu_stacked)
                 if graph_enabled
                 else _trim_fleets_for_forward(cpu_stacked)
             )
@@ -748,6 +786,12 @@ def _step_learner_bucket(
         target_device,
         compile_mode if graph_enabled else None,
         include_value=record_trajectories,
+        shape_key=(
+            int(graph_stacked.planet_feats.shape[0]),
+            int(graph_stacked.planet_feats.shape[1]),
+            int(graph_stacked.fleet_feats.shape[1]),
+            int(_global_feats_or_empty(graph_stacked).shape[1]),
+        ),
     )
     with torch.no_grad():
         if graph_enabled:
@@ -765,7 +809,8 @@ def _step_learner_bucket(
         )
     out = _slice_policy_output(out, real_rows)
 
-    if record_trajectories:
+    record_value_only = record_trajectories and learner_action_agent is not None
+    if record_trajectories and not record_value_only:
         if callable(fast_sampler) and policy_rows is not None:
             record_source_mask = None
             if cpu_stacked is not None and learner_rows:
@@ -817,46 +862,134 @@ def _step_learner_bucket(
             )
         records = []
 
+    if learner_action_agent is not None and learner_rows:
+        override_obs = [raw_obs_list[k] for k in learner_rows]
+        act_batch = getattr(learner_action_agent, "act_batch", None)
+        if callable(act_batch):
+            override_actions = act_batch(override_obs)
+        else:
+            override_actions = [learner_action_agent(obs) for obs in override_obs]
+        for row, acts in zip(learner_rows, override_actions, strict=True):
+            actions_list[row] = acts
+
     if record_trajectories and learner_rows:
         row_idx = torch.as_tensor(
             learner_rows, device=out.value.device, dtype=torch.long
         )
-        rec = _materialize_records_cpu(
-            stacked,
-            cpu_stacked,
-            out,
-            records,
-            row_idx,
-            learner_rows,
-        )
-        for j, env_idx in enumerate(learner_envs):
-            traj = trajectories[env_idx]
-            traj.encoded.append(
-                EncodedObs(
-                    planet_feats=rec["planet_feats"][j],
-                    planet_mask=rec["planet_mask"][j],
-                    planet_owned_mask=rec["planet_owned_mask"][j],
-                    planet_ids=rec["planet_ids"][j],
-                    planet_garrison=rec["planet_garrison"][j],
-                    fleet_feats=rec["fleet_feats"][j],
-                    fleet_mask=rec["fleet_mask"][j],
-                    global_feats=rec["global_feats"][j],
-                    fleet_target_planet_idx=None
-                    if rec["fleet_target_planet_idx"] is None
-                    else rec["fleet_target_planet_idx"][j],
-                )
+        if record_value_only:
+            rec = _materialize_value_records_cpu(
+                stacked,
+                cpu_stacked,
+                out,
+                row_idx,
+                learner_rows,
             )
-            traj.launch.append(rec["launch"][j])
-            traj.target_idx.append(rec["target_idx"][j])
-            traj.fraction.append(rec["fraction"][j])
-            traj.log_prob.append(rec["log_prob"][j])
-            traj.value.append(rec["value"][j])
-            traj.owned_mask.append(rec["owned_mask"][j])
-            traj.target_legal_mask.append(rec["target_legal_mask"][j])
-            traj.reward.append(0.0)
+            for j, env_idx in enumerate(learner_envs):
+                traj = trajectories[env_idx]
+                traj.encoded.append(
+                    EncodedObs(
+                        planet_feats=rec["planet_feats"][j],
+                        planet_mask=rec["planet_mask"][j],
+                        planet_owned_mask=rec["planet_owned_mask"][j],
+                        planet_ids=rec["planet_ids"][j],
+                        planet_garrison=rec["planet_garrison"][j],
+                        fleet_feats=rec["fleet_feats"][j],
+                        fleet_mask=rec["fleet_mask"][j],
+                        global_feats=rec["global_feats"][j],
+                        fleet_target_planet_idx=None
+                        if rec["fleet_target_planet_idx"] is None
+                        else rec["fleet_target_planet_idx"][j],
+                    )
+                )
+                traj.value.append(rec["value"][j])
+                traj.reward.append(0.0)
+        else:
+            rec = _materialize_records_cpu(
+                stacked,
+                cpu_stacked,
+                out,
+                records,
+                row_idx,
+                learner_rows,
+            )
+            for j, env_idx in enumerate(learner_envs):
+                traj = trajectories[env_idx]
+                traj.encoded.append(
+                    EncodedObs(
+                        planet_feats=rec["planet_feats"][j],
+                        planet_mask=rec["planet_mask"][j],
+                        planet_owned_mask=rec["planet_owned_mask"][j],
+                        planet_ids=rec["planet_ids"][j],
+                        planet_garrison=rec["planet_garrison"][j],
+                        fleet_feats=rec["fleet_feats"][j],
+                        fleet_mask=rec["fleet_mask"][j],
+                        global_feats=rec["global_feats"][j],
+                        fleet_target_planet_idx=None
+                        if rec["fleet_target_planet_idx"] is None
+                        else rec["fleet_target_planet_idx"][j],
+                    )
+                )
+                traj.launch.append(rec["launch"][j])
+                traj.target_idx.append(rec["target_idx"][j])
+                traj.fraction.append(rec["fraction"][j])
+                traj.log_prob.append(rec["log_prob"][j])
+                traj.value.append(rec["value"][j])
+                traj.owned_mask.append(rec["owned_mask"][j])
+                traj.target_legal_mask.append(rec["target_legal_mask"][j])
+                traj.reward.append(0.0)
 
     for k, (env_idx, seat, _obs) in enumerate(bucket):
         actions_per_env[env_idx][seat] = actions_list[k]
+
+
+def _materialize_value_records_cpu(
+    stacked: EncodedObs,
+    cpu_stacked: EncodedObs | None,
+    out: Any,
+    row_idx: torch.Tensor,
+    rows: list[int],
+) -> dict[str, torch.Tensor]:
+    """Copy value-pretrain rollout records to CPU without action sidecars."""
+    feature_source = cpu_stacked if cpu_stacked is not None else stacked
+    feature_rows = (
+        torch.as_tensor(rows, dtype=torch.long)
+        if feature_source.planet_feats.device.type == "cpu"
+        else row_idx
+    )
+    value_cpu = out.value.index_select(0, row_idx).detach().cpu()
+    return {
+        "planet_feats": feature_source.planet_feats.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "planet_mask": feature_source.planet_mask.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "planet_owned_mask": feature_source.planet_owned_mask.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "planet_ids": feature_source.planet_ids.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "planet_garrison": feature_source.planet_garrison.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "fleet_feats": feature_source.fleet_feats.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "fleet_mask": feature_source.fleet_mask.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "fleet_target_planet_idx": None
+        if feature_source.fleet_target_planet_idx is None
+        else feature_source.fleet_target_planet_idx.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "global_feats": _global_feats_or_empty(feature_source)
+        .index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "value": value_cpu,
+    }
 
 
 def _materialize_records_cpu(

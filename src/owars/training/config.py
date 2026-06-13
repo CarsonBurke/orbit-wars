@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -14,6 +15,9 @@ from owars.policies.config import normalize_attention_config
 @dataclass
 class GameCfg:
     num_players: int = 2          # 2 or 4
+    # Training formats sampled uniformly per rollout wave. Empty means use
+    # `num_players` only. For self-training we use [2, 4] for a 50/50 mix.
+    train_num_players: list[int] = field(default_factory=list)
     episode_steps: int = 500
     act_timeout: float = 1.0
     ship_speed: float = 6.0
@@ -135,9 +139,11 @@ class OptimCfg:
     lr_warmup_steps: int = 100
     # KL-feedback LR controller. PPO always runs the configured epoch count;
     # KL is used only to adapt the next update's LR and to expose explosions in
-    # the logs. The signal is `PPOLog.per_planet_approx_kl`, smoothed by an EMA
-    # with this half-life in PPO updates. The persistent LR scale is multiplied
-    # by `kl_lr_target / kl_ema` after each update, then clamped.
+    # the logs. The signal is the latest-minibatch
+    # `PPOLog.per_planet_approx_kl` (not joint row KL), smoothed by an EMA with
+    # this half-life in PPO updates. The persistent LR scale is multiplied by
+    # sqrt(`kl_lr_target / kl_ema`) after each update, then clamped; the square
+    # root damps controller oscillation when KL is noisy.
     kl_lr_target: float = 0.025
     kl_lr_ema_half_life: float = 20.0
     kl_lr_min_scale: float = 0.1
@@ -335,9 +341,13 @@ class OpponentsCfg:
     ``mode="fixed"`` samples static builtin opponents from `fixed_opponents`
     and never uses self-play or snapshots. This is the low-noise training mode
     for measuring learner progress against a stationary baseline.
+
+    ``mode="no_builtins"`` is a learned-policy-only training pool: current
+    learner + active training snapshots + historical training archive. It uses
+    no fixed builtin agents in the training opponent mix.
     """
 
-    mode: Literal["league", "fixed"] = "league"
+    mode: Literal["league", "fixed", "no_builtins"] = "league"
     fixed_opponents: list[str] = field(default_factory=lambda: ["sniper_v17"])
     snapshot_every: int = 25      # save a frozen snapshot for the pool every N updates
     top_k: int = 10               # max live snapshots; lowest-Elo evicted past this
@@ -345,6 +355,22 @@ class OpponentsCfg:
     snapshot_device: str = "train"  # "cpu", "cuda", or "train" to mirror run.device
     initial_rating: float = 1500.0
     k_factor: float = 32.0
+    active_pool_size: int = 16
+    historical_training_archive_size: int = 128
+    current_learner_prob: float = 0.4
+    active_pool_prob: float = 0.3
+    historical_archive_prob: float = 0.3
+    active_difficulty_weight: float = 1.0
+    active_uncertainty_weight: float = 0.25
+    active_recency_weight: float = 0.25
+    active_hardness_weight: float = 0.5
+    active_recency_half_life_updates: float = 50.0
+    min_games_before_active_eviction: int = 16
+    active_stats_ema_decay: float = 0.95
+    historical_sample_panel_size: int = 8
+    historical_agent_cache_size: int = 8
+    recent_eviction_archive_size: int | None = None
+    notable_archive_size: int | None = None
 
 
 @dataclass
@@ -458,6 +484,13 @@ class RunConfig:
             raise ValueError("ppo.value_gae_lambda must be in [0, 1]")
         if not 0.0 < cfg.ppo.gamma <= 1.0:
             raise ValueError("ppo.gamma must be in (0, 1]")
+        if cfg.game.num_players not in {2, 4}:
+            raise ValueError("game.num_players must be 2 or 4")
+        if not cfg.game.train_num_players:
+            cfg.game.train_num_players = [cfg.game.num_players]
+        if not all(players in {2, 4} for players in cfg.game.train_num_players):
+            raise ValueError("game.train_num_players entries must be 2 or 4")
+        cfg.game.train_num_players = list(dict.fromkeys(cfg.game.train_num_players))
         if cfg.reward.signal == "win_terminal" and cfg.ppo.gamma != 1.0:
             raise ValueError("reward.signal='win_terminal' requires ppo.gamma=1.0")
         if cfg.ppo.clip_coef <= 0.0 or cfg.ppo.clip_coef_high <= 0.0:
@@ -479,13 +512,22 @@ class RunConfig:
             raise ValueError("optim.minibatch_size must be positive")
         if cfg.optim.epochs_per_update <= 0:
             raise ValueError("optim.epochs_per_update must be positive")
-        if cfg.optim.kl_lr_target <= 0.0:
+        if not math.isfinite(cfg.optim.kl_lr_target) or cfg.optim.kl_lr_target <= 0.0:
             raise ValueError("optim.kl_lr_target must be positive")
-        if cfg.optim.kl_lr_ema_half_life <= 0.0:
+        if (
+            not math.isfinite(cfg.optim.kl_lr_ema_half_life)
+            or cfg.optim.kl_lr_ema_half_life <= 0.0
+        ):
             raise ValueError("optim.kl_lr_ema_half_life must be positive")
-        if cfg.optim.kl_lr_min_scale <= 0.0:
+        if (
+            not math.isfinite(cfg.optim.kl_lr_min_scale)
+            or cfg.optim.kl_lr_min_scale <= 0.0
+        ):
             raise ValueError("optim.kl_lr_min_scale must be positive")
-        if cfg.optim.kl_lr_max_scale < cfg.optim.kl_lr_min_scale:
+        if (
+            not math.isfinite(cfg.optim.kl_lr_max_scale)
+            or cfg.optim.kl_lr_max_scale < cfg.optim.kl_lr_min_scale
+        ):
             raise ValueError(
                 "optim.kl_lr_max_scale must be >= optim.kl_lr_min_scale"
             )
@@ -537,14 +579,102 @@ class RunConfig:
             raise ValueError("sac.alpha_discrete_lr/continuous_lr must be positive")
         from .league import BUILTIN
 
-        if cfg.opponents.mode not in {"league", "fixed"}:
-            raise ValueError("opponents.mode must be 'league' or 'fixed'")
+        if cfg.opponents.mode not in {"league", "fixed", "no_builtins"}:
+            raise ValueError(
+                "opponents.mode must be 'league', 'fixed', or 'no_builtins'"
+            )
         if not 0.0 <= cfg.opponents.self_play_prob <= 1.0:
             raise ValueError("opponents.self_play_prob must be in [0, 1]")
         if cfg.opponents.top_k <= 0:
             raise ValueError("opponents.top_k must be positive")
         if cfg.opponents.snapshot_every <= 0:
             raise ValueError("opponents.snapshot_every must be positive")
+        if cfg.opponents.active_pool_size <= 0:
+            raise ValueError("opponents.active_pool_size must be positive")
+        if cfg.opponents.historical_training_archive_size <= 0:
+            raise ValueError(
+                "opponents.historical_training_archive_size must be positive"
+            )
+        sampling_probs = (
+            cfg.opponents.current_learner_prob,
+            cfg.opponents.active_pool_prob,
+            cfg.opponents.historical_archive_prob,
+        )
+        if (
+            any((not math.isfinite(p)) or p < 0.0 for p in sampling_probs)
+            or sum(sampling_probs) <= 0.0
+        ):
+            raise ValueError(
+                "opponents current/active/historical probabilities must be "
+                "non-negative and have positive total"
+            )
+        utility_weights = (
+            cfg.opponents.active_difficulty_weight,
+            cfg.opponents.active_uncertainty_weight,
+            cfg.opponents.active_recency_weight,
+            cfg.opponents.active_hardness_weight,
+        )
+        if (
+            any((not math.isfinite(w)) or w < 0.0 for w in utility_weights)
+            or sum(utility_weights) <= 0.0
+        ):
+            raise ValueError(
+                "opponents active utility weights must be non-negative and "
+                "have positive total"
+            )
+        if (
+            not math.isfinite(cfg.opponents.active_recency_half_life_updates)
+            or cfg.opponents.active_recency_half_life_updates <= 0.0
+        ):
+            raise ValueError(
+                "opponents.active_recency_half_life_updates must be positive"
+            )
+        if cfg.opponents.min_games_before_active_eviction < 0:
+            raise ValueError(
+                "opponents.min_games_before_active_eviction must be non-negative"
+            )
+        if (
+            not math.isfinite(cfg.opponents.active_stats_ema_decay)
+            or not 0.0 <= cfg.opponents.active_stats_ema_decay < 1.0
+        ):
+            raise ValueError("opponents.active_stats_ema_decay must be in [0, 1)")
+        if cfg.opponents.historical_sample_panel_size <= 0:
+            raise ValueError("opponents.historical_sample_panel_size must be positive")
+        if cfg.opponents.historical_agent_cache_size <= 0:
+            raise ValueError("opponents.historical_agent_cache_size must be positive")
+        if (
+            cfg.opponents.recent_eviction_archive_size is not None
+            and cfg.opponents.recent_eviction_archive_size < 0
+        ):
+            raise ValueError(
+                "opponents.recent_eviction_archive_size must be non-negative"
+            )
+        if (
+            cfg.opponents.notable_archive_size is not None
+            and cfg.opponents.notable_archive_size < 0
+        ):
+            raise ValueError("opponents.notable_archive_size must be non-negative")
+        default_archive_bucket_cap = (
+            cfg.opponents.historical_training_archive_size // 4
+        )
+        recent_archive_cap = (
+            default_archive_bucket_cap
+            if cfg.opponents.recent_eviction_archive_size is None
+            else cfg.opponents.recent_eviction_archive_size
+        )
+        notable_archive_cap = (
+            default_archive_bucket_cap
+            if cfg.opponents.notable_archive_size is None
+            else cfg.opponents.notable_archive_size
+        )
+        if (
+            recent_archive_cap + notable_archive_cap
+            > cfg.opponents.historical_training_archive_size
+        ):
+            raise ValueError(
+                "opponents recent/notable archive caps must fit within "
+                "historical_training_archive_size"
+            )
         unknown_fixed = set(cfg.opponents.fixed_opponents) - set(BUILTIN)
         if unknown_fixed:
             raise ValueError(
@@ -554,6 +684,11 @@ class RunConfig:
         if cfg.opponents.mode == "fixed" and not cfg.opponents.fixed_opponents:
             raise ValueError(
                 "opponents.mode='fixed' requires non-empty opponents.fixed_opponents"
+            )
+        if cfg.opponents.mode == "no_builtins" and cfg.ppo.pretrain_updates > 0:
+            raise ValueError(
+                "opponents.mode='no_builtins' requires ppo.pretrain_updates=0; "
+                "value pretraining uses builtin behavior policies"
             )
 
         unknown = set(cfg.sac.builtin_opponents) - set(BUILTIN)

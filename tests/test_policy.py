@@ -1,9 +1,16 @@
 import pytest
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
-from owars.policies.model import HLGaussLoss, _symexp, _symlog
+from owars.policies.model import (
+    HLGaussLoss,
+    _destination_fleet_stats,
+    _symexp,
+    _symlog,
+    justnorm,
+)
 from owars.policies.sampling import BETA_SAMPLE_EPS, _deterministic_fraction
 
 
@@ -328,6 +335,93 @@ def test_destination_fleet_cross_attention_only_reads_matching_destination():
     assert not torch.allclose(base[:, 0], changed[:, 0])
     assert torch.allclose(base[:, 1], changed[:, 1], atol=1e-6)
     assert torch.allclose(base[:, 2], changed[:, 2], atol=1e-6)
+
+
+def test_destination_fleet_cross_attention_matches_dense_reference_with_gqa():
+    from owars.policies.model import DestinationFleetCrossAttention
+
+    torch.manual_seed(0)
+    attn = DestinationFleetCrossAttention(dim=32, n_heads=4, n_kv_heads=1).eval()
+    planets = torch.randn(2, 5, 32)
+    fleets = torch.randn(2, 7, 32)
+    planet_mask = torch.tensor(
+        [
+            [True, True, True, True, False],
+            [True, True, True, False, False],
+        ]
+    )
+    fleet_mask = torch.tensor(
+        [
+            [True, True, False, True, True, True, False],
+            [True, False, True, True, False, True, True],
+        ]
+    )
+    target_idx = torch.tensor(
+        [
+            [0, 1, 0, 2, 2, -1, 4],
+            [2, 2, 0, 2, 1, 4, -1],
+        ]
+    )
+
+    with torch.no_grad():
+        got = attn(planets, fleets, planet_mask, fleet_mask, target_idx)
+
+        b, p, _ = planets.shape
+        q = attn.c_q(planets).unflatten(-1, (attn.n_heads, attn.head_dim))
+        k = attn.c_k(fleets).unflatten(-1, (attn.n_kv_heads, attn.head_dim))
+        v = attn.c_v(fleets).unflatten(-1, (attn.n_kv_heads, attn.head_dim))
+        sqk_q = (attn.sqk_q * (1.0 / attn.base_scale)).view(
+            1, 1, attn.n_heads, attn.head_dim
+        )
+        sqk_k = (attn.sqk_k * (1.0 / attn.base_scale)).view(
+            1, 1, attn.n_kv_heads, attn.head_dim
+        )
+        q = (sqk_q * justnorm(q)).transpose(1, 2)
+        k = (sqk_k * justnorm(k)).transpose(1, 2)
+        v = v.masked_fill(~fleet_mask.unsqueeze(-1).unsqueeze(-1), 0.0).transpose(1, 2)
+        k = k.repeat_interleave(attn.n_heads // attn.n_kv_heads, dim=1)
+        v = v.repeat_interleave(attn.n_heads // attn.n_kv_heads, dim=1)
+        valid_dest = fleet_mask & (target_idx >= 0) & (target_idx < p)
+        dest_idx = torch.where(valid_dest, target_idx, torch.full_like(target_idx, -1))
+        arange_p = torch.arange(p)
+        mask = planet_mask[:, :, None] & (dest_idx[:, None, :] == arange_p[None, :, None])
+        ref = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask[:, None],
+            scale=attn.head_dim**0.5,
+        )
+        ref = attn.out_proj(ref.transpose(1, 2).flatten(-2))
+
+    assert torch.allclose(got, ref, atol=1e-5)
+
+
+def test_destination_fleet_stats_pool_counts_and_ship_mass():
+    fleet_feats = torch.zeros(1, 4, 20)
+    fleet_feats[0, :, 4] = torch.log1p(torch.tensor([10.0, 20.0, 5.0, 7.0])) / 8.0
+    fleet_feats[0, :, 8] = torch.tensor([0.2, 0.5, 0.9, 0.1])
+    fleet_feats[0, 0, 14] = 1.0
+    fleet_feats[0, 1, 16] = 1.0
+    fleet_feats[0, 2, 16] = 1.0
+    fleet_feats[0, 3, 14] = 1.0
+    fleet_feats[0, 0, 13] = 1.0
+    fleet_feats[0, 0, 10] = 0.25
+    fleet_mask = torch.tensor([[True, True, True, False]])
+    target_idx = torch.tensor([[2, 2, 1, 2]])
+
+    stats = _destination_fleet_stats(fleet_feats, fleet_mask, target_idx, 4)
+
+    assert stats.shape == (1, 4, 13)
+    assert stats[0, 2, 0] == pytest.approx(2.0 / 64.0)
+    assert stats[0, 2, 1] == pytest.approx(1.0 / 64.0)
+    assert stats[0, 2, 2] == pytest.approx(1.0 / 64.0)
+    assert stats[0, 2, 3] == pytest.approx(torch.log1p(torch.tensor(30.0)).item() / 8.0)
+    assert stats[0, 2, 4] == pytest.approx(torch.log1p(torch.tensor(10.0)).item() / 8.0)
+    assert stats[0, 2, 5] == pytest.approx(torch.log1p(torch.tensor(20.0)).item() / 8.0)
+    assert stats[0, 1, 10] == pytest.approx(0.9)
+    assert stats[0, 2, 11] == pytest.approx(0.25)
+    assert stats[0, 2, 12] == pytest.approx(1.0 / 64.0)
 
 
 def test_noop_column_is_stable_across_planet_counts():

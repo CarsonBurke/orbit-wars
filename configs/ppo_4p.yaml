@@ -1,7 +1,7 @@
-# Four-player FFA config.
+# Mixed 2-player / 4-player FFA self-training config.
 #
 # Differences from `ppo_base.yaml`:
-#   - num_players: 4
+#   - train_num_players: [2, 4]
 #   - longer training (4-player games have longer credit-assignment chains)
 #   - larger snapshot pool (FFA strategy collapse is steeper, so a deeper
 #     league of past selves helps)
@@ -16,6 +16,7 @@ run:
 
 game:
   num_players: 4
+  train_num_players: [2, 4]  # self-training samples 2p vs 4p uniformly per rollout wave
   episode_steps: 500
   ship_speed: 6.0
 
@@ -71,10 +72,17 @@ rollout:
   env_backend: rust
 
 opponents:
+  mode: no_builtins
   snapshot_device: train
   snapshot_every: 1
-  top_k: 12
-  self_play_prob: 0.8
+  current_learner_prob: 0.4
+  active_pool_prob: 0.3
+  historical_archive_prob: 0.3
+  active_pool_size: 16
+  historical_training_archive_size: 128
+  historical_sample_panel_size: 8
+  historical_agent_cache_size: 8
+  min_games_before_active_eviction: 16
   initial_rating: 1500.0
   k_factor: 32.0
 
