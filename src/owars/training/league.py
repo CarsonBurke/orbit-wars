@@ -107,6 +107,19 @@ class OpponentSlot:
     agent: AgentFn | None
 
 
+@dataclass(frozen=True)
+class OpponentSamplePanel:
+    """Bounded opponent identities for one rollout wave.
+
+    Source probabilities are still sampled per opponent seat, but non-current
+    draws are restricted to these identities. That keeps self-training from
+    fragmenting rollout inference across every retained snapshot in the pool.
+    """
+
+    active: tuple[str, ...] = ()
+    historical: tuple[str, ...] = ()
+
+
 class LazyLearnedAgent:
     """LearnedAgent wrapper that loads retained archive snapshots on demand.
 
@@ -389,6 +402,7 @@ class NoBuiltinTrainingPool:
         self,
         *,
         active_pool_size: int = 16,
+        active_sample_panel_size: int = 2,
         historical_training_archive_size: int = 128,
         current_learner_prob: float = 0.4,
         active_pool_prob: float = 0.3,
@@ -400,7 +414,7 @@ class NoBuiltinTrainingPool:
         recency_half_life_updates: float = 50.0,
         min_games_before_eviction: int = 16,
         stats_ema_decay: float = 0.95,
-        historical_sample_panel_size: int = 8,
+        historical_sample_panel_size: int = 2,
         historical_agent_cache_size: int = 8,
         recent_eviction_archive_size: int | None = None,
         notable_archive_size: int | None = None,
@@ -409,6 +423,8 @@ class NoBuiltinTrainingPool:
     ):
         if active_pool_size <= 0:
             raise ValueError("active_pool_size must be positive")
+        if active_sample_panel_size <= 0:
+            raise ValueError("active_sample_panel_size must be positive")
         if historical_training_archive_size <= 0:
             raise ValueError("historical_training_archive_size must be positive")
         probs = (current_learner_prob, active_pool_prob, historical_archive_prob)
@@ -466,6 +482,7 @@ class NoBuiltinTrainingPool:
             )
 
         self.active_pool_size = active_pool_size
+        self.active_sample_panel_size = active_sample_panel_size
         self.historical_training_archive_size = historical_training_archive_size
         self.current_learner_prob = current_learner_prob
         self.active_pool_prob = active_pool_prob
@@ -771,61 +788,129 @@ class NoBuiltinTrainingPool:
         k: int,
         *,
         current_update: int | None = None,
+        panel: OpponentSamplePanel | None = None,
     ) -> list[OpponentSlot]:
         if current_update is not None and int(current_update) != self.current_update:
             self.set_current_update(int(current_update))
+        panel = self._sanitize_panel(panel)
         update = self.current_update
-        slots = [self._sample_one(update) for _ in range(k)]
-        self._diversify_if_all_same_non_current(slots, update)
+        slots = [self._sample_one(update, panel) for _ in range(k)]
+        self._diversify_if_all_same_non_current(slots, update, panel)
         return slots
 
-    def _sample_one(self, current_update: int) -> OpponentSlot:
-        source = self._sample_source()
+    def sample_panel(
+        self,
+        *,
+        current_update: int | None = None,
+    ) -> OpponentSamplePanel:
+        """Sample a bounded learned-opponent panel for one rollout wave."""
+        if current_update is not None and int(current_update) != self.current_update:
+            self.set_current_update(int(current_update))
+        active = self._sample_name_panel(
+            self.active_snapshot_names(),
+            self.active_sample_panel_size,
+        )
+        historical = self._choose_historical_panel()
+        return OpponentSamplePanel(
+            active=tuple(active),
+            historical=tuple(sorted(historical)),
+        )
+
+    def _sample_name_panel(self, names: Sequence[str], size: int) -> list[str]:
+        if len(names) <= size:
+            return list(names)
+        return self.rng.sample(list(names), size)
+
+    def _sanitize_panel(
+        self,
+        panel: OpponentSamplePanel | None,
+    ) -> OpponentSamplePanel | None:
+        if panel is None:
+            return None
+        active = tuple(name for name in panel.active if name in self._active)
+        historical = tuple(
+            name for name in panel.historical if name in self._historical_names()
+        )
+        return OpponentSamplePanel(active=active, historical=historical)
+
+    def _sample_one(
+        self,
+        current_update: int,
+        panel: OpponentSamplePanel | None = None,
+    ) -> OpponentSlot:
+        source = self._sample_source(panel)
         if source == "current":
             return OpponentSlot(name=LEARNER_NAME, agent=None)
         if source == "active":
-            name = self.rng.choice(self.active_snapshot_names())
+            active_names = (
+                list(panel.active) if panel is not None else self.active_snapshot_names()
+            )
+            name = self.rng.choice(active_names)
         else:
-            name = self._sample_historical_name()
+            name = self._sample_historical_name(panel)
         self._snapshots[name].last_sampled_update = current_update
         return OpponentSlot(name=name, agent=self._snapshots[name].agent)
 
-    def _sample_source(self) -> str:
+    def _sample_source(self, panel: OpponentSamplePanel | None = None) -> str:
         weighted: list[tuple[str, float]] = []
+        active_available = bool(panel.active) if panel is not None else bool(self._active)
+        historical_available = (
+            bool(panel.historical)
+            if panel is not None
+            else bool(self._historical_names())
+        )
         if self.current_learner_prob > 0.0:
             weighted.append(("current", self.current_learner_prob))
-        if self._active and self.active_pool_prob > 0.0:
+        if active_available and self.active_pool_prob > 0.0:
             weighted.append(("active", self.active_pool_prob))
-        if self._historical_names() and self.historical_archive_prob > 0.0:
+        if historical_available and self.historical_archive_prob > 0.0:
             weighted.append(("historical", self.historical_archive_prob))
         if not weighted:
             return "current"
         return self._weighted_choice(weighted)
 
-    def _sample_historical_name(self) -> str:
-        self._ensure_historical_panel()
+    def _sample_historical_name(
+        self,
+        panel: OpponentSamplePanel | None = None,
+    ) -> str:
+        if panel is None:
+            self._ensure_historical_panel()
         weighted = [
             (bucket, weight)
             for bucket, weight in self.HISTORICAL_BUCKET_WEIGHTS.items()
-            if self._historical_bucket_panel(bucket)
+            if self._historical_bucket_panel(bucket, panel)
         ]
         bucket = self._weighted_choice(weighted)
-        return self.rng.choice(sorted(self._historical_bucket_panel(bucket)))
+        return self.rng.choice(sorted(self._historical_bucket_panel(bucket, panel)))
 
     def _ensure_historical_panel(self) -> None:
         names = self._historical_names()
         if self._historical_panel_update == self.current_update:
             self._historical_panel &= names
             return
+        self._historical_panel = self._choose_historical_panel()
+        self._historical_panel_update = self.current_update
+
+    def _choose_historical_panel(self) -> set[str]:
+        names = self._historical_names()
         if len(names) <= self.historical_sample_panel_size:
-            self._historical_panel = set(names)
-            self._historical_panel_update = self.current_update
-            return
+            return set(names)
         panel: set[str] = set()
-        for bucket in self.HISTORICAL_BUCKET_WEIGHTS:
+        non_empty_buckets = [
+            bucket
+            for bucket in self.HISTORICAL_BUCKET_WEIGHTS
+            if self._historical_buckets[bucket]
+        ]
+        if len(non_empty_buckets) > self.historical_sample_panel_size:
+            bucket_order = self._sample_bucket_panel(
+                non_empty_buckets,
+                self.historical_sample_panel_size,
+            )
+        else:
+            bucket_order = non_empty_buckets
+        for bucket in bucket_order:
             bucket_names = sorted(self._historical_buckets[bucket])
-            if bucket_names and len(panel) < self.historical_sample_panel_size:
-                panel.add(self.rng.choice(bucket_names))
+            panel.add(self.rng.choice(bucket_names))
         while len(panel) < self.historical_sample_panel_size:
             weighted = [
                 (bucket, weight)
@@ -836,16 +921,34 @@ class NoBuiltinTrainingPool:
                 break
             bucket = self._weighted_choice(weighted)
             panel.add(self.rng.choice(sorted(self._historical_buckets[bucket] - panel)))
-        self._historical_panel = panel
-        self._historical_panel_update = self.current_update
+        return panel
 
-    def _historical_bucket_panel(self, bucket: str) -> set[str]:
+    def _sample_bucket_panel(self, buckets: Sequence[str], size: int) -> list[str]:
+        remaining = list(buckets)
+        selected: list[str] = []
+        while remaining and len(selected) < size:
+            bucket = self._weighted_choice(
+                [
+                    (name, self.HISTORICAL_BUCKET_WEIGHTS[name])
+                    for name in remaining
+                ]
+            )
+            selected.append(bucket)
+            remaining.remove(bucket)
+        return selected
+
+    def _historical_bucket_panel(
+        self,
+        bucket: str,
+        panel: OpponentSamplePanel | None = None,
+    ) -> set[str]:
         names = self._historical_buckets[bucket]
         if not names:
             return set()
-        if not self._historical_panel:
+        panel_names = set(panel.historical) if panel is not None else self._historical_panel
+        if not panel_names:
             return names
-        return names & self._historical_panel
+        return names & panel_names
 
     def _weighted_choice(self, weighted: Sequence[tuple[str, float]]) -> str:
         total = sum(weight for _, weight in weighted)
@@ -861,6 +964,7 @@ class NoBuiltinTrainingPool:
         self,
         slots: list[OpponentSlot],
         current_update: int,
+        panel: OpponentSamplePanel | None = None,
     ) -> None:
         if len(slots) < 2:
             return
@@ -871,9 +975,13 @@ class NoBuiltinTrainingPool:
         if any(slot.name != first for slot in non_current):
             return
         if first in self._active:
-            same_source = set(self.active_snapshot_names())
+            same_source = set(panel.active) if panel is not None else set(
+                self.active_snapshot_names()
+            )
         elif first in self._historical_names():
-            same_source = self._historical_names()
+            same_source = set(panel.historical) if panel is not None else (
+                self._historical_names()
+            )
         else:
             same_source = set()
         alternatives = sorted(same_source - {first})

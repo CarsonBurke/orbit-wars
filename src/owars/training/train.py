@@ -837,6 +837,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     elif cfg.opponents.mode == "no_builtins":
         pool = NoBuiltinTrainingPool(
             active_pool_size=cfg.opponents.active_pool_size,
+            active_sample_panel_size=cfg.opponents.active_sample_panel_size,
             historical_training_archive_size=(
                 cfg.opponents.historical_training_archive_size
             ),
@@ -979,13 +980,22 @@ def _ppo_loop(
                 rollout_envs = min(vec.num_envs, remaining_format_games)
                 remaining_format_games -= rollout_envs
                 format_counts[num_players] += rollout_envs
+                opponent_panel = (
+                    pool.sample_panel(current_update=update)
+                    if cfg.opponents.mode == "no_builtins"
+                    else None
+                )
                 # Sample opponents once per env for this wave, then play all
                 # envs in parallel. Each env's seat assignment is fixed for the
                 # episode; the rollout batches policy forwards across all
                 # alive envs.
                 opponents_per_env = [
                     (
-                        pool.sample(num_players - 1, current_update=update)
+                        pool.sample(
+                            num_players - 1,
+                            current_update=update,
+                            panel=opponent_panel,
+                        )
                         if cfg.opponents.mode == "no_builtins"
                         else pool.sample(num_players - 1)
                     )

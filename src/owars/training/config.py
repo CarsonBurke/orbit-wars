@@ -356,6 +356,7 @@ class OpponentsCfg:
     initial_rating: float = 1500.0
     k_factor: float = 32.0
     active_pool_size: int = 16
+    active_sample_panel_size: int = 2
     historical_training_archive_size: int = 128
     current_learner_prob: float = 0.4
     active_pool_prob: float = 0.3
@@ -367,7 +368,7 @@ class OpponentsCfg:
     active_recency_half_life_updates: float = 50.0
     min_games_before_active_eviction: int = 16
     active_stats_ema_decay: float = 0.95
-    historical_sample_panel_size: int = 8
+    historical_sample_panel_size: int = 2
     historical_agent_cache_size: int = 8
     recent_eviction_archive_size: int | None = None
     notable_archive_size: int | None = None
@@ -591,6 +592,8 @@ class RunConfig:
             raise ValueError("opponents.snapshot_every must be positive")
         if cfg.opponents.active_pool_size <= 0:
             raise ValueError("opponents.active_pool_size must be positive")
+        if cfg.opponents.active_sample_panel_size <= 0:
+            raise ValueError("opponents.active_sample_panel_size must be positive")
         if cfg.opponents.historical_training_archive_size <= 0:
             raise ValueError(
                 "opponents.historical_training_archive_size must be positive"

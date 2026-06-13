@@ -164,6 +164,8 @@ def test_no_builtins_opponent_mode_loads():
     assert cfg.opponents.current_learner_prob == 0.4
     assert cfg.opponents.active_pool_prob == 0.3
     assert cfg.opponents.historical_archive_prob == 0.3
+    assert cfg.opponents.active_sample_panel_size == 2
+    assert cfg.opponents.historical_sample_panel_size == 2
     assert cfg.opponents.fixed_opponents == ["sniper_v17"]
 
 
@@ -189,6 +191,7 @@ def test_no_builtins_opponent_mode_rejects_builtin_value_pretraining():
             "historical_archive_prob": 0.0,
         },
         {"active_pool_size": 0},
+        {"active_sample_panel_size": 0},
         {"historical_training_archive_size": 0},
         {"active_recency_half_life_updates": 0.0},
         {"min_games_before_active_eviction": -1},

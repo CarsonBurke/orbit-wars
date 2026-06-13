@@ -110,8 +110,9 @@ opponents:
   active_pool_prob: 0.3
   historical_archive_prob: 0.3
   active_pool_size: 16
+  active_sample_panel_size: 2
   historical_training_archive_size: 128
-  historical_sample_panel_size: 8
+  historical_sample_panel_size: 2
   historical_agent_cache_size: 8
   min_games_before_active_eviction: 16
   initial_rating: 1500.0

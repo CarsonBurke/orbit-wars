@@ -347,6 +347,120 @@ def test_no_builtin_historical_sampling_uses_per_update_panel(tmp_path: Path):
     assert pool.current_update == 9
 
 
+def test_no_builtin_panel_caps_active_snapshot_identities(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=8,
+        active_sample_panel_size=2,
+        current_learner_prob=0.0,
+        active_pool_prob=1.0,
+        historical_archive_prob=0.0,
+        rng=random.Random(7),
+    )
+    model = _tiny_model()
+    for idx in range(6):
+        pool.add_snapshot(f"a{idx}", model, tmp_path / f"a{idx}.pt")
+
+    panel = pool.sample_panel()
+    slots = pool.sample(200, panel=panel)
+
+    assert len(panel.active) == 2
+    assert {slot.name for slot in slots} <= set(panel.active)
+
+
+def test_no_builtin_panel_keeps_source_probabilities(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        active_sample_panel_size=1,
+        historical_training_archive_size=8,
+        historical_sample_panel_size=1,
+        min_games_before_eviction=0,
+        current_learner_prob=0.4,
+        active_pool_prob=0.3,
+        historical_archive_prob=0.3,
+        rng=random.Random(8),
+    )
+    model = _tiny_model()
+    pool.add_snapshot("hist", model, tmp_path / "hist.pt", created_update=0)
+    pool.set_current_update(1)
+    pool.add_snapshot("active", model, tmp_path / "active.pt", created_update=1)
+    panel = pool.sample_panel()
+
+    slots = pool.sample(6000, panel=panel)
+    current = sum(1 for slot in slots if slot.name == LEARNER_NAME)
+    active = sum(1 for slot in slots if slot.name in panel.active)
+    historical = sum(1 for slot in slots if slot.name in panel.historical)
+
+    assert 0.37 * len(slots) <= current <= 0.43 * len(slots)
+    assert 0.27 * len(slots) <= active <= 0.33 * len(slots)
+    assert 0.27 * len(slots) <= historical <= 0.33 * len(slots)
+
+
+def test_no_builtin_historical_panel_samples_weighted_buckets_when_capped(
+    tmp_path: Path,
+):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=12,
+        historical_sample_panel_size=2,
+        recent_eviction_archive_size=4,
+        notable_archive_size=4,
+        min_games_before_eviction=0,
+        rng=random.Random(9),
+    )
+    model = _tiny_model()
+    pool.set_current_update(0)
+    notable = pool.add_snapshot(
+        "notable",
+        model,
+        tmp_path / "notable.pt",
+        notable=True,
+    )
+    pool.set_current_update(1)
+    pool.add_snapshot("recent", model, tmp_path / "recent.pt")
+    pool.set_current_update(2)
+    pool.add_snapshot("active", model, tmp_path / "active.pt")
+    pool.set_current_update(4)
+    pool.rebuild_historical_archive()
+
+    assert notable in pool.historical_snapshot_names("notable")
+    assert pool.historical_snapshot_names("recent_eviction")
+    assert pool.historical_snapshot_names("log")
+
+    seen_buckets: set[str] = set()
+    for _ in range(200):
+        panel = pool.sample_panel()
+        for bucket in ("log", "recent_eviction", "notable"):
+            if set(panel.historical) & set(pool.historical_snapshot_names(bucket)):
+                seen_buckets.add(bucket)
+
+    assert seen_buckets == {"log", "recent_eviction", "notable"}
+
+
+def test_no_builtin_sample_filters_stale_panel(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=4,
+        min_games_before_eviction=0,
+        current_learner_prob=0.0,
+        active_pool_prob=0.0,
+        historical_archive_prob=1.0,
+        rng=random.Random(10),
+    )
+    model = _tiny_model()
+    pool.add_snapshot("old", model, tmp_path / "old.pt", created_update=0)
+    panel = pool.sample_panel()
+    pool.set_current_update(1)
+    pool.add_snapshot("new", model, tmp_path / "new.pt", created_update=1)
+    for update in range(2, 10):
+        pool.set_current_update(update)
+        pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
+
+    slots = pool.sample(4, panel=panel)
+
+    assert len(slots) == 4
+    assert all(slot.name == LEARNER_NAME or slot.name in pool.all_snapshot_names() for slot in slots)
+
+
 def test_no_builtin_sample_current_update_rotates_panel_clock(tmp_path: Path):
     pool = NoBuiltinTrainingPool(
         active_pool_size=1,

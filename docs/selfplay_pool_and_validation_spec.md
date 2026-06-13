@@ -129,9 +129,18 @@ Recommended initial settings:
 ```text
 snapshot_every_updates: 1
 active_pool_size: 12-20
+active_sample_panel_size: 2-4
 historical_training_archive_size: 64-256
+historical_sample_panel_size: 2-4
 validation_archive_size: 16-64
 ```
+
+Training samples a small active/archive opponent panel per rollout wave, then
+draws opponent seats from that panel using the normal current/active/historical
+probabilities. This is a throughput constraint, not a ranking rule: it prevents
+one rollout from fragmenting learned-opponent inference across every retained
+snapshot while panels rotate across waves and updates. The validation archive
+remains a separate stable panel.
 
 The active pool does not need every snapshot. Every snapshot may first enter a
 candidate buffer, then either:
@@ -540,8 +549,9 @@ opponents:
   snapshot_every: 1
   snapshot_device: train
   active_pool_size: 16
+  active_sample_panel_size: 2
   historical_training_archive_size: 128
-  historical_sample_panel_size: 8
+  historical_sample_panel_size: 2
   historical_agent_cache_size: 8
 
   min_games_before_active_eviction: 16
