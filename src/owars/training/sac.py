@@ -61,13 +61,13 @@ import torch.nn.functional as F  # noqa: N812
 from torch.utils.tensorboard import SummaryWriter
 
 from ..policies.config import OrbitPolicyConfig
-from ..policies.model import normalize_matrices
 from ..policies.features import (
     MAX_PLANETS,
     EncodedObs,
     bucket_fleet_width,
     encode_raw_observations,
 )
+from ..policies.model import normalize_matrices
 from ..policies.sac_model import (
     QComponents,
     SACActor,
@@ -532,8 +532,8 @@ def _time_feat_from_obs(
     """
     vals = []
     for o in obs_list:
-        get = o.get if isinstance(o, dict) else lambda k, d=None: getattr(o, k, d)
-        step = float(get("step", 0) or 0)
+        step_raw = o.get("step", 0) if isinstance(o, dict) else getattr(o, "step", 0)
+        step = float(step_raw or 0)
         vals.append(min(1.0, max(0.0, step / float(episode_steps))))
     return torch.tensor(vals, dtype=torch.float32, device=device)
 
@@ -1618,7 +1618,7 @@ def _select_opponent_for_episode(state: SACState) -> tuple[str, Any]:
 
 def _run_updates(
     state: SACState,
-    prefetcher: "_ReplayPrefetcher",
+    prefetcher: _ReplayPrefetcher,
     sac: Any,
     device: torch.device,
     *,
