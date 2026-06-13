@@ -126,7 +126,7 @@ def test_bucket_fleets_for_graph_fixed_width_does_not_truncate_used_fleets():
 
     padded = _bucket_fleets_for_graph(feats, fixed_width=1024)
 
-    assert padded.fleet_feats.shape[1] == 1100
+    assert padded.fleet_feats.shape[1] == 2048
     assert padded.fleet_mask[0, 1099]
     assert int(padded.fleet_target_planet_idx[0, 1099]) == 7
 

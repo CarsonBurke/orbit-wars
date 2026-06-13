@@ -190,8 +190,10 @@ def _bucket_fleets_for_graph(
     fixed_width: int | None = None,
 ) -> EncodedObs:
     used = active_fleet_width(feats.fleet_mask)
-    width = max(used, int(fixed_width)) if fixed_width is not None else (
-        bucket_fleet_width(used)
+    width = (
+        int(fixed_width)
+        if fixed_width is not None and used <= int(fixed_width)
+        else bucket_fleet_width(used)
     )
     return slice_encoded_fleet_width(feats, width)
 
