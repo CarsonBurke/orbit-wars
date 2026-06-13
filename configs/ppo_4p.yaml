@@ -28,28 +28,35 @@ model:
   dropout: 0.0
   planet_rope_fraction: 0.25
   planet_rope_base: 10000.0
-  encoder_backend: fleet_latent
+  encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
   value_min: -100000.0
   value_max: 100000.0
   value_num_bins: 153
+  value_sigma_to_bin_ratio: 2.0
+  critic_mtp_horizon: 6
   value_symlog: true
 
 optim:
   lr: 2.0e-4
   head_lr: 2.0e-4
+  kl_lr_target: 0.025
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
   weight_decay: 1.0e-4
-  grad_clip: 0.5
+  grad_clip: 1.0
   minibatch_size: 4096
   epochs_per_update: 4
 
 ppo:
   gamma: 0.997
   gae_lambda: 0.95
+  advantage_transform: rankgauss
   norm_advantage: true
-  spo_eps_low: 0.4
-  spo_eps_high: 0.56
+  clip_coef: 0.2
+  clip_coef_high: 0.28
   value_coef: 1.0
   target_entropy_coef: 0.015
   fraction_entropy_coef: 0.0

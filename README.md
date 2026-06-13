@@ -49,17 +49,20 @@ python scripts/ablate.py --matrix ablations/headline.yaml
 
 ## Submitting
 
-1. Build the bundle:
-   ```bash
-   python scripts/bundle.py --ckpt checkpoints/ppo_base/final.pt --out submission.tar.gz
-   ```
-2. Sanity-check it:
-   ```bash
-   python submission/main.py
-   ```
-3. Submit:
-   ```bash
-   kaggle competitions submit orbit-wars -f submission.tar.gz -m "ppo_base v1"
-   ```
+Use the helper script for real submissions. It builds the tarball, validates the extracted bundle locally, loads Kaggle credentials from the environment or `.env`, then uploads through the Kaggle CLI.
+
+```bash
+uv run --extra kaggle python scripts/submit.py \
+  --ckpt checkpoints/ppo_sniper/latest.pt \
+  --out submission_ppo_sniper_latest.tar.gz \
+  --message "ppo_sniper latest checkpoint"
+```
+
+For a build + validation pass without upload, add `--dry-run`. To inspect current server status:
+
+```bash
+set -a; . ./.env; set +a
+uv run --extra kaggle kaggle competitions submissions -c orbit-wars
+```
 
 See [`submission/README.md`](./submission/README.md) for runtime constraints (no internet, 1 second per turn, validation episode).

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import copy
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,7 +32,25 @@ import torch
 from ..agents.heuristic import heuristic_agent
 from ..agents.learned import LearnedAgent
 from ..agents.random_agent import random_agent
-from ..agents.sniper import sniper_agent
+from ..agents.sniper import (
+    sniper_agent,
+    sniper_v2_agent,
+    sniper_v3_agent,
+    sniper_v4_agent,
+    sniper_v5_agent,
+    sniper_v6_agent,
+    sniper_v7_agent,
+    sniper_v8_agent,
+    sniper_v9_agent,
+    sniper_v10_agent,
+    sniper_v11_agent,
+    sniper_v12_agent,
+    sniper_v13_agent,
+    sniper_v14_agent,
+    sniper_v15_agent,
+    sniper_v16_agent,
+    sniper_v17_agent,
+)
 from ..policies.model import OrbitPolicy
 from .elo import EloTracker
 
@@ -43,6 +61,22 @@ LEARNER_NAME = "learner"
 BUILTIN: dict[str, AgentFn] = {
     "random": random_agent,
     "sniper": sniper_agent,
+    "sniper_v2": sniper_v2_agent,
+    "sniper_v3": sniper_v3_agent,
+    "sniper_v4": sniper_v4_agent,
+    "sniper_v5": sniper_v5_agent,
+    "sniper_v6": sniper_v6_agent,
+    "sniper_v7": sniper_v7_agent,
+    "sniper_v8": sniper_v8_agent,
+    "sniper_v9": sniper_v9_agent,
+    "sniper_v10": sniper_v10_agent,
+    "sniper_v11": sniper_v11_agent,
+    "sniper_v12": sniper_v12_agent,
+    "sniper_v13": sniper_v13_agent,
+    "sniper_v14": sniper_v14_agent,
+    "sniper_v15": sniper_v15_agent,
+    "sniper_v16": sniper_v16_agent,
+    "sniper_v17": sniper_v17_agent,
     "heuristic": heuristic_agent,
 }
 
@@ -78,6 +112,7 @@ class OpponentPool:
         self.device = device
         self.rng = rng or random.Random()
         self._frozen: dict[str, AgentFn] = {}
+        self._frozen_paths: dict[str, Path] = {}
 
     # --- snapshot management -------------------------------------------------
 
@@ -123,6 +158,7 @@ class OpponentPool:
             device=self.device,
             deterministic=False,
         )
+        self._frozen_paths[name] = ckpt_path
         if seed_rating is None:
             seed_rating = self.elo.get(LEARNER_NAME)
         self.elo.set(name, float(seed_rating))
@@ -139,6 +175,9 @@ class OpponentPool:
         ranked = sorted(self._frozen.keys(), key=lambda n: self.elo.ucb(n), reverse=True)
         for name in ranked[self.top_k :]:
             self._frozen.pop(name, None)
+            path = self._frozen_paths.pop(name, None)
+            if path is not None:
+                path.unlink(missing_ok=True)
             # Leave the rating in EloTracker — it's history; cheap to keep.
 
     def snapshot_names(self) -> list[str]:
@@ -159,3 +198,33 @@ class OpponentPool:
             return OpponentSlot(name=LEARNER_NAME, agent=None)
         name = self.rng.choice(self.snapshot_names())
         return OpponentSlot(name=name, agent=self._frozen[name])
+
+
+class FixedOpponentPool:
+    """Static builtin-opponent sampler with the `OpponentPool` rollout API."""
+
+    def __init__(
+        self,
+        opponent_names: Sequence[str],
+        rng: random.Random | None = None,
+    ):
+        unknown = set(opponent_names) - set(BUILTIN)
+        if unknown:
+            raise ValueError(
+                f"unknown fixed opponents {sorted(unknown)}; "
+                f"valid: {sorted(BUILTIN)}"
+            )
+        if not opponent_names:
+            raise ValueError("fixed opponent mode requires at least one opponent")
+        self.opponent_names = list(opponent_names)
+        self.rng = rng or random.Random()
+
+    def sample(self, k: int) -> list[OpponentSlot]:
+        return [self._sample_one() for _ in range(k)]
+
+    def _sample_one(self) -> OpponentSlot:
+        name = self.rng.choice(self.opponent_names)
+        return OpponentSlot(name=name, agent=BUILTIN[name])
+
+    def snapshot_names(self) -> list[str]:
+        return []

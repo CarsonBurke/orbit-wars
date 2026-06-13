@@ -218,6 +218,23 @@ class VecEnv:
             out.append(state)
         return out
 
+    def reset_subset(self, indices: list[int]) -> dict[int, Any]:
+        """Reset only `indices` (the envs that just finished an episode).
+
+        Returns `{env_idx: state}`. Continuous off-policy rollouts (SAC) reset
+        envs independently as they terminate, unlike the all-or-nothing
+        `reset()` an episodic PPO rollout uses at the start of each batch.
+        """
+        for i in indices:
+            self._remotes[i].send((_RESET, None))
+        out: dict[int, Any] = {}
+        for i in indices:
+            tag, state, _done, _final, _html = self._remotes[i].recv()
+            if tag != "ok":
+                raise RuntimeError(f"worker {i} reset failed: {state}")
+            out[i] = state
+        return out
+
     def step_subset(
         self, indices: list[int], actions: list[Any]
     ) -> dict[int, tuple[Any, bool, Any]]:

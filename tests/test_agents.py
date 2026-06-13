@@ -1,7 +1,8 @@
 import math
 
-from owars.agents import HeuristicAgent, random_agent, sniper_agent
+from owars.agents import HeuristicAgent, random_agent, sniper_agent, sniper_v4_agent
 from owars.agents.learned import _FleetTargetTracker
+from owars.policies.sampling import _lead_solution
 
 
 def _obs(my_planet, enemy_planet, my_ships=50, enemy_ships=10):
@@ -37,18 +38,161 @@ def test_random_agent_returns_valid_move_format():
 
 
 def test_sniper_attacks_when_strong_enough():
-    moves = sniper_agent(_obs((10, 10), (90, 90), my_ships=50, enemy_ships=10))
+    moves = sniper_agent(_obs((10, 10), (30, 10), my_ships=50, enemy_ships=10))
     assert len(moves) == 1
     from_id, angle, ships = moves[0]
     assert from_id == 0
     assert ships == 11  # garrison + 1
-    # Aimed at +x +y direction (target is to the lower-right).
-    assert angle > 0
+    assert abs(angle) < 1e-6
+
+
+def test_sniper_leads_orbiting_targets():
+    obs = {
+        "player": 1,
+        "step": 39,
+        "planets": [
+            [7, 1, 40.94067950847622, 3.0626606347240966, 2.6094379124341005, 23, 5],
+            [15, -1, 50.91883994305307, 15.10845967653814, 1.0, 18, 1],
+        ],
+        "fleets": [],
+        "angular_velocity": 0.04,
+        "initial_planets": [],
+        "comet_planet_ids": [],
+        "comets": [],
+        "remainingOverageTime": 60.0,
+    }
+
+    moves = sniper_agent(obs)
+    assert len(moves) == 1
+    naive = math.atan2(
+        15.10845967653814 - 3.0626606347240966,
+        50.91883994305307 - 40.94067950847622,
+    )
+    assert abs(moves[0][1] - naive) > 0.1
+
+
+def test_sniper_treats_comet_target_as_non_orbiting():
+    source_x, source_y = 30.230528337169282, 37.113714576315715
+    target_x, target_y = 47.52883413524248, 97.05854540070332
+    obs = {
+        "player": 0,
+        "step": 50,
+        "planets": [
+            [13, 0, source_x, source_y, 1.0, 20, 1],
+            [29, -1, target_x, target_y, 1.0, 7, 1],
+        ],
+        "fleets": [],
+        "angular_velocity": 0.04,
+        "initial_planets": [],
+        "comet_planet_ids": [29],
+        "comets": [
+            {
+                "planet_ids": [29],
+                "paths": [[[47.52883413524248, 97.05854540070332], [47.0, 95.0]]],
+                "path_index": 0,
+            }
+        ],
+        "remainingOverageTime": 60.0,
+    }
+    static_solution = _lead_solution(
+        source_x,
+        source_y,
+        1.0,
+        target_x,
+        target_y,
+        1.0,
+        obs["angular_velocity"],
+        8,
+        target_is_comet=True,
+    )
+    orbiting_solution = _lead_solution(
+        source_x,
+        source_y,
+        1.0,
+        target_x,
+        target_y,
+        1.0,
+        obs["angular_velocity"],
+        8,
+        target_is_comet=False,
+    )
+
+    moves = sniper_agent(obs)
+
+    assert len(moves) == 1
+    assert moves[0][0] == 13
+    assert static_solution is not None
+    assert orbiting_solution is not None
+    assert abs(moves[0][1] - static_solution.angle) < 1e-9
+    assert abs(moves[0][1] - orbiting_solution.angle) > 0.1
+
+
+def test_sniper_skips_route_swept_moving_source_shot():
+    obs = {
+        "player": 0,
+        "step": 0,
+        "planets": [
+            [0, 0, 80.0, 50.0, 1.0, 50, 3],
+            [1, -1, 56.68747071561468, 74.08895463542983, 1.0, 10, 2],
+        ],
+        "fleets": [],
+        "angular_velocity": 0.05,
+        "initial_planets": [],
+        "comet_planet_ids": [],
+        "comets": [],
+        "remainingOverageTime": 60.0,
+    }
+
+    assert sniper_agent(obs) == []
 
 
 def test_sniper_holds_when_weak():
     moves = sniper_agent(_obs((10, 10), (90, 90), my_ships=5, enemy_ships=20))
     assert moves == []
+
+
+def test_sniper_v4_does_not_duplicate_completed_capture():
+    obs = {
+        "player": 0,
+        "step": 0,
+        "planets": [
+            [0, 0, 10.0, 10.0, 1.0, 35, 3],
+            [1, 0, 10.0, 20.0, 1.0, 35, 3],
+            [2, -1, 40.0, 10.0, 1.0, 8, 2],
+        ],
+        "fleets": [],
+        "angular_velocity": 0.0,
+        "initial_planets": [],
+        "comet_planet_ids": [],
+        "comets": [],
+        "remainingOverageTime": 60.0,
+    }
+
+    moves = sniper_v4_agent(obs)
+
+    assert len(moves) == 1
+    assert sum(move[2] for move in moves if move[0] in {0, 1}) <= 9
+
+
+def test_sniper_v4_reserves_against_inbound_enemy_fleet():
+    obs = {
+        "player": 0,
+        "step": 0,
+        "planets": [
+            [0, 0, 20.0, 20.0, 1.0, 20, 3],
+            [1, -1, 45.0, 20.0, 1.0, 5, 2],
+        ],
+        "fleets": [
+            [9, 1, 35.0, 20.0, math.pi, 3, 15],
+        ],
+        "angular_velocity": 0.0,
+        "initial_planets": [],
+        "comet_planet_ids": [],
+        "comets": [],
+        "remainingOverageTime": 60.0,
+    }
+
+    assert sniper_v4_agent(obs) == []
 
 
 def test_heuristic_keeps_reserve():

@@ -18,12 +18,14 @@ from ..policies.sampling import ActionContext
 from .numpy_env import NumpyVecEnv
 
 _RESET = "reset"
+_RESET_SUBSET = "reset_subset"
 _STEP = "step"
 _STEP_FAST = "step_fast"
 _OBSERVATION = "observation"
 _OBSERVATIONS = "observations"
 _POLICY_BATCH = "policy_batch"
 _REWARD_POTENTIALS = "reward_potentials"
+_PRODUCTION_MARGINS = "production_margins"
 _CLOSE = "close"
 _SET_RECORDING = "set_recording"
 
@@ -78,6 +80,9 @@ def _numpy_shard_worker(
                 remote.send(("ok", None))
             elif cmd == _RESET:
                 remote.send(("ok", vec.reset()))
+            elif cmd == _RESET_SUBSET:
+                indices = [int(idx) for idx in payload]
+                remote.send(("ok", vec.reset_subset(indices)))
             elif cmd == _STEP:
                 indices, actions = payload
                 remote.send(("ok", vec.step_subset(indices, actions)))
@@ -93,10 +98,20 @@ def _numpy_shard_worker(
                     ("ok", [vec.observation(idx, player) for idx, player in rows])
                 )
             elif cmd == _POLICY_BATCH:
-                rows = [(int(idx), int(player)) for idx, player in payload]
+                rows_payload, include_fleet_targets = payload
+                rows = [(int(idx), int(player)) for idx, player in rows_payload]
                 # Keep tensors on CPU across process boundaries. The parent
                 # process performs the single pinned CPU -> CUDA transfer.
-                remote.send(("ok", vec.policy_batch(rows, device="cpu")))
+                remote.send(
+                    (
+                        "ok",
+                        vec.policy_batch(
+                            rows,
+                            device="cpu",
+                            include_fleet_targets=bool(include_fleet_targets),
+                        ),
+                    )
+                )
             elif cmd == _REWARD_POTENTIALS:
                 rows, production_weight = payload
                 rows = [(int(idx), int(player)) for idx, player in rows]
@@ -108,6 +123,9 @@ def _numpy_shard_worker(
                         ),
                     )
                 )
+            elif cmd == _PRODUCTION_MARGINS:
+                rows = [(int(idx), int(player)) for idx, player in payload]
+                remote.send(("ok", vec.production_margins(rows)))
             else:
                 remote.send(("err", f"unknown cmd: {cmd!r}"))
     except Exception as exc:
@@ -191,6 +209,32 @@ class ShardedNumpyVecEnv:
             start, _size = self.shards[shard_idx]
             for local_idx, state in enumerate(payload):
                 states[start + local_idx] = state
+        return states
+
+    def reset_subset(self, indices: list[int]) -> dict[int, Any]:
+        self.last_replay_html = None
+        grouped_indices: list[list[int]] = [[] for _ in self.shards]
+        for env_idx in indices:
+            shard_idx, local_idx = self._env_to_shard[env_idx]
+            grouped_indices[shard_idx].append(local_idx)
+
+        active_shards: list[int] = []
+        for shard_idx, local_indices in enumerate(grouped_indices):
+            if not local_indices:
+                continue
+            self._remotes[shard_idx].send((_RESET_SUBSET, local_indices))
+            active_shards.append(shard_idx)
+
+        states: dict[int, Any] = {}
+        for shard_idx in active_shards:
+            tag, payload = self._remotes[shard_idx].recv()
+            if tag != "ok":
+                raise RuntimeError(
+                    f"numpy shard {shard_idx} reset_subset failed: {payload}"
+                )
+            start, _size = self.shards[shard_idx]
+            for local_idx, state in payload.items():
+                states[start + int(local_idx)] = state
         return states
 
     def step_subset(
@@ -288,6 +332,7 @@ class ShardedNumpyVecEnv:
         *,
         device: str = "cpu",
         pin_memory: bool = False,
+        include_fleet_targets: bool = False,
     ) -> tuple[EncodedObs, list[ActionContext]]:
         del device, pin_memory
         if not rows:
@@ -304,7 +349,9 @@ class ShardedNumpyVecEnv:
         for shard_idx, local_rows in enumerate(grouped_rows):
             if not local_rows:
                 continue
-            self._remotes[shard_idx].send((_POLICY_BATCH, local_rows))
+            self._remotes[shard_idx].send(
+                (_POLICY_BATCH, (local_rows, include_fleet_targets))
+            )
             active_shards.append(shard_idx)
 
         encoded_by_pos: list[EncodedObs | None] = [None] * len(rows)
@@ -364,6 +411,39 @@ class ShardedNumpyVecEnv:
         values = [value for value in out if value is not None]
         if len(values) != len(rows):
             raise RuntimeError("incomplete sharded reward potentials")
+        return values
+
+    def production_margins(self, rows: list[tuple[int, int]]) -> Any:
+        if not rows:
+            return []
+
+        grouped_rows: list[list[tuple[int, int]]] = [[] for _ in self.shards]
+        grouped_positions: list[list[int]] = [[] for _ in self.shards]
+        for pos, (env_idx, player) in enumerate(rows):
+            shard_idx, local_idx = self._env_to_shard[env_idx]
+            grouped_rows[shard_idx].append((local_idx, player))
+            grouped_positions[shard_idx].append(pos)
+
+        active_shards: list[int] = []
+        for shard_idx, local_rows in enumerate(grouped_rows):
+            if not local_rows:
+                continue
+            self._remotes[shard_idx].send((_PRODUCTION_MARGINS, local_rows))
+            active_shards.append(shard_idx)
+
+        out: list[float | None] = [None] * len(rows)
+        for shard_idx in active_shards:
+            tag, payload = self._remotes[shard_idx].recv()
+            if tag != "ok":
+                raise RuntimeError(
+                    f"numpy shard {shard_idx} production_margins failed: {payload}"
+                )
+            for value, pos in zip(payload, grouped_positions[shard_idx], strict=True):
+                out[pos] = float(value)
+
+        values = [value for value in out if value is not None]
+        if len(values) != len(rows):
+            raise RuntimeError("incomplete sharded production margins")
         return values
 
     def set_recording(self, enabled: bool) -> None:

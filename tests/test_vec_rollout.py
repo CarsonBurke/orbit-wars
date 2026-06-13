@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -7,6 +9,7 @@ from owars.policies.features import EncodedObs
 from owars.agents.learned import _FleetTargetTracker
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
+from owars.training.config import RewardCfg
 from owars.training.league import LEARNER_NAME, OpponentSlot
 from owars.training.numpy_env import NumpyVecEnv
 from owars.training.sharded_numpy_env import ShardedNumpyVecEnv
@@ -16,8 +19,11 @@ from owars.training.vec_env import (
     _strip_action_sidecars,
 )
 from owars.training.vec_rollout import (
+    _empty_traj,
+    _finalize_trajectory,
     _normalize_learner_seats,
     _obs_reward_potential,
+    _reward_potentials,
     _resolve_seat_agents,
     _trim_fleets_for_forward,
     _state_reward_potential,
@@ -59,22 +65,22 @@ def test_normalize_learner_seats_validates_length_and_range():
         _normalize_learner_seats([0, 2, 1], num_envs=3, num_players=2)
 
 
-def test_trim_fleets_for_forward_keeps_planet_tensors_and_trims_fleets():
+def test_trim_fleets_for_forward_keeps_planet_tensors_and_buckets_fleets():
     feats = EncodedObs(
         planet_feats=torch.zeros(2, 64, 19),
         planet_mask=torch.ones(2, 64, dtype=torch.bool),
         planet_owned_mask=torch.zeros(2, 64, dtype=torch.bool),
         planet_ids=torch.arange(64).expand(2, -1),
         planet_garrison=torch.zeros(2, 64),
-        fleet_feats=torch.zeros(2, 384, 20),
-        fleet_mask=torch.zeros(2, 384, dtype=torch.bool),
+        fleet_feats=torch.zeros(2, 513, 20),
+        fleet_mask=torch.zeros(2, 513, dtype=torch.bool),
     )
     feats.fleet_mask[0, 3] = True
     feats.fleet_mask[1, 18] = True
 
     trimmed = _trim_fleets_for_forward(feats)
 
-    assert trimmed.fleet_feats.shape[1] == 19
+    assert trimmed.fleet_feats.shape[1] == 64
     assert trimmed.planet_feats.data_ptr() == feats.planet_feats.data_ptr()
     assert trimmed.planet_mask.data_ptr() == feats.planet_mask.data_ptr()
 
@@ -116,6 +122,76 @@ def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():
         done_state, player=0, num_players=3, episode_steps=100, production_weight=1.0
     )
     assert early_finish_phi == pytest.approx(phi)
+
+
+def test_reward_potentials_can_use_production_margin_signal():
+    obs = {
+        "player": 0,
+        "step": 10,
+        "planets": [
+            [0, 0, 0.0, 0.0, 1.0, 10, 2],
+            [1, 1, 0.0, 0.0, 1.0, 20, 1],
+            [2, 2, 0.0, 0.0, 1.0, 5, 4],
+        ],
+        "fleets": [[10, 0, 0.0, 0.0, 0.0, 0, 999]],
+    }
+    state = [
+        {"status": "ACTIVE", "observation": obs},
+        {"status": "ACTIVE", "observation": {**obs, "player": 1}},
+        {"status": "ACTIVE", "observation": {**obs, "player": 2}},
+    ]
+    values = _reward_potentials(
+        vec=object(),
+        states=[state],
+        rows=[(0, 0)],
+        num_players=3,
+        episode_steps=100,
+        reward_cfg=RewardCfg(signal="production_margin"),
+    )
+
+    assert values == pytest.approx([2 - 4])
+
+
+def test_win_terminal_signal_has_no_dense_potential_and_applies_terminal_outcome():
+    state = [
+        {
+            "status": "ACTIVE",
+            "observation": {
+                "player": 0,
+                "step": 10,
+                "planets": [[0, 0, 0.0, 0.0, 1.0, 10, 2]],
+                "fleets": [],
+            },
+        }
+    ]
+    reward_cfg = RewardCfg(
+        signal="win_terminal",
+        win_value=1.0,
+        loss_value=-1.0,
+        draw_value=0.0,
+    )
+
+    assert _reward_potentials(
+        vec=object(),
+        states=[state],
+        rows=[(0, 0)],
+        num_players=2,
+        episode_steps=100,
+        reward_cfg=reward_cfg,
+    ) == [0.0]
+
+    traj = _empty_traj()
+    traj.reward.append(0.0)
+    _finalize_trajectory(
+        traj,
+        [SimpleNamespace(score=12.0, reward=12.0), SimpleNamespace(score=7.0, reward=7.0)],
+        learner_seat=0,
+        reward_cfg=reward_cfg,
+    )
+
+    assert traj.won is True
+    assert traj.final_score == pytest.approx(5.0)
+    assert traj.reward == pytest.approx([1.0])
 
 
 def test_kaggle_vecenv_helpers_preserve_policy_target_sidecars():
@@ -188,6 +264,8 @@ def test_numpy_fast_rollout_records_configured_learner_seats():
         assert any(mask.any() for mask in traj.owned_mask)
         for owned, obs in zip(traj.owned_mask, traj.encoded, strict=True):
             assert owned.equal(obs.planet_owned_mask)
+            assert obs.global_feats is not None
+            assert obs.global_feats.shape == (model.cfg.global_features,)
 
 
 def test_numpy_reward_potentials_match_materialized_observations():

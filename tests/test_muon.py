@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from owars.training.muon import Muon, zeropower_via_newtonschulz5
+from owars.training.muon import Muon, MultiOptimizer, zeropower_via_newtonschulz5
 
 
 def _clone_params(params: list[torch.nn.Parameter]) -> list[torch.nn.Parameter]:
@@ -48,7 +49,7 @@ def test_fused_muon_matches_scalar_muon_step():
             momentum=0.9,
             backend_steps=3,
             nesterov=nesterov,
-            row_normalize=True,
+            normuon=True,
             fused=False,
             momentum_warmup_steps=2,
             momentum_warmup_start=0.8,
@@ -62,7 +63,7 @@ def test_fused_muon_matches_scalar_muon_step():
             momentum=0.9,
             backend_steps=3,
             nesterov=nesterov,
-            row_normalize=True,
+            normuon=True,
             fused=True,
             momentum_warmup_steps=2,
             momentum_warmup_start=0.8,
@@ -82,6 +83,11 @@ def test_fused_muon_matches_scalar_muon_step():
             b_scalar = scalar.state[p_scalar]["momentum_buffer"]
             b_fused = fused.state[p_fused]["momentum_buffer"]
             assert torch.allclose(b_scalar, b_fused, atol=1e-6, rtol=1e-6)
+            # NorMuon's per-neuron second-moment EMA must also stay in lockstep
+            # between the scalar and fused (bucketed) paths.
+            v_scalar = scalar.state[p_scalar]["second_momentum_buffer"]
+            v_fused = fused.state[p_fused]["second_momentum_buffer"]
+            assert torch.allclose(v_scalar, v_fused, atol=1e-6, rtol=1e-6)
 
 
 def test_muon_state_dict_preserves_warmup_step_count():
@@ -111,3 +117,22 @@ def test_muon_state_dict_preserves_warmup_step_count():
     restored.load_state_dict(opt.state_dict())
 
     assert restored._step_count == opt._step_count
+
+
+def test_multi_optimizer_lr_scale_composes_with_warmup():
+    p = torch.nn.Parameter(torch.zeros(4, 4))
+    inner = torch.optim.SGD([p], lr=1.0)
+    opt = MultiOptimizer([inner], lr_warmup_steps=2)
+    opt.set_lr_scale(0.5)
+    p.grad = torch.zeros_like(p)
+
+    opt.step()  # warmup 1/2 x scale 0.5
+    assert inner.param_groups[0]["lr"] == pytest.approx(0.25)
+    opt.step()  # warmup 2/2 x scale 0.5
+    assert inner.param_groups[0]["lr"] == pytest.approx(0.5)
+    opt.step()  # post-warmup: the schedule scale alone persists
+    assert inner.param_groups[0]["lr"] == pytest.approx(0.5)
+
+    opt.set_lr_scale(0.1)
+    opt.step()
+    assert inner.param_groups[0]["lr"] == pytest.approx(0.1)

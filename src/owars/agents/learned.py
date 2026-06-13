@@ -10,6 +10,7 @@ the submission shell can lazy-load weights only once per process.
 from __future__ import annotations
 
 import math
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +18,11 @@ import torch
 import torch.nn as nn
 
 from ..policies.features import (
-    MAX_FLEETS,
     MAX_PLANETS,
     EncodedObs,
+    bucket_encoded_fleet_width,
     encode_raw_observations,
+    fleet_target_planet_idx_or_empty,
 )
 from ..policies.model import (
     OrbitPolicy,
@@ -29,6 +31,11 @@ from ..policies.model import (
     restore_fp32_params,
 )
 from ..policies.sampling import sample_batch_actions_raw
+
+
+def _policy_config_from_checkpoint(raw: dict[str, Any]) -> OrbitPolicyConfig:
+    allowed = {field.name for field in fields(OrbitPolicyConfig)}
+    return OrbitPolicyConfig(**{k: v for k, v in raw.items() if k in allowed})
 
 
 def _angle_delta(a: float, b: float) -> float:
@@ -169,6 +176,7 @@ class _InferenceForwardKernel(nn.Module):
 
     def forward(
         self,
+        global_feats: torch.Tensor,
         planet_feats: torch.Tensor,
         planet_mask: torch.Tensor,
         planet_owned_mask: torch.Tensor,
@@ -176,6 +184,7 @@ class _InferenceForwardKernel(nn.Module):
         planet_garrison: torch.Tensor,
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -185,6 +194,8 @@ class _InferenceForwardKernel(nn.Module):
             planet_garrison=planet_garrison,
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
+            global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
         )
         with torch.autocast(
             device_type="cuda",
@@ -223,20 +234,40 @@ def _pad_encoded(feats: EncodedObs, rows: int) -> EncodedObs:
         planet_garrison=_pad_rows(feats.planet_garrison, rows),
         fleet_feats=_pad_rows(feats.fleet_feats, rows),
         fleet_mask=_pad_rows(feats.fleet_mask, rows, fill=False),
+        global_feats=None
+        if feats.global_feats is None
+        else _pad_rows(feats.global_feats, rows),
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else _pad_rows(feats.fleet_target_planet_idx, rows, fill=-1),
     )
+
+
+def _global_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
+    if feats.global_feats is not None:
+        return feats.global_feats
+    batch = feats.planet_feats.shape[0]
+    return feats.planet_feats.new_zeros(batch, 0)
 
 
 def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
     return PolicyOutput(
         launch_logits=out.launch_logits[:rows],
         target_logits=out.target_logits[:rows],
-        fraction_mean=out.fraction_mean[:rows],
-        fraction_log_std=out.fraction_log_std[:rows],
         value=out.value[:rows],
         value_logits=out.value_logits[:rows],
         planet_owned_mask=out.planet_owned_mask[:rows],
         planet_mask=out.planet_mask[:rows],
         planet_ids=out.planet_ids[:rows],
+        action_logit_softcap=out.action_logit_softcap,
+        launch_log_std=None if out.launch_log_std is None else out.launch_log_std[:rows],
+        launch_prob_floor=out.launch_prob_floor,
+        fraction_alpha=None if out.fraction_alpha is None else out.fraction_alpha[:rows],
+        fraction_beta=None if out.fraction_beta is None else out.fraction_beta[:rows],
+        fraction_mean=None if out.fraction_mean is None else out.fraction_mean[:rows],
+        fraction_log_std=(
+            None if out.fraction_log_std is None else out.fraction_log_std[:rows]
+        ),
     )
 
 
@@ -250,7 +281,7 @@ class LearnedAgent:
         compile_graph_rows: int | None = None,
     ):
         state = torch.load(ckpt_path, map_location=device)
-        cfg = OrbitPolicyConfig(**state["config"])
+        cfg = _policy_config_from_checkpoint(state["config"])
         self.model = OrbitPolicy(cfg).to(device)
         # Match the training-time fp32-master pattern so loaded checkpoints
         # cast cleanly under autocast on CUDA. CPU load (kaggle submission
@@ -258,7 +289,7 @@ class LearnedAgent:
         if torch.device(device).type == "cuda":
             self.model.bfloat16()
             restore_fp32_params(self.model)
-        self.model.load_state_dict(state["model"])
+        self.model.load_state_dict(state["model"], strict=True)
         self.model.eval()
         self.device = device
         self.deterministic = deterministic
@@ -268,7 +299,7 @@ class LearnedAgent:
             if self.compile_mode is not None and compile_graph_rows is not None
             else None
         )
-        self._forward_kernels: dict[tuple[int, bool], nn.Module] = {}
+        self._forward_kernels: dict[tuple[int, int, bool], nn.Module] = {}
         self._tracker = _FleetTargetTracker()
         self._batch_trackers: dict[tuple[Any, ...], _FleetTargetTracker] = {}
         if self.compile_graph_rows is not None:
@@ -300,11 +331,22 @@ class LearnedAgent:
             planet_garrison=torch.zeros(rows, MAX_PLANETS, device=device),
             fleet_feats=torch.zeros(
                 rows,
-                MAX_FLEETS,
+                1,
                 self.model.cfg.fleet_features,
                 device=device,
             ),
-            fleet_mask=torch.zeros(rows, MAX_FLEETS, dtype=torch.bool, device=device),
+            fleet_mask=torch.zeros(rows, 1, dtype=torch.bool, device=device),
+            fleet_target_planet_idx=torch.full(
+                (rows, 1),
+                -1,
+                dtype=torch.long,
+                device=device,
+            ),
+            global_feats=torch.zeros(
+                rows,
+                self.model.cfg.global_features,
+                device=device,
+            ),
         )
         with torch.inference_mode():
             self._forward(feats, rows, include_value=False)
@@ -327,8 +369,9 @@ class LearnedAgent:
             graph_rows = _next_power_of_two(rows)
         else:
             graph_rows = rows
+        feats = bucket_encoded_fleet_width(feats) if self.compile_mode is not None else feats
         graph_feats = _pad_encoded(feats, graph_rows) if graph_rows != rows else feats
-        kernel_key = (graph_rows, bool(include_value))
+        kernel_key = (graph_rows, int(graph_feats.fleet_feats.shape[1]), bool(include_value))
         kernel = self._forward_kernels.get(kernel_key)
         if kernel is None:
             kernel = _InferenceForwardKernel(
@@ -347,6 +390,7 @@ class LearnedAgent:
         if self.compile_mode is not None:
             _mark_cuda_graph_step(device)
         out = kernel(
+            _global_feats_or_empty(graph_feats),
             graph_feats.planet_feats,
             graph_feats.planet_mask,
             graph_feats.planet_owned_mask,
@@ -354,13 +398,19 @@ class LearnedAgent:
             graph_feats.planet_garrison,
             graph_feats.fleet_feats,
             graph_feats.fleet_mask,
+            fleet_target_planet_idx_or_empty(graph_feats),
         )
         return _slice_policy_output(out, rows) if graph_rows != rows else out
 
     @torch.inference_mode()
     def __call__(self, obs: Any) -> list[list]:
         annotated = self._tracker.annotate(obs)
-        feats = encode_raw_observations([annotated], device=self.device)
+        feats = encode_raw_observations(
+            [annotated],
+            device=self.device,
+            include_fleet_targets=self.model.cfg.encoder_backend
+            == "destination_conditioned",
+        )
         out = self._forward(feats, 1, include_value=False)
         actions = sample_batch_actions_raw(
             out,
@@ -385,6 +435,8 @@ class LearnedAgent:
             annotated,
             device=self.device,
             pin_memory=torch.device(self.device).type == "cuda",
+            include_fleet_targets=self.model.cfg.encoder_backend
+            == "destination_conditioned",
         )
         out = self._forward(feats, len(annotated), include_value=False)
         actions_list = sample_batch_actions_raw(

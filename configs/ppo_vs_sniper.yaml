@@ -1,0 +1,125 @@
+# PPO fixed-opponent config: train only against the tuned sniper_v17 bot.
+#
+# 2-player PPO config.
+#
+# Defaults baked in:
+#   - CleanRL clip-higher surrogate with `clip_coef = 0.2`,
+#     `clip_coef_high = 0.28`, rank-Gaussian policy advantages, and
+#     minibatch advantage normalization.
+#   - Dense reward = delta of raw projected population margin.
+#   - Conventional GAE: γ = 0.997, λ = 0.95.
+#   - Distributional value head (symlog HL-Gauss CE on ±100k raw margin / 153 bins), unclipped.
+
+run:
+  name: ppo_vs_sniper
+  seed: 0
+  device: cuda
+  compile_mode: reduce-overhead
+  log_root: runs
+  ckpt_root: checkpoints
+  total_updates: 1000
+
+game:
+  num_players: 2
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  dim: 128         # head_dim = dim / n_heads = 32 — Flash Attention 2 only
+                   # accepts head_dim ∈ {16, 32, 64, 128, 256}, so 32 is the
+                   # cheapest setting that lets SDPA dispatch to the FA2 kernel
+                   # under bf16 autocast. dim=96 (head_dim=24) silently fell
+                   # back to the math/mem-efficient kernel.
+  ff_dim: 256      # 2·dim — sufficient for the trunk's small token count
+                   # (≤17 planets + meta), and halves PPO-update activation
+                   # footprint vs the canonical 4·dim.
+  depth: 3
+  n_heads: 4
+  n_kv_heads: 1
+  dropout: 0.0
+  planet_rope_fraction: 0.25   # partial 2D RoPE over 8/32 dims per head, planets only
+  planet_rope_base: 10000.0
+  encoder_backend: destination_conditioned
+  num_fleet_latents: 64
+  fleet_tokenizer_depth: 1
+  value_min: -100000.0
+  value_max: 100000.0
+  value_num_bins: 153
+  value_sigma_to_bin_ratio: 2.0
+  critic_mtp_horizon: 6
+  value_symlog: true
+  action_logit_softcap: 8.0
+
+optim:
+  # Muon (transformer block matrix params). Matches parameter-golf
+  # `matrix_lr=0.022`.
+  # `muon_weight_decay` left at 0 — pg uses heavy WD because LM training is
+  # stationary; PPO is non-stationary (each update sees a new behavior
+  # distribution) and WD would bias the policy toward pre-update weights
+  # in a way the importance ratio doesn't account for.
+  muon_lr: 0.022   # parameter-golf's `matrix_lr` exactly.
+  # AdamW (input projections, task heads, biases, tokens).
+  lr: 3.0e-4
+  head_lr: 3.0e-4
+  kl_lr_target: 0.025
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
+  weight_decay: 1.0e-4
+  grad_clip: 1.0   # actor and critic flows are clipped separately, including
+                   # each flow's task head plus shared-trunk components.
+  # Fixed minibatch SIZE (no minibatch_count) so every optimizer step has the
+  # same leading dim across updates. `n` is the sum of full-episode trajectory
+  # lengths and swings widely per update, so a fixed COUNT would give a
+  # per-update-variable `ceil(n/count)` size — under `reduce-overhead` each new
+  # shape records a fresh CUDA-graph memory pool that is never freed, leaking
+  # VRAM and stalling on recompiles. A fixed size pads the tail to one constant
+  # shape, so a single cudagraph is captured once and replayed every update.
+  minibatch_size: 1024
+  epochs_per_update: 4
+
+ppo:
+  gamma: 0.997
+  gae_lambda: 0.95
+  advantage_transform: rankgauss
+  norm_advantage: true
+  clip_coef: 0.2
+  clip_coef_high: 0.28
+  value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
+
+  target_entropy_coef: 0.0      # no explicit entropy bonus; exploration comes from stochastic sampling
+  fraction_entropy_coef: 0.0
+  pretrain_updates: 0   # PMA critic token gives the value head a dedicated
+                        # representation, and pretraining against `heuristic`
+                        # warms V on a state distribution PPO immediately
+                        # leaves. Cold-start pain is brief; the wallclock cost
+                        # of pretraining wasn't paying for itself.
+  pretrain_episodes: 32
+  pretrain_lr: 1.0e-3
+  pretrain_behavior: heuristic
+
+rollout:
+  num_envs: 128             # parallel envs
+  games_per_env_per_update: 1  # 128 full games per PPO update
+  num_workers: 0            # only used by numpy_mp
+  env_backend: rust
+
+opponents:
+  mode: fixed
+  fixed_opponents: [sniper_v17]
+  snapshot_device: train
+  snapshot_every: 1   # ignored in fixed mode
+  top_k: 10           # ignored in fixed mode
+  self_play_prob: 0.8
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+reward:
+  signal: projected_margin
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
+  draw_value: 0.0
+  margin_scale: 0.0

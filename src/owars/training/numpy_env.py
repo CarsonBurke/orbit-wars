@@ -19,13 +19,16 @@ import numpy as np
 import torch
 
 from ..game import MAX_SHIP_SPEED
+from ..game.destination_oracle import infer_fleet_destinations
+from ..game.observation import parse_observation
 from ..policies.features import (
     FLEET_FEAT_DIM,
-    MAX_FLEETS,
+    GLOBAL_FEAT_DIM,
     MAX_OMEGA,
     MAX_PLANETS,
     PLANET_FEAT_DIM,
     EncodedObs,
+    _global_features,
 )
 from ..policies.sampling import ActionContext
 
@@ -1054,6 +1057,8 @@ class NumpyVecEnv:
         self.episode_steps = episode_steps
         self.ship_speed = ship_speed
         self.comet_speed = comet_speed
+        self.random_seed = random_seed
+        self.reset_count = np.zeros(num_envs, dtype=np.int64)
         self.envs = [
             NumpyOrbitWarsEnv(
                 num_players=num_players,
@@ -1084,9 +1089,17 @@ class NumpyVecEnv:
         self._planet_slot_cache: list[dict[int, int] | None] = [None] * num_envs
         self._initial_planet_slot_cache: list[dict[int, int] | None] = [None] * num_envs
 
+    def _reset_seed(self, idx: int) -> int | None:
+        if self.random_seed is None:
+            return None
+        return int(self.random_seed + idx + self.reset_count[idx] * self.num_envs)
+
     def reset(self) -> list[list[dict[str, Any]]]:
         self.last_replay_html = None
-        states = [env.reset() for env in self.envs]
+        states = []
+        for idx, env in enumerate(self.envs):
+            states.append(env.reset(seed=self._reset_seed(idx)))
+            self.reset_count[idx] += 1
         self.planet_mask.fill(False)
         self.initial_planet_mask.fill(False)
         self.initial_orbit_radius.fill(0.0)
@@ -1104,6 +1117,21 @@ class NumpyVecEnv:
             self._store_env(i, env)
         self.last_states = states
         return states
+
+    def reset_subset(self, indices: list[int]) -> dict[int, list[dict[str, Any]]]:
+        self.last_replay_html = None
+        out: dict[int, list[dict[str, Any]]] = {}
+        for idx in indices:
+            state = self.envs[idx].reset(seed=self._reset_seed(idx))
+            self.reset_count[idx] += 1
+            self._store_env(idx, self.envs[idx])
+            if idx >= len(self.last_states):
+                self.last_states.extend(
+                    [[] for _ in range(idx + 1 - len(self.last_states))]
+                )
+            self.last_states[idx] = state
+            out[idx] = state
+        return out
 
     def step_subset(
         self, indices: list[int], actions: list[Any]
@@ -1387,6 +1415,9 @@ class NumpyVecEnv:
         """Materialize one player observation for non-learner Python agents."""
         return self._observation(idx, player, self._observation_base(idx))
 
+    def observations(self, rows: list[tuple[int, int]]) -> list[dict[str, Any]]:
+        return [self.observation(int(idx), int(player)) for idx, player in rows]
+
     def reward_potentials(
         self,
         rows: list[tuple[int, int]],
@@ -1398,6 +1429,26 @@ class NumpyVecEnv:
             values[row] = self._reward_potential(
                 int(idx), int(player), float(production_weight)
             )
+        return values
+
+    def production_margins(self, rows: list[tuple[int, int]]) -> np.ndarray:
+        values = np.empty(len(rows), dtype=np.float32)
+        for row, (idx, player) in enumerate(rows):
+            production = np.zeros(self.num_players, dtype=np.float64)
+            for planet in self.planets[int(idx), self.planet_mask[int(idx)]]:
+                owner = int(planet[P_OWNER])
+                if owner != -1:
+                    production[owner] += float(planet[P_PROD])
+            own = float(production[int(player)])
+            enemy = max(
+                (
+                    float(production[p])
+                    for p in range(self.num_players)
+                    if p != int(player)
+                ),
+                default=0.0,
+            )
+            values[row] = own - enemy
         return values
 
     def _reward_potential(
@@ -1432,22 +1483,44 @@ class NumpyVecEnv:
         *,
         device: str = "cpu",
         pin_memory: bool = False,
+        include_fleet_targets: bool = False,
     ) -> tuple[EncodedObs, list[ActionContext]]:
         """Encode policy rows directly from dense simulator arrays."""
         b = len(rows)
+        fleet_width = max(
+            1,
+            *(
+                int(np.count_nonzero(self.fleet_mask[int(env_idx)]))
+                for env_idx, _player in rows
+            ),
+        )
+        g_feats = np.zeros((b, GLOBAL_FEAT_DIM), dtype=np.float32)
         p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
         p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
         p_owned = np.zeros((b, MAX_PLANETS), dtype=bool)
         p_ids = -np.ones((b, MAX_PLANETS), dtype=np.int64)
         p_gar = np.zeros((b, MAX_PLANETS), dtype=np.float32)
-        f_feats = np.zeros((b, MAX_FLEETS, FLEET_FEAT_DIM), dtype=np.float32)
-        f_mask = np.zeros((b, MAX_FLEETS), dtype=bool)
+        f_feats = np.zeros((b, fleet_width, FLEET_FEAT_DIM), dtype=np.float32)
+        f_mask = np.zeros((b, fleet_width), dtype=bool)
+        f_target = (
+            -np.ones((b, fleet_width), dtype=np.int64)
+            if include_fleet_targets
+            else None
+        )
         contexts: list[ActionContext] = []
+        target_cache: dict[int, np.ndarray] = {}
 
         for row, (env_idx, player) in enumerate(rows):
             planets = self.planets[env_idx, self.planet_mask[env_idx]].copy()
             fleets = self.fleets[env_idx, self.fleet_mask[env_idx]].copy()
             env = self.envs[env_idx]
+            g_feats[row] = _global_features(
+                int(self.step_count[env_idx]),
+                int(player),
+                self.num_players,
+                planets,
+                fleets,
+            )
             self._fill_policy_planet_features(
                 row,
                 int(player),
@@ -1463,11 +1536,27 @@ class NumpyVecEnv:
             self._fill_policy_fleet_features(
                 row,
                 int(player),
-                fleets[:MAX_FLEETS],
+                fleets[:fleet_width],
                 planets,
                 f_feats,
                 f_mask,
             )
+            if f_target is not None and env_idx not in target_cache:
+                base = self._observation_base(env_idx)
+                parsed = parse_observation(self._observation(env_idx, 0, base))
+                dest_idx, _eta, status = infer_fleet_destinations(
+                    parsed,
+                    max_fleets=len(parsed.fleets),
+                )
+                target_cache[env_idx] = np.where(status == 1, dest_idx, -1).astype(
+                    np.int64,
+                    copy=False,
+                )
+            if f_target is not None:
+                targets = target_cache[env_idx]
+                n_targets = min(len(targets), fleet_width)
+                if n_targets:
+                    f_target[row, :n_targets] = targets[:n_targets]
             contexts.append(
                 ActionContext(
                     planets=planets,
@@ -1492,6 +1581,12 @@ class NumpyVecEnv:
                     f_feats, device, pin_memory=pin_memory
                 ),
                 fleet_mask=_tensor_from_numpy(f_mask, device, pin_memory=pin_memory),
+                global_feats=_tensor_from_numpy(
+                    g_feats, device, pin_memory=pin_memory
+                ),
+                fleet_target_planet_idx=None
+                if f_target is None
+                else _tensor_from_numpy(f_target, device, pin_memory=pin_memory),
             ),
             contexts,
         )

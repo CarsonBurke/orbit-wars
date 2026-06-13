@@ -124,6 +124,55 @@ def test_fleet_features_handle_missing_source():
     assert fleet_row[7] == 0.0  # has_from bit
 
 
+def test_fleet_destination_sidecar_marks_planet_hits_for_all_fleets():
+    obs = _toy_obs_with_fleet()
+    obs["planets"] = [
+        [0, 0, 20.0, 10.0, 1.0, 50, 3],
+        [1, 1, 80.0, 10.0, 1.0, 30, 2],
+    ]
+    obs["fleets"] = [
+        [42, 0, 15.0, 10.0, 0.0, 0, 20],
+        [43, 1, 85.0, 10.0, math.pi, 1, 20],
+    ]
+
+    assert encode_observation(parse_observation(obs)).fleet_target_planet_idx is None
+    assert encode_raw_observations([obs]).fleet_target_planet_idx is None
+
+    typed = encode_observation(parse_observation(obs), include_fleet_targets=True)
+    raw = encode_raw_observations([obs], include_fleet_targets=True)
+
+    assert typed.fleet_target_planet_idx is not None
+    assert raw.fleet_target_planet_idx is not None
+    assert typed.fleet_target_planet_idx[:2].tolist() == [0, 1]
+    assert raw.fleet_target_planet_idx[0, :2].tolist() == [0, 1]
+    assert typed.fleet_target_planet_idx[2:].eq(-1).all()
+    assert raw.fleet_target_planet_idx[0, 2:].eq(-1).all()
+
+
+def test_fleet_encoding_width_tracks_large_actual_count():
+    obs = _toy_obs_with_fleet()
+    obs["planets"] = [
+        [0, 0, 20.0, 10.0, 1.0, 50, 3],
+        [1, 1, 80.0, 10.0, 1.0, 30, 2],
+    ]
+    obs["fleets"] = [
+        [1000 + i, i % 2, 15.0, 10.0, 0.0, 0, 20]
+        for i in range(400)
+    ]
+
+    typed = encode_observation(parse_observation(obs), include_fleet_targets=True)
+    raw = encode_raw_observations([obs], include_fleet_targets=True)
+
+    assert typed.fleet_feats.shape == (400, FLEET_FEAT_DIM)
+    assert typed.fleet_mask.shape == (400,)
+    assert typed.fleet_target_planet_idx is not None
+    assert typed.fleet_target_planet_idx.shape == (400,)
+    assert raw.fleet_feats.shape == (1, 400, FLEET_FEAT_DIM)
+    assert raw.fleet_mask.shape == (1, 400)
+    assert raw.fleet_target_planet_idx is not None
+    assert raw.fleet_target_planet_idx.shape == (1, 400)
+
+
 def test_raw_fleet_features_include_intended_target_metadata():
     obs = _toy_obs_with_fleet()
     obs["fleet_targets"] = {"42": [7, 12.0, 80.0, 20.0]}

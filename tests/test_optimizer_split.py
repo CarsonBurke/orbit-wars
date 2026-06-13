@@ -2,7 +2,7 @@ from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
 from owars.training.config import OptimCfg
 from owars.training.ppo import _grad_clip_groups
-from owars.training.train import _build_optimizer, _split_params
+from owars.training.train import _build_optimizer, _split_params, _value_pretrain_params
 
 
 def _group_by_name(model: OrbitPolicy) -> dict[str, str]:
@@ -32,32 +32,81 @@ def test_optimizer_split_matches_parameter_golf_boundary():
         "layers.0.attn.c_k.weight",
         "layers.0.attn.c_v.weight",
         "layers.0.attn.out_proj.weight",
-        "layers.0.ff.0.weight",
-        "layers.0.ff.2.weight",
+        "layers.0.c_fc.weight",
+        "layers.0.mlp_proj.weight",
         "fleet_tokenizer.layers.0.cross_attn.c_q.weight",
         "fleet_tokenizer.layers.0.cross_attn.out_proj.weight",
         "fleet_tokenizer.layers.0.self_block.attn.c_q.weight",
-        "fleet_tokenizer.layers.0.self_block.ff.2.weight",
+        "fleet_tokenizer.layers.0.self_block.mlp_proj.weight",
     ):
         assert group[name] == "muon_blocks"
 
     for name in (
         "target_query.weight",
         "target_key.weight",
-        "launch_head.weight",
-        "launch_head.bias",
-        "fraction_head.weight",
-        "fraction_head.bias",
-        "fraction_log_std",
+        "target_noop_key",
+        "fraction_alpha_head.weight",
+        "fraction_alpha_head.bias",
+        "fraction_beta_head.weight",
+        "fraction_beta_head.bias",
         "value_head.0.weight",
         "value_head.2.weight",
     ):
         assert group[name] == "adamw_head"
 
+    assert group["global_embed.weight"] == "adamw_default"
     assert group["planet_embed.weight"] == "adamw_default"
     assert group["fleet_embed.weight"] == "adamw_default"
     assert group["target_q_gain"] == "adamw_control"
-    assert group["layers.0.attn.q_gain"] == "adamw_control"
+    # nGPT hypersphere controls (per-channel eigen LRs, QK `sqk`, MLP `suv`)
+    # share the control-LR group with the target-readout temperature.
+    assert group["layers.0.attn_alpha.alpha"] == "adamw_control"
+    assert group["layers.0.mlp_alpha.alpha"] == "adamw_control"
+    assert group["layers.0.attn.sqk_q"] == "adamw_control"
+    assert group["layers.0.attn.sqk_k"] == "adamw_control"
+    assert group["layers.0.suv"] == "adamw_control"
+
+
+def test_destination_conditioned_optimizer_split_matches_attention_roles():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+
+    group = _group_by_name(model)
+
+    for name in (
+        "destination_fleet_conditioner.cross_attn.c_q.weight",
+        "destination_fleet_conditioner.cross_attn.c_k.weight",
+        "destination_fleet_conditioner.cross_attn.c_v.weight",
+        "destination_fleet_conditioner.cross_attn.out_proj.weight",
+    ):
+        assert group[name] == "muon_blocks"
+    assert group["destination_fleet_conditioner.cross_attn.sqk_q"] == "adamw_control"
+    assert group["destination_fleet_conditioner.cross_attn.sqk_k"] == "adamw_control"
+    assert group["destination_fleet_conditioner.mod.weight"] == "adamw_default"
+    assert group["destination_fleet_conditioner.mod.bias"] == "adamw_default"
+
+
+def test_destination_conditioned_value_pretrain_steps_active_conditioner_params():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+
+    pretrain_ids = {id(param) for param in _value_pretrain_params(model)}
+
+    assert model.destination_fleet_conditioner is not None
+    for param in model.destination_fleet_conditioner.parameters():
+        assert id(param) in pretrain_ids
 
 
 def test_optimizer_group_lrs_follow_split():
@@ -101,17 +150,19 @@ def test_grad_clip_groups_match_real_policy_roles():
         "target_query.weight",
         "target_key.weight",
         "target_q_gain",
-        "launch_head.weight",
-        "launch_head.bias",
-        "fraction_head.weight",
-        "fraction_head.bias",
-        "fraction_log_std",
+        "target_noop_key",
+        "fraction_alpha_head.weight",
+        "fraction_alpha_head.bias",
+        "fraction_beta_head.weight",
+        "fraction_beta_head.bias",
     ):
         assert groups[name] == "actor"
 
     assert groups["value_head.0.weight"] == "critic"
     assert groups["value_head.2.weight"] == "critic"
+    assert groups["global_embed.weight"] == "shared"
     assert groups["planet_embed.weight"] == "shared"
     assert groups["actor_token"] == "shared"
     assert groups["critic_token"] == "shared"
+    assert groups["global_token"] == "shared"
     assert groups["layers.0.attn.c_q.weight"] == "shared"

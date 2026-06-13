@@ -10,7 +10,8 @@ import torch
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy
 from owars.training.elo import EloTracker
-from owars.training.league import LEARNER_NAME, OpponentPool
+from owars.agents.sniper import sniper_agent
+from owars.training.league import FixedOpponentPool, LEARNER_NAME, OpponentPool
 
 
 def _tiny_model() -> OrbitPolicy:
@@ -75,9 +76,45 @@ def test_sampling_only_picks_alive_snapshots(tmp_path: Path):
         assert s.name in alive
 
 
+def test_eviction_unlinks_checkpoint_file(tmp_path: Path):
+    """Evicted snapshots must delete their on-disk checkpoint, otherwise
+    runs with `snapshot_every: 1` accumulate ~1 file per update forever."""
+    elo = EloTracker(initial_rating=1500.0)
+    pool = OpponentPool(elo=elo, top_k=2, self_play_prob=0.0, rng=random.Random(0))
+    model = _tiny_model()
+
+    low = tmp_path / "low.pt"
+    mid = tmp_path / "mid.pt"
+    high = tmp_path / "high.pt"
+    pool.add_snapshot("low", model, low, seed_rating=1400.0)
+    pool.add_snapshot("mid", model, mid, seed_rating=1500.0)
+    pool.add_snapshot("high", model, high, seed_rating=1700.0)
+
+    assert not low.exists()
+    assert mid.exists()
+    assert high.exists()
+
+
 def test_new_snapshot_inherits_learner_rating(tmp_path: Path):
     elo = EloTracker(initial_rating=1500.0)
     elo.set(LEARNER_NAME, 1700.0)
     pool = OpponentPool(elo=elo, top_k=4, self_play_prob=0.0, rng=random.Random(0))
     pool.add_snapshot("a", _tiny_model(), tmp_path / "a.pt")
     assert elo.get("frozen:a") == 1700.0
+
+
+def test_fixed_opponent_pool_samples_static_builtin():
+    pool = FixedOpponentPool(["sniper"], rng=random.Random(0))
+    slots = pool.sample(8)
+    assert all(s.name == "sniper" for s in slots)
+    assert all(s.agent is sniper_agent for s in slots)
+    assert pool.snapshot_names() == []
+
+
+def test_fixed_opponent_pool_rejects_unknown_builtin():
+    try:
+        FixedOpponentPool(["not_real"], rng=random.Random(0))
+    except ValueError as exc:
+        assert "unknown fixed opponents" in str(exc)
+    else:
+        raise AssertionError("unknown fixed opponent should raise")

@@ -1,0 +1,215 @@
+# Test branch SAC config — hybrid discrete+continuous variant.
+#
+# Differences from ppo_base.yaml:
+#   - The actor emits the SAME factored action PPO does: per source planet a
+#     Bernoulli launch, a masked Categorical target, and a tanh-squashed Normal
+#     fraction. The launch ANGLE is solved analytically from the chosen target
+#     by the lead-intercept solver (not learned) — the fraction is the only
+#     continuous action dim. SAC treatment: discrete-SAC with the EXACT
+#     closed-form launch+target policy gradient (no REINFORCE), reparam
+#     tanh-Normal for the fraction, with two independently-tuned temperatures
+#     (alpha_discrete, alpha_continuous).
+#   - The critic is FACTORED (dueling) in REAL ship-margin units:
+#     Q(s,a) = V(s) + adv(s,a). V(s) = bins_to_scalar(nV) is decoded from an
+#     HL-Gauss two-hot distribution over symlog-spaced bins (clamped to
+#     [value_min, value_max], so the bootstrap cannot diverge — the scalar
+#     symlog-MSE critic this replaces had a loss whose gradient vanished at large
+#     |Q|, letting the deadly triad run Q away to ~1e12). adv = Σ_i A_i is the
+#     summed per-planet advantage, each head tanh-bounded to ±adv_scale (so adv is
+#     bounded ±n_owned·adv_scale) and LINEAR in the policy probs, so the soft-value
+#     expectation stays closed-form (no REINFORCE). The TD loss is split: V learns
+#     the full target y via cross-entropy against its two-hot encoding; adv learns
+#     the residual (y − V), V detached, via a Huber loss — orthogonal heads, the
+#     tanh bound alone anchoring the V/A split (no centering). The ACTOR ascends
+#     the real-units advantage directly (min_j E[adv_j] + α·H): V is an
+#     action-independent baseline, and adv is now in the SAME units as the reward,
+#     so a single real-units α balances value vs entropy in actor and bootstrap
+#     alike (no symlog-Jacobian state dependence to decouple them).
+#   - Three independent set-transformer networks (actor, qf1, qf2) plus
+#     EMA target copies of qf1/qf2. cleanrl convention; no shared trunk.
+#   - Adam everywhere (Muon is not applied for SAC in this branch — the
+#     non-stationary replay distribution + soft Q targets makes orthogonalized
+#     updates a separate research question).
+
+run:
+  name: sac_vs_sniper
+  seed: 0
+  device: cuda
+  compile_mode: reduce-overhead
+  log_root: runs
+  ckpt_root: checkpoints
+  # SAC reads this as a total ENV-STEP (transition) budget, NOT gradient
+  # updates: the batched loop runs total_updates / rollout.num_envs ticks, and
+  # each tick does num_envs*sac.gradient_steps critic updates (see gradient_steps).
+  total_updates: 500000
+
+game:
+  num_players: 2
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  # Smaller backbone than PPO. Three independent networks at PPO scale would
+  # be 3× the parameter footprint; SAC sample efficiency lets us cut depth.
+  dim: 96
+  ff_dim: 192
+  depth: 2
+  n_heads: 4
+  n_kv_heads: 1
+  dropout: 0.0
+  planet_rope_fraction: 0.25
+  planet_rope_base: 10000.0
+  encoder_backend: fleet_latent
+  num_fleet_latents: 32
+  fleet_tokenizer_depth: 1
+  # Distributional value head for the factored SAC critic: HL-Gauss two-hot over
+  # `value_num_bins` symlog-spaced bins in [value_min, value_max]. The advantages
+  # tilt this distribution; the decoded scalar is clamped to the range, which
+  # bounds the bootstrap (see sac_model.SACSoftQ).
+  # Value support sized to the DELTA production-margin reward (see `reward`).
+  # The reward is Φ(s')−Φ(s) with Φ=production margin, so the discounted return
+  # ≈ the net/total margin *change* over the remaining game, O(±10²) production
+  # units — NOT margin/(1−γ). A ±1000 symlog support keeps the operating range
+  # off the saturating bins while symlog packs fine resolution near 0 (where
+  # most near-balanced states sit). Watch losses/qf1_value: if it pins near
+  # ±1000 widen; if it stays ≪100 tighten for resolution. Watch
+  # losses/explained_variance: it should climb well above ~0 once the critic
+  # tracks state value rather than the marginal (the old ±1e5 support made the
+  # bins ~4500 ships wide — the critic could not resolve action differences).
+  value_min: -1000.0
+  value_max: 1000.0
+  value_num_bins: 153
+  value_symlog: true
+  # Real-units bound on the per-planet advantage heads: each emits
+  # adv_scale·tanh(raw/adv_scale), so the summed advantage is ±n_owned·adv_scale
+  # ship-margin units. 40 gives headroom over the per-capture margin tail
+  # (~30 ships); watch losses/adv_spread — raise toward 60 if it saturates.
+  adv_scale: 40.0
+
+optim:
+  # SAC uses Adam for everything; muon_* / head_lr / control_lr in this section
+  # are ignored by the SAC trainer but kept for RunConfig parity.
+  muon_lr: 0.022
+  lr: 3.0e-4
+  head_lr: 3.0e-4
+  weight_decay: 0.0
+  grad_clip: 0.0
+  minibatch_size: 256    # used by sac.batch_size; SAC reads from sac section
+  epochs_per_update: 1
+
+ppo:
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_coef_high: 0.28
+  value_coef: 1.0
+  target_entropy_coef: 0.0
+  fraction_entropy_coef: 0.0
+  pretrain_updates: 0
+
+sac:
+  # cleanrl SAC standard. NOTE: SAC's Φ is the bare production-RATE margin (no
+  # turns_left projection — that's the PPO potential), so the delta reward's
+  # discounted return is the (1−γ)-weighted INTEGRAL of the margin, effective
+  # horizon ~1/(1−γ)=100 steps. γ=0.99 is therefore near-term-weighted over a
+  # 500-step game; the FiLM time feature is what carries endgame value. Raise
+  # toward 0.997 (horizon ~330) if late-game play needs more weight.
+  gamma: 0.99
+  tau: 0.005
+  alpha: 0.2
+  autotune: true
+  # Two independently-tuned entropy temperatures: discrete (launch+target) and
+  # continuous (fraction). disc_target_entropy_ratio scales the per-sample
+  # max categorical+Bernoulli entropy over the legal target support.
+  alpha_discrete: 0.2
+  alpha_continuous: 0.2
+  alpha_discrete_lr: 1.0e-3
+  alpha_continuous_lr: 1.0e-3
+  # disc target entropy is tuned on the PER-PLANET average (bounded), so α_disc
+  # no longer runs away as the owned-planet count grows.
+  disc_target_entropy_ratio: 0.7
+  # Continuous-fraction target entropy per launched dim (scaled by Σ g·p).
+  # cleanrl's -1.0 (= -dim). The α-weighted alpha loss (α = log_alpha.exp(), see
+  # _actor_alpha_step) self-damps as α shrinks, so this no longer collapses α_cont.
+  target_entropy_per_dim: -1.0
+  no_op_fraction: 0.02
+  log_std_min: -5.0
+  log_std_max: 2.0
+  # CPU-resident buffer (standard SAC); the sampled minibatch is moved to the
+  # GPU per update via a pinned, async, prefetched transfer that overlaps the
+  # H2D with compute (see ReplayBuffer.sample / _ReplayPrefetcher).
+  buffer_size: 50000
+  # Large minibatch: the model is tiny (dim 96, depth 2) and the GPU is
+  # underutilized at 256, so 2048 buys a much lower-variance critic gradient.
+  batch_size: 2048
+  learning_starts: 5000
+  # Cadence counts CRITIC UPDATES (not ticks), continuous across ticks, exactly
+  # like cleanrl: an actor+alpha step every policy_frequency-th critic update
+  # (with the policy_frequency-compensation loop ⇒ net 1:1 actor:critic), and a
+  # target polyak every target_network_frequency-th critic update.
+  policy_frequency: 2
+  target_network_frequency: 1
+  # UTD: critic updates PER COLLECTED TRANSITION. Each tick collects num_envs
+  # transitions and runs num_envs*gradient_steps critic updates, so
+  # gradient_steps=1 is cleanrl's UTD=1. Raise for higher UTD (SAC tolerates
+  # UTD≫1; grad_clip guards divergence).
+  gradient_steps: 0.015625
+  q_lr: 1.0e-3
+  policy_lr: 3.0e-4
+  alpha_lr: 1.0e-3
+  weight_decay: 0.0
+  # cleanrl SAC runs unclipped on bounded-reward Gym tasks. Here the HL-Gauss CE
+  # critic loss and the bounded scalar-advantage actor objective keep the LOSS
+  # well-scaled, but the parameter-space grad norm (CE through the encoder, plus
+  # the advantage attention) is still O(10²–10³) early, so this clip is an active
+  # guard — expect losses/qf_grad_norm to sit near the clip during warmup and
+  # relax as the critic settles. Mainly a divergence guard against rare spikes (a
+  # stray NaN flows into the C-level env and aborts the run with no traceback).
+  # Watch losses/{qf,actor}_grad_norm; lower toward 1 if unstable.
+  grad_clip: 10.0
+  log_metrics_every: 100
+  snapshot_every: 25000
+  # Ignored because opponents.mode=fixed below forces [sniper_v17] every episode.
+  builtin_opponents: [random, sniper_v17, heuristic]
+  builtin_prob: 0.5
+
+rollout:
+  # One subprocess per env; step_subset dispatches then gathers, so envs step in
+  # parallel — 16 ~doubles transitions/sec over 8 given ≥16 spare cores. The
+  # kaggle Python simulator is the per-tick wall-clock floor (env stepping >
+  # the tiny-model forward/update), so scaling envs is the main throughput lever.
+  num_envs: 16
+  num_workers: 0
+  env_backend: rust
+
+opponents:
+  mode: fixed
+  fixed_opponents: [sniper_v17]
+  snapshot_device: train
+  snapshot_every: 1       # ignored in fixed mode
+  top_k: 8                # ignored in fixed mode
+  self_play_prob: 0.5     # ignored in fixed mode
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+# Reward = DELTA of the production margin (a per-event credit signal):
+#   r_t = potential_weight · (Φ(s') − Φ(s)),  Φ = own_production − max_opp_production.
+# The agent is rewarded the step it grows its own production (captures a planet)
+# and penalized the step the enemy grows theirs, so credit lands on the action
+# that caused the swing — non-zero exactly on capture/loss events. Φ is fully
+# observable (production + ownership are per-planet features) and O(±10²); the
+# discounted return is the net/total margin change over the remaining game
+# (NOT margin/(1−γ)), so the critic value is O(±10²) — small enough to resolve
+# action-level differences. The value-to-go still depends on the remaining
+# horizon (less time/territory left to swing), so the SAC encoder is
+# FiLM-conditioned on a global time feature to keep the endgame value learnable.
+#   potential_weight scales the reward (kept at raw production units = 1.0).
+#   production_weight / win/loss/draw / margin_scale are unused by this reward.
+reward:
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
+  draw_value: 0.0
+  margin_scale: 0.0

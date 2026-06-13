@@ -28,7 +28,12 @@ from typing import Any
 
 import torch
 
-from ..policies.features import EncodedObs, encode_raw_observations
+from ..policies.features import (
+    EncodedObs,
+    bucket_encoded_fleet_width,
+    encode_raw_observations,
+    fleet_target_planet_idx_or_empty,
+)
 from ..policies.model import OrbitPolicy, PolicyOutput
 from ..policies.sampling import (
     ActionContext,
@@ -39,6 +44,7 @@ from ..policies.sampling import (
 )
 from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
+from .rollout import _obs_production_margin
 from .rollout import Trajectory
 from .vec_env import VecEnv
 
@@ -74,6 +80,7 @@ class _RolloutForwardKernel(torch.nn.Module):
 
     def forward(
         self,
+        global_feats: torch.Tensor,
         planet_feats: torch.Tensor,
         planet_mask: torch.Tensor,
         planet_owned_mask: torch.Tensor,
@@ -81,6 +88,7 @@ class _RolloutForwardKernel(torch.nn.Module):
         planet_garrison: torch.Tensor,
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -90,6 +98,8 @@ class _RolloutForwardKernel(torch.nn.Module):
             planet_garrison=planet_garrison,
             fleet_feats=fleet_feats,
             fleet_mask=fleet_mask,
+            global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -151,41 +161,24 @@ def _pad_encoded_rows(feats: EncodedObs, rows: int) -> EncodedObs:
         planet_garrison=_pad_rows(feats.planet_garrison, rows),
         fleet_feats=_pad_rows(feats.fleet_feats, rows),
         fleet_mask=_pad_rows(feats.fleet_mask, rows, fill=False),
+        global_feats=None
+        if feats.global_feats is None
+        else _pad_rows(feats.global_feats, rows),
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else _pad_rows(feats.fleet_target_planet_idx, rows, fill=-1),
     )
 
 
-def _active_fleet_width(fleet_mask: torch.Tensor) -> int:
-    if fleet_mask.device.type != "cpu":
-        return int(fleet_mask.shape[1])
-    if fleet_mask.shape[1] == 0 or not bool(fleet_mask.any()):
-        return 1
-    cols = torch.nonzero(fleet_mask.any(dim=0), as_tuple=False)
-    return int(cols[-1].item()) + 1
-
-
-def _select_fleet_width(feats: EncodedObs) -> int:
-    current = int(feats.fleet_feats.shape[1])
-    used = _active_fleet_width(feats.fleet_mask)
-    return max(1, min(current, used))
-
-
-def _slice_fleet_width(feats: EncodedObs, width: int) -> EncodedObs:
-    current = int(feats.fleet_feats.shape[1])
-    if width >= current:
-        return feats
-    return EncodedObs(
-        planet_feats=feats.planet_feats,
-        planet_mask=feats.planet_mask,
-        planet_owned_mask=feats.planet_owned_mask,
-        planet_ids=feats.planet_ids,
-        planet_garrison=feats.planet_garrison,
-        fleet_feats=feats.fleet_feats[:, :width],
-        fleet_mask=feats.fleet_mask[:, :width],
-    )
+def _global_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
+    if feats.global_feats is not None:
+        return feats.global_feats
+    batch = feats.planet_feats.shape[0]
+    return feats.planet_feats.new_zeros(batch, 0)
 
 
 def _trim_fleets_for_forward(feats: EncodedObs) -> EncodedObs:
-    return _slice_fleet_width(feats, _select_fleet_width(feats))
+    return bucket_encoded_fleet_width(feats)
 
 
 def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
@@ -194,13 +187,20 @@ def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
     return PolicyOutput(
         launch_logits=out.launch_logits[:rows],
         target_logits=out.target_logits[:rows],
-        fraction_mean=out.fraction_mean[:rows],
-        fraction_log_std=out.fraction_log_std[:rows],
         value=out.value[:rows],
         value_logits=out.value_logits[:rows],
         planet_owned_mask=out.planet_owned_mask[:rows],
         planet_mask=out.planet_mask[:rows],
         planet_ids=out.planet_ids[:rows],
+        action_logit_softcap=out.action_logit_softcap,
+        launch_log_std=None if out.launch_log_std is None else out.launch_log_std[:rows],
+        launch_prob_floor=out.launch_prob_floor,
+        fraction_alpha=None if out.fraction_alpha is None else out.fraction_alpha[:rows],
+        fraction_beta=None if out.fraction_beta is None else out.fraction_beta[:rows],
+        fraction_mean=None if out.fraction_mean is None else out.fraction_mean[:rows],
+        fraction_log_std=(
+            None if out.fraction_log_std is None else out.fraction_log_std[:rows]
+        ),
     )
 
 
@@ -337,6 +337,16 @@ def _state_reward_potential(
     )
 
 
+def _state_production_margin(
+    state: Any,
+    player: int,
+    num_players: int,
+) -> float:
+    slot = state[player]
+    obs = slot["observation"] if isinstance(slot, dict) else slot.observation
+    return _obs_production_margin(obs, player, num_players)
+
+
 def _reward_potentials(
     vec: Any,
     states: Sequence[Any],
@@ -347,6 +357,21 @@ def _reward_potentials(
 ) -> list[float]:
     if not rows:
         return []
+    if reward_cfg.signal == "win_terminal":
+        return [0.0] * len(rows)
+    if reward_cfg.signal == "production_margin":
+        native_production = getattr(vec, "production_margins", None)
+        if callable(native_production):
+            values = native_production(rows)
+            return [float(v) for v in values]
+        return [
+            _state_production_margin(
+                states[env_idx],
+                player,
+                num_players,
+            )
+            for env_idx, player in rows
+        ]
     native = getattr(vec, "reward_potentials", None)
     if callable(native):
         values = native(rows, production_weight=reward_cfg.production_weight)
@@ -405,7 +430,7 @@ def rollout_episodes_batched(
     states = vec.reset()
     dones = [False] * num_envs
     episode_steps = int(getattr(vec, "episode_steps", 500))
-    dense_potential = record_trajectories and reward_cfg.potential_weight != 0.0
+    dense_potential = record_trajectories and reward_cfg.uses_dense_potential()
     previous_potential = [0.0] * num_envs
     if dense_potential:
         previous_potential = _reward_potentials(
@@ -421,6 +446,8 @@ def rollout_episodes_batched(
     fast_observation = getattr(vec, "observation", None)
     fast_observations = getattr(vec, "observations", None)
     fast_step_subset = getattr(vec, "step_subset_fast", None)
+    fast_builtin_actions = getattr(vec, "builtin_actions", None)
+    native_builtin_opponents = set(getattr(vec, "native_builtin_opponents", ()))
     use_fast_numpy_path = (
         bool(getattr(vec, "fast_rollout", False))
         and callable(fast_policy_batch)
@@ -454,6 +481,12 @@ def rollout_episodes_batched(
                         and getattr(slot.agent, "model", None) is not None
                     )
                     if can_fast_snapshot:
+                        opp_buckets[slot.name].append((env_idx, seat, None, slot))
+                    elif (
+                        use_fast_numpy_path
+                        and callable(fast_builtin_actions)
+                        and slot.name in native_builtin_opponents
+                    ):
                         opp_buckets[slot.name].append((env_idx, seat, None, slot))
                     elif use_fast_numpy_path:
                         pending_opp_obs.append((env_idx, seat))
@@ -503,6 +536,22 @@ def rollout_episodes_batched(
         # builtin Python baselines stay on the scalar callable path.
         for _name, bucket in opp_buckets.items():
             agent = bucket[0][3].agent
+            if (
+                use_fast_numpy_path
+                and callable(fast_builtin_actions)
+                and _name in native_builtin_opponents
+            ):
+                rows = [(env_idx, seat) for env_idx, seat, _obs, _slot in bucket]
+                batched_actions = fast_builtin_actions(
+                    _name,
+                    rows,
+                    native_actions=True,
+                )
+                for (env_idx, seat, _obs, _slot), acts in zip(
+                    bucket, batched_actions, strict=True
+                ):
+                    actions_per_env[env_idx][seat] = acts
+                continue
             agent_model = getattr(agent, "model", None)
             if (
                 use_fast_numpy_path
@@ -604,6 +653,10 @@ def _step_learner_bucket(
     record_on_cpu = record_trajectories and target_device.type == "cuda"
     graph_enabled = target_device.type == "cuda" and compile_mode is not None
     graph_rows = max(int(graph_rows or len(bucket)), len(bucket))
+    include_fleet_targets = (
+        getattr(getattr(model, "cfg", None), "encoder_backend", None)
+        == "destination_conditioned"
+    )
     action_contexts: list[ActionContext] | None = None
     policy_rows: list[tuple[int, int]] | None = None
     fast_sampler = getattr(getattr(policy_batch, "__self__", None), "sample_batch_with_records", None)
@@ -612,7 +665,10 @@ def _step_learner_bucket(
         policy_rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
         if target_device.type == "cuda":
             cpu_stacked, action_contexts = policy_batch(
-                policy_rows, device="cpu", pin_memory=False
+                policy_rows,
+                device="cpu",
+                pin_memory=False,
+                include_fleet_targets=include_fleet_targets,
             )
             device_source = (
                 cpu_stacked
@@ -629,6 +685,7 @@ def _step_learner_bucket(
                 policy_rows,
                 device=device,
                 pin_memory=target_device.type == "cuda",
+                include_fleet_targets=include_fleet_targets,
             )
             if stacked.planet_feats.device != target_device:
                 stacked = _encoded_to_device(stacked, target_device)
@@ -637,7 +694,11 @@ def _step_learner_bucket(
                 stacked = _trim_fleets_for_forward(stacked)
     else:
         cpu_stacked = (
-            encode_raw_observations(raw_obs_list, device="cpu")
+            encode_raw_observations(
+                raw_obs_list,
+                device="cpu",
+                include_fleet_targets=include_fleet_targets,
+            )
             if record_on_cpu
             else None
         )
@@ -655,6 +716,7 @@ def _step_learner_bucket(
                 raw_obs_list,
                 device=device,
                 pin_memory=target_device.type == "cuda",
+                include_fleet_targets=include_fleet_targets,
             )
             cpu_stacked = (
                 stacked
@@ -691,6 +753,7 @@ def _step_learner_bucket(
         if graph_enabled:
             _mark_cuda_graph_step(target_device)
         out = kernel(
+            _global_feats_or_empty(graph_stacked),
             graph_stacked.planet_feats,
             graph_stacked.planet_mask,
             graph_stacked.planet_owned_mask,
@@ -698,6 +761,7 @@ def _step_learner_bucket(
             graph_stacked.planet_garrison,
             graph_stacked.fleet_feats,
             graph_stacked.fleet_mask,
+            fleet_target_planet_idx_or_empty(graph_stacked),
         )
     out = _slice_policy_output(out, real_rows)
 
@@ -776,6 +840,10 @@ def _step_learner_bucket(
                     planet_garrison=rec["planet_garrison"][j],
                     fleet_feats=rec["fleet_feats"][j],
                     fleet_mask=rec["fleet_mask"][j],
+                    global_feats=rec["global_feats"][j],
+                    fleet_target_planet_idx=None
+                    if rec["fleet_target_planet_idx"] is None
+                    else rec["fleet_target_planet_idx"][j],
                 )
             )
             traj.launch.append(rec["launch"][j])
@@ -880,6 +948,15 @@ def _materialize_records_cpu(
         "fleet_mask": feature_source.fleet_mask.index_select(0, feature_rows)
         .detach()
         .cpu(),
+        "fleet_target_planet_idx": None
+        if feature_source.fleet_target_planet_idx is None
+        else feature_source.fleet_target_planet_idx.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "global_feats": _global_feats_or_empty(feature_source)
+        .index_select(0, feature_rows)
+        .detach()
+        .cpu(),
         "target_idx": target_idx_cpu,
         "launch": launch_cpu,
         "fraction": fraction_cpu,
@@ -909,4 +986,8 @@ def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
         planet_garrison=move(feats.planet_garrison),
         fleet_feats=move(feats.fleet_feats),
         fleet_mask=move(feats.fleet_mask),
+        global_feats=None if feats.global_feats is None else move(feats.global_feats),
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else move(feats.fleet_target_planet_idx),
     )

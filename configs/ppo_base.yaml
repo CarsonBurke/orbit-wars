@@ -3,8 +3,9 @@
 # 2-player PPO config.
 #
 # Defaults baked in:
-#   - CleanRL SPO-asym surrogate with `spo_eps_low = 0.4`,
-#     `spo_eps_high = 0.56`, and minibatch advantage normalization.
+#   - CleanRL clip-higher surrogate with `clip_coef = 0.2`,
+#     `clip_coef_high = 0.28`, rank-Gaussian policy advantages, and
+#     minibatch advantage normalization.
 #   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
 #   - Distributional value head (symlog HL-Gauss CE on ±100k raw margin / 153 bins), unclipped.
@@ -39,12 +40,14 @@ model:
   dropout: 0.0
   planet_rope_fraction: 0.25   # partial 2D RoPE over 8/32 dims per head, planets only
   planet_rope_base: 10000.0
-  encoder_backend: fleet_latent
+  encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
   value_min: -100000.0
   value_max: 100000.0
   value_num_bins: 153
+  value_sigma_to_bin_ratio: 2.0
+  critic_mtp_horizon: 6
   value_symlog: true
 
 optim:
@@ -58,22 +61,29 @@ optim:
   # AdamW (input projections, task heads, biases, tokens).
   lr: 3.0e-4
   head_lr: 3.0e-4
+  # KL-adaptive LR. PPO always runs all epochs; per-planet approx KL controls
+  # the next update's optimizer scale so explosions stay visible in logs.
+  kl_lr_target: 0.025
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
   weight_decay: 1.0e-4
-  grad_clip: 0.5   # actor and critic gradients are clipped separately, including
-                   # their shared-trunk components, then summed before step.
+  grad_clip: 1.0   # actor and critic flows are clipped separately, including
+                   # each flow's task head plus shared-trunk components.
   minibatch_size: 4096
   epochs_per_update: 4
 
 ppo:
   gamma: 0.997
   gae_lambda: 0.95
+  advantage_transform: rankgauss
   norm_advantage: true
-  spo_eps_low: 0.4
-  spo_eps_high: 0.56
+  clip_coef: 0.2
+  clip_coef_high: 0.28
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
 
   target_entropy_coef: 0.01     # categorical target distribution has no structural floor, so keep it from collapsing
-  fraction_entropy_coef: 0.0    # squashed-Gaussian Normal entropy approximation; keep off by default
+  fraction_entropy_coef: 0.0    # native Beta entropy; keep off by default
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`
                         # warms V on a state distribution PPO immediately

@@ -1,9 +1,10 @@
+import pytest
 import torch
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
-from owars.policies.model import HLGaussLoss
-from owars.policies.sampling import _deterministic_fraction
+from owars.policies.model import HLGaussLoss, _symexp, _symlog
+from owars.policies.sampling import BETA_SAMPLE_EPS, _deterministic_fraction
 
 
 def _obs():
@@ -27,8 +28,17 @@ def _obs():
 def test_encode_shapes():
     o = parse_observation(_obs())
     feats = encode_observation(o)
+    assert feats.global_feats is not None
+    assert feats.global_feats.shape == (27,)
+    assert torch.allclose(feats.global_feats[:2], torch.tensor([0.0, 1.0]))
+    # Self slot starts at offset 4: planet_count, production, planet_ships,
+    # fleet_count, fleet_ships. Enemy_0 follows at offset 9.
+    assert torch.allclose(feats.global_feats[4:6], torch.tensor([1.0 / 64.0, 3.0 / 320.0]))
+    assert torch.allclose(feats.global_feats[9:11], torch.tensor([1.0 / 64.0, 2.0 / 320.0]))
+    assert torch.allclose(feats.global_feats[24:26], torch.tensor([1.0 / 64.0, 1.0 / 320.0]))
     assert feats.planet_feats.shape == (64, 19)
-    assert feats.fleet_feats.shape == (384, 20)
+    assert feats.fleet_feats.shape == (1, 20)
+    assert feats.fleet_target_planet_idx is None
     assert int(feats.planet_mask.sum()) == 3
     assert int(feats.fleet_mask.sum()) == 1
     assert bool(feats.planet_owned_mask[0]) and not bool(feats.planet_owned_mask[1])
@@ -43,11 +53,11 @@ def test_policy_forward_shapes():
     # batch dim was added implicitly by the encoder fast path.
     assert out.launch_logits.shape == (1, 64)
     assert out.target_logits.shape == (1, 64, 64)
-    assert out.fraction_mean.shape == (1, 64)
-    assert out.fraction_log_std.shape == (1, 64)
+    assert out.fraction_alpha.shape == (1, 64)
+    assert out.fraction_beta.shape == (1, 64)
     assert out.value.shape == (1,)
-    # Distributional value head: per-bin logits over the configured support.
-    assert out.value_logits.shape == (1, cfg.value_num_bins)
+    # Distributional MTP value head: per-horizon, per-bin logits.
+    assert out.value_logits.shape == (1, cfg.critic_mtp_horizon, cfg.value_num_bins)
     # Recovered scalar value lives inside the bin support.
     assert cfg.value_min <= float(out.value.item()) <= cfg.value_max
 
@@ -92,6 +102,55 @@ def test_symlog_hl_gauss_encodes_wide_raw_margin_targets():
     zero_logits = torch.zeros(3, 153)
     values = encoder.bins_to_scalar(zero_logits)
     assert torch.allclose(values, torch.zeros(3), atol=1e-4)
+
+
+def test_symlog_hl_gauss_decodes_expected_raw_scalar():
+    encoder = HLGaussLoss(
+        min_value=-100_000.0,
+        max_value=100_000.0,
+        num_bins=153,
+        symlog=True,
+    )
+    centers = encoder.encoder.centers
+    logits = -0.5 * ((centers - _symlog(torch.tensor(1000.0))) / 2.0).square()
+
+    got = encoder.bins_to_scalar(logits.unsqueeze(0))
+    expected = (logits.softmax(dim=-1) * _symexp(centers)).sum().unsqueeze(0)
+    certainty_equivalent = encoder.encoder(logits.unsqueeze(0))
+
+    assert torch.allclose(got, expected, atol=1e-4)
+    assert not torch.allclose(got, certainty_equivalent, rtol=0.1, atol=1.0)
+
+
+def test_policy_value_encoder_uses_configured_hl_gauss_sigma():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=2,
+        n_heads=2,
+        value_num_bins=153,
+        value_sigma_to_bin_ratio=2.0,
+        value_symlog=True,
+    )
+    model = OrbitPolicy(cfg)
+    bin_width = (
+        model.value_encoder.encoder.support[1] - model.value_encoder.encoder.support[0]
+    )
+
+    assert model.value_encoder.encoder.sigma == pytest.approx(
+        float(2.0 * bin_width),
+        rel=1e-5,
+    )
+
+
+def test_value_head_starts_from_zero_logits_without_bias():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    out = model(encode_observation(parse_observation(_obs())))
+
+    assert model.value_head[-1].bias is None
+    assert torch.allclose(out.value_logits, torch.zeros_like(out.value_logits), atol=1e-6)
+    assert torch.allclose(out.value, torch.zeros_like(out.value), atol=1e-4)
 
 
 def test_planet_rope_can_be_disabled():
@@ -139,17 +198,139 @@ def test_fleet_latent_encoder_compresses_fleet_tokens():
         model._embed_tokens(feats)
     )
 
-    assert h.shape[1] == 2 + 64 + cfg.num_fleet_latents
+    assert h.shape[1] == 3 + 64 + cfg.num_fleet_latents
     assert full_mask.shape[1] == h.shape[1]
     assert planet_mask.shape[-1] == 64
     assert fleet_mask.shape[-1] == cfg.num_fleet_latents
     assert rope_cache is not None
-    assert planet_slice == slice(2, 66)
+    assert planet_slice == slice(3, 67)
     assert p == 64
     assert f == cfg.num_fleet_latents
 
 
-def test_launch_prior_is_stable_across_planet_counts():
+def test_destination_conditioned_encoder_scopes_fleets_before_trunk():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(
+        parse_observation(_obs()), include_fleet_targets=True
+    )
+
+    h, full_mask, planet_mask, fleet_mask, rope_cache, planet_slice, p, f = (
+        model._embed_tokens(feats)
+    )
+    out = model(feats)
+
+    assert model.fleet_tokenizer is None
+    assert model.destination_fleet_conditioner is not None
+    assert h.shape[1] == 3 + 64
+    assert full_mask.shape[1] == h.shape[1]
+    assert planet_mask.shape[-1] == 64
+    assert fleet_mask.shape[-1] == 0
+    assert rope_cache is not None
+    assert planet_slice == slice(3, 67)
+    assert p == 64
+    assert f == 0
+    assert out.launch_logits.shape == (1, 64)
+    assert out.target_logits.shape == (1, 64, 64)
+
+
+def test_destination_conditioned_encoder_is_identity_without_inbound_fleets():
+    from owars.policies.model import justnorm
+
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(
+        parse_observation(_obs()), include_fleet_targets=True
+    )
+    feats.fleet_target_planet_idx.fill_(-1)
+
+    h, _full_mask, _planet_mask, _fleet_mask, _rope_cache, planet_slice, _p, _f = (
+        model._embed_tokens(feats)
+    )
+    expected_planets = justnorm(model.planet_embed(feats.planet_feats.unsqueeze(0)))
+
+    assert torch.allclose(h[:, planet_slice], expected_planets, atol=1e-6)
+
+
+def test_destination_conditioned_encoder_is_zero_init_identity_with_inbound_fleets():
+    from owars.policies.model import justnorm
+
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(
+        parse_observation(_obs()), include_fleet_targets=True
+    )
+    feats.fleet_target_planet_idx.fill_(-1)
+    feats.fleet_target_planet_idx[0] = 0
+
+    assert model.destination_fleet_conditioner is not None
+    assert torch.count_nonzero(model.destination_fleet_conditioner.mod.weight) == 0
+    assert torch.count_nonzero(model.destination_fleet_conditioner.mod.bias) == 0
+
+    h, _full_mask, _planet_mask, _fleet_mask, _rope_cache, planet_slice, _p, _f = (
+        model._embed_tokens(feats)
+    )
+    expected_planets = justnorm(model.planet_embed(feats.planet_feats.unsqueeze(0)))
+
+    assert torch.allclose(h[:, planet_slice], expected_planets, atol=1e-6)
+
+
+def test_destination_conditioned_encoder_requires_sidecar():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    model = OrbitPolicy(cfg)
+    feats = encode_observation(parse_observation(_obs()))
+
+    with pytest.raises(ValueError, match="fleet_target_planet_idx"):
+        model(feats)
+
+
+def test_destination_fleet_cross_attention_only_reads_matching_destination():
+    from owars.policies.model import DestinationFleetCrossAttention
+
+    torch.manual_seed(0)
+    attn = DestinationFleetCrossAttention(dim=32, n_heads=2).eval()
+    planets = torch.randn(1, 3, 32)
+    fleets = torch.randn(1, 4, 32)
+    planet_mask = torch.ones(1, 3, dtype=torch.bool)
+    fleet_mask = torch.tensor([[True, True, False, True]])
+    target_idx = torch.tensor([[0, 1, 0, -1]])
+
+    with torch.no_grad():
+        base = attn(planets, fleets, planet_mask, fleet_mask, target_idx)
+        changed_fleets = fleets.clone()
+        changed_fleets[:, 0] += 10.0
+        changed = attn(planets, changed_fleets, planet_mask, fleet_mask, target_idx)
+
+    assert not torch.allclose(base[:, 0], changed[:, 0])
+    assert torch.allclose(base[:, 1], changed[:, 1], atol=1e-6)
+    assert torch.allclose(base[:, 2], changed[:, 2], atol=1e-6)
+
+
+def test_noop_column_is_stable_across_planet_counts():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
     model = OrbitPolicy(cfg).eval()
     with torch.no_grad():
@@ -167,28 +348,37 @@ def test_launch_prior_is_stable_across_planet_counts():
         small = model(encode_observation(parse_observation(obs_small))).launch_logits
         large = model(encode_observation(parse_observation(obs_large))).launch_logits
 
-    expected = torch.sigmoid(torch.tensor(-1.5))
-    assert torch.allclose(small.sigmoid()[0, 0], expected, atol=1e-5)
-    assert torch.allclose(large.sigmoid()[0, 0], expected, atol=1e-5)
+    assert torch.allclose(small[0, 0], torch.zeros(()), atol=1e-5)
+    assert torch.allclose(large[0, 0], torch.zeros(()), atol=1e-5)
 
 
-def test_fraction_log_std_is_direct_parameter_expanded_over_planets():
+def test_fraction_beta_concentrations_are_unimodal():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
     model = OrbitPolicy(cfg)
     out = model(encode_observation(parse_observation(_obs())))
 
-    assert "fraction_log_std" in dict(model.named_parameters())
-    expected = model.fraction_log_std.detach().expand_as(out.fraction_log_std)
-    assert torch.allclose(out.fraction_log_std, expected)
+    assert "fraction_alpha_head.weight" in dict(model.named_parameters())
+    assert "fraction_beta_head.weight" in dict(model.named_parameters())
+    assert torch.all(out.fraction_alpha >= 1.0)
+    assert torch.all(out.fraction_beta >= 1.0)
 
 
-def test_deterministic_fraction_uses_squashed_mean():
-    fraction = torch.tensor([0.1, 0.9])
-    mean = torch.atanh(2.0 * fraction - 1.0)
+def test_deterministic_fraction_uses_beta_mode():
+    alpha = torch.tensor([2.0, 9.0, 1.0, 9.0, 1.0])
+    beta = torch.tensor([9.0, 2.0, 9.0, 1.0, 1.0])
 
-    got = _deterministic_fraction(mean)
+    got = _deterministic_fraction(alpha, beta)
 
-    assert torch.allclose(got, fraction, atol=1e-6)
+    expected = torch.tensor(
+        [
+            1.0 / 9.0,
+            8.0 / 9.0,
+            BETA_SAMPLE_EPS,
+            1.0 - BETA_SAMPLE_EPS,
+            0.5,
+        ]
+    )
+    assert torch.allclose(got, expected, atol=1e-6)
 
 
 def test_policy_accepts_legacy_fleet_feature_width():
@@ -221,8 +411,12 @@ def test_policy_ignores_padded_token_features():
     valid_cols = feats.planet_mask.unsqueeze(0)
     assert torch.allclose(clean_out.value, noisy_out.value)
     assert torch.allclose(
-        clean_out.fraction_mean[valid_planets],
-        noisy_out.fraction_mean[valid_planets],
+        clean_out.fraction_alpha[valid_planets],
+        noisy_out.fraction_alpha[valid_planets],
+    )
+    assert torch.allclose(
+        clean_out.fraction_beta[valid_planets],
+        noisy_out.fraction_beta[valid_planets],
     )
     assert torch.allclose(
         clean_out.launch_logits[valid_planets],
@@ -246,3 +440,24 @@ def test_sample_actions_returns_legal_moves():
     for m in moves:
         assert m.from_planet_id in owned_ids
         assert 1 <= m.num_ships < 50  # less than current garrison
+
+
+def test_ngpt_control_stats_reports_effective_init_values():
+    from owars.policies.model import ngpt_control_stats
+
+    cfg = OrbitPolicyConfig(
+        dim=32, ff_dim=64, depth=2, n_heads=2,
+        eigen_alpha_init=0.05, qk_gain_init=1.0,
+        encoder_backend="fleet_latent", num_fleet_latents=4,
+        fleet_tokenizer_depth=1,
+    )
+    model = OrbitPolicy(cfg)
+    stats = ngpt_control_stats(model)
+
+    # Effective units: a fresh model sits exactly at its configured inits.
+    assert abs(stats["eigen_alpha_mean"] - 0.05) < 1e-6
+    assert abs(stats["eigen_alpha_max"] - 0.05) < 1e-6
+    assert abs(stats["sqk_q_eff_mean"] - 1.0) < 1e-6
+    assert abs(stats["sqk_k_eff_mean"] - 1.0) < 1e-6
+    assert abs(stats["suv_mean"] - 1.0) < 1e-6
+    assert abs(stats["target_q_gain"] - 1.0) < 1e-6

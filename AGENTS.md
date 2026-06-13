@@ -34,9 +34,10 @@ Code for the **Orbit Wars** Kaggle simulation competition. We submit an agent (a
 
 - **Configs are the source of truth.** A run is `python scripts/train.py --config configs/<name>.yaml`. Don't bury hyperparameters in code.
 - **Ablations are configs that override a base config.** See `ablations/`. Run them via `scripts/ablate.py`; one tensorboard subdir per cell.
+- **Scripts are self-healing workflow utilities.** Treat `scripts/` as living automation for training, evaluation, bundling, monitoring, and analysis. Update scripts when use cases, best practices, or optimal workflows change; don't preserve stale behavior just because a script used to work that way.
 - **Tensorboard, always.** Every training run writes to `runs/<config_name>/<timestamp>/`. Scalars: policy loss, value loss, entropy, KL, SPO penalty, win-rate per opponent, mean margin. Histograms: predicted-target distributions, fraction-of-garrison.
 - **Don't commit data, checkpoints, runs, or `submission*.tar.gz`** — `.gitignore` covers them.
-- **The default model is in `src/owars/policies/model.py`** — a small set-transformer over planet/fleet tokens with target-attention and a Beta-distributed fraction head. See `STRATEGY.md` for the why.
+- **The default model is in `src/owars/policies/model.py`** — a small set-transformer over planet/fleet tokens with target-attention and a Beta-distributed fraction head.
 - **The runtime entry point is `submission/main.py`.** It vendors `src/owars/` and lazy-loads weights — the bundle runs offline by design.
 - Don't concern yourself with backwards compatiQbility with old weights and architectures
 
@@ -74,7 +75,6 @@ The full canonical reference is in `data/raw/README.md` (the official "How to Pl
 
 ## Quick links
 
-- `STRATEGY.md` — modeling plan, architecture rationale, ablation plan
 - `configs/baseline_heuristic.yaml` — sanity baseline (no learning)
 - `configs/ppo_base.yaml` — first PPO config (the "main" 2-player model)
 - `configs/ppo_4p.yaml` — 4-player FFA variant

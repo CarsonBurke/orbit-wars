@@ -12,6 +12,8 @@ from owars.policies.sampling import (
     ActionContext,
     SampleBatchRecord,
     SampleRecord,
+    _categorical_action_log_probs,
+    _record_from_materialized_launch,
     sample_actions,
     sample_batch_actions,
     sample_batch_actions_context,
@@ -83,8 +85,8 @@ def _model() -> OrbitPolicy:
 def _forced_move_output(feats) -> PolicyOutput:
     """PolicyOutput that deterministically launches from planet 0 to planet 1.
 
-    A large pre-squash mean on planet 0 sends most of the garrison. All other
-    planets use mean 0, whose deterministic fraction is 0.5.
+    A high-alpha Beta on planet 0 sends most of the garrison. All other
+    planets use symmetric Beta parameters, whose deterministic fraction is 0.5.
     """
     batched = feats.planet_ids.dim() == 2
     b = int(feats.planet_ids.shape[0]) if batched else 1
@@ -94,14 +96,14 @@ def _forced_move_output(feats) -> PolicyOutput:
     target_logits = torch.full((b, p, p), -100.0)
     target_logits[:, 0, :] = -100.0
     target_logits[:, 0, 1] = 100.0
-    fraction_mean = torch.zeros((b, p))
-    fraction_mean[:, 0] = 3.0
-    fraction_log_std = torch.zeros((b, p))
+    fraction_alpha = torch.full((b, p), 2.0)
+    fraction_beta = torch.full((b, p), 2.0)
+    fraction_alpha[:, 0] = 20.0
     if not batched:
         launch_logits = launch_logits[:1]
         target_logits = target_logits[:1]
-        fraction_mean = fraction_mean[:1]
-        fraction_log_std = fraction_log_std[:1]
+        fraction_alpha = fraction_alpha[:1]
+        fraction_beta = fraction_beta[:1]
         planet_owned_mask = feats.planet_owned_mask.unsqueeze(0)
         planet_mask = feats.planet_mask.unsqueeze(0)
         planet_ids = feats.planet_ids.unsqueeze(0)
@@ -112,13 +114,13 @@ def _forced_move_output(feats) -> PolicyOutput:
     return PolicyOutput(
         launch_logits=launch_logits,
         target_logits=target_logits,
-        fraction_mean=fraction_mean,
-        fraction_log_std=fraction_log_std,
         value=torch.zeros(b),
         value_logits=torch.zeros(b, 51),
         planet_owned_mask=planet_owned_mask,
         planet_mask=planet_mask,
         planet_ids=planet_ids,
+        fraction_alpha=fraction_alpha,
+        fraction_beta=fraction_beta,
     )
 
 
@@ -131,9 +133,9 @@ def _forced_source_output(feats, target_scores: dict[int, float]) -> PolicyOutpu
     target_logits = torch.full((b, p, p), -100.0)
     for target, score in target_scores.items():
         target_logits[:, 0, target] = score
-    fraction_mean = torch.zeros((b, p))
-    fraction_mean[:, 0] = 3.0
-    fraction_log_std = torch.zeros((b, p))
+    fraction_alpha = torch.full((b, p), 2.0)
+    fraction_beta = torch.full((b, p), 2.0)
+    fraction_alpha[:, 0] = 20.0
     if not batched:
         planet_owned_mask = feats.planet_owned_mask.unsqueeze(0)
         planet_mask = feats.planet_mask.unsqueeze(0)
@@ -145,13 +147,13 @@ def _forced_source_output(feats, target_scores: dict[int, float]) -> PolicyOutpu
     return PolicyOutput(
         launch_logits=launch_logits,
         target_logits=target_logits,
-        fraction_mean=fraction_mean,
-        fraction_log_std=fraction_log_std,
         value=torch.zeros(b),
         value_logits=torch.zeros(b, 51),
         planet_owned_mask=planet_owned_mask,
         planet_mask=planet_mask,
         planet_ids=planet_ids,
+        fraction_alpha=fraction_alpha,
+        fraction_beta=fraction_beta,
     )
 
 
@@ -167,13 +169,13 @@ def _duplicate_source_output() -> PolicyOutput:
     return PolicyOutput(
         launch_logits=launch_logits,
         target_logits=target_logits,
-        fraction_mean=torch.full((1, 3), 1.5),
-        fraction_log_std=torch.zeros((1, 3)),
         value=torch.zeros(1),
         value_logits=torch.zeros(1, 51),
         planet_owned_mask=torch.tensor([[True, True, False]]),
         planet_mask=torch.tensor([[True, True, True]]),
         planet_ids=torch.tensor([[0, 0, 1]]),
+        fraction_alpha=torch.full((1, 3), 20.0),
+        fraction_beta=torch.full((1, 3), 2.0),
     )
 
 
@@ -193,9 +195,26 @@ def test_stack_encoded_preserves_fields():
     assert stacked.planet_feats.shape[0] == 2
     assert stacked.planet_feats.shape[1:] == feats_a.planet_feats.shape
     assert stacked.fleet_mask.shape == (2, feats_a.fleet_mask.shape[0])
+    assert stacked.fleet_target_planet_idx is None
+    feats_a_targets = encode_observation(obs_a, include_fleet_targets=True)
+    feats_b_targets = encode_observation(obs_b, include_fleet_targets=True)
+    stacked_targets = stack_encoded([feats_a_targets, feats_b_targets])
+    assert stacked_targets.fleet_target_planet_idx is not None
+    assert stacked_targets.fleet_target_planet_idx.shape == (
+        2,
+        feats_a.fleet_mask.shape[0],
+    )
     # Element 0 must equal the original.
     assert torch.equal(stacked.planet_feats[0], feats_a.planet_feats)
     assert torch.equal(stacked.fleet_feats[1], feats_b.fleet_feats)
+    assert torch.equal(
+        stacked_targets.fleet_target_planet_idx[0],
+        feats_a_targets.fleet_target_planet_idx,
+    )
+    assert torch.equal(
+        stacked_targets.fleet_target_planet_idx[1],
+        feats_b_targets.fleet_target_planet_idx,
+    )
 
 
 def test_batched_sampler_shapes_and_record_lengths():
@@ -278,19 +297,107 @@ def test_batched_matches_single_under_fixed_seed():
     assert torch.allclose(single_rec.log_prob, batched_recs[0].log_prob, atol=1e-6)
 
 
-def test_batched_deterministic_argmax_matches_logits():
+def test_batched_deterministic_uses_categorical_mode():
     o = parse_observation(_obs())
     feats = encode_observation(o)
     stacked = stack_encoded([feats, feats])
     model = _model()
     out = model(stacked)
     _, records = sample_batch_with_records(out, [o, o], deterministic=True)
-    expected = out.target_logits.argmax(dim=-1)
-    expected_launch = (out.launch_logits > 0.0).to(records[0].launch.dtype)
+    target_legal_mask = torch.stack([r.target_legal_mask for r in records])
+    target_logits = out.target_logits.masked_fill(~target_legal_mask, float("-inf"))
+    action_log_probs = _categorical_action_log_probs(
+        out.launch_logits,
+        target_logits,
+        out.action_logit_softcap,
+        deterministic=True,
+    )
+    action_idx = action_log_probs.argmax(dim=-1)
+    expected_launch = (action_idx > 0).to(records[0].launch.dtype)
+    expected_target = (action_idx - 1).clamp_min(0)
+    source = out.planet_owned_mask & out.planet_mask
+    expected_launch = expected_launch * source.to(dtype=expected_launch.dtype)
     assert torch.equal(records[0].launch, expected_launch[0])
     assert torch.equal(records[1].launch, expected_launch[1])
-    assert torch.equal(records[0].target_idx, expected[0])
-    assert torch.equal(records[1].target_idx, expected[1])
+    assert torch.equal(records[0].target_idx[source[0]], expected_target[0][source[0]])
+    assert torch.equal(records[1].target_idx[source[1]], expected_target[1][source[1]])
+
+
+def test_categorical_deterministic_stays_idle_when_only_move_mass_beats_noop():
+    obs = _obs()
+    obs["angular_velocity"] = 0.0
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    p = feats.planet_ids.shape[-1]
+    out = PolicyOutput(
+        launch_logits=torch.full((1, p), -100.0),
+        target_logits=torch.full((1, p, p), -100.0),
+        value=torch.zeros(1),
+        value_logits=torch.zeros(1, 51),
+        planet_owned_mask=feats.planet_owned_mask.unsqueeze(0),
+        planet_mask=feats.planet_mask.unsqueeze(0),
+        planet_ids=feats.planet_ids.unsqueeze(0),
+        action_logit_softcap=8.0,
+        fraction_alpha=torch.full((1, p), 20.0),
+        fraction_beta=torch.full((1, p), 2.0),
+    )
+    out.launch_logits[:, 0] = 0.0
+    out.target_logits[:, 0, 1] = 0.2
+    out.target_logits[:, 0, 2] = 0.2
+
+    actions, records = sample_batch_with_records_raw(
+        out, [obs], deterministic=True
+    )
+
+    assert actions[0] == []
+    assert records[0].launch[0].item() == 0.0
+    assert records[0].target_idx[0].item() == 0
+
+
+def test_categorical_record_keeps_sampled_launch_when_materialization_fails():
+    launch = torch.tensor([1.0, 0.0])
+    target_idx = torch.tensor([1, 0])
+    frac = torch.tensor([0.4, 0.4])
+    launch_logits = torch.zeros(2)
+    target_logits = torch.tensor(
+        [
+            [float("-inf"), 0.0],
+            [float("-inf"), float("-inf")],
+        ]
+    )
+    alpha = torch.full((2,), 2.0)
+    beta = torch.full((2,), 2.0)
+
+    record = _record_from_materialized_launch(
+        launch,
+        target_idx,
+        frac,
+        launch_logits,
+        None,
+        8.0,
+        target_logits,
+        alpha,
+        beta,
+        "beta",
+        materialized=[False, False],
+    )
+
+    action_log_probs = _categorical_action_log_probs(
+        launch_logits,
+        target_logits,
+        8.0,
+    )
+    frac_lp = (
+        (alpha - 1.0) * frac.log()
+        + (beta - 1.0) * torch.log1p(-frac)
+        - (torch.lgamma(alpha) + torch.lgamma(beta) - torch.lgamma(alpha + beta))
+    )
+    expected = action_log_probs[0, target_idx[0] + 1] + frac_lp[0]
+
+    assert record.raw_launch[0].item() == 1.0
+    assert record.launch[0].item() == 1.0
+    assert torch.allclose(record.log_prob[0], expected, atol=1e-6)
+    assert record.launch[1].item() == 0.0
 
 
 def test_moves_only_sampler_matches_record_path_deterministic():
@@ -344,13 +451,13 @@ def test_deterministic_moves_only_fallback_allows_multiple_sources():
     out = PolicyOutput(
         launch_logits=torch.full((1, p), -100.0),
         target_logits=torch.full((1, p, p), -100.0),
-        fraction_mean=torch.zeros((1, p)),
-        fraction_log_std=torch.zeros((1, p)),
         value=torch.zeros(1),
         value_logits=torch.zeros(1, 51),
         planet_owned_mask=feats.planet_owned_mask.unsqueeze(0),
         planet_mask=feats.planet_mask.unsqueeze(0),
         planet_ids=feats.planet_ids.unsqueeze(0),
+        fraction_alpha=torch.full((1, p), 2.0),
+        fraction_beta=torch.full((1, p), 2.0),
     )
     out.launch_logits[:, 0] = -1.0
     out.launch_logits[:, 2] = -1.2
@@ -478,6 +585,7 @@ def test_sampler_records_noop_when_only_target_is_planet_blocked():
     o = parse_observation(obs)
     feats = encode_observation(o)
     out = _forced_source_output(feats, {1: 100.0})
+    out.target_logits[:, 0, 2:] = float("-inf")
 
     moves, record = sample_with_record(out, o, deterministic=True)
     raw_actions, raw_records = sample_batch_with_records_raw(
@@ -591,7 +699,7 @@ def test_no_launch_record_still_masks_missing_legal_target_support():
     assert not raw_records[0].target_legal_mask[0].any()
 
 
-def test_sampler_masks_comet_target_to_legal_alternative():
+def test_sampler_allows_comet_target_when_route_is_legal():
     obs = _obs()
     obs["comet_planet_ids"] = [1]
     o = parse_observation(obs)
@@ -599,9 +707,11 @@ def test_sampler_masks_comet_target_to_legal_alternative():
     out = _forced_move_output(feats)
 
     moves, record = sample_with_record(out, o, deterministic=True)
+    raw_actions = sample_batch_actions_raw(out, [obs], deterministic=True)
     assert moves
     assert record.launch[0].item() == 1.0
-    assert record.target_idx[0].item() == 2
+    assert record.target_idx[0].item() == 1
+    assert raw_actions[0][0][3] == 1
     assert sample_actions(out, o, deterministic=True)
     assert sample_batch_actions_context(
         out,
@@ -614,3 +724,45 @@ def test_sampler_masks_comet_target_to_legal_alternative():
         ],
         deterministic=True,
     )[0]
+
+
+def test_sampler_treats_orbit_threshold_comet_as_comet_not_orbiter():
+    obs = _obs()
+    obs["step"] = 50
+    obs["planets"] = [
+        [13, 0, 30.230528337169282, 37.113714576315715, 1.0, 20, 1],
+        [29, -1, 47.52883413524248, 97.05854540070332, 1.0, 7, 1],
+        [18, 1, 70.0, 75.0, 1.0, 20, 1],
+    ]
+    obs["initial_planets"] = [row.copy() for row in obs["planets"]]
+    obs["comet_planet_ids"] = [29]
+    obs["comets"] = [
+        {
+            "planet_ids": [29],
+            "paths": [[[47.52883413524248, 97.05854540070332], [47.0, 95.0]]],
+            "path_index": 0,
+        }
+    ]
+    o = parse_observation(obs)
+    feats = encode_observation(o)
+    out = _forced_move_output(feats)
+
+    moves, record = sample_with_record(out, o, deterministic=True)
+    raw_actions = sample_batch_actions_raw(out, [obs], deterministic=True)
+    context_actions = sample_batch_actions_context(
+        out,
+        [
+            ActionContext(
+                planets=obs["planets"],
+                angular_velocity=obs["angular_velocity"],
+                comet_planet_ids=obs["comet_planet_ids"],
+            )
+        ],
+        deterministic=True,
+    )
+
+    assert moves
+    assert record.target_legal_mask[0, 1]
+    assert record.launch[0].item() == 1.0
+    assert raw_actions[0] and raw_actions[0][0][3] == 29
+    assert context_actions[0] and context_actions[0][0][3] == 29

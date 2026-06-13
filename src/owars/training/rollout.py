@@ -60,6 +60,51 @@ def _obs_reward_potential(
     return own - enemy
 
 
+def _obs_production_margin(obs: Any, player: int, num_players: int) -> float:
+    """Production margin Φ = (own production) − (max opponent production).
+
+    The SAC reward is the per-step DELTA of this quantity, Φ(s')−Φ(s): the agent
+    is rewarded the step it grows its own production (a capture) and penalized
+    the step the enemy grows theirs, so credit lands on the action that caused
+    the swing. Φ is fully observable (production + ownership are per-planet
+    features) and O(±10²), keeping the critic value well-conditioned. The
+    delta's value-to-go still depends on the remaining horizon (less time and
+    territory left to swing), so the SAC encoder is FiLM-conditioned on a global
+    time feature to keep the endgame value learnable.
+    """
+    get = obs.get if isinstance(obs, dict) else lambda key, default=None: getattr(obs, key, default)
+    production = [0.0] * num_players
+    for planet in get("planets", []) or []:
+        owner = int(planet[1])
+        if owner != -1:
+            production[owner] += float(planet[6])
+    own = production[player]
+    enemy = max(
+        (production[p] for p in range(num_players) if p != player), default=0.0
+    )
+    return own - enemy
+
+
+def _obs_reward_signal(
+    obs: Any,
+    player: int,
+    num_players: int,
+    episode_steps: int,
+    reward_cfg: RewardCfg,
+) -> float:
+    if reward_cfg.signal == "win_terminal":
+        return 0.0
+    if reward_cfg.signal == "production_margin":
+        return _obs_production_margin(obs, player, num_players)
+    return _obs_reward_potential(
+        obs,
+        player,
+        num_players,
+        episode_steps,
+        reward_cfg.production_weight,
+    )
+
+
 @dataclass
 class Trajectory:
     """Per-step records for the *learning* agent only.
@@ -102,10 +147,16 @@ def make_env(num_players: int, episode_steps: int, ship_speed: float, debug: boo
 
 
 def _policy_step(
-    model: OrbitPolicy, obs: Any, device: str, deterministic: bool
+    model: OrbitPolicy,
+    obs: Any,
+    device: str,
+    deterministic: bool,
 ) -> tuple[list[list], dict]:
+    include_fleet_targets = model.cfg.encoder_backend == "destination_conditioned"
     if isinstance(obs, dict):
-        feats = encode_raw_observations([obs], device=device)
+        feats = encode_raw_observations(
+            [obs], device=device, include_fleet_targets=include_fleet_targets
+        )
         autocast_enabled = torch.device(device).type == "cuda"
         with (
             torch.no_grad(),
@@ -115,7 +166,9 @@ def _policy_step(
         ):
             out = model(feats)
             actions_list, records = sample_batch_with_records_raw(
-                out, [obs], deterministic=deterministic
+                out,
+                [obs],
+                deterministic=deterministic,
             )
         actions = actions_list[0]
         return [move[:3] for move in actions], {
@@ -127,7 +180,9 @@ def _policy_step(
         }
 
     parsed = parse_observation(obs)
-    feats = encode_observation(parsed, device=device)
+    feats = encode_observation(
+        parsed, device=device, include_fleet_targets=include_fleet_targets
+    )
     autocast_enabled = torch.device(device).type == "cuda"
     with (
         torch.no_grad(),
@@ -136,7 +191,11 @@ def _policy_step(
         ),
     ):
         out = model(feats)
-        moves, record = sample_with_record(out, parsed, deterministic=deterministic)
+        moves, record = sample_with_record(
+            out,
+            parsed,
+            deterministic=deterministic,
+        )
     return [m.as_list() for m in moves], {
         "feats": feats,
         "policy_out": out,
@@ -184,13 +243,14 @@ def rollout_episode(
 
     state = env.reset(num_agents=num_players)
     previous_potential = 0.0
-    if reward_cfg.potential_weight != 0.0:
-        previous_potential = _obs_reward_potential(
+    dense_potential = reward_cfg.uses_dense_potential()
+    if dense_potential:
+        previous_potential = _obs_reward_signal(
             state[learner_ix]["observation"],
             learner_ix,
             num_players,
             episode_steps,
-            reward_cfg.production_weight,
+            reward_cfg,
         )
 
     traj = Trajectory(
@@ -205,7 +265,12 @@ def rollout_episode(
         for seat, slot in enumerate(state):
             if agents[seat] == "__learner__":
                 obs = learner_tracker.annotate(slot["observation"])
-                acts, info = _policy_step(model, obs, device, deterministic)
+                acts, info = _policy_step(
+                    model,
+                    obs,
+                    device,
+                    deterministic,
+                )
                 actions.append(acts)
                 learner_tracker.record(slot["observation"], info["moves"])
                 _record_step(traj, info)
@@ -213,13 +278,13 @@ def rollout_episode(
                 obs = slot["observation"]
                 actions.append(agents[seat](obs))
         state = env.step(actions)
-        if reward_cfg.potential_weight != 0.0 and traj.reward:
-            current_potential = _obs_reward_potential(
+        if dense_potential and traj.reward:
+            current_potential = _obs_reward_signal(
                 state[learner_ix]["observation"],
                 learner_ix,
                 num_players,
                 episode_steps,
-                reward_cfg.production_weight,
+                reward_cfg,
             )
             traj.reward[-1] += reward_cfg.potential_weight * (
                 current_potential - previous_potential
