@@ -86,6 +86,7 @@ class OrbitPolicyConfig:
     # and are masked at episode tails.
     value_hidden: int = 64
     value_num_bins: int = 153
+    value_sigma_to_bin_ratio: float = 0.5
     critic_mtp_horizon: int = 6
     value_min: float = -100_000.0
     value_max: float = 100_000.0

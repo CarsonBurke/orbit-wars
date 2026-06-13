@@ -47,6 +47,7 @@ class ModelCfg:
     fleet_tokenizer_depth: int = 1
     value_hidden: int = 64
     value_num_bins: int = 153
+    value_sigma_to_bin_ratio: float = 0.5
     critic_mtp_horizon: int = 6
     value_min: float = -100_000.0
     value_max: float = 100_000.0
@@ -506,6 +507,8 @@ class RunConfig:
             raise ValueError(f"model.{exc}") from exc
         if cfg.model.value_min >= cfg.model.value_max:
             raise ValueError("model.value_min must be less than model.value_max")
+        if cfg.model.value_sigma_to_bin_ratio <= 0.0:
+            raise ValueError("model.value_sigma_to_bin_ratio must be positive")
         if cfg.model.critic_mtp_horizon <= 0:
             raise ValueError("model.critic_mtp_horizon must be positive")
         if cfg.model.adv_scale <= 0.0:

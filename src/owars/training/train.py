@@ -250,6 +250,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         fleet_tokenizer_depth=cfg.model.fleet_tokenizer_depth,
         value_hidden=cfg.model.value_hidden,
         value_num_bins=cfg.model.value_num_bins,
+        value_sigma_to_bin_ratio=cfg.model.value_sigma_to_bin_ratio,
         critic_mtp_horizon=cfg.model.critic_mtp_horizon,
         value_min=cfg.model.value_min,
         value_max=cfg.model.value_max,

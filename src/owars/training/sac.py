@@ -1295,6 +1295,7 @@ def _build_policy_cfg(cfg: RunConfig) -> OrbitPolicyConfig:
         fleet_tokenizer_depth=m.fleet_tokenizer_depth,
         value_hidden=m.value_hidden,
         value_num_bins=m.value_num_bins,
+        value_sigma_to_bin_ratio=m.value_sigma_to_bin_ratio,
         value_min=m.value_min,
         value_max=m.value_max,
         value_symlog=m.value_symlog,

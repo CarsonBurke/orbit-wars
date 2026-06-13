@@ -80,6 +80,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from hl_gauss_pytorch import HLGaussLoss as _LibraryHLGaussLoss
+
 try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 except Exception:  # pragma: no cover - optional on older torch builds
@@ -1142,13 +1143,16 @@ class HLGaussLoss(nn.Module):
       - `target_probs(value)` encodes a scalar to a per-bin probability
         vector via the truncated-Gaussian CDF over the bin support, with
         renormalization so the truncated tails don't bias the target.
-      - `bins_to_scalar(logits)` recovers E[V] = Σ softmax(logits)_i · c_i.
+      - `bins_to_scalar(logits)` recovers the expected raw scalar over bin
+        centers. With symlog support this is E[symexp(c_i)], matching the
+        CleanRL v149 Bellman scalar path, not symexp(E[c_i]).
       - `loss(logits, target_probs)` is just F.cross_entropy on a per-element
         basis (caller is responsible for masking/reduction).
 
     With `symlog=True`, `min_value` / `max_value` are raw values. The library
     transforms those endpoints to symlog space for the histogram support and
-    applies symexp when decoding scalar predictions.
+    applies symlog when encoding scalar targets. Scalar decode maps each
+    symlog-space bin center back to raw space before taking the expectation.
     """
 
     def __init__(
@@ -1201,7 +1205,11 @@ class HLGaussLoss(nn.Module):
         return self.encoder.transform_to_probs(values.float())
 
     def bins_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
-        return self.encoder(logits.float()).clamp(self.min_value, self.max_value)
+        probs = logits.float().softmax(dim=-1)
+        centers = self.encoder.centers.float()
+        if self.symlog:
+            centers = _symexp(centers)
+        return (probs * centers).sum(dim=-1).clamp(self.min_value, self.max_value)
 
 
 def _symlog(x: torch.Tensor) -> torch.Tensor:
@@ -1366,6 +1374,7 @@ class OrbitPolicy(nn.Module):
             min_value=cfg.value_min,
             max_value=cfg.value_max,
             num_bins=cfg.value_num_bins,
+            sigma_to_bin_ratio=cfg.value_sigma_to_bin_ratio,
             symlog=cfg.value_symlog,
         )
         self.value_head = nn.Sequential(
@@ -1384,11 +1393,9 @@ class OrbitPolicy(nn.Module):
             and self.value_head[0].weight.shape[1] >= 64
         ):
             nn.init.orthogonal_(self.value_head[0].weight, gain=0.1)
-        # Zero-init the value head's last layer so V(s) is the *uniform*
-        # distribution over bins at step 0 — same parameter-golf lever as
-        # the action heads. Recovered scalar starts at 0 (mean of bin
-        # centers on the symmetric [-1, 1] support) so cold-start advantage
-        # is not corrupted by a random bin distribution.
+        # Zero-init the bias-free value head. With symmetric supports, zero
+        # logits are a neutral scalar prior, matching CleanRL v149's
+        # nocriticbias critic.
         nn.init.zeros_(self.value_head[-1].weight)
         # Cached on-device self-target mask. P is bounded by MAX_PLANETS,
         # so we allocate once at module init and slice per-forward instead

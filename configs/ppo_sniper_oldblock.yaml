@@ -40,6 +40,7 @@ model:
   value_min: -100000.0
   value_max: 100000.0
   value_num_bins: 153
+  value_sigma_to_bin_ratio: 2.0
   critic_mtp_horizon: 6
   value_symlog: true
 

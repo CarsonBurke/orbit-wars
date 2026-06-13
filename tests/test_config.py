@@ -162,6 +162,11 @@ def test_invalid_value_support_raises():
         RunConfig.from_dict({"model": {"value_min": 1.0, "value_max": 1.0}})
 
 
+def test_invalid_value_sigma_to_bin_ratio_raises():
+    with pytest.raises(ValueError, match="value_sigma_to_bin_ratio"):
+        RunConfig.from_dict({"model": {"value_sigma_to_bin_ratio": 0.0}})
+
+
 def test_invalid_critic_mtp_horizon_raises():
     with pytest.raises(ValueError, match="critic_mtp_horizon"):
         RunConfig.from_dict({"model": {"critic_mtp_horizon": 0}})

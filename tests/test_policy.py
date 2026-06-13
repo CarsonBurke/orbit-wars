@@ -1,9 +1,9 @@
-import torch
 import pytest
+import torch
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
-from owars.policies.model import HLGaussLoss
+from owars.policies.model import HLGaussLoss, _symexp, _symlog
 from owars.policies.sampling import BETA_SAMPLE_EPS, _deterministic_fraction
 
 
@@ -102,6 +102,55 @@ def test_symlog_hl_gauss_encodes_wide_raw_margin_targets():
     zero_logits = torch.zeros(3, 153)
     values = encoder.bins_to_scalar(zero_logits)
     assert torch.allclose(values, torch.zeros(3), atol=1e-4)
+
+
+def test_symlog_hl_gauss_decodes_expected_raw_scalar():
+    encoder = HLGaussLoss(
+        min_value=-100_000.0,
+        max_value=100_000.0,
+        num_bins=153,
+        symlog=True,
+    )
+    centers = encoder.encoder.centers
+    logits = -0.5 * ((centers - _symlog(torch.tensor(1000.0))) / 2.0).square()
+
+    got = encoder.bins_to_scalar(logits.unsqueeze(0))
+    expected = (logits.softmax(dim=-1) * _symexp(centers)).sum().unsqueeze(0)
+    certainty_equivalent = encoder.encoder(logits.unsqueeze(0))
+
+    assert torch.allclose(got, expected, atol=1e-4)
+    assert not torch.allclose(got, certainty_equivalent, rtol=0.1, atol=1.0)
+
+
+def test_policy_value_encoder_uses_configured_hl_gauss_sigma():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=2,
+        n_heads=2,
+        value_num_bins=153,
+        value_sigma_to_bin_ratio=2.0,
+        value_symlog=True,
+    )
+    model = OrbitPolicy(cfg)
+    bin_width = (
+        model.value_encoder.encoder.support[1] - model.value_encoder.encoder.support[0]
+    )
+
+    assert model.value_encoder.encoder.sigma == pytest.approx(
+        float(2.0 * bin_width),
+        rel=1e-5,
+    )
+
+
+def test_value_head_starts_from_zero_logits_without_bias():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    out = model(encode_observation(parse_observation(_obs())))
+
+    assert model.value_head[-1].bias is None
+    assert torch.allclose(out.value_logits, torch.zeros_like(out.value_logits), atol=1e-6)
+    assert torch.allclose(out.value, torch.zeros_like(out.value), atol=1e-4)
 
 
 def test_planet_rope_can_be_disabled():
