@@ -9,9 +9,11 @@ Also keeps a regression guard on the log_prob recompute invariant
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as nn_functional
 
@@ -38,6 +40,7 @@ from owars.training.ppo import (
     _minibatch_loss_scale,
     _rank_gaussian_advantage,
     compute_gae,
+    compute_old_log_probs,
     ppo_update,
     value_only_update,
 )
@@ -50,10 +53,10 @@ from owars.training.ppo import (
 # recompute invariant below is vacuously satisfied.
 _TOY_PLANETS = [
     # (id, owner, x, y, radius, ships, production)
-    Planet(0, 0, 8.0, 10.0, 2.1, 80, 3),   # owned
-    Planet(1, 0, 8.0, 40.0, 2.1, 80, 3),   # owned
-    Planet(2, 0, 8.0, 70.0, 2.1, 80, 3),   # owned
-    Planet(3, 1, 8.0, 95.0, 1.7, 30, 2),   # enemy
+    Planet(0, 0, 8.0, 10.0, 2.1, 80, 3),  # owned
+    Planet(1, 0, 8.0, 40.0, 2.1, 80, 3),  # owned
+    Planet(2, 0, 8.0, 70.0, 2.1, 80, 3),  # owned
+    Planet(3, 1, 8.0, 95.0, 1.7, 30, 2),  # enemy
     Planet(4, 1, 30.0, 10.0, 1.7, 30, 2),  # enemy
     Planet(5, -1, 30.0, 40.0, 1.0, 20, 1),  # neutral
     Planet(6, -1, 30.0, 70.0, 1.0, 20, 1),  # neutral
@@ -75,11 +78,17 @@ def _toy_batch(
     torch.manual_seed(0)
     obs = [
         Observation(
-            player=0, step=0,
+            player=0,
+            step=0,
             planets=list(_TOY_PLANETS),
-            fleets=[], angular_velocity=0.0, initial_planets=[],
-            comet_planet_ids=set(), comets=[], remaining_overage_time=60.0,
-        ) for _ in range(batch_size)
+            fleets=[],
+            angular_velocity=0.0,
+            initial_planets=[],
+            comet_planet_ids=set(),
+            comets=[],
+            remaining_overage_time=60.0,
+        )
+        for _ in range(batch_size)
     ]
     feats = encode_observations(
         obs,
@@ -127,7 +136,9 @@ def test_ppo_update_runs_and_returns_finite_metrics():
     optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.5,
         target_entropy_coef=0.01,
         fraction_entropy_coef=0.0,
@@ -135,7 +146,9 @@ def test_ppo_update_runs_and_returns_finite_metrics():
         advantage_transform="rankgauss",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=2, minibatch_size=4, grad_clip=0.5,
+        epochs=2,
+        minibatch_size=4,
+        grad_clip=0.5,
     )
 
     for name in (
@@ -163,6 +176,43 @@ def test_ppo_update_runs_and_returns_finite_metrics():
     assert 0.0 <= log.ratio_clip_frac_high <= 1.0, log.ratio_clip_frac_high
     assert 0.0 <= log.pos_frac <= 1.0, log.pos_frac
     assert log.value_loss >= 0.0, log.value_loss
+
+
+def test_deferred_old_log_probs_match_sampler_records():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=8)
+
+    old_log_prob = compute_old_log_probs(
+        model,
+        batch,
+        minibatch_size=4,
+        compile_mode=None,
+    )
+
+    assert torch.allclose(old_log_prob, batch["old_log_prob"], atol=1e-5, rtol=1e-5)
+
+
+def test_compute_old_log_probs_uses_eval_mode_and_restores_training_state():
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=2,
+        n_heads=2,
+        dropout=0.9,
+        value_num_bins=21,
+    )
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=4)
+    model.train()
+
+    torch.manual_seed(1)
+    first = compute_old_log_probs(model, batch, minibatch_size=2)
+    torch.manual_seed(2)
+    second = compute_old_log_probs(model, batch, minibatch_size=2)
+
+    assert model.training
+    torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
 
 
 def test_trim_ppo_batch_fleet_width_keeps_destination_sidecar_aligned():
@@ -312,6 +362,150 @@ def test_pretrain_value_batch_uses_configured_lambda_return(monkeypatch):
     assert torch.allclose(batch["return"], torch.from_numpy(expected))
 
 
+def test_discounted_return_normalizer_matches_cleanrl_reward_scale():
+    norm = train_mod.DiscountedReturnNormalizer(gamma=0.5, clip=2.0, epsilon=1e-8)
+    episodes = [
+        np.asarray([1.0, 2.0, 10.0], dtype=np.float32),
+        np.asarray([1.0], dtype=np.float32),
+    ]
+
+    mean = 0.0
+    var = 1.0
+    count = 1.0e-4
+    expected_episodes = [np.empty_like(rewards, dtype=np.float32) for rewards in episodes]
+    running = [0.0 for _ in episodes]
+    clip_count = 0
+    reward_count = 0
+    for step in range(max(len(rewards) for rewards in episodes)):
+        active = [
+            episode_idx for episode_idx, rewards in enumerate(episodes) if step < len(rewards)
+        ]
+        rewards = np.asarray(
+            [episodes[episode_idx][step] for episode_idx in active],
+            dtype=np.float32,
+        )
+        for episode_idx, reward in zip(active, rewards, strict=True):
+            running[episode_idx] = running[episode_idx] * 0.5 + float(reward)
+        running_step = np.asarray([running[episode_idx] for episode_idx in active])
+        batch_mean = float(running_step.mean())
+        batch_var = float(running_step.var())
+        batch_count = float(running_step.size)
+        delta = batch_mean - mean
+        total = count + batch_count
+        m2 = var * count + batch_var * batch_count + delta * delta * count * batch_count / total
+        mean += delta * batch_count / total
+        var = m2 / total
+        count = total
+        scaled = rewards / math.sqrt(var + 1e-8)
+        clip_count += int(np.count_nonzero(np.abs(scaled) > 2.0))
+        reward_count += int(scaled.size)
+        clipped = np.clip(scaled, -2.0, 2.0)
+        for local_idx, episode_idx in enumerate(active):
+            expected_episodes[episode_idx][step] = clipped[local_idx]
+
+    got_first, got_second = norm.normalize_episodes(episodes)
+
+    assert np.allclose(got_first, expected_episodes[0])
+    assert np.allclose(got_second, expected_episodes[1])
+    assert math.isclose(norm.mean, mean)
+    assert math.isclose(norm.var, var)
+    assert math.isclose(norm.batch_clip_frac, clip_count / reward_count)
+
+
+def test_stack_trajectories_normalizes_rewards_before_gae(monkeypatch):
+    monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
+    rewards = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+    values = np.zeros_like(rewards)
+    traj = SimpleNamespace(
+        reward=rewards.tolist(),
+        value=[torch.tensor(v) for v in values],
+        launch=[torch.zeros(1) for _ in rewards],
+        target_idx=[torch.zeros(1, dtype=torch.long) for _ in rewards],
+        fraction=[torch.full((1,), 0.5) for _ in rewards],
+        log_prob=[torch.zeros(1) for _ in rewards],
+        owned_mask=[torch.ones(1, dtype=torch.bool) for _ in rewards],
+        target_legal_mask=[torch.ones(1, 1, dtype=torch.bool) for _ in rewards],
+    )
+    norm = train_mod.DiscountedReturnNormalizer(gamma=1.0, clip=None)
+    expected_rewards = norm.normalize_episode(rewards)
+    _adv, expected_return = compute_gae(
+        expected_rewards,
+        values,
+        gamma=1.0,
+        lam=1.0,
+    )
+
+    batch = train_mod._stack_trajectories(
+        [traj],
+        gamma=1.0,
+        gae_lambda=1.0,
+        critic_mtp_horizon=2,
+        reward_normalizer=train_mod.DiscountedReturnNormalizer(gamma=1.0, clip=None),
+    )
+
+    assert torch.allclose(batch["return"], torch.from_numpy(expected_return))
+    assert torch.allclose(batch["return_mtp"][0], torch.tensor(expected_return[:2]))
+
+
+def test_save_ppo_checkpoint_includes_critic_return_normalizer(tmp_path: Path):
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    norm = train_mod.DiscountedReturnNormalizer(gamma=0.9, clip=3.0)
+    norm.normalize_episode(np.asarray([1.0, 2.0], dtype=np.float32))
+    path = tmp_path / "ckpt.pt"
+
+    train_mod._save_ppo_checkpoint(model, path, norm)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert "critic_return_normalizer" in payload
+    restored = train_mod.DiscountedReturnNormalizer(gamma=0.9, clip=3.0)
+    restored.load_state_dict(payload["critic_return_normalizer"])
+    assert restored.gamma == norm.gamma
+    assert restored.clip == norm.clip
+    assert math.isclose(restored.mean, norm.mean)
+    assert math.isclose(restored.var, norm.var)
+    assert math.isclose(restored.count, norm.count)
+
+
+def test_restore_reward_normalizer_from_checkpoint_rejects_raw_critic_checkpoint():
+    norm = train_mod.DiscountedReturnNormalizer(gamma=0.9)
+
+    with pytest.raises(ValueError, match="critic_return_normalizer"):
+        train_mod._restore_reward_normalizer_from_checkpoint(
+            norm,
+            {"model": {}},
+            "old.pt",
+        )
+
+
+def test_restore_reward_normalizer_from_checkpoint_loads_state():
+    source = train_mod.DiscountedReturnNormalizer(gamma=0.9, clip=3.0)
+    source.normalize_episode(np.asarray([1.0, 2.0], dtype=np.float32))
+    restored = train_mod.DiscountedReturnNormalizer(gamma=0.9, clip=3.0)
+
+    train_mod._restore_reward_normalizer_from_checkpoint(
+        restored,
+        {"critic_return_normalizer": source.state_dict()},
+        "new.pt",
+    )
+
+    assert restored.gamma == source.gamma
+    assert restored.clip == source.clip
+    assert math.isclose(restored.mean, source.mean)
+
+
+def test_restore_reward_normalizer_from_checkpoint_rejects_config_mismatch():
+    source = train_mod.DiscountedReturnNormalizer(gamma=0.9, clip=3.0)
+    restored = train_mod.DiscountedReturnNormalizer(gamma=1.0, clip=3.0)
+
+    with pytest.raises(ValueError, match="gamma"):
+        train_mod._restore_reward_normalizer_from_checkpoint(
+            restored,
+            {"critic_return_normalizer": source.state_dict()},
+            "mismatch.pt",
+        )
+
+
 def test_stack_trajectories_can_decouple_policy_and_value_lambdas(monkeypatch):
     monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
     rewards = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
@@ -421,7 +615,9 @@ def test_ppo_update_minibatch_count_runs_exact_count():
     optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.5,
         target_entropy_coef=0.01,
         fraction_entropy_coef=0.0,
@@ -429,7 +625,10 @@ def test_ppo_update_minibatch_count_runs_exact_count():
         advantage_transform="rankgauss",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=1, minibatch_size=2, minibatch_count=3, grad_clip=0.5,
+        epochs=1,
+        minibatch_size=2,
+        minibatch_count=3,
+        grad_clip=0.5,
     )
 
     assert math.isfinite(log.policy_loss)
@@ -454,7 +653,9 @@ def test_ppo_update_minibatch_count_above_batch_size_runs_real_steps_only():
     optim = torch.optim.AdamW(model.parameters(), lr=0.0)
 
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.5,
         target_entropy_coef=0.01,
         fraction_entropy_coef=0.0,
@@ -462,7 +663,10 @@ def test_ppo_update_minibatch_count_above_batch_size_runs_real_steps_only():
         advantage_transform="rankgauss",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=1, minibatch_size=2, minibatch_count=8, grad_clip=0.5,
+        epochs=1,
+        minibatch_size=2,
+        minibatch_count=8,
+        grad_clip=0.5,
     )
 
     assert math.isfinite(log.policy_loss)
@@ -523,10 +727,13 @@ def test_log_prob_recompute_matches_sample_time():
     # Re-run forward (no-grad) and recompute log_prob exactly the way
     # ppo_update does — without taking any optimizer step.
     feats = EncodedObs(
-        planet_feats=batch["planet_feats"], planet_mask=batch["planet_mask"],
-        planet_owned_mask=batch["planet_owned_mask"], planet_ids=batch["planet_ids"],
+        planet_feats=batch["planet_feats"],
+        planet_mask=batch["planet_mask"],
+        planet_owned_mask=batch["planet_owned_mask"],
+        planet_ids=batch["planet_ids"],
         planet_garrison=batch["planet_garrison"],
-        fleet_feats=batch["fleet_feats"], fleet_mask=batch["fleet_mask"],
+        fleet_feats=batch["fleet_feats"],
+        fleet_mask=batch["fleet_mask"],
         global_feats=batch.get("global_feats"),
     )
     with torch.no_grad():
@@ -535,9 +742,7 @@ def test_log_prob_recompute_matches_sample_time():
 
     p = out.target_logits.shape[1]
     target = batch["target_idx"].clamp(0, p - 1)
-    target_logits = out.target_logits.masked_fill(
-        ~batch["target_legal_mask"], float("-inf")
-    )
+    target_logits = out.target_logits.masked_fill(~batch["target_legal_mask"], float("-inf"))
     action_log_probs = _categorical_action_log_probs(
         out.launch_logits,
         target_logits,
@@ -595,9 +800,9 @@ def test_threshold_normal_launch_log_std_controls_exploration():
     low_lp = _threshold_normal_launch_log_prob(mean, low_std, launch)
     high_lp = _threshold_normal_launch_log_prob(mean, high_std, launch)
 
-    assert low_lp[0] > high_lp[0]   # confident no-launch when mean < 0
-    assert low_lp[2] > high_lp[2]   # confident launch when mean > 0
-    assert high_lp[1] > low_lp[1]   # high std explores against mean sign
+    assert low_lp[0] > high_lp[0]  # confident no-launch when mean < 0
+    assert low_lp[2] > high_lp[2]  # confident launch when mean > 0
+    assert high_lp[1] > low_lp[1]  # high std explores against mean sign
     assert high_lp[3] > low_lp[3]
 
 
@@ -624,9 +829,7 @@ def test_conditional_entropy_weights_fraction_by_current_move_probability():
     target_log_probs = torch.log_softmax(torch.zeros(1, 2), dim=-1)
     fraction_entropy = torch.tensor([1.5])
 
-    entropy = _conditional_action_entropy(
-        launch_logits, target_log_probs, fraction_entropy
-    )
+    entropy = _conditional_action_entropy(launch_logits, target_log_probs, fraction_entropy)
 
     expected_launch_entropy = -(0.25 * math.log(0.25) + 0.75 * math.log(0.75))
     expected = expected_launch_entropy + 0.25 * (math.log(2.0) + 1.5)
@@ -685,10 +888,7 @@ def test_policy_value_grad_clip_clips_combined_head_and_shared_flows_then_sums_s
             self.shared = torch.nn.Linear(1, 1, bias=False)
 
     model = Toy()
-    actor_loss = (
-        3.0 * model.target_noop_key.weight.sum()
-        + 4.0 * model.shared.weight.sum()
-    )
+    actor_loss = 3.0 * model.target_noop_key.weight.sum() + 4.0 * model.shared.weight.sum()
     critic_loss = 30.0 * model.value_head.weight.sum() + 40.0 * model.shared.weight.sum()
 
     (
@@ -780,9 +980,7 @@ class _FixedPolicy(torch.nn.Module):
         self.dummy = torch.nn.Parameter(torch.zeros(()))
         self.value_encoder = HLGaussLoss(min_value=-1.0, max_value=1.0, num_bins=5)
         self.new_launch_logits = torch.logit(torch.tensor([[0.25, 0.25]]))
-        self.new_target_logits = torch.log(
-            torch.tensor([[[0.20, 0.80], [0.50, 0.50]]])
-        )
+        self.new_target_logits = torch.log(torch.tensor([[[0.20, 0.80], [0.50, 0.50]]]))
         self.new_fraction_alpha = torch.tensor([[2.0, 2.0]])
         self.new_fraction_beta = torch.tensor([[2.0, 2.0]])
 
@@ -805,10 +1003,7 @@ class _FixedPolicy(torch.nn.Module):
                 self.new_fraction_beta.expand(b, -1).to(feats.planet_feats.device)
                 + self.dummy * 0.0
             ),
-            value_logits=(
-                torch.zeros(b, 5, device=feats.planet_feats.device)
-                + self.dummy * 0.0
-            ),
+            value_logits=(torch.zeros(b, 5, device=feats.planet_feats.device) + self.dummy * 0.0),
         )
 
 
@@ -864,7 +1059,9 @@ def test_clip_higher_clamps_ratio_above_upper_bound_with_positive_advantage():
     optim = torch.optim.AdamW(model.parameters(), lr=0.0)
 
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.0,
         target_entropy_coef=0.0,
         fraction_entropy_coef=0.0,
@@ -872,7 +1069,9 @@ def test_clip_higher_clamps_ratio_above_upper_bound_with_positive_advantage():
         advantage_transform="none",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=1, minibatch_size=1, grad_clip=1.0,
+        epochs=1,
+        minibatch_size=1,
+        grad_clip=1.0,
     )
 
     # max(-A*ratio, -A*clamp) = max(-1.5, -1.28) = -1.28 = -(1 + clip_coef_high).
@@ -903,7 +1102,9 @@ def test_approx_kl_sums_owned_planet_log_probs_cleanrl_style():
     optim = torch.optim.AdamW(model.parameters(), lr=0.0)
 
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.0,
         target_entropy_coef=0.0,
         fraction_entropy_coef=0.0,
@@ -911,15 +1112,14 @@ def test_approx_kl_sums_owned_planet_log_probs_cleanrl_style():
         advantage_transform="none",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=1, minibatch_size=1, grad_clip=1.0,
+        epochs=1,
+        minibatch_size=1,
+        grad_clip=1.0,
     )
 
     joint_ratio = 1.5 * 1.2
     expected_kl = (joint_ratio - 1.0) - math.log(joint_ratio)
-    expected_per_planet_kl = (
-        ((1.5 - 1.0) - math.log(1.5))
-        + ((1.2 - 1.0) - math.log(1.2))
-    ) / 2.0
+    expected_per_planet_kl = (((1.5 - 1.0) - math.log(1.5)) + ((1.2 - 1.0) - math.log(1.2))) / 2.0
     assert math.isclose(log.approx_kl, expected_kl, rel_tol=1e-6)
     assert math.isclose(log.per_planet_approx_kl, expected_per_planet_kl, rel_tol=1e-6)
     assert not math.isclose(log.per_planet_approx_kl, log.approx_kl, rel_tol=1e-6)
@@ -965,7 +1165,9 @@ def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
     optim = torch.optim.AdamW(model.parameters(), lr=0.0)
 
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.0,
         target_entropy_coef=0.0,
         fraction_entropy_coef=0.0,
@@ -973,7 +1175,9 @@ def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
         advantage_transform="none",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=1, minibatch_size=1, grad_clip=1.0,
+        epochs=1,
+        minibatch_size=1,
+        grad_clip=1.0,
     )
 
     latest_kl = (expected_ratio - 1.0) - math.log(expected_ratio)
@@ -1006,7 +1210,9 @@ def test_clip_clamps_ratio_below_lower_bound_with_negative_advantage():
     optim = torch.optim.AdamW(model.parameters(), lr=0.0)
 
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.0,
         target_entropy_coef=0.0,
         fraction_entropy_coef=0.0,
@@ -1014,7 +1220,9 @@ def test_clip_clamps_ratio_below_lower_bound_with_negative_advantage():
         advantage_transform="none",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=1, minibatch_size=1, grad_clip=1.0,
+        epochs=1,
+        minibatch_size=1,
+        grad_clip=1.0,
     )
 
     # max(-A*ratio, -A*clamp) = max(0.5, 0.8) = 0.8 = (1 - clip_coef).
@@ -1051,15 +1259,17 @@ def test_value_only_update_ignores_zero_weight_padding_rows():
     batch["planet_feats"][:, 0, 0] = torch.tensor([0.0, 1.0, 2.0])
 
     with torch.no_grad():
-        logits = model(EncodedObs(
-            planet_feats=batch["planet_feats"],
-            planet_mask=batch["planet_mask"],
-            planet_owned_mask=batch["planet_owned_mask"],
-            planet_ids=batch["planet_ids"],
-            planet_garrison=batch["planet_garrison"],
-            fleet_feats=batch["fleet_feats"],
-            fleet_mask=batch["fleet_mask"],
-        )).value_logits
+        logits = model(
+            EncodedObs(
+                planet_feats=batch["planet_feats"],
+                planet_mask=batch["planet_mask"],
+                planet_owned_mask=batch["planet_owned_mask"],
+                planet_ids=batch["planet_ids"],
+                planet_garrison=batch["planet_garrison"],
+                fleet_feats=batch["fleet_feats"],
+                fleet_mask=batch["fleet_mask"],
+            )
+        ).value_logits
         target_probs = model.value_encoder.target_probs(batch["return"])
         expected = float(
             (-(target_probs * nn_functional.log_softmax(logits, dim=-1)).sum(dim=-1)).mean()
@@ -1133,9 +1343,7 @@ def test_pretrain_value_rounds_episode_batches_up_and_uses_behavior(monkeypatch)
     monkeypatch.setattr(
         train_mod,
         "_slice_encoded_obs_to_device",
-        lambda batch, _mb, _device: SimpleNamespace(
-            planet_feats=batch["planet_feats"]
-        ),
+        lambda batch, _mb, _device: SimpleNamespace(planet_feats=batch["planet_feats"]),
     )
 
     class Logger:
@@ -1164,7 +1372,9 @@ def test_ppo_update_runs_all_configured_epochs():
     batch = _toy_batch(model, batch_size=8)
     optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.5,
         target_entropy_coef=0.01,
         fraction_entropy_coef=0.0,
@@ -1172,7 +1382,9 @@ def test_ppo_update_runs_all_configured_epochs():
         advantage_transform="rankgauss",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=3, minibatch_size=4, grad_clip=0.5,
+        epochs=3,
+        minibatch_size=4,
+        grad_clip=0.5,
     )
     assert log.epochs_run == 3.0
 
@@ -1185,7 +1397,9 @@ def test_ppo_update_runs_all_epochs_when_kl_is_large():
     optim = torch.optim.AdamW(model.parameters(), lr=0.0)
 
     log = ppo_update(
-        model, optim, batch,
+        model,
+        optim,
+        batch,
         value_coef=0.5,
         target_entropy_coef=0.01,
         fraction_entropy_coef=0.0,
@@ -1193,7 +1407,9 @@ def test_ppo_update_runs_all_epochs_when_kl_is_large():
         advantage_transform="rankgauss",
         clip_coef=0.2,
         clip_coef_high=0.28,
-        epochs=3, minibatch_size=4, grad_clip=0.5,
+        epochs=3,
+        minibatch_size=4,
+        grad_clip=0.5,
     )
 
     assert log.approx_kl > 1.0

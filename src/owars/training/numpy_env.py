@@ -27,7 +27,9 @@ from ..policies.features import (
     MAX_OMEGA,
     MAX_PLANETS,
     PLANET_FEAT_DIM,
+    PLANET_INBOUND_FEAT_DIM,
     EncodedObs,
+    _fill_planet_inbound_summary,
     _global_features,
 )
 from ..policies.sampling import ActionContext
@@ -1487,12 +1489,16 @@ class NumpyVecEnv:
     ) -> tuple[EncodedObs, list[ActionContext]]:
         """Encode policy rows directly from dense simulator arrays."""
         b = len(rows)
-        fleet_width = max(
-            1,
-            *(
-                int(np.count_nonzero(self.fleet_mask[int(env_idx)]))
-                for env_idx, _player in rows
-            ),
+        fleet_width = (
+            0
+            if include_fleet_targets
+            else max(
+                1,
+                *(
+                    int(np.count_nonzero(self.fleet_mask[int(env_idx)]))
+                    for env_idx, _player in rows
+                ),
+            )
         )
         g_feats = np.zeros((b, GLOBAL_FEAT_DIM), dtype=np.float32)
         p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
@@ -1507,8 +1513,13 @@ class NumpyVecEnv:
             if include_fleet_targets
             else None
         )
+        planet_inbound = (
+            np.zeros((b, MAX_PLANETS, PLANET_INBOUND_FEAT_DIM), dtype=np.float32)
+            if include_fleet_targets
+            else None
+        )
         contexts: list[ActionContext] = []
-        target_cache: dict[int, np.ndarray] = {}
+        target_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
         for row, (env_idx, player) in enumerate(rows):
             planets = self.planets[env_idx, self.planet_mask[env_idx]].copy()
@@ -1541,22 +1552,70 @@ class NumpyVecEnv:
                 f_feats,
                 f_mask,
             )
-            if f_target is not None and env_idx not in target_cache:
+            cache_key = (int(env_idx), int(player))
+            if f_target is not None and cache_key not in target_cache:
                 base = self._observation_base(env_idx)
-                parsed = parse_observation(self._observation(env_idx, 0, base))
+                parsed = parse_observation(self._observation(env_idx, int(player), base))
                 dest_idx, _eta, status = infer_fleet_destinations(
                     parsed,
                     max_fleets=len(parsed.fleets),
                 )
-                target_cache[env_idx] = np.where(status == 1, dest_idx, -1).astype(
+                exact_targets = self.fleets[env_idx, self.fleet_mask[env_idx]]
+                if len(exact_targets) and exact_targets.shape[1] > F_TARGET:
+                    planet_ids = planets[:MAX_PLANETS, P_ID].astype(np.int64)
+                    id_to_col = {int(pid): col for col, pid in enumerate(planet_ids)}
+                    target_ids = exact_targets[:, F_TARGET].astype(np.int64)
+                    if len(dest_idx) != len(exact_targets):
+                        dest_idx = np.full(len(exact_targets), -1, dtype=np.int64)
+                        _eta = np.zeros(len(exact_targets), dtype=np.float64)
+                        status = np.zeros(len(exact_targets), dtype=np.int64)
+                    owners = exact_targets[:, F_OWNER].astype(np.int64)
+                    for col, target_id in enumerate(target_ids):
+                        if owners[col] != int(player):
+                            continue
+                        exact_dest = id_to_col.get(int(target_id), -1)
+                        if exact_dest >= 0:
+                            dest_idx[col] = exact_dest
+                            _eta[col] = float(exact_targets[col, F_ETA])
+                            status[col] = 1
+                target_cache[cache_key] = (dest_idx, _eta, status)
+            if f_target is not None:
+                dest_idx, eta, status = target_cache[cache_key]
+                targets = np.where(status == 1, dest_idx, -1).astype(
                     np.int64,
                     copy=False,
                 )
-            if f_target is not None:
-                targets = target_cache[env_idx]
                 n_targets = min(len(targets), fleet_width)
                 if n_targets:
                     f_target[row, :n_targets] = targets[:n_targets]
+                if planet_inbound is not None:
+                    summary_feats = f_feats[row]
+                    summary_mask = f_mask[row]
+                    if fleet_width == 0 and len(fleets):
+                        summary_feats = np.zeros(
+                            (len(fleets), FLEET_FEAT_DIM),
+                            dtype=np.float32,
+                        )
+                        summary_mask = np.zeros(len(fleets), dtype=bool)
+                        summary_f_feats = summary_feats[None, :, :]
+                        summary_f_mask = summary_mask[None, :]
+                        self._fill_policy_fleet_features(
+                            0,
+                            int(player),
+                            fleets,
+                            planets,
+                            summary_f_feats,
+                            summary_f_mask,
+                        )
+                    n_summary = min(len(dest_idx), summary_feats.shape[0])
+                    _fill_planet_inbound_summary(
+                        planet_inbound[row],
+                        summary_feats,
+                        summary_mask,
+                        dest_idx[:n_summary],
+                        eta[:n_summary],
+                        status[:n_summary],
+                    )
             contexts.append(
                 ActionContext(
                     planets=planets,
@@ -1587,6 +1646,9 @@ class NumpyVecEnv:
                 fleet_target_planet_idx=None
                 if f_target is None
                 else _tensor_from_numpy(f_target, device, pin_memory=pin_memory),
+                planet_inbound_feats=None
+                if planet_inbound is None
+                else _tensor_from_numpy(planet_inbound, device, pin_memory=pin_memory),
             ),
             contexts,
         )

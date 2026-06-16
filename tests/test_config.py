@@ -85,6 +85,7 @@ def test_win_terminal_reward_normalizes_terminal_only_mc_defaults():
     assert cfg.model.value_max == 1.0
     assert cfg.model.value_num_bins == 41
     assert cfg.model.value_symlog is False
+    assert cfg.ppo.critic_return_norm == "none"
     assert not cfg.reward.uses_dense_potential()
 
 
@@ -226,6 +227,47 @@ def test_rollout_compile_defaults_enabled():
 
     assert cfg.rollout.compile_policy is True
     assert cfg.rollout.compile_fleet_width == 1024
+    assert cfg.rollout.detail_timing is False
+    assert cfg.rollout.sample_detail_timing is False
+
+    timed = RunConfig.from_dict(
+        {"rollout": {"detail_timing": True, "sample_detail_timing": True}}
+    )
+    assert timed.rollout.detail_timing is True
+    assert timed.rollout.sample_detail_timing is True
+
+
+def test_critic_return_norm_config_loads():
+    cfg = RunConfig.from_dict(
+        {
+            "ppo": {
+                "critic_return_norm": "none",
+                "critic_return_norm_gamma": 0.9,
+                "critic_return_norm_clip": None,
+                "critic_return_norm_epsilon": 1.0e-6,
+            }
+        }
+    )
+
+    assert cfg.ppo.critic_return_norm == "none"
+    assert cfg.ppo.critic_return_norm_gamma == 0.9
+    assert cfg.ppo.critic_return_norm_clip is None
+    assert cfg.ppo.critic_return_norm_epsilon == 1.0e-6
+
+
+@pytest.mark.parametrize(
+    "ppo_cfg",
+    [
+        {"critic_return_norm": "zscore"},
+        {"critic_return_norm_gamma": 0.0},
+        {"critic_return_norm_gamma": 1.1},
+        {"critic_return_norm_clip": 0.0},
+        {"critic_return_norm_epsilon": 0.0},
+    ],
+)
+def test_invalid_critic_return_norm_config_raises(ppo_cfg):
+    with pytest.raises(ValueError):
+        RunConfig.from_dict({"ppo": ppo_cfg})
 
 
 @pytest.mark.parametrize(

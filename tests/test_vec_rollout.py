@@ -150,6 +150,26 @@ def test_bucket_fleets_for_graph_fixed_width_pads_underfilled_batches():
     assert torch.all(padded.fleet_target_planet_idx == -1)
 
 
+def test_bucket_fleets_for_graph_uses_inbound_summary_without_fleet_padding():
+    feats = EncodedObs(
+        planet_feats=torch.zeros(2, 64, 19),
+        planet_mask=torch.ones(2, 64, dtype=torch.bool),
+        planet_owned_mask=torch.zeros(2, 64, dtype=torch.bool),
+        planet_ids=torch.arange(64).expand(2, -1),
+        planet_garrison=torch.zeros(2, 64),
+        fleet_feats=torch.zeros(2, 20, 20),
+        fleet_mask=torch.ones(2, 20, dtype=torch.bool),
+        fleet_target_planet_idx=torch.full((2, 20), -1, dtype=torch.long),
+        planet_inbound_feats=torch.zeros(2, 64, 13),
+    )
+
+    padded = _bucket_fleets_for_graph(feats, fixed_width=1024)
+
+    assert padded.fleet_feats.shape[1] == 0
+    assert padded.planet_inbound_feats is not None
+    assert padded.planet_inbound_feats.shape == (2, 64, 13)
+
+
 def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():
     obs = {
         "player": 0,

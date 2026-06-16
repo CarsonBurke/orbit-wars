@@ -8,6 +8,7 @@ overlap path can't be validated here and is covered by manual GPU testing.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from owars.policies.config import OrbitPolicyConfig
@@ -17,8 +18,8 @@ from owars.policies.sac_sampling import get_sac_heads_kernel, run_sac_heads
 from owars.training.config import RunConfig
 from owars.training.sac import (
     ReplayBuffer,
-    _ReplayPrefetcher,
     _builtin_opponent_slate,
+    _ReplayPrefetcher,
 )
 
 PLANET_FEATURES = 19
@@ -30,6 +31,7 @@ def _toy_state(
     fleet_count: int = 3,
     *,
     include_fleet_targets: bool = False,
+    include_planet_inbound: bool = False,
 ) -> EncodedObs:
     g = torch.Generator().manual_seed(seed)
     fleet_target_planet_idx = None
@@ -37,6 +39,11 @@ def _toy_state(
         fleet_target_planet_idx = torch.full((fleet_count,), -1, dtype=torch.int64)
         if fleet_count:
             fleet_target_planet_idx[0] = seed % MAX_PLANETS
+    planet_inbound_feats = None
+    if include_planet_inbound:
+        planet_inbound_feats = torch.zeros(MAX_PLANETS, 13)
+        planet_inbound_feats[seed % MAX_PLANETS, 0] = 1.0 / 64.0
+        planet_inbound_feats[seed % MAX_PLANETS, 3] = float(seed) / 100.0
     return EncodedObs(
         planet_feats=torch.randn(MAX_PLANETS, PLANET_FEATURES, generator=g),
         planet_mask=torch.ones(MAX_PLANETS, dtype=torch.bool),
@@ -46,6 +53,7 @@ def _toy_state(
         fleet_feats=torch.randn(fleet_count, FLEET_FEATURES, generator=g),
         fleet_mask=torch.zeros(fleet_count, dtype=torch.bool),
         fleet_target_planet_idx=fleet_target_planet_idx,
+        planet_inbound_feats=planet_inbound_feats,
     )
 
 
@@ -56,12 +64,8 @@ def _fill(buf: ReplayBuffer, n: int) -> None:
             launch=torch.zeros(MAX_PLANETS),
             target_idx=torch.zeros(MAX_PLANETS, dtype=torch.int64),
             fraction=torch.rand(MAX_PLANETS),
-            target_legal_mask=torch.zeros(
-                MAX_PLANETS, MAX_PLANETS, dtype=torch.bool
-            ),
-            next_target_legal_mask=torch.zeros(
-                MAX_PLANETS, MAX_PLANETS, dtype=torch.bool
-            ),
+            target_legal_mask=torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool),
+            next_target_legal_mask=torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool),
             reward=float(i),
             done=bool(i % 7 == 0),
             next_feats=_toy_state(i + 1000, fleet_count=4 + (i % 5)),
@@ -121,6 +125,124 @@ def test_sample_preserves_dynamic_fleet_targets() -> None:
     assert int(batch.feats.fleet_target_planet_idx[0, 0]) == 1
     assert batch.feats.fleet_target_planet_idx[0, 5:].eq(-1).all()
     assert int(batch.next_feats.fleet_target_planet_idx[0, 0]) == 2
+
+
+def test_sample_preserves_planet_inbound_summaries() -> None:
+    buf = _new_buffer()
+    buf.add(
+        feats=_toy_state(
+            3,
+            fleet_count=9,
+            include_fleet_targets=True,
+            include_planet_inbound=True,
+        ),
+        launch=torch.zeros(MAX_PLANETS),
+        target_idx=torch.zeros(MAX_PLANETS, dtype=torch.int64),
+        fraction=torch.rand(MAX_PLANETS),
+        target_legal_mask=torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool),
+        next_target_legal_mask=torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool),
+        reward=1.0,
+        done=False,
+        next_feats=_toy_state(
+            4,
+            fleet_count=7,
+            include_fleet_targets=True,
+            include_planet_inbound=True,
+        ),
+        time=0.1,
+        next_time=0.2,
+    )
+
+    batch = buf.sample(1, device="cpu")
+
+    assert batch.feats.planet_inbound_feats is not None
+    assert batch.next_feats.planet_inbound_feats is not None
+    assert batch.feats.fleet_feats.shape[1] == 0
+    assert batch.next_feats.fleet_feats.shape[1] == 0
+    assert batch.feats.planet_inbound_feats.shape == (1, MAX_PLANETS, 13)
+    assert torch.isclose(
+        batch.feats.planet_inbound_feats[0, 3, 0],
+        torch.tensor(1.0 / 64.0),
+    )
+    assert torch.isclose(
+        batch.next_feats.planet_inbound_feats[0, 4, 3],
+        torch.tensor(0.04),
+    )
+
+
+def test_replay_rejects_mixed_planet_inbound_modes() -> None:
+    buf = _new_buffer()
+    buf.add(
+        feats=_toy_state(3, include_planet_inbound=True),
+        launch=torch.zeros(MAX_PLANETS),
+        target_idx=torch.zeros(MAX_PLANETS, dtype=torch.int64),
+        fraction=torch.rand(MAX_PLANETS),
+        target_legal_mask=torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool),
+        next_target_legal_mask=torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool),
+        reward=1.0,
+        done=False,
+        next_feats=_toy_state(4, include_planet_inbound=True),
+        time=0.1,
+        next_time=0.2,
+    )
+    state_before = (
+        buf.ptr,
+        buf.size,
+        buf.fleet_cap,
+        buf.has_fleet_targets,
+        buf.has_planet_inbound,
+        buf.planet_inbound_mode,
+    )
+
+    with pytest.raises(ValueError, match="cannot mix planet-inbound"):
+        buf.add(
+            feats=_toy_state(5, fleet_count=9, include_fleet_targets=True),
+            launch=torch.zeros(MAX_PLANETS),
+            target_idx=torch.zeros(MAX_PLANETS, dtype=torch.int64),
+            fraction=torch.rand(MAX_PLANETS),
+            target_legal_mask=torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool),
+            next_target_legal_mask=torch.zeros(
+                MAX_PLANETS,
+                MAX_PLANETS,
+                dtype=torch.bool,
+            ),
+            reward=1.0,
+            done=False,
+            next_feats=_toy_state(6, fleet_count=11, include_fleet_targets=True),
+            time=0.2,
+            next_time=0.3,
+        )
+    assert (
+        buf.ptr,
+        buf.size,
+        buf.fleet_cap,
+        buf.has_fleet_targets,
+        buf.has_planet_inbound,
+        buf.planet_inbound_mode,
+    ) == state_before
+
+
+def test_replay_rejects_current_next_planet_inbound_mismatch() -> None:
+    buf = _new_buffer()
+
+    with pytest.raises(ValueError, match="current and next"):
+        buf.add(
+            feats=_toy_state(3, include_planet_inbound=True),
+            launch=torch.zeros(MAX_PLANETS),
+            target_idx=torch.zeros(MAX_PLANETS, dtype=torch.int64),
+            fraction=torch.rand(MAX_PLANETS),
+            target_legal_mask=torch.zeros(MAX_PLANETS, MAX_PLANETS, dtype=torch.bool),
+            next_target_legal_mask=torch.zeros(
+                MAX_PLANETS,
+                MAX_PLANETS,
+                dtype=torch.bool,
+            ),
+            reward=1.0,
+            done=False,
+            next_feats=_toy_state(4),
+            time=0.1,
+            next_time=0.2,
+        )
 
 
 def test_sample_rejects_oversized_batch() -> None:

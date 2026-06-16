@@ -9,9 +9,9 @@ Per env-step the orchestrator does:
      single `model(...)` forward (this is where the wall-clock win comes
      from — at 16 envs × 2 seats with 80% self-play, the learner bucket
      averages ~25 obs per step instead of doing 25 separate B=1 forwards).
-  3. For each snapshot bucket, run the snapshot's `LearnedAgent` per
-     element (small batches; we don't bother batching across snapshots
-     because a different snapshot = a different model).
+  3. For each snapshot bucket, batch that snapshot's rows separately.
+     Different snapshots are different models, so they cannot share a
+     forward, but each snapshot still uses one batched call for its rows.
   4. Distribute the resulting moves back into per-env action lists, then
      step the alive envs in parallel via `VecEnv.step_subset`.
   5. Trajectories are recorded *only for the learner_seat* of each env —
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -35,6 +36,7 @@ from ..policies.features import (
     bucket_fleet_width,
     encode_raw_observations,
     fleet_target_planet_idx_or_empty,
+    planet_inbound_feats_or_empty,
     slice_encoded_fleet_width,
 )
 from ..policies.model import OrbitPolicy, PolicyOutput
@@ -57,6 +59,27 @@ def _mark_cuda_graph_step(device: torch.device) -> None:
     mark = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
     if callable(mark):
         mark()
+
+
+def _add_timing(timings: dict[str, float] | None, key: str, seconds: float) -> None:
+    if timings is not None:
+        timings[key] = timings.get(key, 0.0) + float(seconds)
+
+
+def _next_power_of_two(n: int) -> int:
+    n = max(1, int(n))
+    return 1 << (n - 1).bit_length()
+
+
+def _snapshot_graph_rows(rows: int, *, max_rows: int = 64) -> int:
+    """Use small static row buckets for frozen snapshots.
+
+    The live learner benefits from one full-row CUDA graph because most seats
+    usually share the current model. Snapshot buckets are often tiny; padding
+    each snapshot to the full learner row count burns GPU work and graph memory
+    for rows that do not exist.
+    """
+    return min(max_rows, _next_power_of_two(max(1, int(rows))))
 
 
 def _kernel_cache(model: torch.nn.Module) -> dict:
@@ -91,6 +114,7 @@ class _RolloutForwardKernel(torch.nn.Module):
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
         fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -102,6 +126,7 @@ class _RolloutForwardKernel(torch.nn.Module):
             fleet_mask=fleet_mask,
             global_feats=global_feats,
             fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -170,6 +195,9 @@ def _pad_encoded_rows(feats: EncodedObs, rows: int) -> EncodedObs:
         fleet_target_planet_idx=None
         if feats.fleet_target_planet_idx is None
         else _pad_rows(feats.fleet_target_planet_idx, rows, fill=-1),
+        planet_inbound_feats=None
+        if feats.planet_inbound_feats is None
+        else _pad_rows(feats.planet_inbound_feats, rows),
     )
 
 
@@ -181,6 +209,8 @@ def _global_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
 
 
 def _trim_fleets_for_forward(feats: EncodedObs) -> EncodedObs:
+    if feats.planet_inbound_feats is not None and feats.planet_inbound_feats.shape[-2] > 0:
+        return slice_encoded_fleet_width(feats, 0)
     return bucket_encoded_fleet_width(feats)
 
 
@@ -189,6 +219,8 @@ def _bucket_fleets_for_graph(
     *,
     fixed_width: int | None = None,
 ) -> EncodedObs:
+    if feats.planet_inbound_feats is not None and feats.planet_inbound_feats.shape[-2] > 0:
+        return slice_encoded_fleet_width(feats, 0)
     used = active_fleet_width(feats.fleet_mask)
     width = (
         int(fixed_width)
@@ -420,6 +452,9 @@ def rollout_episodes_batched(
     compile_fleet_width: int | None = None,
     policy_graph_rows: int | None = None,
     learner_action_agent: Callable[[Any], list[list]] | None = None,
+    defer_log_prob: bool = False,
+    timings: dict[str, float] | None = None,
+    sample_timings: dict[str, float] | None = None,
 ) -> list[Trajectory]:
     """Play `len(opponents_per_env)` episodes in parallel; one Trajectory per env.
 
@@ -478,6 +513,7 @@ def rollout_episodes_batched(
     max_policy_rows = max(1, num_envs * num_players)
 
     while not all(dones):
+        phase_t0 = perf_counter()
         # 1. Bucket (env, seat, obs) tuples by agent identity.
         learner_bucket: list[tuple[int, int, Any]] = []
         learner_obs_requests: list[tuple[int, tuple[int, int]]] = []
@@ -553,6 +589,7 @@ def rollout_episodes_batched(
             ):
                 env_idx, seat, _old_obs = learner_bucket[bucket_idx]
                 learner_bucket[bucket_idx] = (env_idx, seat, obs)
+        _add_timing(timings, "bucket_s", perf_counter() - phase_t0)
 
         actions_per_env: dict[int, list[Any]] = {
             i: [None] * num_players for i in range(num_envs) if not dones[i]
@@ -560,6 +597,7 @@ def rollout_episodes_batched(
 
         # 2. One batched forward for the learner identity.
         if learner_bucket:
+            phase_t0 = perf_counter()
             _step_learner_bucket(
                 model,
                 learner_bucket,
@@ -578,7 +616,11 @@ def rollout_episodes_batched(
                 compile_fleet_width,
                 policy_graph_rows or max_policy_rows,
                 learner_action_agent,
+                defer_log_prob=defer_log_prob,
+                timings=timings,
+                sample_timings=sample_timings,
             )
+            _add_timing(timings, "learner_bucket_s", perf_counter() - phase_t0)
 
         # 3. Per-snapshot inference. Learned snapshots expose `act_batch`;
         # builtin Python baselines stay on the scalar callable path.
@@ -589,6 +631,7 @@ def rollout_episodes_batched(
                 and callable(fast_builtin_actions)
                 and _name in native_builtin_opponents
             ):
+                phase_t0 = perf_counter()
                 rows = [(env_idx, seat) for env_idx, seat, _obs, _slot in bucket]
                 batched_actions = fast_builtin_actions(
                     _name,
@@ -599,6 +642,7 @@ def rollout_episodes_batched(
                     bucket, batched_actions, strict=True
                 ):
                     actions_per_env[env_idx][seat] = acts
+                _add_timing(timings, "builtin_policy_s", perf_counter() - phase_t0)
                 continue
             agent_model = getattr(agent, "model", None)
             if (
@@ -611,6 +655,7 @@ def rollout_episodes_batched(
                     (env_idx, seat, None)
                     for env_idx, seat, _obs, _slot in bucket
                 ]
+                phase_t0 = perf_counter()
                 _step_learner_bucket(
                     agent_model,
                     snapshot_bucket,
@@ -623,9 +668,13 @@ def rollout_episodes_batched(
                     fast_policy_batch_no_context,
                     getattr(agent, "compile_mode", None),
                     None,
-                    policy_graph_rows or max_policy_rows,
+                    _snapshot_graph_rows(len(snapshot_bucket)),
+                    timings=timings,
+                    sample_timings=sample_timings,
                 )
+                _add_timing(timings, "snapshot_bucket_s", perf_counter() - phase_t0)
                 continue
+            phase_t0 = perf_counter()
             act_batch = getattr(agent, "act_batch", None)
             if callable(act_batch):
                 obs_list = [obs for _env_idx, _seat, obs, _slot in bucket]
@@ -637,12 +686,15 @@ def rollout_episodes_batched(
             else:
                 for env_idx, seat, obs, slot in bucket:
                     actions_per_env[env_idx][seat] = slot.agent(obs)
+            _add_timing(timings, "python_policy_s", perf_counter() - phase_t0)
 
         # 4. Step alive envs in parallel.
         active = [i for i in range(num_envs) if not dones[i]]
         actions_list = [actions_per_env[i] for i in active]
         step_subset = fast_step_subset if use_fast_numpy_path else vec.step_subset
+        phase_t0 = perf_counter()
         results = step_subset(active, actions_list)
+        _add_timing(timings, "env_step_s", perf_counter() - phase_t0)
         for i, (state, done, final) in results.items():
             if state is not None:
                 states[i] = state
@@ -650,6 +702,7 @@ def rollout_episodes_batched(
                 dones[i] = True
                 finals[i] = final
         if dense_potential:
+            phase_t0 = perf_counter()
             rows = [
                 (idx, learner_seats[idx])
                 for idx in active
@@ -668,6 +721,7 @@ def rollout_episodes_batched(
                     phi - previous_potential[env_idx]
                 )
                 previous_potential[env_idx] = phi
+            _add_timing(timings, "reward_s", perf_counter() - phase_t0)
 
     # 5. Apply terminal reward + record seat_rewards on each trajectory.
     for env_idx in range(num_envs):
@@ -692,6 +746,9 @@ def _step_learner_bucket(
     compile_fleet_width: int | None = None,
     graph_rows: int | None = None,
     learner_action_agent: Callable[[Any], list[list]] | None = None,
+    defer_log_prob: bool = False,
+    timings: dict[str, float] | None = None,
+    sample_timings: dict[str, float] | None = None,
 ) -> None:
     """Encode + batch-forward the learner identity across (env, seat) pairs.
 
@@ -717,6 +774,7 @@ def _step_learner_bucket(
     policy_rows: list[tuple[int, int]] | None = None
     fast_sampler = getattr(getattr(policy_batch, "__self__", None), "sample_batch_with_records", None)
     fast_actions_sampler = getattr(getattr(policy_batch, "__self__", None), "sample_batch_actions", None)
+    phase_t0 = perf_counter()
     if callable(policy_batch):
         policy_rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
         if target_device.type == "cuda":
@@ -787,6 +845,7 @@ def _step_learner_bucket(
                 stacked = _pad_encoded_rows(stacked, graph_rows)
             else:
                 stacked = _trim_fleets_for_forward(stacked)
+    _add_timing(timings, "policy_feature_s", perf_counter() - phase_t0)
     if cpu_stacked is not None:
         real_rows = cpu_stacked.planet_feats.shape[0]
     else:
@@ -815,25 +874,36 @@ def _step_learner_bucket(
             int(graph_stacked.planet_feats.shape[1]),
             int(graph_stacked.fleet_feats.shape[1]),
             int(_global_feats_or_empty(graph_stacked).shape[1]),
+            int(planet_inbound_feats_or_empty(graph_stacked).shape[-2]),
+            int(planet_inbound_feats_or_empty(graph_stacked).shape[-1]),
         ),
     )
-    with torch.no_grad():
-        if graph_enabled:
-            _mark_cuda_graph_step(target_device)
-        out = kernel(
-            _global_feats_or_empty(graph_stacked),
-            graph_stacked.planet_feats,
-            graph_stacked.planet_mask,
-            graph_stacked.planet_owned_mask,
-            graph_stacked.planet_ids,
-            graph_stacked.planet_garrison,
-            graph_stacked.fleet_feats,
-            graph_stacked.fleet_mask,
-            fleet_target_planet_idx_or_empty(graph_stacked),
-        )
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            if graph_enabled:
+                _mark_cuda_graph_step(target_device)
+            phase_t0 = perf_counter()
+            out = kernel(
+                _global_feats_or_empty(graph_stacked),
+                graph_stacked.planet_feats,
+                graph_stacked.planet_mask,
+                graph_stacked.planet_owned_mask,
+                graph_stacked.planet_ids,
+                graph_stacked.planet_garrison,
+                graph_stacked.fleet_feats,
+                graph_stacked.fleet_mask,
+                fleet_target_planet_idx_or_empty(graph_stacked),
+                planet_inbound_feats_or_empty(graph_stacked),
+            )
+            _add_timing(timings, "policy_forward_s", perf_counter() - phase_t0)
+    finally:
+        model.train(was_training)
     out = _slice_policy_output(out, real_rows)
 
     record_value_only = record_trajectories and learner_action_agent is not None
+    phase_t0 = perf_counter()
     if record_trajectories and not record_value_only:
         if callable(fast_sampler) and policy_rows is not None:
             record_source_mask = None
@@ -849,6 +919,8 @@ def _step_learner_bucket(
                 record_rows=learner_rows,
                 record_source_mask=record_source_mask,
                 native_actions=True,
+                compute_log_prob=not defer_log_prob,
+                timings=sample_timings,
             )
         elif action_contexts is not None:
             actions_list, records = sample_batch_with_records_context(
@@ -871,6 +943,7 @@ def _step_learner_bucket(
                 policy_rows,
                 deterministic=deterministic,
                 native_actions=True,
+                timings=sample_timings,
             )
         elif action_contexts is not None:
             actions_list = sample_batch_actions_context(
@@ -885,8 +958,10 @@ def _step_learner_bucket(
                 deterministic=deterministic,
             )
         records = []
+    _add_timing(timings, "policy_sample_s", perf_counter() - phase_t0)
 
     if learner_action_agent is not None and learner_rows:
+        phase_t0 = perf_counter()
         override_obs = [raw_obs_list[k] for k in learner_rows]
         act_batch = getattr(learner_action_agent, "act_batch", None)
         if callable(act_batch):
@@ -895,8 +970,10 @@ def _step_learner_bucket(
             override_actions = [learner_action_agent(obs) for obs in override_obs]
         for row, acts in zip(learner_rows, override_actions, strict=True):
             actions_list[row] = acts
+        _add_timing(timings, "policy_override_s", perf_counter() - phase_t0)
 
     if record_trajectories and learner_rows:
+        phase_t0 = perf_counter()
         row_idx = torch.as_tensor(
             learner_rows, device=out.value.device, dtype=torch.long
         )
@@ -923,6 +1000,9 @@ def _step_learner_bucket(
                         fleet_target_planet_idx=None
                         if rec["fleet_target_planet_idx"] is None
                         else rec["fleet_target_planet_idx"][j],
+                        planet_inbound_feats=None
+                        if rec["planet_inbound_feats"] is None
+                        else rec["planet_inbound_feats"][j],
                     )
                 )
                 traj.value.append(rec["value"][j])
@@ -951,6 +1031,9 @@ def _step_learner_bucket(
                         fleet_target_planet_idx=None
                         if rec["fleet_target_planet_idx"] is None
                         else rec["fleet_target_planet_idx"][j],
+                        planet_inbound_feats=None
+                        if rec["planet_inbound_feats"] is None
+                        else rec["planet_inbound_feats"][j],
                     )
                 )
                 traj.launch.append(rec["launch"][j])
@@ -961,6 +1044,7 @@ def _step_learner_bucket(
                 traj.owned_mask.append(rec["owned_mask"][j])
                 traj.target_legal_mask.append(rec["target_legal_mask"][j])
                 traj.reward.append(0.0)
+        _add_timing(timings, "policy_record_s", perf_counter() - phase_t0)
 
     for k, (env_idx, seat, _obs) in enumerate(bucket):
         actions_per_env[env_idx][seat] = actions_list[k]
@@ -1008,6 +1092,11 @@ def _materialize_value_records_cpu(
         else feature_source.fleet_target_planet_idx.index_select(0, feature_rows)
         .detach()
         .cpu(),
+        "planet_inbound_feats": None
+        if feature_source.planet_inbound_feats is None
+        else feature_source.planet_inbound_feats.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
         "global_feats": _global_feats_or_empty(feature_source)
         .index_select(0, feature_rows)
         .detach()
@@ -1053,35 +1142,49 @@ def _materialize_records_cpu(
     value = out.value.index_select(0, row_idx)
     b, p = target_idx.shape
     mask_is_cpu = target_legal_mask.device.type == "cpu"
-    flat_parts = [
-        target_idx.float(),
-        launch.float(),
-        fraction.float(),
-        log_prob.float(),
-        value.float().unsqueeze(1),
-        owned_mask.float(),
-    ]
-    if not mask_is_cpu:
-        flat_parts.append(target_legal_mask.float().reshape(b, -1))
-    flat = torch.cat(tuple(flat_parts), dim=1).detach().cpu()
-    pos = 0
-    target_idx_cpu = flat[:, pos : pos + p].long()
-    pos += p
-    launch_cpu = flat[:, pos : pos + p]
-    pos += p
-    fraction_cpu = flat[:, pos : pos + p]
-    pos += p
-    log_prob_cpu = flat[:, pos : pos + p]
-    pos += p
-    value_cpu = flat[:, pos]
-    pos += 1
-    owned_mask_cpu = flat[:, pos : pos + p].bool()
-    pos += p
-    if mask_is_cpu:
+    record_is_cpu = target_idx.device.type == "cpu"
+    if record_is_cpu:
+        value_cpu = value.detach().cpu()
+        owned_mask_cpu = owned_mask.detach().cpu().bool()
+        target_idx_cpu = target_idx.detach().cpu().long()
+        launch_cpu = launch.detach().cpu()
+        fraction_cpu = fraction.detach().cpu()
+        log_prob_cpu = log_prob.detach().cpu()
         target_legal_mask_cpu = target_legal_mask.detach().cpu().bool()
     else:
-        target_legal_width = p * p
-        target_legal_mask_cpu = flat[:, pos : pos + target_legal_width].reshape(b, p, p).bool()
+        flat_parts = [
+            target_idx.float(),
+            launch.float(),
+            fraction.float(),
+            log_prob.float(),
+            value.float().unsqueeze(1),
+            owned_mask.float(),
+        ]
+        if not mask_is_cpu:
+            flat_parts.append(target_legal_mask.float().reshape(b, -1))
+        flat = torch.cat(tuple(flat_parts), dim=1).detach().cpu()
+        pos = 0
+        target_idx_cpu = flat[:, pos : pos + p].long()
+        pos += p
+        launch_cpu = flat[:, pos : pos + p]
+        pos += p
+        fraction_cpu = flat[:, pos : pos + p]
+        pos += p
+        log_prob_cpu = flat[:, pos : pos + p]
+        pos += p
+        value_cpu = flat[:, pos]
+        pos += 1
+        owned_mask_cpu = flat[:, pos : pos + p].bool()
+        pos += p
+        if mask_is_cpu:
+            target_legal_mask_cpu = target_legal_mask.detach().cpu().bool()
+        else:
+            target_legal_width = p * p
+            target_legal_mask_cpu = flat[:, pos : pos + target_legal_width].reshape(
+                b,
+                p,
+                p,
+            ).bool()
 
     return {
         "planet_feats": feature_source.planet_feats.index_select(0, feature_rows)
@@ -1108,6 +1211,11 @@ def _materialize_records_cpu(
         "fleet_target_planet_idx": None
         if feature_source.fleet_target_planet_idx is None
         else feature_source.fleet_target_planet_idx.index_select(0, feature_rows)
+        .detach()
+        .cpu(),
+        "planet_inbound_feats": None
+        if feature_source.planet_inbound_feats is None
+        else feature_source.planet_inbound_feats.index_select(0, feature_rows)
         .detach()
         .cpu(),
         "global_feats": _global_feats_or_empty(feature_source)
@@ -1147,4 +1255,7 @@ def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
         fleet_target_planet_idx=None
         if feats.fleet_target_planet_idx is None
         else move(feats.fleet_target_planet_idx),
+        planet_inbound_feats=None
+        if feats.planet_inbound_feats is None
+        else move(feats.planet_inbound_feats),
     )

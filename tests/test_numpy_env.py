@@ -256,11 +256,17 @@ def test_numpy_vec_fleet_target_metadata_matches_raw_observation_features():
     )
     assert torch.allclose(fast.fleet_feats, expected.fleet_feats)
     assert torch.equal(fast.fleet_target_planet_idx, expected.fleet_target_planet_idx)
-    row = fast.fleet_feats[0, 0].tolist()
-    assert math.isclose(row[9], 1 / 128.0, abs_tol=1e-6)
-    assert math.isclose(row[10], 2 / 500.0, abs_tol=1e-6)
-    assert row[13] == 1.0
-    assert fast.fleet_feats[1, 0, 9:14].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert fast.planet_inbound_feats is not None
+    assert expected.planet_inbound_feats is not None
+    torch.testing.assert_close(fast.planet_inbound_feats, expected.planet_inbound_feats)
+    assert fast.fleet_feats.shape == (2, 0, 20)
+    assert math.isclose(float(fast.planet_inbound_feats[0, 1, 0]), 1 / 64.0)
+    assert math.isclose(float(fast.planet_inbound_feats[0, 1, 1]), 1 / 64.0)
+    assert math.isclose(
+        float(fast.planet_inbound_feats[0, 1, 11]),
+        2 / 500.0,
+        abs_tol=1e-6,
+    )
 
     state = vec.step_subset([0], [[[], []]])[0][0]
     assert state[0]["observation"]["fleet_targets"] == {"0": [1, 1.0, 90.0, 90.0]}

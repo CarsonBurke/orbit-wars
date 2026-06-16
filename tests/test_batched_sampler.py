@@ -200,10 +200,9 @@ def test_stack_encoded_preserves_fields():
     feats_b_targets = encode_observation(obs_b, include_fleet_targets=True)
     stacked_targets = stack_encoded([feats_a_targets, feats_b_targets])
     assert stacked_targets.fleet_target_planet_idx is not None
-    assert stacked_targets.fleet_target_planet_idx.shape == (
-        2,
-        feats_a.fleet_mask.shape[0],
-    )
+    assert stacked_targets.fleet_target_planet_idx.shape == (2, 0)
+    assert stacked_targets.planet_inbound_feats is not None
+    assert stacked_targets.planet_inbound_feats.shape == (2, 64, 13)
     # Element 0 must equal the original.
     assert torch.equal(stacked.planet_feats[0], feats_a.planet_feats)
     assert torch.equal(stacked.fleet_feats[1], feats_b.fleet_feats)
@@ -214,6 +213,10 @@ def test_stack_encoded_preserves_fields():
     assert torch.equal(
         stacked_targets.fleet_target_planet_idx[1],
         feats_b_targets.fleet_target_planet_idx,
+    )
+    assert torch.equal(
+        stacked_targets.planet_inbound_feats[0],
+        feats_a_targets.planet_inbound_feats,
     )
 
 

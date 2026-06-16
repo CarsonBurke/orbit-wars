@@ -80,6 +80,7 @@ BUILTIN: dict[str, AgentFn] = {
 def _copy_model_without_compile_caches(model: OrbitPolicy) -> OrbitPolicy:
     cache_names = (
         "_owars_minibatch_kernel_cache",
+        "_owars_normalize_targets",
         "_owars_rollout_kernel_cache",
     )
     stashed = {
@@ -210,6 +211,7 @@ class OpponentPool:
         model: OrbitPolicy,
         ckpt_path: str | Path,
         seed_rating: float | None = None,
+        checkpoint_extra: dict[str, Any] | None = None,
     ) -> str:
         """Save a frozen copy of `model` to `ckpt_path` and add it to the pool.
 
@@ -222,9 +224,13 @@ class OpponentPool:
             p.requires_grad_(False)
         ckpt_path = Path(ckpt_path)
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {"model": snap.state_dict(), "config": snap.cfg.to_dict()}, ckpt_path
-        )
+        payload: dict[str, Any] = {
+            "model": snap.state_dict(),
+            "config": snap.cfg.to_dict(),
+        }
+        if checkpoint_extra is not None:
+            payload.update(checkpoint_extra)
+        torch.save(payload, ckpt_path)
         name = f"frozen:{label}"
         self._frozen[name] = LearnedAgent(
             ckpt_path,
@@ -525,6 +531,7 @@ class NoBuiltinTrainingPool:
         enter_active: bool = True,
         previous_best: bool = False,
         notable: bool = False,
+        checkpoint_extra: dict[str, Any] | None = None,
     ) -> str:
         """Save a frozen learned snapshot and route it into active/archive pools."""
         created_update = self.current_update if created_update is None else created_update
@@ -533,9 +540,13 @@ class NoBuiltinTrainingPool:
             p.requires_grad_(False)
         ckpt_path = Path(ckpt_path)
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {"model": snap.state_dict(), "config": snap.cfg.to_dict()}, ckpt_path
-        )
+        payload: dict[str, Any] = {
+            "model": snap.state_dict(),
+            "config": snap.cfg.to_dict(),
+        }
+        if checkpoint_extra is not None:
+            payload.update(checkpoint_extra)
+        torch.save(payload, ckpt_path)
         name = f"frozen:{label}"
         if name in self._snapshots:
             raise ValueError(f"snapshot {name!r} already exists")

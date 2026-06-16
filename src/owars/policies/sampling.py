@@ -102,12 +102,10 @@ def _threshold_normal_launch_entropy(
     return -(p * p.log() + (1.0 - p) * (1.0 - p).log())
 
 
-def _categorical_action_log_probs(
+def _categorical_action_logits(
     noop_logits: torch.Tensor,
     target_logits: torch.Tensor,
     action_logit_softcap: float | None,
-    *,
-    deterministic: bool = False,
 ) -> torch.Tensor:
     target_logits_f = target_logits.float()
     noop_logits_f = noop_logits.float()
@@ -132,10 +130,25 @@ def _categorical_action_log_probs(
         (noop_logits_f.unsqueeze(-1), target_logits_f),
         dim=-1,
     )
-    action_logits = torch.where(
+    return torch.where(
         torch.isfinite(action_logits),
         action_logits,
         torch.full_like(action_logits, -1e9),
+    )
+
+
+def _categorical_action_log_probs(
+    noop_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    action_logit_softcap: float | None,
+    *,
+    deterministic: bool = False,
+) -> torch.Tensor:
+    del deterministic
+    action_logits = _categorical_action_logits(
+        noop_logits,
+        target_logits,
+        action_logit_softcap,
     )
     return torch.log_softmax(action_logits, dim=-1)
 
@@ -1381,22 +1394,21 @@ def _sample_categorical_action(
         device=target_logits.device
     )
     target_logits = target_logits.float().masked_fill(~source.unsqueeze(-1), float("-inf"))
-    log_probs = _categorical_action_log_probs(
+    action_logits = _categorical_action_logits(
         noop_logits,
         target_logits,
         action_logit_softcap,
-        deterministic=deterministic,
     )
     if deterministic:
-        action_idx = log_probs.argmax(dim=-1)
+        action_idx = action_logits.argmax(dim=-1)
         target_idx = (action_idx - 1).clamp_min(0)
         launch = (action_idx > 0).to(noop_logits.dtype)
         launch = launch * source.to(dtype=launch.dtype)
         return launch, target_idx
     else:
-        uniform = torch.rand_like(log_probs).clamp_(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
+        uniform = torch.rand_like(action_logits).clamp_(SAMPLE_EPS, 1.0 - SAMPLE_EPS)
         gumbel = -torch.log(-torch.log(uniform))
-        action_idx = (log_probs + gumbel).argmax(dim=-1)
+        action_idx = (action_logits + gumbel).argmax(dim=-1)
     launch = (action_idx > 0).to(noop_logits.dtype)
     target_idx = (action_idx - 1).clamp_min(0)
     return launch, target_idx

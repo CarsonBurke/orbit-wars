@@ -51,11 +51,11 @@ class ModelCfg:
     fleet_tokenizer_depth: int = 1
     value_hidden: int = 64
     value_num_bins: int = 153
-    value_sigma_to_bin_ratio: float = 0.5
+    value_sigma_to_bin_ratio: float = 2.0
     critic_mtp_horizon: int = 6
-    value_min: float = -100_000.0
-    value_max: float = 100_000.0
-    value_symlog: bool = True
+    value_min: float = -64.0
+    value_max: float = 64.0
+    value_symlog: bool = False
     action_logit_softcap: float = 8.0
     # Real-units bound on the per-planet SAC advantage heads (see
     # OrbitPolicyConfig.adv_scale): each head emits adv_scale·tanh(raw/adv_scale).
@@ -190,9 +190,19 @@ class PPOCfg:
     # up under bad predictions. dreamer4 effectively runs the equivalent
     # of `value_coef=1.0` (separate `value_optim`, `dreamer4.py:4543`).
     value_coef: float = 1.0
+    # CleanRL baseline PPO normalizes rewards with a running discounted-return
+    # RMS before GAE. This keeps the critic target scale compact while leaving
+    # episodic-return logging in raw game units. Use "none" for raw-return
+    # ablations.
+    critic_return_norm: Literal["none", "discounted_return_rms"] = (
+        "discounted_return_rms"
+    )
+    critic_return_norm_gamma: float | None = None
+    critic_return_norm_clip: float | None = 10.0
+    critic_return_norm_epsilon: float = 1.0e-8
     # Categorical target entropy has no structural floor, so keep it from
-    # collapsing. Fraction entropy uses the squashed-Gaussian Normal entropy
-    # approximation and is usually left off for PPO.
+    # collapsing. Fraction entropy uses the policy's native Beta distribution
+    # but is left off by default for PPO.
     target_entropy_coef: float = 0.01
     fraction_entropy_coef: float = 0.0
     # No value clipping. dreamer4-style clipping (`max(ce, ce_of_clipped_v)`)
@@ -329,6 +339,8 @@ class RolloutCfg:
     env_backend: str = "rust"  # "rust", "numpy", "numpy_mp", or "kaggle"
     compile_policy: bool = True
     compile_fleet_width: int = 1024
+    detail_timing: bool = False
+    sample_detail_timing: bool = False
 
 
 @dataclass
@@ -479,6 +491,8 @@ class RunConfig:
                 cfg.model.value_num_bins = 41
             if "value_symlog" not in model_section:
                 cfg.model.value_symlog = False
+            if "critic_return_norm" not in ppo_section:
+                cfg.ppo.critic_return_norm = "none"
         if not 0.0 <= cfg.ppo.gae_lambda <= 1.0:
             raise ValueError("ppo.gae_lambda must be in [0, 1]")
         if cfg.ppo.value_gae_lambda is not None and not (
@@ -507,6 +521,21 @@ class RunConfig:
             )
         if cfg.ppo.clip_coef_high < cfg.ppo.clip_coef:
             raise ValueError("ppo.clip_coef_high must be >= ppo.clip_coef")
+        if cfg.ppo.critic_return_norm not in {"none", "discounted_return_rms"}:
+            raise ValueError(
+                "ppo.critic_return_norm must be 'none' or 'discounted_return_rms'"
+            )
+        if cfg.ppo.critic_return_norm_gamma is not None and not (
+            0.0 < cfg.ppo.critic_return_norm_gamma <= 1.0
+        ):
+            raise ValueError("ppo.critic_return_norm_gamma must be in (0, 1]")
+        if (
+            cfg.ppo.critic_return_norm_clip is not None
+            and cfg.ppo.critic_return_norm_clip <= 0.0
+        ):
+            raise ValueError("ppo.critic_return_norm_clip must be positive when set")
+        if cfg.ppo.critic_return_norm_epsilon <= 0.0:
+            raise ValueError("ppo.critic_return_norm_epsilon must be positive")
         if cfg.ppo.advantage_transform not in {"rankgauss", "none"}:
             raise ValueError("ppo.advantage_transform must be 'rankgauss' or 'none'")
         if cfg.optim.minibatch_count is not None and cfg.optim.minibatch_count <= 0:

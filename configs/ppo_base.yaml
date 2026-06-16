@@ -8,7 +8,7 @@
 #     minibatch advantage normalization.
 #   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
-#   - Distributional value head (symlog HL-Gauss CE on ±100k raw margin / 153 bins), unclipped.
+#   - Distributional value head (linear HL-Gauss CE on normalized returns / 153 bins), unclipped.
 
 run:
   name: ppo_base
@@ -44,12 +44,12 @@ model:
   encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
-  value_min: -100000.0
-  value_max: 100000.0
+  value_min: -64.0
+  value_max: 64.0
   value_num_bins: 153
   value_sigma_to_bin_ratio: 2.0
   critic_mtp_horizon: 6
-  value_symlog: true
+  value_symlog: false
 
 optim:
   # Muon (transformer block matrix params). Matches parameter-golf
@@ -82,6 +82,8 @@ ppo:
   clip_coef: 0.2
   clip_coef_high: 0.28
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
+  critic_return_norm: discounted_return_rms
+  critic_return_norm_clip: 10.0
 
   target_entropy_coef: 0.01     # categorical target distribution has no structural floor, so keep it from collapsing
   fraction_entropy_coef: 0.0    # native Beta entropy; keep off by default

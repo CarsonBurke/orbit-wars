@@ -61,7 +61,7 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
 from .config import OrbitPolicyConfig
-from .features import EncodedObs, MAX_PLANETS
+from .features import MAX_PLANETS, EncodedObs
 from .model import (
     CastedLinear,
     DestinationFleetConditioner,
@@ -237,12 +237,18 @@ class SACEncoder(nn.Module):
                 if feats.fleet_target_planet_idx is None
                 else feats.fleet_target_planet_idx.unsqueeze(0)
             )
+            planet_inbound_feats = (
+                None
+                if feats.planet_inbound_feats is None
+                else feats.planet_inbound_feats.unsqueeze(0)
+            )
         else:
             planet_feats = feats.planet_feats
             planet_mask = feats.planet_mask
             fleet_feats = feats.fleet_feats
             fleet_mask = feats.fleet_mask
             fleet_target_planet_idx = feats.fleet_target_planet_idx
+            planet_inbound_feats = feats.planet_inbound_feats
 
         b, p, _ = planet_feats.shape
         f = fleet_feats.shape[1]
@@ -269,20 +275,33 @@ class SACEncoder(nn.Module):
             )
 
         h_p = self.planet_embed(planet_feats)
-        h_f = self.fleet_embed(fleet_feats)
         if self.destination_fleet_conditioner is not None:
+            has_planet_inbound_feats = (
+                planet_inbound_feats is not None
+                and planet_inbound_feats.shape[-2] > 0
+            )
+            if not has_planet_inbound_feats:
+                h_f = self.fleet_embed(fleet_feats)
+            else:
+                h_f = h_p.new_zeros(b, 0, h_p.shape[-1])
             h_p, h_f, fleet_mask = self.destination_fleet_conditioner(
                 h_p,
-                h_f,
                 planet_mask,
                 fleet_mask,
                 fleet_target_planet_idx,
+                fleet_feats,
+                planet_inbound_feats,
+                h_f if not has_planet_inbound_feats else None,
             )
         if self.fleet_tokenizer is not None:
+            if self.destination_fleet_conditioner is None:
+                h_f = self.fleet_embed(fleet_feats)
             h_f = self.fleet_tokenizer(h_f, fleet_mask)
             fleet_mask = torch.ones(
                 b, h_f.shape[1], dtype=torch.bool, device=fleet_mask.device
             )
+        elif self.destination_fleet_conditioner is None:
+            h_f = self.fleet_embed(fleet_feats)
         f = h_f.shape[1]
 
         summary_t = self.summary_token.view(1, 1, -1).expand(b, 1, -1)

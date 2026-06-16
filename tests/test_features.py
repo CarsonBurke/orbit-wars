@@ -143,10 +143,16 @@ def test_fleet_destination_sidecar_marks_planet_hits_for_all_fleets():
 
     assert typed.fleet_target_planet_idx is not None
     assert raw.fleet_target_planet_idx is not None
-    assert typed.fleet_target_planet_idx[:2].tolist() == [0, 1]
-    assert raw.fleet_target_planet_idx[0, :2].tolist() == [0, 1]
-    assert typed.fleet_target_planet_idx[2:].eq(-1).all()
-    assert raw.fleet_target_planet_idx[0, 2:].eq(-1).all()
+    assert typed.fleet_target_planet_idx.shape == (0,)
+    assert raw.fleet_target_planet_idx.shape == (1, 0)
+    assert typed.planet_inbound_feats is not None
+    assert raw.planet_inbound_feats is not None
+    assert math.isclose(float(typed.planet_inbound_feats[0, 0]), 1.0 / 64.0)
+    assert math.isclose(float(typed.planet_inbound_feats[0, 1]), 1.0 / 64.0)
+    assert math.isclose(float(typed.planet_inbound_feats[1, 0]), 1.0 / 64.0)
+    assert math.isclose(float(typed.planet_inbound_feats[1, 2]), 1.0 / 64.0)
+    assert math.isclose(float(raw.planet_inbound_feats[0, 0, 0]), 1.0 / 64.0)
+    assert math.isclose(float(raw.planet_inbound_feats[0, 1, 0]), 1.0 / 64.0)
 
 
 def test_fleet_encoding_width_tracks_large_actual_count():
@@ -163,14 +169,18 @@ def test_fleet_encoding_width_tracks_large_actual_count():
     typed = encode_observation(parse_observation(obs), include_fleet_targets=True)
     raw = encode_raw_observations([obs], include_fleet_targets=True)
 
-    assert typed.fleet_feats.shape == (400, FLEET_FEAT_DIM)
-    assert typed.fleet_mask.shape == (400,)
+    assert typed.fleet_feats.shape == (0, FLEET_FEAT_DIM)
+    assert typed.fleet_mask.shape == (0,)
     assert typed.fleet_target_planet_idx is not None
-    assert typed.fleet_target_planet_idx.shape == (400,)
-    assert raw.fleet_feats.shape == (1, 400, FLEET_FEAT_DIM)
-    assert raw.fleet_mask.shape == (1, 400)
+    assert typed.fleet_target_planet_idx.shape == (0,)
+    assert typed.planet_inbound_feats is not None
+    assert typed.planet_inbound_feats[:, 0].sum() > 0.0
+    assert raw.fleet_feats.shape == (1, 0, FLEET_FEAT_DIM)
+    assert raw.fleet_mask.shape == (1, 0)
     assert raw.fleet_target_planet_idx is not None
-    assert raw.fleet_target_planet_idx.shape == (1, 400)
+    assert raw.fleet_target_planet_idx.shape == (1, 0)
+    assert raw.planet_inbound_feats is not None
+    assert raw.planet_inbound_feats[:, :, 0].sum() > 0.0
 
 
 def test_raw_fleet_features_include_intended_target_metadata():

@@ -17,12 +17,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 
-from ..policies.features import EncodedObs, fleet_target_planet_idx_or_empty
+from ..policies.features import (
+    EncodedObs,
+    fleet_target_planet_idx_or_empty,
+    planet_inbound_feats_or_empty,
+)
 from ..policies.model import OrbitPolicy, normalize_matrices
 from ..policies.sampling import (
     _categorical_action_log_probs,
@@ -30,6 +35,11 @@ from ..policies.sampling import (
     _threshold_normal_launch_log_prob,
     _threshold_normal_launch_prob,
 )
+
+PinnedSliceCache = dict[
+    tuple[int, str, torch.dtype, tuple[int, ...]],
+    tuple[torch.Tensor, torch.cuda.Event | None],
+]
 
 
 def _slice_feats(batch: dict[str, torch.Tensor], mb) -> EncodedObs:
@@ -43,12 +53,13 @@ def _slice_feats(batch: dict[str, torch.Tensor], mb) -> EncodedObs:
         planet_garrison=batch["planet_garrison"][mb],
         fleet_feats=batch["fleet_feats"][mb],
         fleet_mask=batch["fleet_mask"][mb],
-        global_feats=None
-        if batch.get("global_feats") is None
-        else batch["global_feats"][mb],
+        global_feats=None if batch.get("global_feats") is None else batch["global_feats"][mb],
         fleet_target_planet_idx=None
         if batch.get("fleet_target_planet_idx") is None
         else batch["fleet_target_planet_idx"][mb],
+        planet_inbound_feats=None
+        if batch.get("planet_inbound_feats") is None
+        else batch["planet_inbound_feats"][mb],
     )
 
 
@@ -160,6 +171,43 @@ def _fixed_minibatches_by_count(
     return batches
 
 
+def _fixed_order_minibatches(
+    n: int,
+    minibatch_size: int,
+    device: torch.device,
+    *,
+    minibatch_count: int | None = None,
+    weight_device: torch.device | None = None,
+) -> list[tuple[torch.Tensor, torch.Tensor, int]]:
+    """Return deterministic fixed-size minibatches plus real row counts."""
+    if n <= 0:
+        return []
+    if minibatch_count is not None:
+        count = min(max(1, int(minibatch_count)), n)
+        size = math.ceil(n / count)
+    else:
+        size = max(1, int(minibatch_size))
+    weight_device = device if weight_device is None else weight_device
+    batches: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+    for start in range(0, n, size):
+        stop = min(n, start + size)
+        real = stop - start
+        mb = torch.arange(start, stop, device=device)
+        weight = torch.ones(real, device=weight_device, dtype=torch.float32)
+        if real < size:
+            pad = torch.arange(0, size - real, device=device).remainder(n)
+            mb = torch.cat((mb, pad), dim=0)
+            weight = torch.cat(
+                (
+                    weight,
+                    torch.zeros(size - real, device=weight_device, dtype=torch.float32),
+                ),
+                dim=0,
+            )
+        batches.append((mb, weight, real))
+    return batches
+
+
 def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     weights = weights.to(device=values.device, dtype=values.dtype)
     return (values * weights).sum() / weights.sum().clamp_min(1.0)
@@ -251,13 +299,9 @@ def _conditional_action_entropy(
     """Entropy of launch + P(launch) * (target + fraction)."""
     min_real = torch.finfo(target_log_probs.dtype).min
     target_probs = target_log_probs.exp()
-    target_entropy = -(target_probs * target_log_probs.clamp_min(min_real)).sum(
-        dim=-1
-    )
+    target_entropy = -(target_probs * target_log_probs.clamp_min(min_real)).sum(dim=-1)
     launch_prob = launch_logits.sigmoid()
-    return _bernoulli_entropy(launch_logits) + launch_prob * (
-        target_entropy + fraction_entropy
-    )
+    return _bernoulli_entropy(launch_logits) + launch_prob * (target_entropy + fraction_entropy)
 
 
 BETA_SAMPLE_EPS: float = 1e-6
@@ -334,11 +378,97 @@ def _slice_to_device(
     tensor: torch.Tensor,
     mb: torch.Tensor,
     device: torch.device,
+    *,
+    pinned_cache: PinnedSliceCache | None = None,
+    slot: int = 0,
+    name: str = "",
 ) -> torch.Tensor:
+    if pinned_cache is not None and tensor.device.type == "cpu" and device.type == "cuda":
+        mb_cpu = mb if mb.device.type == "cpu" else mb.cpu()
+        shape = (int(mb_cpu.numel()), *tuple(tensor.shape[1:]))
+        key = (int(slot), name, tensor.dtype, shape)
+        entry = pinned_cache.get(key)
+        if entry is None:
+            out = torch.empty(shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+            event = None
+            pinned_cache[key] = (out, event)
+        else:
+            out, event = entry
+            if event is not None:
+                event.synchronize()
+        torch.index_select(tensor, 0, mb_cpu, out=out)
+        moved = out.to(device, non_blocking=True)
+        if event is None:
+            event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        pinned_cache[key] = (out, event)
+        return moved
+
     out = tensor[mb]
     if out.device == device:
         return out
+    if out.device.type == "cpu" and device.type == "cuda":
+        out = out.contiguous()
+        if not out.is_pinned():
+            out = out.pin_memory()
     return out.to(device, non_blocking=True)
+
+
+def _record_streams(value: Any, stream: torch.cuda.Stream) -> None:
+    if isinstance(value, torch.Tensor) and value.device.type == "cuda":
+        value.record_stream(stream)
+    elif isinstance(value, tuple | list):
+        for item in value:
+            _record_streams(item, stream)
+
+
+def _prefetch_staged_minibatches(
+    stage_fn: Any,
+    minibatches: list[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+) -> Any:
+    """Yield staged minibatches, preloading the next CUDA transfer.
+
+    The CPU rollout batch is sliced outside the compiled PPO kernel. On CUDA,
+    each sliced CPU minibatch is pinned in `_slice_to_device`; this helper moves
+    those pinned copies to the model device on side streams while the current
+    minibatch runs backward/optimizer work on the default stream.
+    """
+    if device.type != "cuda" or len(minibatches) <= 1:
+        for mb, row_weight in minibatches:
+            yield stage_fn(mb, row_weight, 0)
+        return
+
+    with torch.cuda.device(device):
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+
+    def submit(
+        item: tuple[torch.Tensor, torch.Tensor],
+        stream: torch.cuda.Stream,
+        slot: int,
+    ):
+        mb, row_weight = item
+        with torch.cuda.stream(stream):
+            return stage_fn(mb, row_weight, slot)
+
+    current_stream = torch.cuda.current_stream(device)
+    staged = submit(minibatches[0], streams[0], 0)
+    ready_stream = streams[0]
+    next_stream_idx = 1
+    for item in minibatches[1:]:
+        current_stream.wait_stream(ready_stream)
+        _record_streams(staged, current_stream)
+        next_stream = streams[next_stream_idx]
+        next_staged = submit(item, next_stream, next_stream_idx)
+        next_stream_idx = 1 - next_stream_idx
+        yield staged
+        staged = next_staged
+        ready_stream = next_stream
+        current_stream = torch.cuda.current_stream(device)
+
+    current_stream.wait_stream(ready_stream)
+    _record_streams(staged, current_stream)
+    yield staged
 
 
 def _global_feats_or_empty(batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -348,14 +478,34 @@ def _global_feats_or_empty(batch: dict[str, torch.Tensor]) -> torch.Tensor:
     return batch["planet_feats"].new_zeros(batch["planet_feats"].shape[0], 0)
 
 
+def _batch_encoded_view(batch: dict[str, torch.Tensor]) -> EncodedObs:
+    return EncodedObs(
+        planet_feats=batch["planet_feats"],
+        planet_mask=batch["planet_mask"],
+        planet_owned_mask=batch["planet_owned_mask"],
+        planet_ids=batch["planet_ids"],
+        planet_garrison=batch["planet_garrison"],
+        fleet_feats=batch["fleet_feats"],
+        fleet_mask=batch["fleet_mask"],
+        fleet_target_planet_idx=batch.get("fleet_target_planet_idx"),
+        planet_inbound_feats=batch.get("planet_inbound_feats"),
+        global_feats=batch.get("global_feats"),
+    )
+
+
 def _stage_ppo_minibatch(
     batch: dict[str, torch.Tensor],
+    global_feats: torch.Tensor,
+    fleet_target_planet_idx: torch.Tensor,
+    planet_inbound_feats: torch.Tensor,
     policy_advantage: torch.Tensor,
     return_mtp: torch.Tensor,
     return_mtp_mask: torch.Tensor,
     mb: torch.Tensor,
     row_weight: torch.Tensor,
     device: torch.device,
+    pinned_cache: PinnedSliceCache | None = None,
+    slot: int = 0,
 ) -> tuple[torch.Tensor, ...]:
     """Slice one logical minibatch and move it to the model device.
 
@@ -364,88 +514,209 @@ def _stage_ppo_minibatch(
     stays outside the compiled fullgraph body.
     """
     return (
-        _slice_to_device(_global_feats_or_empty(batch), mb, device),
-        _slice_to_device(batch["planet_feats"], mb, device),
-        _slice_to_device(batch["planet_mask"], mb, device),
-        _slice_to_device(batch["planet_owned_mask"], mb, device),
-        _slice_to_device(batch["planet_ids"], mb, device),
-        _slice_to_device(batch["planet_garrison"], mb, device),
-        _slice_to_device(batch["fleet_feats"], mb, device),
-        _slice_to_device(batch["fleet_mask"], mb, device),
         _slice_to_device(
-            fleet_target_planet_idx_or_empty(
-                EncodedObs(
-                    planet_feats=batch["planet_feats"],
-                    planet_mask=batch["planet_mask"],
-                    planet_owned_mask=batch["planet_owned_mask"],
-                    planet_ids=batch["planet_ids"],
-                    planet_garrison=batch["planet_garrison"],
-                    fleet_feats=batch["fleet_feats"],
-                    fleet_mask=batch["fleet_mask"],
-                    fleet_target_planet_idx=batch.get("fleet_target_planet_idx"),
-                )
-            ),
+            global_feats, mb, device, pinned_cache=pinned_cache, slot=slot, name="global_feats"
+        ),
+        _slice_to_device(
+            batch["planet_feats"],
             mb,
             device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_feats",
         ),
-        (
-            row_weight
-            if row_weight.device == device
-            else row_weight.to(device, non_blocking=True)
+        _slice_to_device(
+            batch["planet_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_mask",
         ),
-        _slice_to_device(batch["launch"], mb, device),
-        _slice_to_device(batch["target_idx"], mb, device),
-        _slice_to_device(batch["fraction"], mb, device),
-        _slice_to_device(batch["old_log_prob"], mb, device),
-        _slice_to_device(policy_advantage, mb, device),
-        _slice_to_device(return_mtp, mb, device),
-        _slice_to_device(return_mtp_mask, mb, device),
-        _slice_to_device(batch["owned_mask"], mb, device),
-        _slice_to_device(batch["target_legal_mask"], mb, device),
+        _slice_to_device(
+            batch["planet_owned_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_owned_mask",
+        ),
+        _slice_to_device(
+            batch["planet_ids"], mb, device, pinned_cache=pinned_cache, slot=slot, name="planet_ids"
+        ),
+        _slice_to_device(
+            batch["planet_garrison"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_garrison",
+        ),
+        _slice_to_device(
+            batch["fleet_feats"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="fleet_feats",
+        ),
+        _slice_to_device(
+            batch["fleet_mask"], mb, device, pinned_cache=pinned_cache, slot=slot, name="fleet_mask"
+        ),
+        _slice_to_device(
+            fleet_target_planet_idx,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="fleet_target_planet_idx",
+        ),
+        _slice_to_device(
+            planet_inbound_feats,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_inbound_feats",
+        ),
+        (row_weight if row_weight.device == device else row_weight.to(device, non_blocking=True)),
+        _slice_to_device(
+            batch["launch"], mb, device, pinned_cache=pinned_cache, slot=slot, name="launch"
+        ),
+        _slice_to_device(
+            batch["target_idx"], mb, device, pinned_cache=pinned_cache, slot=slot, name="target_idx"
+        ),
+        _slice_to_device(
+            batch["fraction"], mb, device, pinned_cache=pinned_cache, slot=slot, name="fraction"
+        ),
+        _slice_to_device(
+            batch["old_log_prob"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="old_log_prob",
+        ),
+        _slice_to_device(
+            policy_advantage, mb, device, pinned_cache=pinned_cache, slot=slot, name="advantage"
+        ),
+        _slice_to_device(
+            return_mtp, mb, device, pinned_cache=pinned_cache, slot=slot, name="return_mtp"
+        ),
+        _slice_to_device(
+            return_mtp_mask,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="return_mtp_mask",
+        ),
+        _slice_to_device(
+            batch["owned_mask"], mb, device, pinned_cache=pinned_cache, slot=slot, name="owned_mask"
+        ),
+        _slice_to_device(
+            batch["target_legal_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="target_legal_mask",
+        ),
     )
 
 
 def _stage_value_minibatch(
     batch: dict[str, torch.Tensor],
+    global_feats: torch.Tensor,
+    fleet_target_planet_idx: torch.Tensor,
+    planet_inbound_feats: torch.Tensor,
     return_mtp: torch.Tensor,
     return_mtp_mask: torch.Tensor,
     mb: torch.Tensor,
     row_weight: torch.Tensor,
     device: torch.device,
+    pinned_cache: PinnedSliceCache | None = None,
+    slot: int = 0,
 ) -> tuple[torch.Tensor, ...]:
     """Slice one value-pretrain minibatch and move it to the model device."""
     return (
-        _slice_to_device(_global_feats_or_empty(batch), mb, device),
-        _slice_to_device(batch["planet_feats"], mb, device),
-        _slice_to_device(batch["planet_mask"], mb, device),
-        _slice_to_device(batch["planet_owned_mask"], mb, device),
-        _slice_to_device(batch["planet_ids"], mb, device),
-        _slice_to_device(batch["planet_garrison"], mb, device),
-        _slice_to_device(batch["fleet_feats"], mb, device),
-        _slice_to_device(batch["fleet_mask"], mb, device),
         _slice_to_device(
-            fleet_target_planet_idx_or_empty(
-                EncodedObs(
-                    planet_feats=batch["planet_feats"],
-                    planet_mask=batch["planet_mask"],
-                    planet_owned_mask=batch["planet_owned_mask"],
-                    planet_ids=batch["planet_ids"],
-                    planet_garrison=batch["planet_garrison"],
-                    fleet_feats=batch["fleet_feats"],
-                    fleet_mask=batch["fleet_mask"],
-                    fleet_target_planet_idx=batch.get("fleet_target_planet_idx"),
-                )
-            ),
+            global_feats, mb, device, pinned_cache=pinned_cache, slot=slot, name="global_feats"
+        ),
+        _slice_to_device(
+            batch["planet_feats"],
             mb,
             device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_feats",
         ),
-        (
-            row_weight
-            if row_weight.device == device
-            else row_weight.to(device, non_blocking=True)
+        _slice_to_device(
+            batch["planet_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_mask",
         ),
-        _slice_to_device(return_mtp, mb, device),
-        _slice_to_device(return_mtp_mask, mb, device),
+        _slice_to_device(
+            batch["planet_owned_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_owned_mask",
+        ),
+        _slice_to_device(
+            batch["planet_ids"], mb, device, pinned_cache=pinned_cache, slot=slot, name="planet_ids"
+        ),
+        _slice_to_device(
+            batch["planet_garrison"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_garrison",
+        ),
+        _slice_to_device(
+            batch["fleet_feats"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="fleet_feats",
+        ),
+        _slice_to_device(
+            batch["fleet_mask"], mb, device, pinned_cache=pinned_cache, slot=slot, name="fleet_mask"
+        ),
+        _slice_to_device(
+            fleet_target_planet_idx,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="fleet_target_planet_idx",
+        ),
+        _slice_to_device(
+            planet_inbound_feats,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_inbound_feats",
+        ),
+        (row_weight if row_weight.device == device else row_weight.to(device, non_blocking=True)),
+        _slice_to_device(
+            return_mtp, mb, device, pinned_cache=pinned_cache, slot=slot, name="return_mtp"
+        ),
+        _slice_to_device(
+            return_mtp_mask,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="return_mtp_mask",
+        ),
     )
 
 
@@ -490,6 +761,16 @@ def _clip_grad_norm(
     if not params:
         return torch.zeros((), device=device)
     return torch.nn.utils.clip_grad_norm_(params, max_norm)
+
+
+def _grad_norm(
+    params: list[torch.nn.Parameter],
+    device: torch.device,
+) -> torch.Tensor:
+    norms = [param.grad.detach().norm(2).to(device) for param in params if param.grad is not None]
+    if not norms:
+        return torch.zeros((), device=device)
+    return torch.linalg.vector_norm(torch.stack(norms), ord=2)
 
 
 def _grad_clip_scale(raw_norm: torch.Tensor, max_norm: float) -> torch.Tensor:
@@ -544,28 +825,26 @@ def _backward_actor_critic_with_group_clips(
 
     _clear_param_grads(all_params)
     critic_loss.backward(retain_graph=True)
-    critic_shared_raw_norm = _clip_grad_norm(shared, float("inf"), device)
+    critic_shared_raw_norm = _grad_norm(shared, device)
     critic_norm = _clip_grad_norm(critic_params, clip_norm, device)
+    critic_shared_norm = _grad_norm(shared, device)
     critic_clip_scale = _grad_clip_scale(critic_norm, clip_norm)
-    critic_shared_norm = critic_shared_raw_norm * critic_clip_scale
     critic_clip_frac = (critic_clip_scale < 1.0).to(critic_norm.dtype)
     critic_grads = [
-        (param, param.grad.detach().clone())
-        for param in critic_params
-        if param.grad is not None
+        (param, param.grad.detach().clone()) for param in critic_params if param.grad is not None
     ]
 
     _clear_param_grads(all_params)
     actor_loss.backward()
-    actor_shared_raw_norm = _clip_grad_norm(shared, float("inf"), device)
+    actor_shared_raw_norm = _grad_norm(shared, device)
     actor_norm = _clip_grad_norm(actor_params, clip_norm, device)
+    actor_shared_norm = _grad_norm(shared, device)
     actor_clip_scale = _grad_clip_scale(actor_norm, clip_norm)
-    actor_shared_norm = actor_shared_raw_norm * actor_clip_scale
     actor_clip_frac = (actor_clip_scale < 1.0).to(actor_norm.dtype)
     for param, grad in critic_grads:
         param.grad = grad if param.grad is None else param.grad + grad
 
-    shared_norm = _clip_grad_norm(shared, float("inf"), device)
+    shared_norm = _grad_norm(shared, device)
     return (
         actor_norm,
         critic_norm,
@@ -626,6 +905,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
         fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
         row_weight: torch.Tensor,
         launch: torch.Tensor,
         target_idx: torch.Tensor,
@@ -647,6 +927,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
             fleet_mask=fleet_mask,
             global_feats=global_feats,
             fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -666,9 +947,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         if action_logit_softcap is None:
             launch_logits = launch_logits.masked_fill(~has_legal_target, -20.0)
         out_launch_log_std = getattr(out, "launch_log_std", None)
-        launch_log_std = (
-            None if out_launch_log_std is None else out_launch_log_std.float()
-        )
+        launch_log_std = None if out_launch_log_std is None else out_launch_log_std.float()
         launch_prob_floor = float(getattr(out, "launch_prob_floor", 0.0))
         target_logits = out.target_logits.float().masked_fill(~target_legal_mask, float("-inf"))
         if out.fraction_alpha is None or out.fraction_beta is None:
@@ -773,18 +1052,14 @@ class _PPOMinibatchKernel(torch.nn.Module):
             target_entropy_per_planet = -(
                 target_dist_probs * target_log_probs.clamp_min(min_real)
             ).sum(dim=-1)
-            target_entropy = (
-                (p_move_current * target_entropy_per_planet) * owned_w
-            ).sum() / denom
+            target_entropy = ((p_move_current * target_entropy_per_planet) * owned_w).sum() / denom
         else:
             safe_action_log_probs = torch.where(
                 torch.isfinite(action_log_probs),
                 action_log_probs,
                 torch.zeros_like(action_log_probs),
             )
-            action_entropy = -(
-                action_probs * safe_action_log_probs
-            ).sum(dim=-1)
+            action_entropy = -(action_probs * safe_action_log_probs).sum(dim=-1)
             p_move_current = target_dist_probs.sum(dim=-1)
             planet_entropy = action_entropy + p_move_current * frac_entropy_per_planet
             target_entropy = (action_entropy * owned_w).sum() / denom
@@ -795,21 +1070,15 @@ class _PPOMinibatchKernel(torch.nn.Module):
         legal_target_count = target_legal_mask.to(dtype=owned_f.dtype).sum(dim=-1)
         legal_target_count_mean = (legal_target_count * owned_w).sum() / denom
         uniform_move_prior = (
-            (legal_target_count > 0.0).to(dtype=owned_f.dtype) * 0.5
-            * owned_w
+            (legal_target_count > 0.0).to(dtype=owned_f.dtype) * 0.5 * owned_w
         ).sum() / denom
         launch_mean = (launch_logits * owned_w).sum() / denom
         if action_logit_softcap is not None:
             launch_log_std_mean = launch_logits.sum() * 0.0
-            action_logit_softcap_metric = launch_logits.new_tensor(
-                float(action_logit_softcap)
-            )
+            action_logit_softcap_metric = launch_logits.new_tensor(float(action_logit_softcap))
             target_best = target_logits.amax(dim=-1)
             target_best = torch.where(has_legal_target, target_best, launch_logits)
-            launch_score_mean = (
-                ((launch_logits - target_best) * owned_w).sum()
-                / denom
-            )
+            launch_score_mean = ((launch_logits - target_best) * owned_w).sum() / denom
         elif launch_log_std is None:
             launch_log_std_mean = launch_logits.sum() * 0.0
             action_logit_softcap_metric = launch_logits.sum() * 0.0
@@ -826,12 +1095,8 @@ class _PPOMinibatchKernel(torch.nn.Module):
         concentration = fraction_alpha + fraction_beta
         fraction_concentration_mean = (concentration * owned_w).sum() / denom
         fraction_concentration_max = _weighted_max(concentration, owned_w)
-        fraction_skew_abs_mean = (
-            ((fraction_alpha - fraction_beta).abs() * owned_w).sum() / denom
-        )
-        deterministic_fraction = _deterministic_beta_fraction(
-            fraction_alpha, fraction_beta
-        )
+        fraction_skew_abs_mean = ((fraction_alpha - fraction_beta).abs() * owned_w).sum() / denom
+        deterministic_fraction = _deterministic_beta_fraction(fraction_alpha, fraction_beta)
         deterministic_fraction_mean = (deterministic_fraction * owned_w).sum() / denom
         entropy_bonus = (
             self.target_entropy_coef * (launch_entropy + target_entropy)
@@ -853,12 +1118,8 @@ class _PPOMinibatchKernel(torch.nn.Module):
         # (the side `clip_coef_high` deliberately relaxes).
         clipped_low = ratio < (1.0 - self.clip_coef)
         clipped_high = ratio > (1.0 + self.clip_coef_high)
-        ratio_clip_frac = (
-            (clipped_low | clipped_high).to(owned_f.dtype) * owned_w
-        ).sum() / denom
-        ratio_clip_frac_high = (
-            clipped_high.to(owned_f.dtype) * owned_w
-        ).sum() / denom
+        ratio_clip_frac = ((clipped_low | clipped_high).to(owned_f.dtype) * owned_w).sum() / denom
+        ratio_clip_frac_high = (clipped_high.to(owned_f.dtype) * owned_w).sum() / denom
         executed_launch_frac = (launch_f * owned_w).sum() / denom
 
         row_log_ratio = (log_ratio * owned_f).sum(dim=-1)
@@ -866,9 +1127,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         row_ratio = row_log_ratio.exp()
         row_denom = row_w.sum().clamp_min(1.0)
         row_launch_count = (launch_f * owned_w).sum(dim=-1)
-        turn_no_action_frac = (
-            ((row_launch_count <= 0.0).to(row_w.dtype) * row_w).sum() / row_denom
-        )
+        turn_no_action_frac = ((row_launch_count <= 0.0).to(row_w.dtype) * row_w).sum() / row_denom
         kl = (((row_ratio - 1.0) - row_log_ratio) * row_w).sum() / row_denom
         row_log_ratio_abs_mean = (row_log_ratio.abs() * row_w).sum() / row_denom
         owned_planets_mean = owned_w.sum() / row_denom
@@ -930,6 +1189,7 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
         fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
         row_weight: torch.Tensor,
         ret_mtp: torch.Tensor,
         ret_mtp_mask: torch.Tensor,
@@ -944,6 +1204,7 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
             fleet_mask=fleet_mask,
             global_feats=global_feats,
             fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
         )
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
@@ -961,6 +1222,103 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
             ret_mtp_mask,
         )
         return value_loss, value_loss.detach().float()
+
+
+class _OldLogProbKernel(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, *, autocast_enabled: bool) -> None:
+        super().__init__()
+        self.model = model
+        self.autocast_enabled = bool(autocast_enabled)
+        self._model_accepts_head_flags = isinstance(model, OrbitPolicy)
+
+    def forward(
+        self,
+        global_feats: torch.Tensor,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
+        launch: torch.Tensor,
+        target_idx: torch.Tensor,
+        fraction: torch.Tensor,
+        target_legal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+            global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
+        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            if self._model_accepts_head_flags:
+                out = self.model(feats, include_value=False)
+            else:
+                out = self.model(feats)
+
+        target_legal_mask = target_legal_mask.bool()
+        has_legal_target = target_legal_mask.any(dim=-1)
+        launch_logits = out.launch_logits.float()
+        out_action_logit_softcap = getattr(out, "action_logit_softcap", None)
+        action_logit_softcap = (
+            None if out_action_logit_softcap is None else float(out_action_logit_softcap)
+        )
+        if action_logit_softcap is None:
+            launch_logits = launch_logits.masked_fill(~has_legal_target, -20.0)
+        out_launch_log_std = getattr(out, "launch_log_std", None)
+        launch_log_std = None if out_launch_log_std is None else out_launch_log_std.float()
+        launch_prob_floor = float(getattr(out, "launch_prob_floor", 0.0))
+        target_logits = out.target_logits.float().masked_fill(
+            ~target_legal_mask,
+            float("-inf"),
+        )
+        if out.fraction_alpha is None or out.fraction_beta is None:
+            raise ValueError("PPO OrbitPolicy output must include Beta fraction params")
+        fraction_alpha = out.fraction_alpha.float()
+        fraction_beta = out.fraction_beta.float()
+        p = target_logits.shape[1]
+        launch_f = launch.float().clamp(0.0, 1.0)
+        target = target_idx.clamp(0, p - 1)
+        if action_logit_softcap is None:
+            target_logits = _safe_target_logits(target_logits)
+            launch_lp = _threshold_normal_launch_log_prob(
+                launch_logits,
+                launch_log_std,
+                launch_f,
+                launch_prob_floor,
+            )
+            target_log_probs = F.log_softmax(target_logits, dim=-1)
+            target_lp = target_log_probs.gather(
+                -1,
+                target.unsqueeze(-1),
+            ).squeeze(-1)
+            action_lp = launch_lp + launch_f * target_lp
+        else:
+            action_log_probs = _categorical_action_log_probs(
+                launch_logits,
+                target_logits,
+                action_logit_softcap,
+            )
+            action_idx = torch.where(
+                launch_f > 0.5,
+                target + 1,
+                torch.zeros_like(target),
+            )
+            action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
+        frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
+        return action_lp + launch_f * frac_lp
 
 
 def _kernel_cache(model: torch.nn.Module) -> dict:
@@ -1056,6 +1414,28 @@ def _get_value_only_kernel(
     return kernel
 
 
+def _get_old_log_prob_kernel(
+    model: torch.nn.Module,
+    *,
+    compile_mode: str | None,
+    shape_key: tuple[int, int, int, int, int, int],
+) -> torch.nn.Module:
+    device = _module_device(model)
+    mode = compile_mode if device.type == "cuda" else None
+    key = ("old_log_prob", mode, shape_key)
+    cache = _kernel_cache(model)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    kernel = _OldLogProbKernel(
+        model,
+        autocast_enabled=device.type == "cuda",
+    )
+    kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
+    cache[key] = kernel
+    return kernel
+
+
 @dataclass
 class PPOLog:
     policy_loss: float
@@ -1131,8 +1511,7 @@ def compute_gae(
 
 
 def compute_mc_return(rewards: np.ndarray, gamma: float = 1.0) -> np.ndarray:
-    """Plain Monte-Carlo discounted return Σ γ^k r_{t+k}.
-    """
+    """Plain Monte-Carlo discounted return Σ γ^k r_{t+k}."""
     horizon = len(rewards)
     out = np.zeros(horizon, dtype=np.float32)
     running = 0.0
@@ -1140,6 +1519,174 @@ def compute_mc_return(rewards: np.ndarray, gamma: float = 1.0) -> np.ndarray:
         running = rewards[t] + gamma * running
         out[t] = running
     return out
+
+
+def _stage_old_log_prob_minibatch(
+    batch: dict[str, torch.Tensor],
+    global_feats: torch.Tensor,
+    fleet_target_planet_idx: torch.Tensor,
+    planet_inbound_feats: torch.Tensor,
+    mb: torch.Tensor,
+    device: torch.device,
+    pinned_cache: PinnedSliceCache | None = None,
+    slot: int = 0,
+) -> tuple[torch.Tensor, ...]:
+    return (
+        _slice_to_device(
+            global_feats, mb, device, pinned_cache=pinned_cache, slot=slot, name="global_feats"
+        ),
+        _slice_to_device(
+            batch["planet_feats"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_feats",
+        ),
+        _slice_to_device(
+            batch["planet_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_mask",
+        ),
+        _slice_to_device(
+            batch["planet_owned_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_owned_mask",
+        ),
+        _slice_to_device(
+            batch["planet_ids"], mb, device, pinned_cache=pinned_cache, slot=slot, name="planet_ids"
+        ),
+        _slice_to_device(
+            batch["planet_garrison"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_garrison",
+        ),
+        _slice_to_device(
+            batch["fleet_feats"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="fleet_feats",
+        ),
+        _slice_to_device(
+            batch["fleet_mask"], mb, device, pinned_cache=pinned_cache, slot=slot, name="fleet_mask"
+        ),
+        _slice_to_device(
+            fleet_target_planet_idx,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="fleet_target_planet_idx",
+        ),
+        _slice_to_device(
+            planet_inbound_feats,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_inbound_feats",
+        ),
+        _slice_to_device(
+            batch["launch"], mb, device, pinned_cache=pinned_cache, slot=slot, name="launch"
+        ),
+        _slice_to_device(
+            batch["target_idx"], mb, device, pinned_cache=pinned_cache, slot=slot, name="target_idx"
+        ),
+        _slice_to_device(
+            batch["fraction"], mb, device, pinned_cache=pinned_cache, slot=slot, name="fraction"
+        ),
+        _slice_to_device(
+            batch["target_legal_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="target_legal_mask",
+        ),
+    )
+
+
+def compute_old_log_probs(
+    model: OrbitPolicy,
+    batch: dict[str, torch.Tensor],
+    *,
+    minibatch_size: int,
+    minibatch_count: int | None = None,
+    compile_mode: str | None = None,
+    output_device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Compute frozen behavior log-probs for a stacked PPO rollout batch."""
+    n = int(batch["planet_feats"].shape[0])
+    if n <= 0:
+        return batch["launch"].new_empty(batch["launch"].shape).float()
+    batch_device = batch["planet_feats"].device
+    batch_view = _batch_encoded_view(batch)
+    global_feats = _global_feats_or_empty(batch)
+    fleet_target_planet_idx = fleet_target_planet_idx_or_empty(batch_view)
+    planet_inbound_feats = planet_inbound_feats_or_empty(batch_view)
+    device = _module_device(model)
+    out_device = torch.device(output_device) if output_device is not None else batch_device
+    if minibatch_count is not None:
+        static_minibatch_rows = math.ceil(n / max(1, min(int(minibatch_count), n)))
+    else:
+        static_minibatch_rows = max(1, int(minibatch_size))
+    was_training = model.training
+    model.eval()
+    try:
+        kernel = _get_old_log_prob_kernel(
+            model,
+            compile_mode=compile_mode,
+            shape_key=(
+                static_minibatch_rows,
+                int(batch["planet_feats"].shape[1]),
+                int(batch["fleet_feats"].shape[1]),
+                int(global_feats.shape[1]),
+                int(planet_inbound_feats.shape[-2]),
+                int(planet_inbound_feats.shape[-1]),
+            ),
+        )
+        chunks: list[torch.Tensor] = []
+        pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
+        with torch.no_grad():
+            for mb, _row_weight, real in _fixed_order_minibatches(
+                n,
+                minibatch_size,
+                batch_device,
+                minibatch_count=minibatch_count,
+                weight_device=device,
+            ):
+                staged = _stage_old_log_prob_minibatch(
+                    batch,
+                    global_feats,
+                    fleet_target_planet_idx,
+                    planet_inbound_feats,
+                    mb,
+                    device,
+                    pinned_cache=pinned_cache,
+                )
+                if compile_mode is not None:
+                    _mark_cuda_graph_step(device)
+                old_lp = kernel(*staged)
+                retained = old_lp[:real].detach()
+                if retained.device == out_device:
+                    retained = retained.clone()
+                else:
+                    retained = retained.to(out_device, non_blocking=True)
+                chunks.append(retained)
+        return torch.cat(chunks, dim=0).float()
+    finally:
+        model.train(was_training)
 
 
 def ppo_update(
@@ -1182,6 +1729,10 @@ def ppo_update(
     """
     n = batch["planet_feats"].shape[0]
     batch_device = batch["planet_feats"].device
+    batch_view = _batch_encoded_view(batch)
+    global_feats = _global_feats_or_empty(batch)
+    fleet_target_planet_idx = fleet_target_planet_idx_or_empty(batch_view)
+    planet_inbound_feats = planet_inbound_feats_or_empty(batch_view)
     device = _module_device(model)
     policy_advantage = _shape_policy_advantage(
         batch["advantage"],
@@ -1226,11 +1777,14 @@ def ppo_update(
             static_minibatch_rows,
             int(batch["planet_feats"].shape[1]),
             int(batch["fleet_feats"].shape[1]),
-            int(_global_feats_or_empty(batch).shape[1]),
+            int(global_feats.shape[1]),
             int(return_mtp.shape[1]),
+            int(planet_inbound_feats.shape[-2]),
+            int(planet_inbound_feats.shape[-1]),
         ),
     )
     epochs_run = 0
+    pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
     for _ in range(epochs):
         if minibatch_count is not None:
             logical_minibatch_size = math.ceil(n / max(1, int(minibatch_count)))
@@ -1242,21 +1796,32 @@ def ppo_update(
             )
         else:
             logical_minibatch_size = None
-            minibatches = _fixed_minibatches(
-                n, minibatch_size, batch_device, weight_device=device
-            )
-        for mb, row_weight in minibatches:
-            if compile_mode is not None:
-                _mark_cuda_graph_step(device)
-            staged = _stage_ppo_minibatch(
+            minibatches = _fixed_minibatches(n, minibatch_size, batch_device, weight_device=device)
+
+        def stage(
+            mb: torch.Tensor,
+            row_weight: torch.Tensor,
+            slot: int,
+        ) -> tuple[torch.Tensor, ...]:
+            return _stage_ppo_minibatch(
                 batch,
+                global_feats,
+                fleet_target_planet_idx,
+                planet_inbound_feats,
                 policy_advantage,
                 return_mtp,
                 return_mtp_mask,
                 mb,
                 row_weight,
                 device,
+                pinned_cache=pinned_cache,
+                slot=slot,
             )
+
+        for staged in _prefetch_staged_minibatches(stage, minibatches, device):
+            row_weight = staged[10]
+            if compile_mode is not None:
+                _mark_cuda_graph_step(device)
             actor_loss, critic_loss, metrics = kernel(*staged)
             metrics_for_step = metrics.detach().clone()
 
@@ -1274,13 +1839,11 @@ def ppo_update(
                 critic_clip_scale,
                 actor_clip_frac,
                 critic_clip_frac,
-            ) = (
-                _backward_actor_critic_with_group_clips(
-                    model,
-                    actor_loss * loss_scale,
-                    critic_loss * loss_scale,
-                    grad_clip,
-                )
+            ) = _backward_actor_critic_with_group_clips(
+                model,
+                actor_loss * loss_scale,
+                critic_loss * loss_scale,
+                grad_clip,
             )
             optimizer.step()
             # nGPT: re-project the encoder-trunk matrices onto the unit
@@ -1314,20 +1877,12 @@ def ppo_update(
         epochs_run += 1
 
     n_steps = max(1, n_steps)
-    mean_logs_t = (
-        torch.zeros(30, device=device)
-        if metric_sum is None
-        else metric_sum / n_steps
-    )
+    mean_logs_t = torch.zeros(30, device=device) if metric_sum is None else metric_sum / n_steps
     # Match CleanRL's PPO KL logging: `approx_kl` is the latest minibatch's
     # estimate after the PPO epoch loop, not an epoch mean. The surrounding
     # diagnostics stay averaged to preserve their lower-noise TensorBoard
     # behavior.
-    kl_logs_t = (
-        torch.zeros(30, device=device)
-        if last_metrics is None
-        else last_metrics
-    )
+    kl_logs_t = torch.zeros(30, device=device) if last_metrics is None else last_metrics
     grad_logs_t = (
         torch.stack(
             [
@@ -1418,6 +1973,10 @@ def value_only_update(
     """
     n = batch["planet_feats"].shape[0]
     batch_device = batch["planet_feats"].device
+    batch_view = _batch_encoded_view(batch)
+    global_feats = _global_feats_or_empty(batch)
+    fleet_target_planet_idx = fleet_target_planet_idx_or_empty(batch_view)
+    planet_inbound_feats = planet_inbound_feats_or_empty(batch_view)
     device = _module_device(model)
     total: torch.Tensor | None = None
     n_steps = 0
@@ -1434,26 +1993,43 @@ def value_only_update(
             static_minibatch_rows,
             int(batch["planet_feats"].shape[1]),
             int(batch["fleet_feats"].shape[1]),
-            int(_global_feats_or_empty(batch).shape[1]),
+            int(global_feats.shape[1]),
+            int(planet_inbound_feats.shape[-2]),
+            int(planet_inbound_feats.shape[-1]),
         ),
     )
+    pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
     for _ in range(epochs):
-        for mb, row_weight in _fixed_minibatches(
+        minibatches = _fixed_minibatches(
             n,
             minibatch_size,
             batch_device,
             weight_device=device,
-        ):
-            if compile_mode is not None:
-                _mark_cuda_graph_step(device)
-            staged = _stage_value_minibatch(
+        )
+
+        def stage(
+            mb: torch.Tensor,
+            row_weight: torch.Tensor,
+            slot: int,
+        ) -> tuple[torch.Tensor, ...]:
+            return _stage_value_minibatch(
                 batch,
+                global_feats,
+                fleet_target_planet_idx,
+                planet_inbound_feats,
                 return_mtp,
                 return_mtp_mask,
                 mb,
                 row_weight,
                 device,
+                pinned_cache=pinned_cache,
+                slot=slot,
             )
+
+        for staged in _prefetch_staged_minibatches(stage, minibatches, device):
+            row_weight = staged[10]
+            if compile_mode is not None:
+                _mark_cuda_graph_step(device)
             value_loss, metric = kernel(*staged)
 
             optimizer.zero_grad(set_to_none=True)

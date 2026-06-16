@@ -19,10 +19,13 @@ import torch.nn as nn
 
 from ..policies.features import (
     MAX_PLANETS,
+    PLANET_INBOUND_FEAT_DIM,
     EncodedObs,
     bucket_encoded_fleet_width,
     encode_raw_observations,
     fleet_target_planet_idx_or_empty,
+    planet_inbound_feats_or_empty,
+    slice_encoded_fleet_width,
 )
 from ..policies.model import (
     OrbitPolicy,
@@ -185,6 +188,7 @@ class _InferenceForwardKernel(nn.Module):
         fleet_feats: torch.Tensor,
         fleet_mask: torch.Tensor,
         fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -196,6 +200,7 @@ class _InferenceForwardKernel(nn.Module):
             fleet_mask=fleet_mask,
             global_feats=global_feats,
             fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
         )
         with torch.autocast(
             device_type="cuda",
@@ -240,6 +245,9 @@ def _pad_encoded(feats: EncodedObs, rows: int) -> EncodedObs:
         fleet_target_planet_idx=None
         if feats.fleet_target_planet_idx is None
         else _pad_rows(feats.fleet_target_planet_idx, rows, fill=-1),
+        planet_inbound_feats=None
+        if feats.planet_inbound_feats is None
+        else _pad_rows(feats.planet_inbound_feats, rows),
     )
 
 
@@ -299,7 +307,7 @@ class LearnedAgent:
             if self.compile_mode is not None and compile_graph_rows is not None
             else None
         )
-        self._forward_kernels: dict[tuple[int, int, bool], nn.Module] = {}
+        self._forward_kernels: dict[tuple[int, int, int, bool], nn.Module] = {}
         self._tracker = _FleetTargetTracker()
         self._batch_trackers: dict[tuple[Any, ...], _FleetTargetTracker] = {}
         if self.compile_graph_rows is not None:
@@ -308,6 +316,9 @@ class LearnedAgent:
     def _warmup_forward_kernel(self, rows: int) -> None:
         rows = max(1, int(rows))
         device = torch.device(self.device)
+        warmup_fleet_width = (
+            0 if self.model.cfg.encoder_backend == "destination_conditioned" else 1
+        )
         feats = EncodedObs(
             planet_feats=torch.zeros(
                 rows,
@@ -331,13 +342,18 @@ class LearnedAgent:
             planet_garrison=torch.zeros(rows, MAX_PLANETS, device=device),
             fleet_feats=torch.zeros(
                 rows,
-                1,
+                warmup_fleet_width,
                 self.model.cfg.fleet_features,
                 device=device,
             ),
-            fleet_mask=torch.zeros(rows, 1, dtype=torch.bool, device=device),
+            fleet_mask=torch.zeros(
+                rows,
+                warmup_fleet_width,
+                dtype=torch.bool,
+                device=device,
+            ),
             fleet_target_planet_idx=torch.full(
-                (rows, 1),
+                (rows, warmup_fleet_width),
                 -1,
                 dtype=torch.long,
                 device=device,
@@ -346,6 +362,16 @@ class LearnedAgent:
                 rows,
                 self.model.cfg.global_features,
                 device=device,
+            ),
+            planet_inbound_feats=(
+                torch.zeros(
+                    rows,
+                    MAX_PLANETS,
+                    PLANET_INBOUND_FEAT_DIM,
+                    device=device,
+                )
+                if self.model.cfg.encoder_backend == "destination_conditioned"
+                else None
             ),
         )
         with torch.inference_mode():
@@ -369,9 +395,25 @@ class LearnedAgent:
             graph_rows = _next_power_of_two(rows)
         else:
             graph_rows = rows
-        feats = bucket_encoded_fleet_width(feats) if self.compile_mode is not None else feats
+        if self.compile_mode is not None:
+            feats = (
+                slice_encoded_fleet_width(feats, 0)
+                if feats.planet_inbound_feats is not None
+                and feats.planet_inbound_feats.shape[-2] > 0
+                else bucket_encoded_fleet_width(feats)
+            )
         graph_feats = _pad_encoded(feats, graph_rows) if graph_rows != rows else feats
-        kernel_key = (graph_rows, int(graph_feats.fleet_feats.shape[1]), bool(include_value))
+        inbound_width = (
+            0
+            if graph_feats.planet_inbound_feats is None
+            else int(graph_feats.planet_inbound_feats.shape[-2])
+        )
+        kernel_key = (
+            graph_rows,
+            int(graph_feats.fleet_feats.shape[1]),
+            inbound_width,
+            bool(include_value),
+        )
         kernel = self._forward_kernels.get(kernel_key)
         if kernel is None:
             kernel = _InferenceForwardKernel(
@@ -399,6 +441,7 @@ class LearnedAgent:
             graph_feats.fleet_feats,
             graph_feats.fleet_mask,
             fleet_target_planet_idx_or_empty(graph_feats),
+            planet_inbound_feats_or_empty(graph_feats),
         )
         return _slice_policy_output(out, rows) if graph_rows != rows else out
 

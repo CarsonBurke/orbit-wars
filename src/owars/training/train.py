@@ -30,6 +30,7 @@ import json
 import math
 import random
 from contextlib import ExitStack, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
@@ -59,6 +60,7 @@ from .muon import MultiOptimizer, Muon
 from .numpy_env import NumpyVecEnv
 from .ppo import (
     compute_gae,
+    compute_old_log_probs,
     ppo_update,
     value_only_update,
 )
@@ -105,6 +107,118 @@ _HEAD_LR_PATTERNS: tuple[str, ...] = (
     "fraction_beta_head",
     "value_head",
 )
+
+
+@dataclass
+class DiscountedReturnNormalizer:
+    gamma: float
+    clip: float | None = 10.0
+    epsilon: float = 1.0e-8
+    mean: float = 0.0
+    var: float = 1.0
+    count: float = 1.0e-4
+    batch_clip_frac: float = 0.0
+    batch_reward_absmax: float = 0.0
+    _batch_clip_count: float = 0.0
+    _batch_reward_count: float = 0.0
+
+    def normalize_episode(self, rewards: np.ndarray) -> np.ndarray:
+        return self.normalize_episodes([rewards])[0]
+
+    def normalize_episodes(self, episodes: list[np.ndarray]) -> list[np.ndarray]:
+        self.begin_batch()
+        out = [np.empty_like(rewards, dtype=np.float32) for rewards in episodes]
+        running = np.zeros(len(episodes), dtype=np.float32)
+        max_len = max((len(rewards) for rewards in episodes), default=0)
+        for step in range(max_len):
+            active = [
+                episode_idx for episode_idx, rewards in enumerate(episodes) if step < len(rewards)
+            ]
+            if not active:
+                continue
+            rewards = np.asarray(
+                [episodes[episode_idx][step] for episode_idx in active],
+                dtype=np.float32,
+            )
+            scaled, next_running = self._normalize_step_vector(
+                rewards,
+                running[active],
+            )
+            running[active] = next_running
+            for local_idx, episode_idx in enumerate(active):
+                out[episode_idx][step] = scaled[local_idx]
+        return out
+
+    def _normalize_step_vector(
+        self,
+        rewards: np.ndarray,
+        running: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        running = running * self.gamma + rewards
+        self._update(running)
+        scaled = rewards / math.sqrt(self.var + self.epsilon)
+        abs_scaled = np.abs(scaled)
+        self.batch_reward_absmax = max(
+            self.batch_reward_absmax,
+            float(abs_scaled.max()) if abs_scaled.size else 0.0,
+        )
+        if self.clip is not None:
+            self._batch_clip_count += float(np.count_nonzero(abs_scaled > self.clip))
+            self._batch_reward_count += float(abs_scaled.size)
+            self.batch_clip_frac = self._batch_clip_count / max(
+                self._batch_reward_count,
+                1.0,
+            )
+            scaled = np.clip(scaled, -self.clip, self.clip)
+        else:
+            self.batch_clip_frac = 0.0
+        return scaled.astype(np.float32, copy=False), running
+
+    def begin_batch(self) -> None:
+        self.batch_clip_frac = 0.0
+        self.batch_reward_absmax = 0.0
+        self._batch_clip_count = 0.0
+        self._batch_reward_count = 0.0
+
+    def _update(self, values: np.ndarray) -> None:
+        if values.size == 0:
+            return
+        batch_mean = float(values.mean())
+        batch_var = float(values.var())
+        batch_count = float(values.size)
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta * delta * self.count * batch_count / total
+        self.mean += delta * batch_count / total
+        self.var = max(m2 / total, self.epsilon)
+        self.count = total
+
+    def state_dict(self) -> dict[str, float | None]:
+        return {
+            "gamma": self.gamma,
+            "clip": self.clip,
+            "epsilon": self.epsilon,
+            "mean": self.mean,
+            "var": self.var,
+            "count": self.count,
+        }
+
+    def load_state_dict(self, state: dict[str, float | None]) -> None:
+        gamma = float(state.get("gamma", self.gamma) or self.gamma)
+        if not math.isclose(gamma, self.gamma, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError("checkpoint critic_return_normalizer gamma does not match config")
+        clip_raw = state.get("clip", self.clip)
+        clip = None if clip_raw is None else float(clip_raw)
+        if clip != self.clip:
+            raise ValueError("checkpoint critic_return_normalizer clip does not match config")
+        epsilon = float(state.get("epsilon", self.epsilon) or self.epsilon)
+        if not math.isclose(epsilon, self.epsilon, rel_tol=0.0, abs_tol=1.0e-18):
+            raise ValueError("checkpoint critic_return_normalizer epsilon does not match config")
+        self.mean = float(state.get("mean", self.mean) or 0.0)
+        self.var = float(state.get("var", self.var) or 1.0)
+        self.count = float(state.get("count", self.count) or 1.0e-4)
 
 
 def kl_lr_ema_alpha(half_life: float) -> float:
@@ -240,9 +354,7 @@ def _build_optimizer(model: OrbitPolicy, cfg: OptimCfg) -> MultiOptimizer:
         betas=(0.9, 0.95),
         fused=True,
     )
-    return MultiOptimizer(
-        [muon_opt, adamw_opt], lr_warmup_steps=cfg.lr_warmup_steps
-    )
+    return MultiOptimizer([muon_opt, adamw_opt], lr_warmup_steps=cfg.lr_warmup_steps)
 
 
 def _build_model(cfg: RunConfig) -> OrbitPolicy:
@@ -274,6 +386,49 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
     return OrbitPolicy(pcfg)
 
 
+def _build_reward_normalizer(cfg: RunConfig) -> DiscountedReturnNormalizer | None:
+    if cfg.ppo.critic_return_norm != "discounted_return_rms":
+        return None
+    return DiscountedReturnNormalizer(
+        gamma=(
+            cfg.ppo.gamma
+            if cfg.ppo.critic_return_norm_gamma is None
+            else cfg.ppo.critic_return_norm_gamma
+        ),
+        clip=cfg.ppo.critic_return_norm_clip,
+        epsilon=cfg.ppo.critic_return_norm_epsilon,
+    )
+
+
+def _restore_reward_normalizer_from_checkpoint(
+    reward_normalizer: DiscountedReturnNormalizer | None,
+    ckpt: object,
+    path: str | Path,
+) -> None:
+    if reward_normalizer is None:
+        return
+    if isinstance(ckpt, dict) and isinstance(
+        ckpt.get("critic_return_normalizer"),
+        dict,
+    ):
+        reward_normalizer.load_state_dict(ckpt["critic_return_normalizer"])
+        return
+    raise ValueError(
+        f"{path} does not contain critic_return_normalizer; checkpoints trained "
+        "with raw/symlog critic targets are not compatible with "
+        "ppo.critic_return_norm=discounted_return_rms. Start a fresh run or set "
+        "ppo.critic_return_norm: none for actor-only/manual migration."
+    )
+
+
+def _reward_normalizer_checkpoint_extra(
+    reward_normalizer: DiscountedReturnNormalizer | None,
+) -> dict[str, object] | None:
+    if reward_normalizer is None:
+        return None
+    return {"critic_return_normalizer": reward_normalizer.state_dict()}
+
+
 def _compile_mode_for_model(model: OrbitPolicy, cfg: RunConfig) -> str | None:
     return cfg.run.compile_mode or None
 
@@ -293,10 +448,12 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
     owned_mask) are added by `_stack_trajectories`, which lets
     `_pretrain_value_batch` skip them entirely.
     """
-    gf, pf, pm, pom, pid, pg, ff, fm, ft = [], [], [], [], [], [], [], [], []
-    fleet_width = 1
+    gf, pf, pm, pom, pid, pg, ff, fm, ft, pi = [], [], [], [], [], [], [], [], [], []
+    fleet_width = 0
+    saw_without_inbound = False
     for t in trajs:
         for e in t.encoded:
+            saw_without_inbound = saw_without_inbound or e.planet_inbound_feats is None
             fleet_width = max(fleet_width, int(e.fleet_feats.shape[0]))
             gf.append(e.global_feats)
             pf.append(e.planet_feats)
@@ -307,6 +464,9 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
             ff.append(e.fleet_feats)
             fm.append(e.fleet_mask)
             ft.append(e.fleet_target_planet_idx)
+            pi.append(e.planet_inbound_feats)
+    if saw_without_inbound:
+        fleet_width = max(1, fleet_width)
 
     def pad_fleet(t: torch.Tensor, fill: float | bool | int = 0) -> torch.Tensor:
         current = int(t.shape[0])
@@ -328,6 +488,7 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
         "fleet_target_planet_idx": None
         if any(t is None for t in ft)
         else torch.stack([pad_fleet(t, fill=-1) for t in ft]),
+        "planet_inbound_feats": None if any(t is None for t in pi) else torch.stack(pi),
     }
 
 
@@ -337,6 +498,7 @@ def _stack_trajectories(
     gae_lambda: float,
     value_gae_lambda: float | None = None,
     critic_mtp_horizon: int = 1,
+    reward_normalizer: DiscountedReturnNormalizer | None = None,
 ) -> dict[str, torch.Tensor]:
     """Flatten per-step records into one PPO batch with optional decoupled GAE."""
     batch = _stack_encoded(trajs)
@@ -367,9 +529,11 @@ def _stack_trajectories(
     target_lam = gae_lambda if value_gae_lambda is None else value_gae_lambda
     mtp_h = max(1, int(critic_mtp_horizon))
     advs_all, rets_all, mtp_all, mtp_mask_all = [], [], [], []
+    rewards_by_traj = [np.asarray(t.reward, dtype=np.float32) for t in trajs]
+    if reward_normalizer is not None:
+        rewards_by_traj = reward_normalizer.normalize_episodes(rewards_by_traj)
     offset = 0
-    for t in trajs:
-        rewards = np.asarray(t.reward, dtype=np.float32)
+    for rewards in rewards_by_traj:
         horizon = len(rewards)
         values = all_values[offset : offset + horizon]
         offset += horizon
@@ -422,13 +586,16 @@ def _trim_ppo_batch_fleet_width(
     if fleet_mask is None or fleet_feats is None or fleet_mask.dim() != 2:
         return batch
     current = int(fleet_mask.shape[1])
-    if current <= 1:
-        return batch
-    width = (
-        bucket_fleet_width(active_fleet_width(fleet_mask))
-        if pad_to_bucket
-        else bucket_fleet_width(active_fleet_width(fleet_mask), current)
-    )
+    if batch.get("planet_inbound_feats") is not None:
+        width = 0
+    else:
+        if current <= 1:
+            return batch
+        width = (
+            bucket_fleet_width(active_fleet_width(fleet_mask))
+            if pad_to_bucket
+            else bucket_fleet_width(active_fleet_width(fleet_mask), current)
+        )
     if width == current:
         return batch
 
@@ -470,6 +637,9 @@ def _slice_encoded_obs_to_device(
         fleet_target_planet_idx=None
         if batch.get("fleet_target_planet_idx") is None
         else batch["fleet_target_planet_idx"][mb].to(device, non_blocking=True),
+        planet_inbound_feats=None
+        if batch.get("planet_inbound_feats") is None
+        else batch["planet_inbound_feats"][mb].to(device, non_blocking=True),
     )
 
 
@@ -492,6 +662,7 @@ def _pretrain_value_batch(
     gamma: float,
     gae_lambda: float,
     critic_mtp_horizon: int = 1,
+    reward_normalizer: DiscountedReturnNormalizer | None = None,
 ) -> dict[str, torch.Tensor]:
     """Critic-target = configured bootstrapped GAE/lambda return.
 
@@ -501,8 +672,10 @@ def _pretrain_value_batch(
     batch = _stack_encoded(trajs)
     mtp_h = max(1, int(critic_mtp_horizon))
     rets_all, mtp_all, mtp_mask_all = [], [], []
-    for t in trajs:
-        rewards = np.asarray(t.reward, dtype=np.float32)
+    rewards_by_traj = [np.asarray(t.reward, dtype=np.float32) for t in trajs]
+    if reward_normalizer is not None:
+        rewards_by_traj = reward_normalizer.normalize_episodes(rewards_by_traj)
+    for t, rewards in zip(trajs, rewards_by_traj, strict=True):
         values = (
             torch.stack(t.value).detach().to(torch.float32).cpu().numpy()
             if t.value
@@ -526,8 +699,15 @@ def _pretrain_value_batch(
     return batch
 
 
-def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Optimizer,
-                   logger: TBLogger, device: torch.device, vec: VecEnv) -> None:
+def pretrain_value(
+    cfg: RunConfig,
+    model: OrbitPolicy,
+    optimizer: torch.optim.Optimizer,
+    logger: TBLogger,
+    device: torch.device,
+    vec: VecEnv,
+    reward_normalizer: DiscountedReturnNormalizer | None = None,
+) -> None:
     """VAPO-style cold-start: regress V(s) onto trajectory outcome.
 
     Behavior policy is `cfg.ppo.pretrain_behavior` (defaults to
@@ -547,8 +727,7 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
     # branch — exactly what we want.
     behavior_slot = OpponentSlot(name=cfg.ppo.pretrain_behavior, agent=behavior)
     opponents_per_env = [
-        [behavior_slot] * (cfg.game.num_players - 1)
-        for _ in range(cfg.rollout.num_envs)
+        [behavior_slot] * (cfg.game.num_players - 1) for _ in range(cfg.rollout.num_envs)
     ]
 
     for step in range(cfg.ppo.pretrain_updates):
@@ -561,20 +740,22 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                 cfg.game.num_players,
                 offset=step * batches + batch_idx,
             )
-            trajs.extend(rollout_episodes_batched(
-                model,
-                vec,
-                opponents_per_env,
-                num_players=cfg.game.num_players,
-                learner_seat=learner_seats,
-                device=str(device),
-                deterministic=False,
-                reward_cfg=cfg.reward,
-                compile_mode=_rollout_compile_mode_for_model(model, cfg),
-                compile_fleet_width=cfg.rollout.compile_fleet_width,
-                policy_graph_rows=cfg.rollout.num_envs,
-                learner_action_agent=behavior,
-            ))
+            trajs.extend(
+                rollout_episodes_batched(
+                    model,
+                    vec,
+                    opponents_per_env,
+                    num_players=cfg.game.num_players,
+                    learner_seat=learner_seats,
+                    device=str(device),
+                    deterministic=False,
+                    reward_cfg=cfg.reward,
+                    compile_mode=_rollout_compile_mode_for_model(model, cfg),
+                    compile_fleet_width=cfg.rollout.compile_fleet_width,
+                    policy_graph_rows=cfg.rollout.num_envs,
+                    learner_action_agent=behavior,
+                )
+            )
         compile_mode = _compile_mode_for_model(model, cfg)
         batch = _trim_ppo_batch_fleet_width(
             _pretrain_value_batch(
@@ -586,11 +767,14 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
                     else cfg.ppo.value_gae_lambda
                 ),
                 critic_mtp_horizon=cfg.model.critic_mtp_horizon,
+                reward_normalizer=reward_normalizer,
             ),
             pad_to_bucket=compile_mode is not None and device.type == "cuda",
         )
         loss = value_only_update(
-            model, optimizer, batch,
+            model,
+            optimizer,
+            batch,
             epochs=1,
             minibatch_size=cfg.optim.minibatch_size,
             grad_clip=cfg.optim.grad_clip,
@@ -608,14 +792,10 @@ def pretrain_value(cfg: RunConfig, model: OrbitPolicy, optimizer: torch.optim.Op
         autocast_enabled = device.type == "cuda"
         with (
             torch.no_grad(),
-            torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled
-            ),
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled),
         ):
             chunks = [
-                model(
-                    _slice_encoded_obs_to_device(batch, slice(s, s + mb), device)
-                ).value
+                model(_slice_encoded_obs_to_device(batch, slice(s, s + mb), device)).value
                 for s in range(0, n, mb)
             ]
             preds = torch.cat(chunks).float().cpu().numpy()
@@ -643,9 +823,16 @@ def _seat_names(learner_seat: int, slots: list[OpponentSlot]) -> list[str]:
     return names
 
 
-def _save_ppo_checkpoint(model: OrbitPolicy, path: Path) -> None:
+def _save_ppo_checkpoint(
+    model: OrbitPolicy,
+    path: Path,
+    reward_normalizer: DiscountedReturnNormalizer | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict(), "config": model.cfg.to_dict()}, path)
+    payload = {"model": model.state_dict(), "config": model.cfg.to_dict()}
+    if reward_normalizer is not None:
+        payload["critic_return_normalizer"] = reward_normalizer.state_dict()
+    torch.save(payload, path)
 
 
 def _value_pretrain_params(model: OrbitPolicy) -> list[torch.nn.Parameter]:
@@ -727,10 +914,7 @@ def _format_episode_counts(
     formats = list(train_num_players)
     rng.shuffle(formats)
     base, extra = divmod(int(total_games), len(formats))
-    return {
-        players: base + (1 if idx < extra else 0)
-        for idx, players in enumerate(formats)
-    }
+    return {players: base + (1 if idx < extra else 0) for idx, players in enumerate(formats)}
 
 
 def _training_vec_counts(cfg: RunConfig) -> dict[int, int]:
@@ -780,6 +964,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     if device.type == "cuda":
         model.bfloat16()
         restore_fp32_params(model)
+    reward_normalizer = _build_reward_normalizer(cfg)
     if load_weights is not None:
         # Resume: load model weights only — fresh optimizer state and a fresh
         # opponent pool. Restoring the optimizer is rarely worth it across
@@ -789,6 +974,11 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
         ckpt = torch.load(load_weights, map_location=device, weights_only=False)
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         model.load_state_dict(state, strict=True)
+        _restore_reward_normalizer_from_checkpoint(
+            reward_normalizer,
+            ckpt,
+            load_weights,
+        )
         print(f"loaded weights from {load_weights}")
     # Re-project the trunk matrices onto the hypersphere: the bf16 round-trip
     # in `restore_fp32_params` (and any loaded checkpoint) can leave row norms
@@ -823,8 +1013,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     )
     elo.ensure(LEARNER_NAME)
     snapshot_device = (
-        str(device) if cfg.opponents.snapshot_device == "train"
-        else cfg.opponents.snapshot_device
+        str(device) if cfg.opponents.snapshot_device == "train" else cfg.opponents.snapshot_device
     )
     if cfg.opponents.mode == "fixed":
         for name in cfg.opponents.fixed_opponents:
@@ -837,9 +1026,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
         pool = NoBuiltinTrainingPool(
             active_pool_size=cfg.opponents.active_pool_size,
             active_sample_panel_size=cfg.opponents.active_sample_panel_size,
-            historical_training_archive_size=(
-                cfg.opponents.historical_training_archive_size
-            ),
+            historical_training_archive_size=(cfg.opponents.historical_training_archive_size),
             current_learner_prob=cfg.opponents.current_learner_prob,
             active_pool_prob=cfg.opponents.active_pool_prob,
             historical_archive_prob=cfg.opponents.historical_archive_prob,
@@ -847,12 +1034,8 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             uncertainty_weight=cfg.opponents.active_uncertainty_weight,
             recency_weight=cfg.opponents.active_recency_weight,
             hardness_weight=cfg.opponents.active_hardness_weight,
-            recency_half_life_updates=(
-                cfg.opponents.active_recency_half_life_updates
-            ),
-            min_games_before_eviction=(
-                cfg.opponents.min_games_before_active_eviction
-            ),
+            recency_half_life_updates=(cfg.opponents.active_recency_half_life_updates),
+            min_games_before_eviction=(cfg.opponents.min_games_before_active_eviction),
             stats_ema_decay=cfg.opponents.active_stats_ema_decay,
             historical_sample_panel_size=cfg.opponents.historical_sample_panel_size,
             historical_agent_cache_size=cfg.opponents.historical_agent_cache_size,
@@ -874,9 +1057,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     vec_counts = _training_vec_counts(cfg)
     with ExitStack() as stack:
         vecs = {
-            num_players: stack.enter_context(
-                _build_training_vec(cfg, num_players, num_envs)
-            )
+            num_players: stack.enter_context(_build_training_vec(cfg, num_players, num_envs))
             for num_players, num_envs in vec_counts.items()
             if num_envs > 0
         }
@@ -891,8 +1072,19 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             logger,
             device,
             vecs[cfg.game.num_players],
+            reward_normalizer,
         )
-        return _ppo_loop(cfg, model, optimizer, elo, pool, logger, device, vecs)
+        return _ppo_loop(
+            cfg,
+            model,
+            optimizer,
+            elo,
+            pool,
+            logger,
+            device,
+            vecs,
+            reward_normalizer,
+        )
 
 
 def _ppo_loop(
@@ -904,6 +1096,7 @@ def _ppo_loop(
     logger: TBLogger,
     device: torch.device,
     vecs: dict[int, VecEnv],
+    reward_normalizer: DiscountedReturnNormalizer | None = None,
 ) -> dict:
     summary: dict = {"updates": []}
     cumulative_margin = 0.0
@@ -922,11 +1115,22 @@ def _ppo_loop(
         # frozen. The init snapshot is *not* pinned — if it's bad it'll lose
         # rating and UCB-eviction will cull it like any other weak snapshot.
         init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
-        pool.add_snapshot("init", model, init_ckpt)
+        pool.add_snapshot(
+            "init",
+            model,
+            init_ckpt,
+            checkpoint_extra=_reward_normalizer_checkpoint_extra(reward_normalizer),
+        )
     elif cfg.opponents.mode == "no_builtins":
         init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
         pool.set_current_update(0)
-        pool.add_snapshot("init", model, init_ckpt, created_update=0)
+        pool.add_snapshot(
+            "init",
+            model,
+            init_ckpt,
+            created_update=0,
+            checkpoint_extra=_reward_normalizer_checkpoint_extra(reward_normalizer),
+        )
 
     # `ppo_update` owns minibatch-level compile/capture. Keeping compilation
     # there lets Inductor see the policy forward, PPO loss, metrics, and
@@ -958,6 +1162,10 @@ def _ppo_loop(
         phase_t0 = update_t0
         trajs = []
         rollout_s = 0.0
+        rollout_timings: dict[str, float] | None = (
+            {} if cfg.rollout.detail_timing or cfg.rollout.sample_detail_timing else None
+        )
+        sample_timings = rollout_timings if cfg.rollout.sample_detail_timing else None
         bookkeeping_s = 0.0
         format_counts = {num_players: 0 for num_players in train_num_players}
         total_games = cfg.rollout.num_envs * cfg.rollout.games_per_env_per_update
@@ -1016,6 +1224,9 @@ def _ppo_loop(
                     compile_mode=_rollout_compile_mode_for_model(model, cfg),
                     compile_fleet_width=cfg.rollout.compile_fleet_width,
                     policy_graph_rows=vec.num_envs * num_players,
+                    defer_log_prob=True,
+                    timings=rollout_timings,
+                    sample_timings=sample_timings,
                 )
                 rollout_s += perf_counter() - phase_t0
 
@@ -1050,6 +1261,7 @@ def _ppo_loop(
             gae_lambda=cfg.ppo.gae_lambda,
             value_gae_lambda=cfg.ppo.value_gae_lambda,
             critic_mtp_horizon=cfg.model.critic_mtp_horizon,
+            reward_normalizer=reward_normalizer,
         )
         stack_s = perf_counter() - phase_t0
 
@@ -1071,6 +1283,14 @@ def _ppo_loop(
         ppo_minibatch_size = _ppo_minibatch_size_for_fleet_width(
             cfg,
             int(batch["fleet_feats"].shape[1]),
+        )
+        batch["old_log_prob"] = compute_old_log_probs(
+            model,
+            batch,
+            minibatch_size=ppo_minibatch_size,
+            minibatch_count=cfg.optim.minibatch_count,
+            compile_mode=compile_mode,
+            output_device=device,
         )
         log = ppo_update(
             model,
@@ -1162,6 +1382,40 @@ def _ppo_loop(
             },
             update,
         )
+        if reward_normalizer is not None:
+            logger.scalars(
+                "reward_norm",
+                {
+                    "mean": reward_normalizer.mean,
+                    "std": math.sqrt(reward_normalizer.var),
+                    "count": reward_normalizer.count,
+                    "gamma": reward_normalizer.gamma,
+                    "clip": reward_normalizer.clip
+                    if reward_normalizer.clip is not None
+                    else float("nan"),
+                    "reward_clip_frac": reward_normalizer.batch_clip_frac,
+                    "reward_absmax_preclip": reward_normalizer.batch_reward_absmax,
+                    "return_mean": float(batch["return"].mean()),
+                    "return_std": float(batch["return"].std())
+                    if batch["return"].numel() > 1
+                    else 0.0,
+                    "return_min": float(batch["return"].min()),
+                    "return_max": float(batch["return"].max()),
+                    "return_absmax": float(batch["return"].abs().max()),
+                    "return_edge_frac": float(
+                        (
+                            (batch["return_mtp"] <= cfg.model.value_min)
+                            | (batch["return_mtp"] >= cfg.model.value_max)
+                        )
+                        .masked_select(batch["return_mtp_mask"])
+                        .float()
+                        .mean()
+                    )
+                    if bool(batch["return_mtp_mask"].any())
+                    else 0.0,
+                },
+                update,
+            )
         logger.scalars(
             "optim",
             {
@@ -1249,17 +1503,13 @@ def _ppo_loop(
                 "margin": margin,
                 "games_2p": float(format_counts.get(2, 0)),
                 "games_4p": float(format_counts.get(4, 0)),
-                "games_4p_frac": (
-                    format_counts.get(4, 0) / max(1, sum(format_counts.values()))
-                ),
+                "games_4p_frac": (format_counts.get(4, 0) / max(1, sum(format_counts.values()))),
                 "cumulative_margin": cumulative_margin,
                 "cumulative_win_margin": cumulative_win_margin,
                 "cumulative_loss_margin": cumulative_loss_margin,
                 "cumulative_mean_margin": cumulative_mean_margin,
                 "episodic_return_mean": episodic_return,
-                "episodic_return_std": (
-                    float(np.std(episode_returns)) if episode_returns else 0.0
-                ),
+                "episodic_return_std": (float(np.std(episode_returns)) if episode_returns else 0.0),
                 "episodic_return_min": min(episode_returns) if episode_returns else 0.0,
                 "episodic_return_max": max(episode_returns) if episode_returns else 0.0,
                 "episodic_length_mean": episodic_length,
@@ -1278,6 +1528,22 @@ def _ppo_loop(
             historical_log_names = pool.historical_snapshot_names("log")
             historical_recent_names = pool.historical_snapshot_names("recent_eviction")
             historical_notable_names = pool.historical_snapshot_names("notable")
+            historical_archive_capacity = float(cfg.opponents.historical_training_archive_size)
+            historical_recent_capacity = (
+                pool.recent_eviction_archive_size
+                if isinstance(pool, NoBuiltinTrainingPool)
+                else cfg.opponents.recent_eviction_archive_size
+            )
+            historical_notable_capacity = (
+                pool.notable_archive_size
+                if isinstance(pool, NoBuiltinTrainingPool)
+                else cfg.opponents.notable_archive_size
+            )
+            historical_log_capacity = (
+                cfg.opponents.historical_training_archive_size
+                - int(historical_recent_capacity or 0)
+                - int(historical_notable_capacity or 0)
+            )
             active_stats = [pool.snapshot_stats(name) for name in active_names]
             learner_win_rates = [stats.learner_win_rate() for stats in active_stats]
             games_vs_current = [stats.games_vs_current for stats in active_stats]
@@ -1286,21 +1552,25 @@ def _ppo_loop(
                     "pool_size": float(len(active_names)),
                     "active_pool_size": float(len(active_names)),
                     "historical_archive_size": float(len(historical_names)),
+                    "historical_archive_count": float(len(historical_names)),
+                    "historical_archive_capacity": historical_archive_capacity,
                     "historical_log_archive_size": float(len(historical_log_names)),
-                    "historical_recent_eviction_size": float(
-                        len(historical_recent_names)
+                    "historical_log_archive_count": float(len(historical_log_names)),
+                    "historical_log_archive_capacity": float(historical_log_capacity),
+                    "historical_recent_eviction_size": float(len(historical_recent_names)),
+                    "historical_recent_eviction_count": float(len(historical_recent_names)),
+                    "historical_recent_eviction_capacity": float(
+                        int(historical_recent_capacity or 0)
                     ),
                     "historical_notable_size": float(len(historical_notable_names)),
+                    "historical_notable_count": float(len(historical_notable_names)),
+                    "historical_notable_capacity": float(int(historical_notable_capacity or 0)),
                     "all_snapshot_count": float(len(pool.all_snapshot_names())),
                     "active_games_vs_current_mean": (
-                        float(np.mean(games_vs_current))
-                        if games_vs_current
-                        else 0.0
+                        float(np.mean(games_vs_current)) if games_vs_current else 0.0
                     ),
                     "active_learner_win_rate_mean": (
-                        float(np.mean(learner_win_rates))
-                        if learner_win_rates
-                        else float("nan")
+                        float(np.mean(learner_win_rates)) if learner_win_rates else float("nan")
                     ),
                     "active_learner_win_rate_abs_dist_from_half": (
                         float(np.mean([abs(wr - 0.5) for wr in learner_win_rates]))
@@ -1326,15 +1596,13 @@ def _ppo_loop(
             }
         )
 
-        is_best = (win_rate > best_win_rate) or (
-            win_rate == best_win_rate and margin > best_margin
-        )
+        is_best = (win_rate > best_win_rate) or (win_rate == best_win_rate and margin > best_margin)
         if cfg.opponents.mode == "fixed" and is_best:
             best_win_rate = win_rate
             best_margin = margin
             best_update = update
             best_path = Path(cfg.run.ckpt_root) / cfg.run.name / "best.pt"
-            _save_ppo_checkpoint(model, best_path)
+            _save_ppo_checkpoint(model, best_path, reward_normalizer)
             best_meta = {
                 "update": best_update,
                 "win_rate": best_win_rate,
@@ -1347,26 +1615,31 @@ def _ppo_loop(
                 json.dumps(best_meta, indent=2, sort_keys=True)
             )
 
-        if (
-            cfg.opponents.mode == "league"
-            and (update + 1) % cfg.opponents.snapshot_every == 0
-        ):
+        if cfg.opponents.mode == "league" and (update + 1) % cfg.opponents.snapshot_every == 0:
             ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / f"snapshot_{update:04d}.pt"
-            pool.add_snapshot(f"{update:04d}", model, ckpt)
+            pool.add_snapshot(
+                f"{update:04d}",
+                model,
+                ckpt,
+                checkpoint_extra=_reward_normalizer_checkpoint_extra(reward_normalizer),
+            )
         elif (
-            cfg.opponents.mode == "no_builtins"
-            and (update + 1) % cfg.opponents.snapshot_every == 0
+            cfg.opponents.mode == "no_builtins" and (update + 1) % cfg.opponents.snapshot_every == 0
         ):
             pool.set_current_update(update + 1)
             ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / f"snapshot_{update:04d}.pt"
-            pool.add_snapshot(f"{update:04d}", model, ckpt, created_update=update + 1)
-        elif (
-            cfg.opponents.mode == "fixed"
-            and (update + 1) % cfg.opponents.snapshot_every == 0
-        ):
+            pool.add_snapshot(
+                f"{update:04d}",
+                model,
+                ckpt,
+                created_update=update + 1,
+                checkpoint_extra=_reward_normalizer_checkpoint_extra(reward_normalizer),
+            )
+        elif cfg.opponents.mode == "fixed" and (update + 1) % cfg.opponents.snapshot_every == 0:
             _save_ppo_checkpoint(
                 model,
                 Path(cfg.run.ckpt_root) / cfg.run.name / "latest.pt",
+                reward_normalizer,
             )
         snapshot_s = perf_counter() - phase_t0
         update_s = perf_counter() - update_t0
@@ -1392,6 +1665,8 @@ def _ppo_loop(
             },
             update,
         )
+        if rollout_timings is not None:
+            logger.scalars("rollout_detail", rollout_timings, update)
         logger.scalars(
             "charts",
             {
@@ -1406,7 +1681,7 @@ def _ppo_loop(
         )
 
     final_path = Path(cfg.run.ckpt_root) / cfg.run.name / "final.pt"
-    _save_ppo_checkpoint(model, final_path)
+    _save_ppo_checkpoint(model, final_path, reward_normalizer)
 
     elo_path = final_path.with_name("elo.json")
     elo_path.write_text(json.dumps(elo.snapshot_dict(), indent=2, sort_keys=True))
@@ -1416,9 +1691,7 @@ def _ppo_loop(
     summary["elo_path"] = str(elo_path)
     summary["elo_learner_final"] = elo.get(LEARNER_NAME)
     summary["cumulative_margin"] = cumulative_margin
-    summary["cumulative_mean_margin"] = (
-        cumulative_margin / max(1, cumulative_games)
-    )
+    summary["cumulative_mean_margin"] = cumulative_margin / max(1, cumulative_games)
     return summary
 
 
@@ -1462,9 +1735,7 @@ def main() -> None:
     if args.env_backend is not None:
         cfg.rollout.env_backend = args.env_backend
     if args.compile_mode is not None:
-        cfg.run.compile_mode = (
-            "" if args.compile_mode.lower() == "none" else args.compile_mode
-        )
+        cfg.run.compile_mode = "" if args.compile_mode.lower() == "none" else args.compile_mode
     summary = train_one_run(cfg, load_weights=args.load)
     print({k: v for k, v in summary.items() if k != "updates"})
 

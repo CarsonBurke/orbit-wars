@@ -245,6 +245,20 @@ def restore_fp32_params(model: nn.Module) -> None:
             param.data = param.data.float()
 
 
+def _normalization_targets(model: nn.Module) -> tuple[nn.Module, ...]:
+    cache = model.__dict__.get("_owars_normalize_targets")
+    if cache is not None:
+        return cache
+
+    targets = tuple(
+        module
+        for module in model.modules()
+        if callable(getattr(module, "normalize_weights", None))
+    )
+    model.__dict__["_owars_normalize_targets"] = targets
+    return targets
+
+
 def normalize_matrices(model: nn.Module) -> None:
     """Re-project every hypersphere-trunk matrix onto the unit sphere.
 
@@ -262,10 +276,8 @@ def normalize_matrices(model: nn.Module) -> None:
     path. Cheap: a handful of small `norm` reductions, no matmuls. Call it
     after each `optimizer.step()` in the training loop.
     """
-    for module in model.modules():
-        normalize = getattr(module, "normalize_weights", None)
-        if callable(normalize):
-            normalize()
+    for module in _normalization_targets(model):
+        module.normalize_weights()
 
 
 @torch.no_grad()
@@ -936,66 +948,89 @@ class DestinationFleetConditioner(nn.Module):
     def forward(
         self,
         planets: torch.Tensor,
-        fleets: torch.Tensor,
         planet_mask: torch.Tensor,
         fleet_mask: torch.Tensor,
         fleet_target_planet_idx: torch.Tensor | None,
-        fleet_feats: torch.Tensor,
+        fleet_feats: torch.Tensor | None = None,
+        planet_inbound_feats: torch.Tensor | None = None,
+        fleets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if fleet_target_planet_idx is None:
-            raise ValueError(
-                "destination_conditioned encoder requires fleet_target_planet_idx"
-            )
-        fleet_target_planet_idx = fleet_target_planet_idx.to(
-            device=fleet_mask.device,
-            dtype=torch.long,
-        )
-        if tuple(fleet_target_planet_idx.shape) != tuple(fleet_mask.shape):
-            raise ValueError(
-                "fleet_target_planet_idx shape must match fleet_mask shape; "
-                f"got {tuple(fleet_target_planet_idx.shape)} vs {tuple(fleet_mask.shape)}"
-            )
-
         b, p, _ = planets.shape
         h_p = justnorm(planets)
-        h_f = justnorm(fleets).masked_fill(~fleet_mask.unsqueeze(-1), 0.0)
-        fleet_ctx = self.cross_attn(
-            h_p,
-            h_f,
-            planet_mask,
-            fleet_mask,
-            fleet_target_planet_idx,
-        )
-        fleet_stats = _destination_fleet_stats(
-            fleet_feats,
-            fleet_mask,
-            fleet_target_planet_idx,
-            p,
-        )
-        valid_dest = (
-            fleet_mask
-            & (fleet_target_planet_idx >= 0)
-            & (fleet_target_planet_idx < p)
-        )
-        has_inbound_i = torch.zeros(
-            b,
-            p,
-            dtype=torch.int8,
-            device=fleet_target_planet_idx.device,
-        )
-        has_inbound_i.scatter_reduce_(
-            1,
-            fleet_target_planet_idx.masked_fill(~valid_dest, 0),
-            valid_dest.to(torch.int8),
-            reduce="amax",
-            include_self=True,
-        )
+        if (
+            planet_inbound_feats is not None
+            and planet_inbound_feats.shape[-2] > 0
+        ):
+            fleet_stats = planet_inbound_feats.to(device=planets.device, dtype=planets.dtype)
+            if tuple(fleet_stats.shape[:2]) != (b, p):
+                raise ValueError(
+                    "planet_inbound_feats shape must match planet tokens; "
+                    f"got {tuple(fleet_stats.shape[:2])} vs {(b, p)}"
+                )
+            if fleet_stats.shape[-1] != _DEST_FLEET_STATS_DIM:
+                fleet_stats = _match_feature_width(fleet_stats, _DEST_FLEET_STATS_DIM)
+            fleet_ctx = h_p.new_zeros(b, p, h_p.shape[-1])
+            has_inbound = fleet_stats[..., 0] > 0.0
+        else:
+            if fleet_target_planet_idx is None:
+                raise ValueError(
+                    "destination_conditioned encoder requires fleet_target_planet_idx "
+                    "or planet_inbound_feats"
+                )
+            if fleets is None or fleet_feats is None:
+                raise ValueError(
+                    "destination_conditioned encoder fallback requires fleet tensors"
+                )
+            fleet_target_planet_idx = fleet_target_planet_idx.to(
+                device=fleet_mask.device,
+                dtype=torch.long,
+            )
+            if tuple(fleet_target_planet_idx.shape) != tuple(fleet_mask.shape):
+                raise ValueError(
+                    "fleet_target_planet_idx shape must match fleet_mask shape; "
+                    f"got {tuple(fleet_target_planet_idx.shape)} vs {tuple(fleet_mask.shape)}"
+                )
+
+            h_f = justnorm(fleets).masked_fill(~fleet_mask.unsqueeze(-1), 0.0)
+            fleet_ctx = self.cross_attn(
+                h_p,
+                h_f,
+                planet_mask,
+                fleet_mask,
+                fleet_target_planet_idx,
+            )
+            fleet_stats = _destination_fleet_stats(
+                fleet_feats,
+                fleet_mask,
+                fleet_target_planet_idx,
+                p,
+            )
+            valid_dest = (
+                fleet_mask
+                & (fleet_target_planet_idx >= 0)
+                & (fleet_target_planet_idx < p)
+            )
+            has_inbound_i = torch.zeros(
+                b,
+                p,
+                dtype=torch.int8,
+                device=fleet_target_planet_idx.device,
+            )
+            has_inbound_i.scatter_reduce_(
+                1,
+                fleet_target_planet_idx.masked_fill(~valid_dest, 0),
+                valid_dest.to(torch.int8),
+                reduce="amax",
+                include_self=True,
+            )
+            has_inbound = has_inbound_i.bool()
+
         gamma, beta = self.mod(torch.cat([fleet_ctx, fleet_stats], dim=-1)).chunk(
             2,
             dim=-1,
         )
         conditioned = justnorm(h_p * (1.0 + gamma) + beta)
-        h_p = torch.where(has_inbound_i.bool().unsqueeze(-1), conditioned, h_p)
+        h_p = torch.where(has_inbound.unsqueeze(-1), conditioned, h_p)
         h_f = h_p.new_zeros(b, 0, h_p.shape[-1])
         fleet_mask = torch.zeros(b, 0, dtype=torch.bool, device=fleet_mask.device)
         return h_p, h_f, fleet_mask
@@ -1470,8 +1505,8 @@ class OrbitPolicy(nn.Module):
         nn.init.zeros_(self.fraction_beta_head.bias)
         # Distributional value head — emits logits over `value_num_bins`
         # bins. Scalar V is recovered from these via `HLGaussLoss.bins_to_scalar`.
-        # The default uses Dreamer4-style symlog buckets over a wide raw
-        # projected-margin support.
+        # PPO defaults use CleanRL-style normalized return units over a compact
+        # linear support; raw-return ablations can still opt into symlog.
         self.value_encoder = HLGaussLoss(
             min_value=cfg.value_min,
             max_value=cfg.value_max,
@@ -1537,6 +1572,11 @@ class OrbitPolicy(nn.Module):
                 if feats.fleet_target_planet_idx is None
                 else feats.fleet_target_planet_idx.unsqueeze(0)
             )
+            planet_inbound_feats = (
+                None
+                if feats.planet_inbound_feats is None
+                else feats.planet_inbound_feats.unsqueeze(0)
+            )
             if feats.global_feats is None:
                 global_feats = None
             elif feats.global_feats.dim() == 1:
@@ -1549,6 +1589,7 @@ class OrbitPolicy(nn.Module):
             fleet_feats = feats.fleet_feats
             fleet_mask = feats.fleet_mask
             fleet_target_planet_idx = feats.fleet_target_planet_idx
+            planet_inbound_feats = feats.planet_inbound_feats
             global_feats = feats.global_feats
 
         b, p, _ = planet_feats.shape
@@ -1577,18 +1618,27 @@ class OrbitPolicy(nn.Module):
 
         h_g = self.global_embed(global_feats)
         h_p = self.planet_embed(planet_feats)
-        h_f = self.fleet_embed(fleet_feats)
         if self.destination_fleet_conditioner is not None:
+            has_planet_inbound_feats = (
+                planet_inbound_feats is not None
+                and planet_inbound_feats.shape[-2] > 0
+            )
+            if not has_planet_inbound_feats:
+                h_f = self.fleet_embed(fleet_feats)
+            else:
+                h_f = h_p.new_zeros(b, 0, h_p.shape[-1])
             h_p, h_f, fleet_mask = self.destination_fleet_conditioner(
                 h_p,
-                h_f,
                 planet_mask,
                 fleet_mask,
                 fleet_target_planet_idx,
                 fleet_feats,
+                planet_inbound_feats,
+                h_f if not has_planet_inbound_feats else None,
             )
             f = 0
         elif self.fleet_tokenizer is not None:
+            h_f = self.fleet_embed(fleet_feats)
             h_f = self.fleet_tokenizer(h_f, fleet_mask)
             fleet_mask = torch.ones(
                 b,
@@ -1597,6 +1647,8 @@ class OrbitPolicy(nn.Module):
                 device=fleet_mask.device,
             )
             f = h_f.shape[1]
+        else:
+            h_f = self.fleet_embed(fleet_feats)
         # Prepend the three prefix tokens, broadcast to batch dim. Parameters
         # are stored flat so compiled backward's broadcast reduction returns
         # `[d]`, matching the actual parameter shape.

@@ -10,6 +10,7 @@ from owars.policies.model import (
     _symexp,
     _symlog,
     justnorm,
+    normalize_matrices,
 )
 from owars.policies.sampling import BETA_SAMPLE_EPS, _deterministic_fraction
 
@@ -76,6 +77,27 @@ def test_planet_rope_frequency_buffer_stays_fp32_after_bfloat16():
     model.bfloat16()
 
     assert model.planet_rope.inv_freq.dtype == torch.float32
+
+
+def test_normalize_matrices_caches_target_modules():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
+    model = OrbitPolicy(cfg)
+
+    normalize_matrices(model)
+    targets = model.__dict__.get("_owars_normalize_targets")
+    expected_targets = tuple(
+        module
+        for module in model.modules()
+        if callable(getattr(module, "normalize_weights", None))
+    )
+
+    assert targets
+    assert targets == expected_targets
+    assert all(callable(getattr(module, "normalize_weights", None)) for module in targets)
+
+    normalize_matrices(model)
+
+    assert model.__dict__["_owars_normalize_targets"] is targets
 
 
 def test_value_histogram_buffers_stay_fp32_after_bfloat16():
@@ -286,7 +308,8 @@ def test_destination_conditioned_encoder_is_zero_init_identity_with_inbound_flee
         parse_observation(_obs()), include_fleet_targets=True
     )
     feats.fleet_target_planet_idx.fill_(-1)
-    feats.fleet_target_planet_idx[0] = 0
+    assert feats.planet_inbound_feats is not None
+    feats.planet_inbound_feats[0, 0] = 1.0 / 64.0
 
     assert model.destination_fleet_conditioner is not None
     assert torch.count_nonzero(model.destination_fleet_conditioner.mod.weight) == 0

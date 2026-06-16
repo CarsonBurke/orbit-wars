@@ -5,20 +5,40 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
+import torch
+
 from owars.agents.sniper import sniper_agent
 from owars.policies.config import OrbitPolicyConfig
-from owars.policies.model import OrbitPolicy
+from owars.policies.model import OrbitPolicy, normalize_matrices
 from owars.training.elo import EloTracker
 from owars.training.league import (
     LEARNER_NAME,
     FixedOpponentPool,
     NoBuiltinTrainingPool,
     OpponentPool,
+    _copy_model_without_compile_caches,
 )
 
 
 def _tiny_model() -> OrbitPolicy:
     return OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
+
+
+def test_snapshot_copy_strips_normalization_target_cache():
+    model = _tiny_model()
+    normalize_matrices(model)
+
+    snap = _copy_model_without_compile_caches(model)
+
+    assert "_owars_normalize_targets" not in snap.__dict__
+
+    normalize_matrices(snap)
+    snap_modules = set(snap.modules())
+    snap_targets = snap.__dict__["_owars_normalize_targets"]
+
+    assert snap_targets
+    assert all(module in snap_modules for module in snap_targets)
+    assert all(module not in model.modules() for module in snap_targets)
 
 
 def test_empty_pool_samples_only_self():
@@ -42,6 +62,37 @@ def test_self_play_prob_split(tmp_path: Path):
     self_count = sum(1 for s in slots if s.name == LEARNER_NAME)
     # Tolerance: ±5%.
     assert 0.45 * n <= self_count <= 0.55 * n
+
+
+def test_opponent_pool_snapshot_persists_checkpoint_extra(tmp_path: Path):
+    elo = EloTracker()
+    pool = OpponentPool(elo=elo, top_k=4, self_play_prob=0.0, rng=random.Random(0))
+    path = tmp_path / "a.pt"
+
+    pool.add_snapshot(
+        "a",
+        _tiny_model(),
+        path,
+        checkpoint_extra={"critic_return_normalizer": {"mean": 1.25}},
+    )
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert payload["critic_return_normalizer"] == {"mean": 1.25}
+
+
+def test_no_builtin_snapshot_persists_checkpoint_extra(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(rng=random.Random(0))
+    path = tmp_path / "a.pt"
+
+    pool.add_snapshot(
+        "a",
+        _tiny_model(),
+        path,
+        checkpoint_extra={"critic_return_normalizer": {"mean": 1.25}},
+    )
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert payload["critic_return_normalizer"] == {"mean": 1.25}
 
 
 def test_top_k_eviction_keeps_highest_elo(tmp_path: Path):
@@ -176,9 +227,7 @@ def test_no_builtin_pool_samples_40_30_30_when_all_sources_exist(tmp_path: Path)
     slots = pool.sample(6000)
     current = sum(1 for slot in slots if slot.name == LEARNER_NAME)
     active = sum(1 for slot in slots if slot.name in pool.active_snapshot_names())
-    historical = sum(
-        1 for slot in slots if slot.name in pool.historical_snapshot_names()
-    )
+    historical = sum(1 for slot in slots if slot.name in pool.historical_snapshot_names())
 
     assert 0.37 * len(slots) <= current <= 0.43 * len(slots)
     assert 0.27 * len(slots) <= active <= 0.33 * len(slots)
@@ -290,8 +339,7 @@ def test_no_builtin_log_archive_retains_log_spaced_candidates(tmp_path: Path):
 
     historical = pool.historical_snapshot_names("log")
     ages = sorted(
-        pool.current_update - pool.snapshot_stats(name).created_update
-        for name in historical
+        pool.current_update - pool.snapshot_stats(name).created_update for name in historical
     )
 
     assert len(historical) <= 7
@@ -332,10 +380,7 @@ def test_no_builtin_recent_eviction_bucket_keeps_newest_representative(
         pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
 
     recent = pool.historical_snapshot_names("recent_eviction")
-    evicted_updates = [
-        pool.snapshot_stats(name).evicted_update
-        for name in recent
-    ]
+    evicted_updates = [pool.snapshot_stats(name).evicted_update for name in recent]
 
     assert max(update for update in evicted_updates if update is not None) == 7
     assert len(recent) <= 3
@@ -355,9 +400,7 @@ def test_no_builtin_recent_eviction_age_handles_update_zero(tmp_path: Path):
     pool.add_snapshot("u0a", model, tmp_path / "u0a.pt")
     pool.add_snapshot("u0b", model, tmp_path / "u0b.pt")
     evicted_at_zero = [
-        name
-        for name in pool.all_snapshot_names()
-        if pool.snapshot_stats(name).evicted_update == 0
+        name for name in pool.all_snapshot_names() if pool.snapshot_stats(name).evicted_update == 0
     ]
     pool.set_current_update(8)
     pool.rebuild_historical_archive()
@@ -529,7 +572,9 @@ def test_no_builtin_sample_filters_stale_panel(tmp_path: Path):
     slots = pool.sample(4, panel=panel)
 
     assert len(slots) == 4
-    assert all(slot.name == LEARNER_NAME or slot.name in pool.all_snapshot_names() for slot in slots)
+    assert all(
+        slot.name == LEARNER_NAME or slot.name in pool.all_snapshot_names() for slot in slots
+    )
 
 
 def test_no_builtin_sample_current_update_rotates_panel_clock(tmp_path: Path):

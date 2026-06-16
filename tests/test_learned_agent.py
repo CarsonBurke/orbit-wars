@@ -1,5 +1,5 @@
-import torch
 import pytest
+import torch
 
 from owars.agents.learned import LearnedAgent
 from owars.game import parse_observation
@@ -76,6 +76,40 @@ def test_learned_agent_ignores_removed_config_keys(tmp_path):
     agent = LearnedAgent(ckpt, device="cpu")
 
     assert isinstance(agent.model, OrbitPolicy)
+
+
+def test_learned_agent_destination_compile_warmup_uses_inbound_summary(
+    tmp_path,
+    monkeypatch,
+):
+    ckpt = tmp_path / "agent.pt"
+    cfg = OrbitPolicyConfig(
+        dim=32,
+        ff_dim=64,
+        depth=1,
+        n_heads=2,
+        encoder_backend="destination_conditioned",
+    )
+    _write_ckpt(ckpt, cfg)
+    seen_shapes: list[tuple[tuple[int, ...], tuple[int, ...] | None]] = []
+
+    def fake_forward(self, feats, rows, *, include_value=True):
+        del rows, include_value
+        seen_shapes.append(
+            (
+                tuple(feats.fleet_feats.shape),
+                None
+                if feats.planet_inbound_feats is None
+                else tuple(feats.planet_inbound_feats.shape),
+            )
+        )
+
+    monkeypatch.setattr(LearnedAgent, "_forward", fake_forward)
+
+    agent = LearnedAgent(ckpt, device="cpu")
+    agent._warmup_forward_kernel(4)
+
+    assert seen_shapes == [((4, 0, 20), (4, 64, 13))]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA compile smoke")

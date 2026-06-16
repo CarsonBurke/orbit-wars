@@ -4,13 +4,18 @@ use std::{
 };
 
 use numpy::ndarray::{Array1, Array2, Array3};
-use numpy::{IntoPyArray, PyReadonlyArray2, PyReadonlyArray3, PyUntypedArrayMethods};
+use numpy::{
+    IntoPyArray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyUntypedArrayMethods,
+};
 use owars_env::oracle::{self, FleetDestination};
 use owars_env::{
     Action, CometGroup, Fleet, Game, GameConfig, GameState, Planet, PlayerAction, Point,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySequence};
+use rand::prelude::*;
+use rand_chacha::ChaCha8Rng;
+use rand_distr::{Beta as BetaDist, Distribution};
 use rayon::prelude::*;
 
 const BOARD_SIZE: f64 = 100.0;
@@ -22,6 +27,7 @@ const MAX_OMEGA: f64 = 0.05;
 const MAX_PLANETS: usize = 64;
 const PLANET_FEAT_DIM: usize = 19;
 const FLEET_FEAT_DIM: usize = 20;
+const PLANET_INBOUND_FEAT_DIM: usize = 13;
 const GLOBAL_PLAYER_SLOTS: usize = 4;
 const GLOBAL_PLAYER_FEATS: usize = 5;
 const GLOBAL_NEUTRAL_FEATS: usize = 3;
@@ -35,6 +41,8 @@ const LOG_1000: f64 = 6.907_755_278_982_137;
 const LEAD_T_HORIZON_STEPS: f64 = 600.0;
 const LEAD_MAX_TURNS: i32 = LEAD_T_HORIZON_STEPS as i32;
 const LEAD_MAX_SCAN_DISTANCE: f64 = std::f64::consts::SQRT_2 * BOARD_SIZE + 8.0;
+const SAMPLE_EPS: f64 = 1e-7;
+const BETA_SAMPLE_EPS: f64 = 1e-6;
 
 #[derive(Clone, Copy)]
 struct LeadSolution {
@@ -244,10 +252,18 @@ struct PressureEntry {
 struct LegalMaskState {
     planet_limit: usize,
     target_motions: Vec<Option<TargetMotion>>,
-    target_cols: Vec<usize>,
     source_cols_by_player: Vec<Vec<usize>>,
-    static_cols: Vec<usize>,
-    moving_cols: Vec<usize>,
+    static_blocker_cols_by_target: Vec<Vec<usize>>,
+    moving_blocker_cols_by_target: Vec<Vec<usize>>,
+}
+
+#[derive(Clone, Copy)]
+struct CompactLegalSource {
+    row: usize,
+    env_idx: usize,
+    source_col: usize,
+    source: Planet,
+    speed: f64,
 }
 
 #[derive(Clone)]
@@ -261,6 +277,20 @@ struct LegalMaskCacheEntry {
 struct RowActionResult {
     actions: Vec<Action>,
     materialized: Vec<bool>,
+}
+
+struct CategoricalBetaRowResult {
+    action: RowActionResult,
+    launch: Vec<f32>,
+    target_idx: Vec<i64>,
+    fraction: Vec<f32>,
+    target_legal_mask: Option<Vec<bool>>,
+}
+
+#[derive(Clone, Copy)]
+struct CompactCategoricalBetaSource {
+    source_col: usize,
+    source_pos: usize,
 }
 
 #[pyclass(skip_from_py_object)]
@@ -611,6 +641,30 @@ impl RustCoreVecEnv {
         self.legal_target_mask_from_state_active_field_array(py, rows, fields_v, batch, planets)
     }
 
+    fn compact_legal_target_mask_from_state_active_fields<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        fields: PyReadonlyArray3<'_, f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let shape = fields.shape();
+        let (batch, planets, field_width) = (shape[0], shape[1], shape[2]);
+        if field_width < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "fields must have shape [batch, planets, >=2]",
+            ));
+        }
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        let fields_v = fields.as_array().to_owned();
+        self.compact_legal_target_mask_from_state_active_field_array(
+            py, rows, fields_v, batch, planets,
+        )
+    }
+
     fn materialize_actions<'py>(
         &self,
         py: Python<'py>,
@@ -739,7 +793,7 @@ impl RustCoreVecEnv {
     }
 
     fn materialize_masked_action_fields_from_state<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         rows: Vec<(usize, usize)>,
         fields: PyReadonlyArray3<'_, f32>,
@@ -758,14 +812,19 @@ impl RustCoreVecEnv {
             ));
         }
         let fields_v = fields.as_array().to_owned();
+        let row_states = rows
+            .iter()
+            .map(|(env_idx, _)| self.legal_mask_state_cached(*env_idx, planets))
+            .collect::<Vec<_>>();
         let games = &self.games;
         let results = py.detach(|| {
             (0..batch)
                 .into_par_iter()
                 .map(|row| {
                     let (env_idx, player) = rows[row];
-                    materialize_masked_action_row_from_state(
+                    materialize_masked_action_row_from_cached_state(
                         &games[env_idx],
+                        &row_states[row],
                         player,
                         planets,
                         |col| fields_v[[row, col, 0]] as f64,
@@ -777,6 +836,217 @@ impl RustCoreVecEnv {
         });
 
         build_materialized_actions_dict(py, batch, planets, native, &results)
+    }
+
+    fn categorical_beta_actions_from_state<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        launch_logits: PyReadonlyArray2<'_, f32>,
+        target_logits: PyReadonlyArray3<'_, f32>,
+        fraction_alpha: PyReadonlyArray2<'_, f32>,
+        fraction_beta: PyReadonlyArray2<'_, f32>,
+        action_logit_softcap: f32,
+        deterministic: bool,
+        record_rows: Vec<usize>,
+        native: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let launch_shape = launch_logits.shape();
+        let target_shape = target_logits.shape();
+        let alpha_shape = fraction_alpha.shape();
+        let beta_shape = fraction_beta.shape();
+        let (batch, planets) = (launch_shape[0], launch_shape[1]);
+        if rows.len() != batch {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rows length must match batch",
+            ));
+        }
+        if target_shape != [batch, planets, planets] {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target_logits must have shape [batch, planets, planets]",
+            ));
+        }
+        if alpha_shape != [batch, planets] || beta_shape != [batch, planets] {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "fraction alpha/beta must have shape [batch, planets]",
+            ));
+        }
+        if action_logit_softcap <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "action_logit_softcap must be positive",
+            ));
+        }
+        for &row in &record_rows {
+            if row >= batch {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "record row out of range",
+                ));
+            }
+        }
+        let mut record_row_mask = vec![false; batch];
+        for &row in &record_rows {
+            record_row_mask[row] = true;
+        }
+
+        let launch_v = launch_logits.as_array().to_owned();
+        let target_v = target_logits.as_array().to_owned();
+        let alpha_v = fraction_alpha.as_array().to_owned();
+        let beta_v = fraction_beta.as_array().to_owned();
+        let row_states = rows
+            .iter()
+            .map(|(env_idx, _)| self.legal_mask_state_cached(*env_idx, planets))
+            .collect::<Vec<_>>();
+        let games = &self.games;
+        let reset_counts = &self.reset_counts;
+        let random_seed = self.random_seed;
+        let results = py.detach(|| {
+            (0..batch)
+                .into_par_iter()
+                .map(|row| {
+                    let (env_idx, player) = rows[row];
+                    categorical_beta_action_row_from_state(
+                        &games[env_idx],
+                        &row_states[row],
+                        row,
+                        env_idx,
+                        player,
+                        planets,
+                        random_seed,
+                        reset_counts[env_idx],
+                        launch_v.row(row).as_slice().expect("contiguous launch row"),
+                        target_v
+                            .index_axis(numpy::ndarray::Axis(0), row)
+                            .as_slice()
+                            .expect("contiguous target row"),
+                        alpha_v.row(row).as_slice().expect("contiguous alpha row"),
+                        beta_v.row(row).as_slice().expect("contiguous beta row"),
+                        action_logit_softcap as f64,
+                        deterministic,
+                        record_row_mask[row],
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        build_categorical_beta_actions_dict(py, planets, native, &record_rows, &results)
+    }
+
+    fn categorical_beta_actions_from_state_compact_sources<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        source_row_idx: PyReadonlyArray1<'_, i64>,
+        source_col_idx: PyReadonlyArray1<'_, i64>,
+        launch_logits: PyReadonlyArray1<'_, f32>,
+        target_logits: PyReadonlyArray2<'_, f32>,
+        fraction_alpha: PyReadonlyArray1<'_, f32>,
+        fraction_beta: PyReadonlyArray1<'_, f32>,
+        planets: usize,
+        action_logit_softcap: f32,
+        deterministic: bool,
+        record_rows: Vec<usize>,
+        native: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let batch = rows.len();
+        let source_count = source_row_idx.shape()[0];
+        if source_col_idx.shape()[0] != source_count
+            || launch_logits.shape()[0] != source_count
+            || fraction_alpha.shape()[0] != source_count
+            || fraction_beta.shape()[0] != source_count
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "compact source arrays must have matching first dimension",
+            ));
+        }
+        if target_logits.shape() != [source_count, planets] {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target_logits must have shape [sources, planets]",
+            ));
+        }
+        if planets == 0 || planets > MAX_PLANETS {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "planets must be in 1..=MAX_PLANETS",
+            ));
+        }
+        if action_logit_softcap <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "action_logit_softcap must be positive",
+            ));
+        }
+        for &row in &record_rows {
+            if row >= batch {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "record row out of range",
+                ));
+            }
+        }
+
+        let source_row_v = source_row_idx.as_array();
+        let source_col_v = source_col_idx.as_array();
+        let launch_v = launch_logits.as_array();
+        let target_v = target_logits.as_array();
+        let alpha_v = fraction_alpha.as_array();
+        let beta_v = fraction_beta.as_array();
+
+        let mut sources_by_row = vec![Vec::<CompactCategoricalBetaSource>::new(); batch];
+        for source_pos in 0..source_count {
+            let row = source_row_v[source_pos];
+            let col = source_col_v[source_pos];
+            if row < 0 || row as usize >= batch {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "source row out of range",
+                ));
+            }
+            if col < 0 || col as usize >= planets {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "source col out of range",
+                ));
+            }
+            sources_by_row[row as usize].push(CompactCategoricalBetaSource {
+                source_col: col as usize,
+                source_pos,
+            });
+        }
+
+        let mut record_row_mask = vec![false; batch];
+        for &row in &record_rows {
+            record_row_mask[row] = true;
+        }
+        let row_states = rows
+            .iter()
+            .map(|(env_idx, _)| self.legal_mask_state_cached(*env_idx, planets))
+            .collect::<Vec<_>>();
+        let games = &self.games;
+        let reset_counts = &self.reset_counts;
+        let random_seed = self.random_seed;
+        let results = py.detach(|| {
+            (0..batch)
+                .into_par_iter()
+                .map(|row| {
+                    let (env_idx, player) = rows[row];
+                    categorical_beta_action_row_from_state_compact_sources(
+                        &games[env_idx],
+                        &row_states[row],
+                        row,
+                        env_idx,
+                        player,
+                        planets,
+                        random_seed,
+                        reset_counts[env_idx],
+                        &sources_by_row[row],
+                        launch_v.as_slice().expect("contiguous compact launch"),
+                        target_v.as_slice().expect("contiguous compact target"),
+                        alpha_v.as_slice().expect("contiguous compact alpha"),
+                        beta_v.as_slice().expect("contiguous compact beta"),
+                        action_logit_softcap as f64,
+                        deterministic,
+                        record_row_mask[row],
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        build_categorical_beta_actions_dict(py, planets, native, &record_rows, &results)
     }
 
     fn policy_batch<'py>(
@@ -1062,6 +1332,71 @@ impl RustCoreVecEnv {
         Ok(out.into_pyarray(py))
     }
 
+    fn compact_legal_target_mask_from_state_active_field_array<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<(usize, usize)>,
+        fields_v: Array3<f32>,
+        batch: usize,
+        planets: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let row_states = rows
+            .iter()
+            .map(|(env_idx, _)| self.legal_mask_state_cached(*env_idx, planets))
+            .collect::<Vec<_>>();
+        let games = &self.games;
+        let (source_specs, flat_mask) = py.detach(|| {
+            let mut source_specs = Vec::with_capacity(batch);
+            for row in 0..batch {
+                let (env_idx, player) = rows[row];
+                append_compact_legal_sources_from_state(
+                    &games[env_idx],
+                    &row_states[row],
+                    row,
+                    env_idx,
+                    player,
+                    planets,
+                    |col| fields_v[[row, col, 0]] as f64,
+                    |col| fields_v[[row, col, 1]] >= 0.5,
+                    &mut source_specs,
+                );
+            }
+            let mut flat_mask = vec![false; source_specs.len() * planets];
+            flat_mask
+                .par_chunks_mut(planets)
+                .enumerate()
+                .for_each(|(idx, out)| {
+                    let spec = source_specs[idx];
+                    fill_compact_legal_source_from_state(
+                        &games[spec.env_idx],
+                        &row_states[spec.row],
+                        planets,
+                        spec,
+                        out,
+                    );
+                });
+            (source_specs, flat_mask)
+        });
+
+        let active_sources = source_specs.len();
+        let mut row_idx = Vec::with_capacity(active_sources);
+        let mut source_idx = Vec::with_capacity(active_sources);
+        for spec in &source_specs {
+            row_idx.push(spec.row as i64);
+            source_idx.push(spec.source_col as i64);
+        }
+        let mask = Array2::from_shape_vec((active_sources, planets), flat_mask).map_err(|err| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to build compact legal mask: {err}"
+            ))
+        })?;
+        let out = PyDict::new(py);
+        out.set_item("row_idx", Array1::from_vec(row_idx).into_pyarray(py))?;
+        out.set_item("source_idx", Array1::from_vec(source_idx).into_pyarray(py))?;
+        out.set_item("mask", mask.into_pyarray(py))?;
+        Ok(out)
+    }
+
     fn reset_core(&mut self, advance_counts: bool) {
         let mut games = Vec::with_capacity(self.num_envs);
         for idx in 0..self.num_envs {
@@ -1209,16 +1544,22 @@ fn policy_batch_dict<'py>(
     include_contexts: bool,
     fleet_dests_by_row: Option<&[Arc<Vec<FleetDestination>>]>,
 ) -> PyResult<Bound<'py, PyDict>> {
+    if !include_contexts {
+        return policy_batch_dict_no_context_parallel(py, games, rows, fleet_dests_by_row);
+    }
     let batch = rows.len();
     if let Some(dests) = fleet_dests_by_row {
         debug_assert_eq!(dests.len(), batch);
     }
-    let fleet_width = rows
-        .iter()
-        .map(|&(env_idx, _)| games[env_idx].fleets.len())
-        .max()
-        .unwrap_or(0)
-        .max(1);
+    let fleet_width = if fleet_dests_by_row.is_some() {
+        0
+    } else {
+        rows.iter()
+            .map(|&(env_idx, _)| games[env_idx].fleets.len())
+            .max()
+            .unwrap_or(0)
+            .max(1)
+    };
     let mut global_feats = Array2::<f32>::zeros((batch, GLOBAL_FEAT_DIM));
     let mut planet_feats = Array3::<f32>::zeros((batch, MAX_PLANETS, PLANET_FEAT_DIM));
     let mut planet_mask = Array2::<bool>::from_elem((batch, MAX_PLANETS), false);
@@ -1227,17 +1568,24 @@ fn policy_batch_dict<'py>(
     let mut planet_garrison = Array2::<f32>::zeros((batch, MAX_PLANETS));
     let mut fleet_feats = Array3::<f32>::zeros((batch, fleet_width, FLEET_FEAT_DIM));
     let mut fleet_mask = Array2::<bool>::from_elem((batch, fleet_width), false);
-    let mut fleet_target_planet_idx = fleet_dests_by_row
-        .map(|_| Array2::<i64>::from_elem((batch, fleet_width), -1));
+    let mut fleet_target_planet_idx =
+        fleet_dests_by_row.map(|_| Array2::<i64>::from_elem((batch, fleet_width), -1));
+    let mut planet_inbound_feats = fleet_dests_by_row
+        .map(|_| Array3::<f32>::zeros((batch, MAX_PLANETS, PLANET_INBOUND_FEAT_DIM)));
     let contexts = PyList::empty(py);
+    let mut comet_motion_by_env: HashMap<usize, HashMap<i32, Option<(f64, f64)>>> = HashMap::new();
 
     for (row, (env_idx, player)) in rows.into_iter().enumerate() {
         let game = &games[env_idx];
+        let comet_motion = comet_motion_by_env
+            .entry(env_idx)
+            .or_insert_with(|| comet_motion_by_id(game));
         fill_global_features(game, player, row, &mut global_feats);
         fill_planet_features(
             game,
             player,
             row,
+            comet_motion,
             &mut PlanetBatchMut {
                 feats: &mut planet_feats,
                 mask: &mut planet_mask,
@@ -1255,6 +1603,11 @@ fn policy_batch_dict<'py>(
                     targets[[row, col]] = dest.dest_idx;
                 }
             }
+        }
+        if let (Some(dests_by_row), Some(inbound)) =
+            (fleet_dests_by_row, planet_inbound_feats.as_mut())
+        {
+            fill_planet_inbound_features(game, player, row, &dests_by_row[row], inbound);
         }
         if include_contexts {
             let planet_rows = planet_rows_array(game);
@@ -1284,8 +1637,191 @@ fn policy_batch_dict<'py>(
     if let Some(targets) = fleet_target_planet_idx {
         out.set_item("fleet_target_planet_idx", targets.into_pyarray(py))?;
     }
+    if let Some(inbound) = planet_inbound_feats {
+        out.set_item("planet_inbound_feats", inbound.into_pyarray(py))?;
+    }
     out.set_item("contexts", contexts)?;
     Ok(out)
+}
+
+fn policy_batch_dict_no_context_parallel<'py>(
+    py: Python<'py>,
+    games: &[Game],
+    rows: Vec<(usize, usize)>,
+    fleet_dests_by_row: Option<&[Arc<Vec<FleetDestination>>]>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let batch = rows.len();
+    if let Some(dests) = fleet_dests_by_row {
+        debug_assert_eq!(dests.len(), batch);
+    }
+    let fleet_width = if fleet_dests_by_row.is_some() {
+        0
+    } else {
+        rows.iter()
+            .map(|&(env_idx, _)| games[env_idx].fleets.len())
+            .max()
+            .unwrap_or(0)
+            .max(1)
+    };
+    let mut comet_motion_by_env = vec![None; games.len()];
+    for &(env_idx, _) in &rows {
+        if comet_motion_by_env[env_idx].is_none() {
+            comet_motion_by_env[env_idx] = Some(comet_motion_by_id(&games[env_idx]));
+        }
+    }
+
+    let mut global_feats = vec![0.0_f32; batch * GLOBAL_FEAT_DIM];
+    let mut planet_feats = vec![0.0_f32; batch * MAX_PLANETS * PLANET_FEAT_DIM];
+    let mut planet_mask = vec![false; batch * MAX_PLANETS];
+    let mut planet_owned = vec![false; batch * MAX_PLANETS];
+    let mut planet_ids = vec![-1_i64; batch * MAX_PLANETS];
+    let mut planet_garrison = vec![0.0_f32; batch * MAX_PLANETS];
+    let mut fleet_feats = vec![0.0_f32; batch * fleet_width * FLEET_FEAT_DIM];
+    let mut fleet_mask = vec![false; batch * fleet_width];
+    let mut planet_inbound_feats =
+        fleet_dests_by_row.map(|_| vec![0.0_f32; batch * MAX_PLANETS * PLANET_INBOUND_FEAT_DIM]);
+
+    py.detach(|| {
+        global_feats
+            .par_chunks_mut(GLOBAL_FEAT_DIM)
+            .zip(planet_feats.par_chunks_mut(MAX_PLANETS * PLANET_FEAT_DIM))
+            .zip(planet_mask.par_chunks_mut(MAX_PLANETS))
+            .zip(planet_owned.par_chunks_mut(MAX_PLANETS))
+            .zip(planet_ids.par_chunks_mut(MAX_PLANETS))
+            .zip(planet_garrison.par_chunks_mut(MAX_PLANETS))
+            .enumerate()
+            .for_each(
+                |(
+                    row,
+                    (
+                        (
+                            (((global_row, planet_feats_row), planet_mask_row), planet_owned_row),
+                            planet_ids_row,
+                        ),
+                        planet_garrison_row,
+                    ),
+                )| {
+                    let (env_idx, player) = rows[row];
+                    let game = &games[env_idx];
+                    let comet_motion = comet_motion_by_env[env_idx]
+                        .as_ref()
+                        .expect("comet motion missing for policy row");
+                    fill_global_features_row(game, player, global_row);
+                    fill_planet_features_row(
+                        game,
+                        player,
+                        comet_motion,
+                        planet_feats_row,
+                        planet_mask_row,
+                        planet_owned_row,
+                        planet_ids_row,
+                        planet_garrison_row,
+                    );
+                },
+            );
+        if fleet_width > 0 {
+            fleet_feats
+                .par_chunks_mut(fleet_width * FLEET_FEAT_DIM)
+                .zip(fleet_mask.par_chunks_mut(fleet_width))
+                .enumerate()
+                .for_each(|(row, (fleet_feats_row, fleet_mask_row))| {
+                    let (env_idx, player) = rows[row];
+                    fill_fleet_features_row(
+                        &games[env_idx],
+                        player,
+                        fleet_width,
+                        fleet_feats_row,
+                        fleet_mask_row,
+                    );
+                });
+        }
+        if let (Some(dests_by_row), Some(inbound)) =
+            (fleet_dests_by_row, planet_inbound_feats.as_mut())
+        {
+            inbound
+                .par_chunks_mut(MAX_PLANETS * PLANET_INBOUND_FEAT_DIM)
+                .enumerate()
+                .for_each(|(row, inbound_row)| {
+                    let (env_idx, player) = rows[row];
+                    fill_planet_inbound_features_row(
+                        &games[env_idx],
+                        player,
+                        &dests_by_row[row],
+                        inbound_row,
+                    );
+                });
+        }
+    });
+
+    let out = PyDict::new(py);
+    out.set_item(
+        "global_feats",
+        Array2::from_shape_vec((batch, GLOBAL_FEAT_DIM), global_feats)
+            .map_err(array_shape_err)?
+            .into_pyarray(py),
+    )?;
+    out.set_item(
+        "planet_feats",
+        Array3::from_shape_vec((batch, MAX_PLANETS, PLANET_FEAT_DIM), planet_feats)
+            .map_err(array_shape_err)?
+            .into_pyarray(py),
+    )?;
+    out.set_item(
+        "planet_mask",
+        Array2::from_shape_vec((batch, MAX_PLANETS), planet_mask)
+            .map_err(array_shape_err)?
+            .into_pyarray(py),
+    )?;
+    out.set_item(
+        "planet_owned_mask",
+        Array2::from_shape_vec((batch, MAX_PLANETS), planet_owned)
+            .map_err(array_shape_err)?
+            .into_pyarray(py),
+    )?;
+    out.set_item(
+        "planet_ids",
+        Array2::from_shape_vec((batch, MAX_PLANETS), planet_ids)
+            .map_err(array_shape_err)?
+            .into_pyarray(py),
+    )?;
+    out.set_item(
+        "planet_garrison",
+        Array2::from_shape_vec((batch, MAX_PLANETS), planet_garrison)
+            .map_err(array_shape_err)?
+            .into_pyarray(py),
+    )?;
+    out.set_item(
+        "fleet_feats",
+        Array3::from_shape_vec((batch, fleet_width, FLEET_FEAT_DIM), fleet_feats)
+            .map_err(array_shape_err)?
+            .into_pyarray(py),
+    )?;
+    out.set_item(
+        "fleet_mask",
+        Array2::from_shape_vec((batch, fleet_width), fleet_mask)
+            .map_err(array_shape_err)?
+            .into_pyarray(py),
+    )?;
+    if fleet_dests_by_row.is_some() {
+        out.set_item(
+            "fleet_target_planet_idx",
+            Array2::<i64>::from_elem((batch, fleet_width), -1).into_pyarray(py),
+        )?;
+    }
+    if let Some(inbound) = planet_inbound_feats {
+        out.set_item(
+            "planet_inbound_feats",
+            Array3::from_shape_vec((batch, MAX_PLANETS, PLANET_INBOUND_FEAT_DIM), inbound)
+                .map_err(array_shape_err)?
+                .into_pyarray(py),
+        )?;
+    }
+    out.set_item("contexts", PyList::empty(py))?;
+    Ok(out)
+}
+
+fn array_shape_err(err: numpy::ndarray::ShapeError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build feature array: {err}"))
 }
 
 fn global_player_slot(owner: i32, player: usize, num_players: usize) -> Option<usize> {
@@ -1304,6 +1840,22 @@ fn clip01(x: f64) -> f32 {
 }
 
 fn fill_global_features(game: &Game, player: usize, row: usize, global_feats: &mut Array2<f32>) {
+    let Some(row_out) = global_feats
+        .as_slice_mut()
+        .and_then(|flat| flat.get_mut(row * GLOBAL_FEAT_DIM..(row + 1) * GLOBAL_FEAT_DIM))
+    else {
+        fill_global_features_indexed(game, player, row, global_feats);
+        return;
+    };
+    fill_global_features_row(game, player, row_out);
+}
+
+fn fill_global_features_indexed(
+    game: &Game,
+    player: usize,
+    row: usize,
+    global_feats: &mut Array2<f32>,
+) {
     let step = game.step;
     let step_f = f64::from(step);
     let step_norm = (step_f / FEATURE_EPISODE_STEPS).clamp(0.0, 1.0);
@@ -1353,6 +1905,57 @@ fn fill_global_features(game: &Game, player: usize, row: usize, global_feats: &m
     global_feats[[row, offset + 1]] = clip01(neutral_production / GLOBAL_PRODUCTION_SCALE);
     global_feats[[row, offset + 2]] =
         clip01(neutral_ships.max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
+}
+
+fn fill_global_features_row(game: &Game, player: usize, out: &mut [f32]) {
+    let step = game.step;
+    let step_f = f64::from(step);
+    let step_norm = (step_f / FEATURE_EPISODE_STEPS).clamp(0.0, 1.0);
+    let remaining_norm = ((FEATURE_EPISODE_STEPS - step_f) / FEATURE_EPISODE_STEPS).clamp(0.0, 1.0);
+    let phase_step = (step - FIRST_COMET_STEP).rem_euclid(COMET_PERIOD_STEPS);
+    let phase = f64::from(phase_step) / f64::from(COMET_PERIOD_STEPS);
+    let angle = 2.0 * std::f64::consts::PI * phase;
+    let mut player_stats = [[0.0_f64; GLOBAL_PLAYER_FEATS]; GLOBAL_PLAYER_SLOTS];
+    let mut neutral_count = 0.0_f64;
+    let mut neutral_production = 0.0_f64;
+    let mut neutral_ships = 0.0_f64;
+
+    for planet in &game.planets {
+        if planet.owner < 0 {
+            neutral_count += 1.0;
+            neutral_production += f64::from(planet.production);
+            neutral_ships += f64::from(planet.ships);
+            continue;
+        }
+        if let Some(slot) = global_player_slot(planet.owner, player, game.num_players) {
+            player_stats[slot][0] += 1.0;
+            player_stats[slot][1] += f64::from(planet.production);
+            player_stats[slot][2] += f64::from(planet.ships);
+        }
+    }
+    for fleet in &game.fleets {
+        if let Some(slot) = global_player_slot(fleet.owner, player, game.num_players) {
+            player_stats[slot][3] += 1.0;
+            player_stats[slot][4] += f64::from(fleet.ships);
+        }
+    }
+
+    out[0] = step_norm as f32;
+    out[1] = remaining_norm as f32;
+    out[2] = angle.sin() as f32;
+    out[3] = angle.cos() as f32;
+    let mut offset = 4;
+    for stats in player_stats {
+        out[offset] = clip01(stats[0] / MAX_PLANETS as f64);
+        out[offset + 1] = clip01(stats[1] / GLOBAL_PRODUCTION_SCALE);
+        out[offset + 2] = clip01(stats[2].max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
+        out[offset + 3] = clip01(stats[3].max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
+        out[offset + 4] = clip01(stats[4].max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
+        offset += GLOBAL_PLAYER_FEATS;
+    }
+    out[offset] = clip01(neutral_count / MAX_PLANETS as f64);
+    out[offset + 1] = clip01(neutral_production / GLOBAL_PRODUCTION_SCALE);
+    out[offset + 2] = clip01(neutral_ships.max(0.0).ln_1p() / GLOBAL_SHIP_LOG_SCALE);
 }
 
 fn game_from_observation(
@@ -3412,8 +4015,13 @@ struct PlanetBatchMut<'a> {
     garrison: &'a mut Array2<f32>,
 }
 
-fn fill_planet_features(game: &Game, player: usize, row: usize, batch: &mut PlanetBatchMut<'_>) {
-    let comet_motion = comet_motion_by_id(game);
+fn fill_planet_features(
+    game: &Game,
+    player: usize,
+    row: usize,
+    comet_motion: &HashMap<i32, Option<(f64, f64)>>,
+    batch: &mut PlanetBatchMut<'_>,
+) {
     for (col, p) in game.planets.iter().take(MAX_PLANETS).enumerate() {
         let owner = p.owner;
         let x = p.x;
@@ -3460,6 +4068,63 @@ fn fill_planet_features(game: &Game, player: usize, row: usize, batch: &mut Plan
     }
 }
 
+fn fill_planet_features_row(
+    game: &Game,
+    player: usize,
+    comet_motion: &HashMap<i32, Option<(f64, f64)>>,
+    feats: &mut [f32],
+    mask: &mut [bool],
+    owned_mask: &mut [bool],
+    ids: &mut [i64],
+    garrison: &mut [f32],
+) {
+    for (col, p) in game.planets.iter().take(MAX_PLANETS).enumerate() {
+        let offset = col * PLANET_FEAT_DIM;
+        let owner = p.owner;
+        let x = p.x;
+        let y = p.y;
+        let rx = x - CENTER;
+        let ry = y - CENTER;
+        let orbital_radius = (rx * rx + ry * ry).sqrt();
+        feats[offset] = (rx / BOARD_SIZE) as f32;
+        feats[offset + 1] = (ry / BOARD_SIZE) as f32;
+        feats[offset + 2] = (orbital_radius / BOARD_SIZE) as f32;
+        feats[offset + 3] = (p.radius / 5.0) as f32;
+        feats[offset + 4] = ((p.ships as f64).ln_1p() / 8.0) as f32;
+        feats[offset + 5] = (p.production as f64 / 5.0) as f32;
+        if let Some(step) = comet_motion.get(&p.id) {
+            feats[offset + 12] = 1.0;
+            if let Some((dx, dy)) = step {
+                let norm = (dx * dx + dy * dy).sqrt();
+                if norm > 0.0 {
+                    feats[offset + 6] = (dx / norm) as f32;
+                    feats[offset + 7] = (dy / norm) as f32;
+                    feats[offset + 8] = (norm / MAX_SHIP_SPEED).min(1.0) as f32;
+                }
+            }
+        } else {
+            let is_orbiting = orbital_radius + p.radius < ROTATION_RADIUS_LIMIT;
+            if is_orbiting && orbital_radius > 1e-9 {
+                let vx = -ry * game.angular_velocity;
+                let vy = rx * game.angular_velocity;
+                let speed = (vx * vx + vy * vy).sqrt();
+                feats[offset + 6] = (vx / speed.max(1e-9)) as f32;
+                feats[offset + 7] = (vy / speed.max(1e-9)) as f32;
+                feats[offset + 8] = (speed / MAX_SHIP_SPEED).min(1.0) as f32;
+                feats[offset + 10] = (game.angular_velocity.abs() / MAX_OMEGA) as f32;
+                feats[offset + 11] = 1.0;
+            }
+            feats[offset + 9] = (orbital_radius / 50.0) as f32;
+        }
+        fill_owner_features_row(feats, offset + 13, owner, player, game.num_players);
+        feats[offset + 18] = 1.0;
+        mask[col] = true;
+        owned_mask[col] = owner == player as i32;
+        ids[col] = p.id as i64;
+        garrison[col] = p.ships as f32;
+    }
+}
+
 fn fill_fleet_features(
     game: &Game,
     player: usize,
@@ -3467,12 +4132,15 @@ fn fill_fleet_features(
     feats: &mut Array3<f32>,
     mask: &mut Array2<bool>,
 ) {
+    let fleet_width = feats.shape()[1];
+    if fleet_width == 0 {
+        return;
+    }
     let pos_by_id = game
         .planets
         .iter()
         .map(|p| (p.id, (p.x, p.y)))
         .collect::<HashMap<_, _>>();
-    let fleet_width = feats.shape()[1];
     for (col, f) in game.fleets.iter().take(fleet_width).enumerate() {
         feats[[row, col, 0]] = ((f.x - CENTER) / BOARD_SIZE) as f32;
         feats[[row, col, 1]] = ((f.y - CENTER) / BOARD_SIZE) as f32;
@@ -3498,6 +4166,211 @@ fn fill_fleet_features(
     }
 }
 
+fn fill_fleet_features_row(
+    game: &Game,
+    player: usize,
+    fleet_width: usize,
+    feats: &mut [f32],
+    mask: &mut [bool],
+) {
+    if fleet_width == 0 {
+        return;
+    }
+    let pos_by_id = game
+        .planets
+        .iter()
+        .map(|p| (p.id, (p.x, p.y)))
+        .collect::<HashMap<_, _>>();
+    for (col, f) in game.fleets.iter().take(fleet_width).enumerate() {
+        let offset = col * FLEET_FEAT_DIM;
+        feats[offset] = ((f.x - CENTER) / BOARD_SIZE) as f32;
+        feats[offset + 1] = ((f.y - CENTER) / BOARD_SIZE) as f32;
+        feats[offset + 2] = f.angle.cos() as f32;
+        feats[offset + 3] = f.angle.sin() as f32;
+        feats[offset + 4] = ((f.ships as f64).ln_1p() / 8.0) as f32;
+        if let Some((sx, sy)) = pos_by_id.get(&f.from_planet_id) {
+            feats[offset + 5] = ((*sx - CENTER) / BOARD_SIZE) as f32;
+            feats[offset + 6] = ((*sy - CENTER) / BOARD_SIZE) as f32;
+            feats[offset + 7] = 1.0;
+        }
+        let sp = 1.0 + (MAX_SHIP_SPEED - 1.0) * ((f.ships.max(1) as f64).ln() / LOG_1000).powf(1.5);
+        feats[offset + 8] = (sp.min(MAX_SHIP_SPEED) / MAX_SHIP_SPEED).min(1.0) as f32;
+        if f.owner == player as i32 && f.target_id >= 0 {
+            feats[offset + 9] = (f.target_id as f32) / 128.0;
+            feats[offset + 10] = (f.eta.max(0.0) / 500.0).min(1.0) as f32;
+            feats[offset + 11] = ((f.target_x - CENTER) / BOARD_SIZE) as f32;
+            feats[offset + 12] = ((f.target_y - CENTER) / BOARD_SIZE) as f32;
+            feats[offset + 13] = 1.0;
+        }
+        fill_owner_features_row(feats, offset + 14, f.owner, player, game.num_players);
+        mask[col] = true;
+    }
+}
+
+fn fill_planet_inbound_features(
+    game: &Game,
+    player: usize,
+    row: usize,
+    dests: &[FleetDestination],
+    feats: &mut Array3<f32>,
+) {
+    let mut total_count = [0.0_f64; MAX_PLANETS];
+    let mut self_count = [0.0_f64; MAX_PLANETS];
+    let mut enemy_count = [0.0_f64; MAX_PLANETS];
+    let mut total_ship = [0.0_f64; MAX_PLANETS];
+    let mut self_ship = [0.0_f64; MAX_PLANETS];
+    let mut enemy_ship = [0.0_f64; MAX_PLANETS];
+    let mut max_ship = [0.0_f64; MAX_PLANETS];
+    let mut max_self_ship = [0.0_f64; MAX_PLANETS];
+    let mut max_enemy_ship = [0.0_f64; MAX_PLANETS];
+    let mut speed_sum = [0.0_f64; MAX_PLANETS];
+    let mut max_speed = [0.0_f64; MAX_PLANETS];
+    let mut eta_sum = [0.0_f64; MAX_PLANETS];
+    let mut known_eta_count = [0.0_f64; MAX_PLANETS];
+
+    for (fleet, dest) in game.fleets.iter().zip(dests.iter()) {
+        if dest.status != oracle::STATUS_PLANET {
+            continue;
+        }
+        let Ok(planet_idx) = usize::try_from(dest.dest_idx) else {
+            continue;
+        };
+        if planet_idx >= MAX_PLANETS {
+            continue;
+        }
+        let ship_mass = f64::from(fleet.ships.max(0));
+        let ship_log = ship_mass.ln_1p() / 8.0;
+        let speed = clip01(fleet_speed_local(fleet.ships, game.ship_speed) / MAX_SHIP_SPEED) as f64;
+        let self_f = if fleet.owner == player as i32 {
+            1.0
+        } else {
+            0.0
+        };
+        let enemy_f = if fleet.owner >= 0 && fleet.owner != player as i32 {
+            1.0
+        } else {
+            0.0
+        };
+
+        total_count[planet_idx] += 1.0;
+        self_count[planet_idx] += self_f;
+        enemy_count[planet_idx] += enemy_f;
+        total_ship[planet_idx] += ship_mass;
+        self_ship[planet_idx] += ship_mass * self_f;
+        enemy_ship[planet_idx] += ship_mass * enemy_f;
+        max_ship[planet_idx] = max_ship[planet_idx].max(ship_log);
+        if self_f > 0.0 {
+            max_self_ship[planet_idx] = max_self_ship[planet_idx].max(ship_log);
+        }
+        if enemy_f > 0.0 {
+            max_enemy_ship[planet_idx] = max_enemy_ship[planet_idx].max(ship_log);
+        }
+        speed_sum[planet_idx] += speed;
+        max_speed[planet_idx] = max_speed[planet_idx].max(speed);
+        known_eta_count[planet_idx] += 1.0;
+        eta_sum[planet_idx] += (dest.eta.max(0.0) / FEATURE_EPISODE_STEPS).min(1.0);
+    }
+
+    for planet_idx in 0..MAX_PLANETS {
+        feats[[row, planet_idx, 0]] = clip01(total_count[planet_idx] / 64.0);
+        feats[[row, planet_idx, 1]] = clip01(self_count[planet_idx] / 64.0);
+        feats[[row, planet_idx, 2]] = clip01(enemy_count[planet_idx] / 64.0);
+        feats[[row, planet_idx, 3]] = clip01(total_ship[planet_idx].ln_1p() / 8.0);
+        feats[[row, planet_idx, 4]] = clip01(self_ship[planet_idx].ln_1p() / 8.0);
+        feats[[row, planet_idx, 5]] = clip01(enemy_ship[planet_idx].ln_1p() / 8.0);
+        feats[[row, planet_idx, 6]] = max_ship[planet_idx] as f32;
+        feats[[row, planet_idx, 7]] = max_self_ship[planet_idx] as f32;
+        feats[[row, planet_idx, 8]] = max_enemy_ship[planet_idx] as f32;
+        feats[[row, planet_idx, 9]] =
+            (speed_sum[planet_idx] / total_count[planet_idx].max(1.0)) as f32;
+        feats[[row, planet_idx, 10]] = max_speed[planet_idx] as f32;
+        feats[[row, planet_idx, 11]] =
+            (eta_sum[planet_idx] / known_eta_count[planet_idx].max(1.0)) as f32;
+        feats[[row, planet_idx, 12]] = clip01(known_eta_count[planet_idx] / 64.0);
+    }
+}
+
+fn fill_planet_inbound_features_row(
+    game: &Game,
+    player: usize,
+    dests: &[FleetDestination],
+    feats: &mut [f32],
+) {
+    let mut total_count = [0.0_f64; MAX_PLANETS];
+    let mut self_count = [0.0_f64; MAX_PLANETS];
+    let mut enemy_count = [0.0_f64; MAX_PLANETS];
+    let mut total_ship = [0.0_f64; MAX_PLANETS];
+    let mut self_ship = [0.0_f64; MAX_PLANETS];
+    let mut enemy_ship = [0.0_f64; MAX_PLANETS];
+    let mut max_ship = [0.0_f64; MAX_PLANETS];
+    let mut max_self_ship = [0.0_f64; MAX_PLANETS];
+    let mut max_enemy_ship = [0.0_f64; MAX_PLANETS];
+    let mut speed_sum = [0.0_f64; MAX_PLANETS];
+    let mut max_speed = [0.0_f64; MAX_PLANETS];
+    let mut eta_sum = [0.0_f64; MAX_PLANETS];
+    let mut known_eta_count = [0.0_f64; MAX_PLANETS];
+
+    for (fleet, dest) in game.fleets.iter().zip(dests.iter()) {
+        if dest.status != oracle::STATUS_PLANET {
+            continue;
+        }
+        let Ok(planet_idx) = usize::try_from(dest.dest_idx) else {
+            continue;
+        };
+        if planet_idx >= MAX_PLANETS {
+            continue;
+        }
+        let ship_mass = f64::from(fleet.ships.max(0));
+        let ship_log = ship_mass.ln_1p() / 8.0;
+        let speed = clip01(fleet_speed_local(fleet.ships, game.ship_speed) / MAX_SHIP_SPEED) as f64;
+        let self_f = if fleet.owner == player as i32 {
+            1.0
+        } else {
+            0.0
+        };
+        let enemy_f = if fleet.owner >= 0 && fleet.owner != player as i32 {
+            1.0
+        } else {
+            0.0
+        };
+
+        total_count[planet_idx] += 1.0;
+        self_count[planet_idx] += self_f;
+        enemy_count[planet_idx] += enemy_f;
+        total_ship[planet_idx] += ship_mass;
+        self_ship[planet_idx] += ship_mass * self_f;
+        enemy_ship[planet_idx] += ship_mass * enemy_f;
+        max_ship[planet_idx] = max_ship[planet_idx].max(ship_log);
+        if self_f > 0.0 {
+            max_self_ship[planet_idx] = max_self_ship[planet_idx].max(ship_log);
+        }
+        if enemy_f > 0.0 {
+            max_enemy_ship[planet_idx] = max_enemy_ship[planet_idx].max(ship_log);
+        }
+        speed_sum[planet_idx] += speed;
+        max_speed[planet_idx] = max_speed[planet_idx].max(speed);
+        known_eta_count[planet_idx] += 1.0;
+        eta_sum[planet_idx] += (dest.eta.max(0.0) / FEATURE_EPISODE_STEPS).min(1.0);
+    }
+
+    for planet_idx in 0..MAX_PLANETS {
+        let offset = planet_idx * PLANET_INBOUND_FEAT_DIM;
+        feats[offset] = clip01(total_count[planet_idx] / 64.0);
+        feats[offset + 1] = clip01(self_count[planet_idx] / 64.0);
+        feats[offset + 2] = clip01(enemy_count[planet_idx] / 64.0);
+        feats[offset + 3] = clip01(total_ship[planet_idx].ln_1p() / 8.0);
+        feats[offset + 4] = clip01(self_ship[planet_idx].ln_1p() / 8.0);
+        feats[offset + 5] = clip01(enemy_ship[planet_idx].ln_1p() / 8.0);
+        feats[offset + 6] = max_ship[planet_idx] as f32;
+        feats[offset + 7] = max_self_ship[planet_idx] as f32;
+        feats[offset + 8] = max_enemy_ship[planet_idx] as f32;
+        feats[offset + 9] = (speed_sum[planet_idx] / total_count[planet_idx].max(1.0)) as f32;
+        feats[offset + 10] = max_speed[planet_idx] as f32;
+        feats[offset + 11] = (eta_sum[planet_idx] / known_eta_count[planet_idx].max(1.0)) as f32;
+        feats[offset + 12] = clip01(known_eta_count[planet_idx] / 64.0);
+    }
+}
+
 fn fill_owner_features(
     feats: &mut Array3<f32>,
     row: usize,
@@ -3516,6 +4389,26 @@ fn fill_owner_features(
         let slot = diff - 1;
         if (0..=2).contains(&slot) {
             feats[[row, col, start + 2 + slot as usize]] = 1.0;
+        }
+    }
+}
+
+fn fill_owner_features_row(
+    feats: &mut [f32],
+    start: usize,
+    owner: i32,
+    player: usize,
+    num_players: usize,
+) {
+    if owner == player as i32 {
+        feats[start] = 1.0;
+    } else if owner == -1 {
+        feats[start + 1] = 1.0;
+    } else {
+        let diff = (owner - player as i32).rem_euclid(num_players.max(2) as i32);
+        let slot = diff - 1;
+        if (0..=2).contains(&slot) {
+            feats[start + 2 + slot as usize] = 1.0;
         }
     }
 }
@@ -3656,7 +4549,7 @@ fn fill_legal_mask_row_from_state<FFrac, FActive>(
             continue;
         }
         let src_offset = i * planets_len;
-        for &j in &state.target_cols {
+        for j in 0..planet_limit {
             if i == j {
                 continue;
             }
@@ -3669,17 +4562,16 @@ fn fill_legal_mask_row_from_state<FFrac, FActive>(
             ) else {
                 continue;
             };
-            if !route_clear_to_solution_with_cols(
+            if !route_clear_to_solution_with_target_blocker_cols(
                 source.id,
-                game.planets[j].id,
                 source.x,
                 source.y,
                 source.radius,
                 &solution,
                 speed,
                 &state.target_motions,
-                &state.static_cols,
-                &state.moving_cols,
+                &state.static_blocker_cols_by_target[j],
+                &state.moving_blocker_cols_by_target[j],
             ) {
                 continue;
             }
@@ -3688,33 +4580,106 @@ fn fill_legal_mask_row_from_state<FFrac, FActive>(
     }
 }
 
+fn append_compact_legal_sources_from_state<FFrac, FActive>(
+    game: &Game,
+    state: &LegalMaskState,
+    row: usize,
+    env_idx: usize,
+    player: usize,
+    planets_len: usize,
+    frac_at: FFrac,
+    active_at: FActive,
+    out: &mut Vec<CompactLegalSource>,
+) where
+    FFrac: Fn(usize) -> f64,
+    FActive: Fn(usize) -> bool,
+{
+    let planet_limit = state.planet_limit.min(planets_len);
+    let Some(source_cols) = state.source_cols_by_player.get(player) else {
+        return;
+    };
+    for &i in source_cols {
+        if i >= planet_limit || !active_at(i) {
+            continue;
+        }
+        let source = game.planets[i];
+        if source.owner != player as i32 || source.ships < 2 {
+            continue;
+        }
+        let send = ships_to_send(source.ships, frac_at(i));
+        if send <= 0 {
+            continue;
+        }
+        let speed = fleet_speed_local(send, game.ship_speed);
+        if speed <= 0.0 {
+            continue;
+        }
+        out.push(CompactLegalSource {
+            row,
+            env_idx,
+            source_col: i,
+            source,
+            speed,
+        });
+    }
+}
+
+fn fill_compact_legal_source_from_state(
+    _game: &Game,
+    state: &LegalMaskState,
+    planets_len: usize,
+    spec: CompactLegalSource,
+    out: &mut [bool],
+) {
+    let planet_limit = state.planet_limit.min(planets_len);
+    for j in 0..planet_limit {
+        if spec.source_col == j {
+            continue;
+        }
+        let Some(solution) = lead_solution_cached_with_speed(
+            &spec.source,
+            state.target_motions[j]
+                .as_ref()
+                .expect("target column is present"),
+            spec.speed,
+        ) else {
+            continue;
+        };
+        if !route_clear_to_solution_with_target_blocker_cols(
+            spec.source.id,
+            spec.source.x,
+            spec.source.y,
+            spec.source.radius,
+            &solution,
+            spec.speed,
+            &state.target_motions,
+            &state.static_blocker_cols_by_target[j],
+            &state.moving_blocker_cols_by_target[j],
+        ) {
+            continue;
+        }
+        out[j] = true;
+    }
+}
+
 fn legal_mask_state(game: &Game, planets_len: usize) -> LegalMaskState {
     let planet_limit = planets_len.min(game.planets.len());
     let comet_ids = comet_id_set(game);
-    let is_comet_col = game
-        .planets
-        .iter()
-        .take(planet_limit)
-        .map(|target| {
-            comet_ids
-                .as_ref()
-                .is_some_and(|ids| ids.contains(&target.id))
-        })
-        .collect::<Vec<_>>();
     let target_motions = game
         .planets
         .iter()
         .take(planet_limit)
-        .enumerate()
-        .map(|(idx, target)| {
+        .map(|target| {
+            let is_comet = comet_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&target.id));
             Some(cached_target_motion(
                 target,
                 game.angular_velocity,
-                is_comet_col[idx],
+                is_comet,
             ))
         })
         .collect::<Vec<_>>();
-    let target_cols = (0..planet_limit).collect::<Vec<_>>();
     let mut source_cols_by_player = vec![Vec::new(); game.num_players];
     for (idx, planet) in game.planets.iter().take(planet_limit).enumerate() {
         if planet.owner < 0 || planet.ships < 2 {
@@ -3745,13 +4710,30 @@ fn legal_mask_state(game: &Game, planets_len: usize) -> LegalMaskState {
                 .then_some(idx)
         })
         .collect::<Vec<_>>();
+    let static_blocker_cols_by_target = (0..planet_limit)
+        .map(|target_idx| {
+            static_cols
+                .iter()
+                .copied()
+                .filter(|&idx| idx != target_idx)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let moving_blocker_cols_by_target = (0..planet_limit)
+        .map(|target_idx| {
+            moving_cols
+                .iter()
+                .copied()
+                .filter(|&idx| idx != target_idx)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     LegalMaskState {
         planet_limit,
         target_motions,
-        target_cols,
         source_cols_by_player,
-        static_cols,
-        moving_cols,
+        static_blocker_cols_by_target,
+        moving_blocker_cols_by_target,
     }
 }
 
@@ -3795,6 +4777,448 @@ fn build_materialized_actions_dict<'py>(
     out.set_item("actions", actions)?;
     out.set_item("materialized", materialized.into_pyarray(py))?;
     Ok(out)
+}
+
+fn build_categorical_beta_actions_dict<'py>(
+    py: Python<'py>,
+    planets: usize,
+    native: bool,
+    record_rows: &[usize],
+    results: &[CategoricalBetaRowResult],
+) -> PyResult<Bound<'py, PyDict>> {
+    let actions = PyList::empty(py);
+    for result in results {
+        if native {
+            actions.append(Py::new(
+                py,
+                NativeActionList {
+                    actions: result.action.actions.clone(),
+                },
+            )?)?;
+        } else {
+            let row_actions = PyList::empty(py);
+            for action in &result.action.actions {
+                let item = PyList::empty(py);
+                item.append(action.from_planet_id)?;
+                item.append(action.angle)?;
+                item.append(action.ships)?;
+                item.append(action.target_id)?;
+                item.append(action.eta)?;
+                item.append(action.target_x)?;
+                item.append(action.target_y)?;
+                row_actions.append(item)?;
+            }
+            actions.append(row_actions)?;
+        }
+    }
+
+    let records = record_rows.len();
+    let mut launch = Array2::<f32>::zeros((records, planets));
+    let mut raw_launch = Array2::<f32>::zeros((records, planets));
+    let mut target_idx = Array2::<i64>::zeros((records, planets));
+    let mut fraction = Array2::<f32>::zeros((records, planets));
+    let mut target_legal_mask = Array3::<bool>::from_elem((records, planets, planets), true);
+    for (record_pos, &row) in record_rows.iter().enumerate() {
+        let result = &results[row];
+        for col in 0..planets {
+            launch[[record_pos, col]] = result.launch[col];
+            raw_launch[[record_pos, col]] = result.launch[col];
+            target_idx[[record_pos, col]] = result.target_idx[col];
+            fraction[[record_pos, col]] = result.fraction[col];
+            let offset = col * planets;
+            let row_target_legal_mask = result
+                .target_legal_mask
+                .as_ref()
+                .expect("recorded categorical beta row must include target legal mask");
+            for target in 0..planets {
+                target_legal_mask[[record_pos, col, target]] =
+                    row_target_legal_mask[offset + target];
+            }
+        }
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("actions", actions)?;
+    out.set_item("launch", launch.into_pyarray(py))?;
+    out.set_item("raw_launch", raw_launch.into_pyarray(py))?;
+    out.set_item("target_idx", target_idx.into_pyarray(py))?;
+    out.set_item("fraction", fraction.into_pyarray(py))?;
+    out.set_item("target_legal_mask", target_legal_mask.into_pyarray(py))?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn categorical_beta_action_row_from_state(
+    game: &Game,
+    state: &LegalMaskState,
+    row: usize,
+    env_idx: usize,
+    player: usize,
+    planets: usize,
+    random_seed: u32,
+    reset_count: u32,
+    launch_logits: &[f32],
+    target_logits: &[f32],
+    fraction_alpha: &[f32],
+    fraction_beta: &[f32],
+    action_logit_softcap: f64,
+    deterministic: bool,
+    record_target_legal_mask: bool,
+) -> CategoricalBetaRowResult {
+    let mut fraction = vec![0.5_f32; planets];
+    let source_cols = state
+        .source_cols_by_player
+        .get(player)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if deterministic {
+        for col in 0..planets {
+            let alpha = fraction_alpha[col] as f64;
+            let beta = fraction_beta[col] as f64;
+            fraction[col] = deterministic_beta_fraction(alpha, beta) as f32;
+        }
+    } else {
+        for &col in source_cols {
+            if col >= planets {
+                continue;
+            }
+            let alpha = fraction_alpha[col] as f64;
+            let beta = fraction_beta[col] as f64;
+            fraction[col] = sample_beta_fraction(
+                alpha,
+                beta,
+                sample_seed(
+                    random_seed,
+                    reset_count,
+                    game.step,
+                    env_idx,
+                    player,
+                    row,
+                    col,
+                    1,
+                ),
+            ) as f32;
+        }
+    }
+
+    let mut source_specs = Vec::new();
+    append_compact_legal_sources_from_state(
+        game,
+        state,
+        row,
+        env_idx,
+        player,
+        planets,
+        |col| fraction[col] as f64,
+        |_col| true,
+        &mut source_specs,
+    );
+    let mut legal_by_source = vec![false; source_specs.len() * planets];
+    for (idx, out) in legal_by_source.chunks_mut(planets).enumerate() {
+        fill_compact_legal_source_from_state(game, state, planets, source_specs[idx], out);
+    }
+
+    let mut launch = vec![0.0_f32; planets];
+    let mut target_idx = vec![0_i64; planets];
+    let mut target_legal_mask = record_target_legal_mask.then(|| {
+        let mut mask = vec![true; planets * planets];
+        for (col, planet) in game.planets.iter().take(planets).enumerate() {
+            if planet.owner == player as i32 {
+                let offset = col * planets;
+                mask[offset..offset + planets].fill(false);
+            }
+        }
+        mask
+    });
+
+    for (spec_idx, spec) in source_specs.iter().enumerate() {
+        let source_col = spec.source_col;
+        if source_col >= planets {
+            continue;
+        }
+        let legal = &legal_by_source[spec_idx * planets..(spec_idx + 1) * planets];
+        if let Some(mask) = target_legal_mask.as_mut() {
+            let mask_offset = source_col * planets;
+            mask[mask_offset..mask_offset + planets].copy_from_slice(legal);
+        }
+        let (launch_value, target_value) = select_categorical_beta_action(
+            launch_logits[source_col] as f64,
+            &target_logits[source_col * planets..(source_col + 1) * planets],
+            legal,
+            action_logit_softcap,
+            deterministic,
+            sample_seed(
+                random_seed,
+                reset_count,
+                game.step,
+                env_idx,
+                player,
+                row,
+                source_col,
+                2,
+            ),
+        );
+        launch[source_col] = launch_value;
+        target_idx[source_col] = target_value as i64;
+    }
+
+    let action = materialize_masked_action_row_from_cached_state(
+        game,
+        state,
+        player,
+        planets,
+        |col| launch[col] as f64,
+        |col| target_idx[col].max(0) as usize,
+        |col| fraction[col] as f64,
+    );
+    CategoricalBetaRowResult {
+        action,
+        launch,
+        target_idx,
+        fraction,
+        target_legal_mask,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn categorical_beta_action_row_from_state_compact_sources(
+    game: &Game,
+    state: &LegalMaskState,
+    row: usize,
+    env_idx: usize,
+    player: usize,
+    planets: usize,
+    random_seed: u32,
+    reset_count: u32,
+    sources: &[CompactCategoricalBetaSource],
+    launch_logits: &[f32],
+    target_logits: &[f32],
+    fraction_alpha: &[f32],
+    fraction_beta: &[f32],
+    action_logit_softcap: f64,
+    deterministic: bool,
+    record_target_legal_mask: bool,
+) -> CategoricalBetaRowResult {
+    let mut fraction = vec![0.5_f32; planets];
+    let mut source_pos_by_col = vec![usize::MAX; planets];
+    for source in sources {
+        if source.source_col >= planets {
+            continue;
+        }
+        source_pos_by_col[source.source_col] = source.source_pos;
+        let alpha = fraction_alpha[source.source_pos] as f64;
+        let beta = fraction_beta[source.source_pos] as f64;
+        fraction[source.source_col] = if deterministic {
+            deterministic_beta_fraction(alpha, beta) as f32
+        } else {
+            sample_beta_fraction(
+                alpha,
+                beta,
+                sample_seed(
+                    random_seed,
+                    reset_count,
+                    game.step,
+                    env_idx,
+                    player,
+                    row,
+                    source.source_col,
+                    1,
+                ),
+            ) as f32
+        };
+    }
+
+    let mut source_specs = Vec::new();
+    append_compact_legal_sources_from_state(
+        game,
+        state,
+        row,
+        env_idx,
+        player,
+        planets,
+        |col| fraction[col] as f64,
+        |col| col < source_pos_by_col.len() && source_pos_by_col[col] != usize::MAX,
+        &mut source_specs,
+    );
+    let mut legal_by_source = vec![false; source_specs.len() * planets];
+    for (idx, out) in legal_by_source.chunks_mut(planets).enumerate() {
+        fill_compact_legal_source_from_state(game, state, planets, source_specs[idx], out);
+    }
+
+    let mut launch = vec![0.0_f32; planets];
+    let mut target_idx = vec![0_i64; planets];
+    let mut target_legal_mask = record_target_legal_mask.then(|| {
+        let mut mask = vec![true; planets * planets];
+        for (col, planet) in game.planets.iter().take(planets).enumerate() {
+            if planet.owner == player as i32 {
+                let offset = col * planets;
+                mask[offset..offset + planets].fill(false);
+            }
+        }
+        mask
+    });
+
+    for (spec_idx, spec) in source_specs.iter().enumerate() {
+        let source_col = spec.source_col;
+        if source_col >= planets {
+            continue;
+        }
+        let source_pos = source_pos_by_col[source_col];
+        if source_pos == usize::MAX {
+            continue;
+        }
+        let legal = &legal_by_source[spec_idx * planets..(spec_idx + 1) * planets];
+        if let Some(mask) = target_legal_mask.as_mut() {
+            let mask_offset = source_col * planets;
+            mask[mask_offset..mask_offset + planets].copy_from_slice(legal);
+        }
+        let target_offset = source_pos * planets;
+        let (launch_value, target_value) = select_categorical_beta_action(
+            launch_logits[source_pos] as f64,
+            &target_logits[target_offset..target_offset + planets],
+            legal,
+            action_logit_softcap,
+            deterministic,
+            sample_seed(
+                random_seed,
+                reset_count,
+                game.step,
+                env_idx,
+                player,
+                row,
+                source_col,
+                2,
+            ),
+        );
+        launch[source_col] = launch_value;
+        target_idx[source_col] = target_value as i64;
+    }
+
+    let action = materialize_masked_action_row_from_cached_state(
+        game,
+        state,
+        player,
+        planets,
+        |col| launch[col] as f64,
+        |col| target_idx[col].max(0) as usize,
+        |col| fraction[col] as f64,
+    );
+    CategoricalBetaRowResult {
+        action,
+        launch,
+        target_idx,
+        fraction,
+        target_legal_mask,
+    }
+}
+
+fn deterministic_beta_fraction(alpha: f64, beta: f64) -> f64 {
+    let mode = if alpha > 1.0 && beta > 1.0 {
+        (alpha - 1.0) / (alpha + beta - 2.0).max(BETA_SAMPLE_EPS)
+    } else if alpha <= 1.0 && beta > 1.0 {
+        BETA_SAMPLE_EPS
+    } else if alpha > 1.0 && beta <= 1.0 {
+        1.0 - BETA_SAMPLE_EPS
+    } else {
+        0.5
+    };
+    mode.clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
+}
+
+fn sample_beta_fraction(alpha: f64, beta: f64, seed: u64) -> f64 {
+    if !(alpha.is_finite() && beta.is_finite()) || alpha <= 0.0 || beta <= 0.0 {
+        return 0.5;
+    }
+    let Ok(dist) = BetaDist::new(alpha, beta) else {
+        return 0.5;
+    };
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    dist.sample(&mut rng)
+        .clamp(BETA_SAMPLE_EPS, 1.0 - BETA_SAMPLE_EPS)
+}
+
+fn select_categorical_beta_action(
+    noop_logit: f64,
+    target_logits: &[f32],
+    legal: &[bool],
+    softcap: f64,
+    deterministic: bool,
+    seed: u64,
+) -> (f32, usize) {
+    let legal_count = legal
+        .iter()
+        .zip(target_logits.iter())
+        .filter(|&(&is_legal, &logit)| is_legal && (logit as f64).is_finite())
+        .count();
+    let noop_softcapped = softcap * (noop_logit / softcap).tanh();
+    let noop = if noop_softcapped.is_finite() {
+        noop_softcapped
+    } else {
+        -1.0e9
+    };
+    let mut best_idx = 0usize;
+    let mut best_score = noop;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    if !deterministic {
+        best_score += sample_gumbel(&mut rng);
+    }
+    if legal_count > 0 {
+        let target_norm = (legal_count as f64).ln();
+        for (target, (&logit, &is_legal)) in target_logits.iter().zip(legal.iter()).enumerate() {
+            let logit = logit as f64;
+            if !is_legal || !logit.is_finite() {
+                continue;
+            }
+            let mut score = softcap * (logit / softcap).tanh() - target_norm;
+            if !deterministic {
+                score += sample_gumbel(&mut rng);
+            }
+            if score > best_score {
+                best_score = score;
+                best_idx = target + 1;
+            }
+        }
+    }
+    if best_idx == 0 {
+        (0.0, 0)
+    } else {
+        (1.0, best_idx - 1)
+    }
+}
+
+fn sample_gumbel(rng: &mut ChaCha8Rng) -> f64 {
+    let u = rng.random::<f64>().clamp(SAMPLE_EPS, 1.0 - SAMPLE_EPS);
+    -(-u.ln()).ln()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_seed(
+    random_seed: u32,
+    reset_count: u32,
+    step: i32,
+    env_idx: usize,
+    player: usize,
+    row: usize,
+    col: usize,
+    stream: u64,
+) -> u64 {
+    let mut x = random_seed as u64;
+    x ^= (reset_count as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x ^= ((step as i64 as u64) << 32) ^ step as i64 as u64;
+    x ^= (env_idx as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= (player as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= (row as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
+    x ^= (col as u64).wrapping_mul(0xa5a3_58d4_cca4_6d1d);
+    x ^= stream.wrapping_mul(0x8a5c_9d5d_762f_4a6d);
+    splitmix64(x)
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 fn planets_by_col<FIds, FMask>(
@@ -4137,6 +5561,94 @@ where
     result
 }
 
+fn materialize_masked_action_row_from_cached_state<FLaunch, FTarget, FFrac>(
+    game: &Game,
+    state: &LegalMaskState,
+    player: usize,
+    planets_len: usize,
+    launch_at: FLaunch,
+    target_at: FTarget,
+    frac_at: FFrac,
+) -> RowActionResult
+where
+    FLaunch: Fn(usize) -> f64,
+    FTarget: Fn(usize) -> usize,
+    FFrac: Fn(usize) -> f64,
+{
+    let planet_limit = state.planet_limit.min(planets_len).min(game.planets.len());
+    let mut result = RowActionResult {
+        actions: Vec::new(),
+        materialized: vec![false; planets_len],
+    };
+    let mut remaining = game
+        .planets
+        .iter()
+        .take(planet_limit)
+        .map(|planet| planet.ships)
+        .collect::<Vec<_>>();
+    let Some(source_cols) = state.source_cols_by_player.get(player) else {
+        return result;
+    };
+    for &i in source_cols {
+        if i >= planet_limit || launch_at(i) < 0.5 {
+            continue;
+        }
+        let source = game.planets[i];
+        let source_ships = remaining[i];
+        if source.owner != player as i32 || source_ships < 2 {
+            continue;
+        }
+        let ti = target_at(i);
+        if ti == i || ti >= planet_limit {
+            continue;
+        }
+        let target = game.planets[ti];
+        let send = ships_to_send(source_ships, frac_at(i));
+        if send <= 0 {
+            continue;
+        }
+        let speed = fleet_speed_local(send, game.ship_speed);
+        if speed <= 0.0 {
+            continue;
+        }
+        let Some(target_motion) = state
+            .target_motions
+            .get(ti)
+            .and_then(|motion| motion.as_ref())
+        else {
+            continue;
+        };
+        let Some(solution) = lead_solution_cached_with_speed(&source, target_motion, speed) else {
+            continue;
+        };
+        if !route_clear_to_solution_with_target_blocker_cols(
+            source.id,
+            source.x,
+            source.y,
+            source.radius,
+            &solution,
+            speed,
+            &state.target_motions,
+            &state.static_blocker_cols_by_target[ti],
+            &state.moving_blocker_cols_by_target[ti],
+        ) {
+            continue;
+        }
+        result.actions.push(Action {
+            from_planet_id: source.id,
+            angle: solution.angle,
+            ships: send,
+            target_id: target.id,
+            eta: solution.time,
+            target_x: solution.x,
+            target_y: solution.y,
+        });
+        result.materialized[i] = true;
+        remaining[i] = source_ships - send;
+    }
+    result
+}
+
 fn ships_to_send(remaining: i32, frac: f64) -> i32 {
     if remaining < 2 {
         return 0;
@@ -4220,6 +5732,26 @@ fn lead_solution_cached_with_speed(
     target: &TargetMotion,
     speed: f64,
 ) -> Option<LeadSolution> {
+    if speed <= 0.0 {
+        return None;
+    }
+    if !target.is_orbiting {
+        let dx = target.x - source.x;
+        let dy = target.y - source.y;
+        let distance = (dx * dx + dy * dy).sqrt();
+        if distance / speed > LEAD_T_HORIZON_STEPS {
+            return None;
+        }
+        let offset = (source.radius + 0.1).max(0.0);
+        return Some(LeadSolution {
+            angle: dy.atan2(dx),
+            time: ((distance - offset - target.radius).max(0.0) / speed)
+                .ceil()
+                .max(1.0),
+            x: target.x,
+            y: target.y,
+        });
+    }
     let mut solution =
         lead_solution_from_point_cached_with_speed(source.x, source.y, target, speed)?;
     let mut angle = solution.angle;
@@ -4447,9 +5979,9 @@ fn route_clear_to_solution(
     if !inside_board(start.0, start.1) || !inside_board(final_point.0, final_point.1) {
         return false;
     }
-    if point_to_segment_distance_sq_local((CENTER, CENTER), start, final_point)
-        < SUN_RADIUS * SUN_RADIUS
-    {
+    let center_path_dist_sq =
+        point_to_segment_distance_sq_local((CENTER, CENTER), start, final_point);
+    if center_path_dist_sq < SUN_RADIUS * SUN_RADIUS {
         return false;
     }
 
@@ -4528,9 +6060,9 @@ fn route_clear_to_solution_with_cols(
     if !inside_board(start.0, start.1) || !inside_board(final_point.0, final_point.1) {
         return false;
     }
-    if point_to_segment_distance_sq_local((CENTER, CENTER), start, final_point)
-        < SUN_RADIUS * SUN_RADIUS
-    {
+    let center_path_dist_sq =
+        point_to_segment_distance_sq_local((CENTER, CENTER), start, final_point);
+    if center_path_dist_sq < SUN_RADIUS * SUN_RADIUS {
         return false;
     }
 
@@ -4573,6 +6105,103 @@ fn route_clear_to_solution_with_cols(
             if motion.id == target_id {
                 continue;
             }
+            let pos = motion_position_at(motion, turn - 1);
+            if motion.id != source_id
+                && point_to_segment_distance_sq_local(pos, old, new) < motion.radius_sq
+            {
+                return false;
+            }
+            if turn < final_turn {
+                let next_pos = motion_position_at(motion, turn);
+                if point_to_segment_distance_sq_local(new, pos, next_pos) < motion.radius_sq {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn route_clear_to_solution_with_target_blocker_cols(
+    source_id: i32,
+    source_x: f64,
+    source_y: f64,
+    source_radius: f64,
+    solution: &LeadSolution,
+    speed: f64,
+    blockers: &[Option<TargetMotion>],
+    static_cols: &[usize],
+    moving_cols: &[usize],
+) -> bool {
+    if speed <= 0.0 {
+        return false;
+    }
+    let offset = (source_radius + 0.1).max(0.0);
+    let dir_x = solution.angle.cos();
+    let dir_y = solution.angle.sin();
+    let start = (source_x + dir_x * offset, source_y + dir_y * offset);
+    let final_turn = (solution.time.ceil() as usize).max(1);
+    let final_point = (
+        start.0 + dir_x * speed * final_turn as f64,
+        start.1 + dir_y * speed * final_turn as f64,
+    );
+    if !inside_board(start.0, start.1) || !inside_board(final_point.0, final_point.1) {
+        return false;
+    }
+    let center_path_dist_sq =
+        point_to_segment_distance_sq_local((CENTER, CENTER), start, final_point);
+    if center_path_dist_sq < SUN_RADIUS * SUN_RADIUS {
+        return false;
+    }
+
+    for &idx in static_cols {
+        let Some(motion) = blockers[idx].as_ref() else {
+            continue;
+        };
+        if motion.id == source_id {
+            continue;
+        }
+        if point_to_segment_distance_sq_local((motion.x, motion.y), start, final_point)
+            < motion.radius_sq
+        {
+            return false;
+        }
+    }
+    if moving_cols.is_empty() {
+        return true;
+    }
+    let mut relevant_moving_cols = [0_usize; MAX_PLANETS];
+    let mut relevant_moving_len = 0_usize;
+    for &idx in moving_cols {
+        let Some(motion) = blockers[idx].as_ref() else {
+            continue;
+        };
+        let reach = motion.orbit_radius + motion.radius;
+        if center_path_dist_sq > reach * reach {
+            continue;
+        }
+        if relevant_moving_len < relevant_moving_cols.len() {
+            relevant_moving_cols[relevant_moving_len] = idx;
+            relevant_moving_len += 1;
+        }
+    }
+    if relevant_moving_len == 0 {
+        return true;
+    }
+
+    for turn in 1..=final_turn {
+        let old = (
+            start.0 + dir_x * speed * (turn - 1) as f64,
+            start.1 + dir_y * speed * (turn - 1) as f64,
+        );
+        let new = (
+            start.0 + dir_x * speed * turn as f64,
+            start.1 + dir_y * speed * turn as f64,
+        );
+        for &idx in &relevant_moving_cols[..relevant_moving_len] {
+            let Some(motion) = blockers[idx].as_ref() else {
+                continue;
+            };
             let pos = motion_position_at(motion, turn - 1);
             if motion.id != source_id
                 && point_to_segment_distance_sq_local(pos, old, new) < motion.radius_sq

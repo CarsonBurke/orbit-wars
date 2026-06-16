@@ -63,9 +63,11 @@ from torch.utils.tensorboard import SummaryWriter
 from ..policies.config import OrbitPolicyConfig
 from ..policies.features import (
     MAX_PLANETS,
+    PLANET_INBOUND_FEAT_DIM,
     EncodedObs,
     bucket_fleet_width,
     encode_raw_observations,
+    planet_inbound_feats_or_empty,
 )
 from ..policies.model import normalize_matrices
 from ..policies.sac_model import (
@@ -120,15 +122,15 @@ class SACBatch:
 
     feats: EncodedObs
     next_feats: EncodedObs
-    launch: torch.Tensor               # [B, P] float 0/1
-    target_idx: torch.Tensor           # [B, P] int64
-    fraction: torch.Tensor             # [B, P] float
-    target_legal_mask: torch.Tensor    # [B, P, P] bool — legal support at s
+    launch: torch.Tensor  # [B, P] float 0/1
+    target_idx: torch.Tensor  # [B, P] int64
+    fraction: torch.Tensor  # [B, P] float
+    target_legal_mask: torch.Tensor  # [B, P, P] bool — legal support at s
     next_target_legal_mask: torch.Tensor  # [B, P, P] bool — legal support at s'
-    reward: torch.Tensor               # [B]
-    done: torch.Tensor                 # [B] float (0/1)
-    time: torch.Tensor                 # [B] game-clock ∈ [0,1] at s (FiLM cond)
-    next_time: torch.Tensor            # [B] game-clock ∈ [0,1] at s'
+    reward: torch.Tensor  # [B]
+    done: torch.Tensor  # [B] float (0/1)
+    time: torch.Tensor  # [B] game-clock ∈ [0,1] at s (FiLM cond)
+    next_time: torch.Tensor  # [B] game-clock ∈ [0,1] at s'
 
 
 class ReplayBuffer:
@@ -161,8 +163,10 @@ class ReplayBuffer:
             raise ValueError("capacity must be positive")
         self.capacity = int(capacity)
         self.device = torch.device(device)
-        self.fleet_cap = 1
+        self.fleet_cap = 0
         self.has_fleet_targets = False
+        self.has_planet_inbound = False
+        self.planet_inbound_mode: bool | None = None
         f32 = torch.float32
         i64 = torch.int64
 
@@ -192,19 +196,18 @@ class ReplayBuffer:
                 "fleet_target_planet_idx": torch.full(
                     (capacity, self.fleet_cap), -1, dtype=i64, device=self.device
                 ),
+                "planet_inbound_feats": torch.zeros(
+                    (capacity, MAX_PLANETS, PLANET_INBOUND_FEAT_DIM),
+                    dtype=f32,
+                    device=self.device,
+                ),
             }
 
         self.state = state_block()
         self.next_state = state_block()
-        self.launch = torch.zeros(
-            (capacity, MAX_PLANETS), dtype=f32, device=self.device
-        )
-        self.target_idx = torch.zeros(
-            (capacity, MAX_PLANETS), dtype=i64, device=self.device
-        )
-        self.fraction = torch.zeros(
-            (capacity, MAX_PLANETS), dtype=f32, device=self.device
-        )
+        self.launch = torch.zeros((capacity, MAX_PLANETS), dtype=f32, device=self.device)
+        self.target_idx = torch.zeros((capacity, MAX_PLANETS), dtype=i64, device=self.device)
+        self.fraction = torch.zeros((capacity, MAX_PLANETS), dtype=f32, device=self.device)
         self.target_legal_mask = torch.zeros(
             (capacity, MAX_PLANETS, MAX_PLANETS), dtype=torch.bool, device=self.device
         )
@@ -223,7 +226,7 @@ class ReplayBuffer:
         return self.size
 
     def _ensure_fleet_capacity(self, width: int) -> None:
-        width = max(1, int(width))
+        width = max(0, int(width))
         if width <= self.fleet_cap:
             return
         old = self.fleet_cap
@@ -270,22 +273,38 @@ class ReplayBuffer:
                 raise ValueError(f"{name} expected {want_dim}D, got {tuple(t.shape)}")
             return t
 
+        def _effective_fleet_width(s: EncodedObs, name: str) -> int:
+            if s.planet_inbound_feats is not None:
+                return 0
+            return int(_check_unbatched(s.fleet_feats, name, 2).shape[0])
+
+        uses_planet_inbound = feats.planet_inbound_feats is not None
+        if uses_planet_inbound != (next_feats.planet_inbound_feats is not None):
+            raise ValueError(
+                "SAC replay transitions must use the same planet_inbound_feats "
+                "mode for current and next observations"
+            )
+        if self.planet_inbound_mode is not None and (
+            self.planet_inbound_mode != uses_planet_inbound
+        ):
+            raise ValueError(
+                "SAC replay cannot mix planet-inbound summary observations with "
+                "raw fleet-token observations"
+            )
+
         self._ensure_fleet_capacity(
             max(
-                int(_check_unbatched(feats.fleet_feats, "fleet_feats", 2).shape[0]),
-                int(
-                    _check_unbatched(
-                        next_feats.fleet_feats,
-                        "next_fleet_feats",
-                        2,
-                    ).shape[0]
-                ),
+                _effective_fleet_width(feats, "fleet_feats"),
+                _effective_fleet_width(next_feats, "next_fleet_feats"),
             )
         )
         self.has_fleet_targets |= (
             feats.fleet_target_planet_idx is not None
             or next_feats.fleet_target_planet_idx is not None
         )
+        if self.planet_inbound_mode is None:
+            self.planet_inbound_mode = uses_planet_inbound
+        self.has_planet_inbound = bool(self.planet_inbound_mode)
 
         def _write_state(block: dict[str, torch.Tensor], s: EncodedObs) -> None:
             block["planet_feats"][idx].copy_(
@@ -297,14 +316,10 @@ class ReplayBuffer:
                 _check_unbatched(s.planet_mask, "planet_mask", 1).to(self.device)
             )
             block["planet_owned_mask"][idx].copy_(
-                _check_unbatched(s.planet_owned_mask, "planet_owned_mask", 1).to(
-                    self.device
-                )
+                _check_unbatched(s.planet_owned_mask, "planet_owned_mask", 1).to(self.device)
             )
             block["planet_ids"][idx].copy_(
-                _check_unbatched(s.planet_ids, "planet_ids", 1).to(
-                    self.device, dtype=torch.int64
-                )
+                _check_unbatched(s.planet_ids, "planet_ids", 1).to(self.device, dtype=torch.int64)
             )
             block["planet_garrison"][idx].copy_(
                 _check_unbatched(s.planet_garrison, "planet_garrison", 1).to(
@@ -314,16 +329,15 @@ class ReplayBuffer:
             fleet_feats = _check_unbatched(s.fleet_feats, "fleet_feats", 2).to(
                 self.device, dtype=torch.float32
             )
-            fleet_mask = _check_unbatched(s.fleet_mask, "fleet_mask", 1).to(
-                self.device
-            )
-            fleet_width = int(fleet_feats.shape[0])
+            fleet_mask = _check_unbatched(s.fleet_mask, "fleet_mask", 1).to(self.device)
+            fleet_width = 0 if s.planet_inbound_feats is not None else int(fleet_feats.shape[0])
             block["fleet_feats"][idx].zero_()
             block["fleet_mask"][idx].zero_()
             block["fleet_target_planet_idx"][idx].fill_(-1)
+            block["planet_inbound_feats"][idx].zero_()
             if fleet_width:
-                block["fleet_feats"][idx, :fleet_width].copy_(fleet_feats)
-                block["fleet_mask"][idx, :fleet_width].copy_(fleet_mask)
+                block["fleet_feats"][idx, :fleet_width].copy_(fleet_feats[:fleet_width])
+                block["fleet_mask"][idx, :fleet_width].copy_(fleet_mask[:fleet_width])
                 if s.fleet_target_planet_idx is not None:
                     targets = _check_unbatched(
                         s.fleet_target_planet_idx,
@@ -335,6 +349,14 @@ class ReplayBuffer:
                         block["fleet_target_planet_idx"][idx, :target_width].copy_(
                             targets[:target_width]
                         )
+            if s.planet_inbound_feats is not None:
+                block["planet_inbound_feats"][idx].copy_(
+                    _check_unbatched(
+                        s.planet_inbound_feats,
+                        "planet_inbound_feats",
+                        2,
+                    ).to(self.device, dtype=torch.float32)
+                )
 
         _write_state(self.state, feats)
         _write_state(self.next_state, next_feats)
@@ -342,22 +364,16 @@ class ReplayBuffer:
             _check_unbatched(launch, "launch", 1).to(self.device, dtype=torch.float32)
         )
         self.target_idx[idx].copy_(
-            _check_unbatched(target_idx, "target_idx", 1).to(
-                self.device, dtype=torch.int64
-            )
+            _check_unbatched(target_idx, "target_idx", 1).to(self.device, dtype=torch.int64)
         )
         self.fraction[idx].copy_(
-            _check_unbatched(fraction, "fraction", 1).to(
-                self.device, dtype=torch.float32
-            )
+            _check_unbatched(fraction, "fraction", 1).to(self.device, dtype=torch.float32)
         )
         self.target_legal_mask[idx].copy_(
             _check_unbatched(target_legal_mask, "target_legal_mask", 2).to(self.device)
         )
         self.next_target_legal_mask[idx].copy_(
-            _check_unbatched(
-                next_target_legal_mask, "next_target_legal_mask", 2
-            ).to(self.device)
+            _check_unbatched(next_target_legal_mask, "next_target_legal_mask", 2).to(self.device)
         )
         self.reward[idx] = float(reward)
         self.done[idx] = float(bool(done))
@@ -375,12 +391,8 @@ class ReplayBuffer:
         non_blocking: bool = False,
     ) -> SACBatch:
         if self.size < batch_size:
-            raise ValueError(
-                f"requested batch_size {batch_size} > buffer size {self.size}"
-            )
-        idx = torch.randint(
-            0, self.size, (batch_size,), dtype=torch.long, device=self.device
-        )
+            raise ValueError(f"requested batch_size {batch_size} > buffer size {self.size}")
+        idx = torch.randint(0, self.size, (batch_size,), dtype=torch.long, device=self.device)
         out_device = torch.device(device)
         # CPU→CUDA: route the gathered rows through pinned host memory so the H2D
         # is true DMA and `non_blocking` actually overlaps (the copy source must
@@ -409,6 +421,9 @@ class ReplayBuffer:
                 fleet_mask=_move(block["fleet_mask"]),
                 fleet_target_planet_idx=_move(block["fleet_target_planet_idx"])
                 if self.has_fleet_targets
+                else None,
+                planet_inbound_feats=_move(block["planet_inbound_feats"])
+                if self.has_planet_inbound
                 else None,
             )
 
@@ -448,6 +463,8 @@ def _record_batch_stream(batch: SACBatch, stream: torch.cuda.Stream) -> None:
         _rec(obs.fleet_mask)
         if obs.fleet_target_planet_idx is not None:
             _rec(obs.fleet_target_planet_idx)
+        if obs.planet_inbound_feats is not None:
+            _rec(obs.planet_inbound_feats)
     for t in (
         batch.launch,
         batch.target_idx,
@@ -484,9 +501,7 @@ class _ReplayPrefetcher:
     throughput and correctness on a GPU before relying on the overlap.
     """
 
-    def __init__(
-        self, replay: ReplayBuffer, batch_size: int, device: torch.device
-    ) -> None:
+    def __init__(self, replay: ReplayBuffer, batch_size: int, device: torch.device) -> None:
         self._replay = replay
         self._batch_size = batch_size
         self._device = device
@@ -550,11 +565,11 @@ class SACUpdateOutput:
     qf1_value: float
     qf2_value: float
     qf_grad_norm: float
-    boot_value: float          # hard (entropy-free) bootstrap value, real units
+    boot_value: float  # hard (entropy-free) bootstrap value, real units
     boot_entropy_bonus: float  # entropy contribution to the soft target, real units
-    explained_var: float       # EV of taken-Q vs bootstrap target (critic health)
-    adv_explained_var: float   # EV of the action-dependent advantage vs target residual
-    adv_spread: float          # std of the decoded advantage contribution (real units)
+    explained_var: float  # EV of taken-Q vs bootstrap target (critic health)
+    adv_explained_var: float  # EV of the action-dependent advantage vs target residual
+    adv_spread: float  # std of the decoded advantage contribution (real units)
     alpha_disc: float
     alpha_cont: float
     # Actor-side metrics; `None` on a logging tick where no actor update ran
@@ -563,11 +578,11 @@ class SACUpdateOutput:
     actor_grad_norm: float | None
     alpha_disc_loss: float | None
     alpha_cont_loss: float | None
-    h_disc_mean: float | None          # achieved discrete entropy, summed over owned (batch mean)
-    h_disc_per_planet: float | None    # achieved per-owned-planet discrete entropy
-    target_h_disc: float | None        # per-owned-planet target entropy α_disc drives toward
-    logp_frac_mean: float | None       # p-weighted Σ g·p·logp_frac (= -H_cont)
-    target_h_cont: float | None        # launch-mass-scaled target entropy α_cont drives toward
+    h_disc_mean: float | None  # achieved discrete entropy, summed over owned (batch mean)
+    h_disc_per_planet: float | None  # achieved per-owned-planet discrete entropy
+    target_h_disc: float | None  # per-owned-planet target entropy α_disc drives toward
+    logp_frac_mean: float | None  # p-weighted Σ g·p·logp_frac (= -H_cont)
+    target_h_cont: float | None  # launch-mass-scaled target entropy α_cont drives toward
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +617,7 @@ def _encoded_args(feats: EncodedObs) -> tuple[torch.Tensor, ...]:
         feats.fleet_feats,
         feats.fleet_mask,
         fleet_targets,
+        planet_inbound_feats_or_empty(feats),
     )
 
 
@@ -618,6 +634,9 @@ def _encoded_row(feats: EncodedObs, i: int) -> EncodedObs:
         fleet_target_planet_idx=None
         if feats.fleet_target_planet_idx is None
         else feats.fleet_target_planet_idx[i],
+        planet_inbound_feats=None
+        if feats.planet_inbound_feats is None
+        else feats.planet_inbound_feats[i],
     )
 
 
@@ -630,6 +649,7 @@ def _encoded_from_args(
     fleet_feats: torch.Tensor,
     fleet_mask: torch.Tensor,
     fleet_target_planet_idx: torch.Tensor,
+    planet_inbound_feats: torch.Tensor,
 ) -> EncodedObs:
     return EncodedObs(
         planet_feats=planet_feats,
@@ -640,6 +660,7 @@ def _encoded_from_args(
         fleet_feats=fleet_feats,
         fleet_mask=fleet_mask,
         fleet_target_planet_idx=fleet_target_planet_idx,
+        planet_inbound_feats=planet_inbound_feats,
     )
 
 
@@ -725,6 +746,7 @@ class _SACQKernel(torch.nn.Module):
         ff: torch.Tensor,
         fm: torch.Tensor,
         fti: torch.Tensor,
+        pif: torch.Tensor,
         npf: torch.Tensor,
         npm: torch.Tensor,
         npom: torch.Tensor,
@@ -733,6 +755,7 @@ class _SACQKernel(torch.nn.Module):
         nff: torch.Tensor,
         nfm: torch.Tensor,
         nfti: torch.Tensor,
+        npif: torch.Tensor,
         launch: torch.Tensor,
         target_idx: torch.Tensor,
         fraction: torch.Tensor,
@@ -745,8 +768,8 @@ class _SACQKernel(torch.nn.Module):
         alpha_d: torch.Tensor,
         alpha_c: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm, fti)
-        next_feats = _encoded_from_args(npf, npm, npom, npid, npg, nff, nfm, nfti)
+        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm, fti, pif)
+        next_feats = _encoded_from_args(npf, npm, npom, npid, npg, nff, nfm, nfti, npif)
         gate = (feats.planet_owned_mask & feats.planet_mask).float()
         next_gate = (next_feats.planet_owned_mask & next_feats.planet_mask).float()
 
@@ -764,9 +787,7 @@ class _SACQKernel(torch.nn.Module):
                 q_next_twin = []
                 v_only_next_twin = []  # V' alone (no advantage), diagnostic only
                 for qt in (self.qf1_target, self.qf2_target):
-                    comp = qt.components(
-                        next_feats, next_action.fraction, time_feat=next_time
-                    )
+                    comp = qt.components(next_feats, next_action.fraction, time_feat=next_time)
                     v_next = qt.bins_to_scalar(comp.nV)
                     adv_next = expected_advantage(
                         comp,
@@ -831,9 +852,7 @@ class _SACQKernel(torch.nn.Module):
         # critic that tracks state-conditional value approaches 1. This is the
         # decisive health check for the value-scale / observability fix.
         q1_full = v1 + adv1
-        explained_var = (
-            1.0 - (y_f - q1_full).var() / y_f.var().clamp_min(1e-8)
-        ).detach()
+        explained_var = (1.0 - (y_f - q1_full).var() / y_f.var().clamp_min(1e-8)).detach()
         # Advantage EV: does the critic's ACTION-DEPENDENT part explain the
         # action-relevant residual of the target, or is `explained_var` above just
         # the critic predicting its own (action-independent) state value? adv_contrib
@@ -905,33 +924,28 @@ class _SACActorKernel(torch.nn.Module):
         ff: torch.Tensor,
         fm: torch.Tensor,
         fti: torch.Tensor,
+        pif: torch.Tensor,
         legal: torch.Tensor,
         time: torch.Tensor,
         alpha_d: torch.Tensor,
         alpha_c: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm, fti)
+        feats = _encoded_from_args(pf, pm, pom, pid, pg, ff, fm, fti, pif)
         gate = (feats.planet_owned_mask & feats.planet_mask).float()
 
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
-            action = self.actor.get_action(
-                feats, legal, deterministic=False, time_feat=time
-            )
+            action = self.actor.get_action(feats, legal, deterministic=False, time_feat=time)
             adv_per_twin = []
             for qf in (self.qf1, self.qf2):
                 comp = qf.components(feats, action.fraction, time_feat=time)
                 # nA0 detached (no-launch baseline), nAL live (pathwise fraction
                 # grad). nV is unused by the scalar advantage — the actor ascends
                 # `adv`, the action-dependent part of Q; V is the fixed baseline.
-                comp_actor = QComponents(
-                    nV=comp.nV.detach(), nA0=comp.nA0.detach(), nAL=comp.nAL
-                )
+                comp_actor = QComponents(nV=comp.nV.detach(), nA0=comp.nA0.detach(), nAL=comp.nAL)
                 adv_per_twin.append(
-                    expected_advantage(
-                        comp_actor, action.launch_p, action.target_probs, gate
-                    )
+                    expected_advantage(comp_actor, action.launch_p, action.target_probs, gate)
                 )
         # Pessimistic over twins on the SCALAR advantage (the action-dependent part
         # of Q; the V baseline contributes no policy gradient). adv is in real
@@ -950,9 +964,7 @@ class _SACActorKernel(torch.nn.Module):
         )
 
 
-def _clip_optimizer_grads(
-    optimizer: torch.optim.Optimizer, grad_clip: float
-) -> torch.Tensor:
+def _clip_optimizer_grads(optimizer: torch.optim.Optimizer, grad_clip: float) -> torch.Tensor:
     """Clip the optimizer's grad-norm to `grad_clip` (no clip when ≤0) and return
     the PRE-clip total L2 norm.
 
@@ -980,11 +992,11 @@ class _QStats:
     qf1_value: torch.Tensor
     qf2_value: torch.Tensor
     grad_norm: torch.Tensor
-    boot_value: torch.Tensor          # hard (entropy-free) bootstrap value, real units
+    boot_value: torch.Tensor  # hard (entropy-free) bootstrap value, real units
     boot_entropy_bonus: torch.Tensor  # entropy contribution to soft_v_next, real units
-    explained_var: torch.Tensor       # EV of taken-Q vs bootstrap target (critic health)
-    adv_explained_var: torch.Tensor   # EV of the action-dependent advantage vs target residual
-    adv_spread: torch.Tensor          # std of the decoded advantage contribution (real units)
+    explained_var: torch.Tensor  # EV of taken-Q vs bootstrap target (critic health)
+    adv_explained_var: torch.Tensor  # EV of the action-dependent advantage vs target residual
+    adv_spread: torch.Tensor  # std of the decoded advantage contribution (real units)
 
 
 @dataclass
@@ -995,11 +1007,13 @@ class _ActorStats:
     alpha_disc_loss: torch.Tensor
     alpha_cont_loss: torch.Tensor
     grad_norm: torch.Tensor
-    h_disc: torch.Tensor             # achieved discrete entropy, summed over owned (batch mean)
-    h_disc_per_planet: torch.Tensor  # achieved per-owned-planet discrete entropy (α_disc target quantity)
-    target_h_disc: torch.Tensor      # per-owned-planet target entropy α_disc drives toward
-    cont_logp: torch.Tensor          # p-weighted Σ g·p·logp_frac (= -H_cont)
-    target_h_cont: torch.Tensor      # launch-mass-scaled target entropy α_cont drives toward
+    h_disc: torch.Tensor  # achieved discrete entropy, summed over owned (batch mean)
+    h_disc_per_planet: (
+        torch.Tensor
+    )  # achieved per-owned-planet discrete entropy (α_disc target quantity)
+    target_h_disc: torch.Tensor  # per-owned-planet target entropy α_disc drives toward
+    cont_logp: torch.Tensor  # p-weighted Σ g·p·logp_frac (= -H_cont)
+    target_h_cont: torch.Tensor  # launch-mass-scaled target entropy α_cont drives toward
 
 
 def _q_step(
@@ -1369,6 +1383,9 @@ def _encoded_to(feats: EncodedObs, device: torch.device | str) -> EncodedObs:
         fleet_target_planet_idx=None
         if feats.fleet_target_planet_idx is None
         else feats.fleet_target_planet_idx.to(device),
+        planet_inbound_feats=None
+        if feats.planet_inbound_feats is None
+        else feats.planet_inbound_feats.to(device),
     )
 
 
@@ -1442,9 +1459,7 @@ def _sample_actions_with_records(
             out, contexts, deterministic=deterministic
         )
         return actions, _records_to_cpu_list(records)
-    actions, records = sample_batch_with_records_raw(
-        out, obs, deterministic=deterministic
-    )
+    actions, records = sample_batch_with_records_raw(out, obs, deterministic=deterministic)
     return actions, _records_to_cpu_list(records)
 
 
@@ -1513,12 +1528,8 @@ def _build_state(cfg: RunConfig, device: torch.device) -> SACState:
         dtype=torch.float32,
         requires_grad=True,
     )
-    alpha_disc_optimizer = torch.optim.Adam(
-        [log_alpha_disc], lr=sac.alpha_discrete_lr
-    )
-    alpha_cont_optimizer = torch.optim.Adam(
-        [log_alpha_cont], lr=sac.alpha_continuous_lr
-    )
+    alpha_disc_optimizer = torch.optim.Adam([log_alpha_disc], lr=sac.alpha_discrete_lr)
+    alpha_cont_optimizer = torch.optim.Adam([log_alpha_cont], lr=sac.alpha_continuous_lr)
 
     run_dir = Path(cfg.run.log_root) / cfg.run.name / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1706,9 +1717,7 @@ def _run_updates(
         # Target polyak per cleanrl cadence (once every target_network_frequency
         # critic updates, NOT once per tick).
         if learn_step % sac.target_network_frequency == 0:
-            _target_step(
-                state.qf1, state.qf2, state.qf1_target, state.qf2_target, sac.tau
-            )
+            _target_step(state.qf1, state.qf2, state.qf1_target, state.qf2_target, sac.tau)
 
     # Materialize metrics to CPU only on logging ticks (the one place we sync).
     if tick % sac.log_metrics_every == 0 and q_stats is not None:
@@ -1727,8 +1736,7 @@ def train(cfg: RunConfig) -> None:
     sac = cfg.sac
     if cfg.game.num_players != 2:
         raise NotImplementedError(
-            "SAC test branch supports 2-player games only; got num_players="
-            f"{cfg.game.num_players}"
+            f"SAC test branch supports 2-player games only; got num_players={cfg.game.num_players}"
         )
     device = torch.device(cfg.run.device)
     if device.type == "cuda":
@@ -1761,12 +1769,8 @@ def train(cfg: RunConfig) -> None:
     # Compiled + autocast(bf16) actor-heads kernel for batched rollout inference
     # (FA-2 via SDPA on CUDA; eager identity on CPU). Same knob PPO uses.
     compile_mode = cfg.run.compile_mode or None
-    heads_kernel = get_sac_heads_kernel(
-        state.actor, device=device, compile_mode=compile_mode
-    )
-    include_fleet_targets = (
-        state.actor.cfg.encoder_backend == "destination_conditioned"
-    )
+    heads_kernel = get_sac_heads_kernel(state.actor, device=device, compile_mode=compile_mode)
+    include_fleet_targets = state.actor.cfg.encoder_backend == "destination_conditioned"
 
     def production_margin(obs: Any, seat: int) -> float:
         return _obs_production_margin(obs, seat, num_players)
@@ -1823,15 +1827,13 @@ def train(cfg: RunConfig) -> None:
             # so stored (launch, target_idx, fraction, mask) and executed moves
             # always agree.
             learner_rows = [(e, learner_seat[e]) for e in range(num_envs)]
-            learner_obs, learner_enc, learner_contexts, learner_time = (
-                _policy_inputs_for_rows(
-                    vec,
-                    states,
-                    learner_rows,
-                    episode_steps=cfg.game.episode_steps,
-                    device=device,
-                    include_fleet_targets=include_fleet_targets,
-                )
+            learner_obs, learner_enc, learner_contexts, learner_time = _policy_inputs_for_rows(
+                vec,
+                states,
+                learner_rows,
+                episode_steps=cfg.game.episode_steps,
+                device=device,
+                include_fleet_targets=include_fleet_targets,
             )
             learner_out = run_sac_heads(
                 heads_kernel, learner_enc, device=device, time_feat=learner_time
@@ -1848,12 +1850,9 @@ def train(cfg: RunConfig) -> None:
             )
 
             if not warmup:
-                materialize_raw_sum += sum(
-                    float(r.raw_launch.sum()) for r in learner_records
-                )
+                materialize_raw_sum += sum(float(r.raw_launch.sum()) for r in learner_records)
                 materialize_gap_sum += sum(
-                    float(r.raw_launch.sum() - r.launch.sum())
-                    for r in learner_records
+                    float(r.raw_launch.sum() - r.launch.sum()) for r in learner_records
                 )
                 materialize_log_tick += 1
                 if materialize_log_tick >= sac.log_metrics_every:
@@ -1889,14 +1888,10 @@ def train(cfg: RunConfig) -> None:
                     device=device,
                     include_fleet_targets=include_fleet_targets,
                 )
-                opp_out = run_sac_heads(
-                    heads_kernel, opp_enc, device=device, time_feat=opp_time
-                )
+                opp_out = run_sac_heads(heads_kernel, opp_enc, device=device, time_feat=opp_time)
                 if opp_contexts is not None:
-                    sampled_opp_actions, _opp_records = (
-                        sample_batch_with_records_context(
-                            opp_out, opp_contexts, deterministic=False, record_rows=[]
-                        )
+                    sampled_opp_actions, _opp_records = sample_batch_with_records_context(
+                        opp_out, opp_contexts, deterministic=False, record_rows=[]
                     )
                 else:
                     sampled_opp_actions = sample_batch_actions_raw(
@@ -1950,6 +1945,8 @@ def train(cfg: RunConfig) -> None:
                 next_contexts,
                 deterministic=False,
             )
+            learner_time_values = learner_time.detach().to("cpu").tolist()
+            next_learner_time_values = next_learner_time.detach().to("cpu").tolist()
 
             # ---- reward, terminal flag, replay insert, episode logging ----
             for e in range(num_envs):
@@ -1959,9 +1956,7 @@ def train(cfg: RunConfig) -> None:
                 # Φ = own_production − max_opponent_production — non-zero exactly
                 # on capture/loss events, so credit lands on the action that
                 # caused the swing. See `_obs_production_margin`.
-                cur_prod_margin = production_margin(
-                    next_learner_obs[e], learner_seat[e]
-                )
+                cur_prod_margin = production_margin(next_learner_obs[e], learner_seat[e])
                 step_reward = cfg.reward.potential_weight * (
                     cur_prod_margin - previous_prod_margin[e]
                 )
@@ -1980,17 +1975,16 @@ def train(cfg: RunConfig) -> None:
 
                 if dones[e]:
                     opp_name = opponents[e][0]
-                    seat_scores = [
-                        float(getattr(s, "score", s.reward or 0.0))
-                        for s in finals[e]
-                    ]
+                    seat_scores = [float(getattr(s, "score", s.reward or 0.0)) for s in finals[e]]
                     ours = seat_scores[learner_seat[e]]
                     theirs = seat_scores[opp_seat[e]]
                     won = ours > theirs
                     drawn = ours == theirs
                     outcome = (
-                        cfg.reward.win_value if won
-                        else cfg.reward.draw_value if drawn
+                        cfg.reward.win_value
+                        if won
+                        else cfg.reward.draw_value
+                        if drawn
                         else cfg.reward.loss_value
                     )
                     margin = ours - theirs
@@ -2006,20 +2000,12 @@ def train(cfg: RunConfig) -> None:
                     # Distinct x per finishing env within this tick's step range.
                     log_step = global_step + e
                     return_total = episode_return[e] + step_reward
-                    state.writer.add_scalar(
-                        "episode/return", return_total, log_step
-                    )
-                    state.writer.add_scalar(
-                        "charts/episodic_return", return_total, log_step
-                    )
-                    state.writer.add_scalar(
-                        "charts/episodic_length", episode_length[e], log_step
-                    )
+                    state.writer.add_scalar("episode/return", return_total, log_step)
+                    state.writer.add_scalar("charts/episodic_return", return_total, log_step)
+                    state.writer.add_scalar("charts/episodic_length", episode_length[e], log_step)
                     state.writer.add_scalar("episode/win_rate", float(won), log_step)
                     state.writer.add_scalar("episode/margin", margin, log_step)
-                    state.writer.add_scalar(
-                        f"winrate/{opp_name}", float(won), log_step
-                    )
+                    state.writer.add_scalar(f"winrate/{opp_name}", float(won), log_step)
                     state.writer.add_scalar(
                         f"winrate_cumulative/{opp_name}",
                         wins_vs[opp_name] / n_vs,
@@ -2059,8 +2045,8 @@ def train(cfg: RunConfig) -> None:
                     step_reward,
                     terminal,
                     _encoded_row(next_learner_enc, e),
-                    float(learner_time[e].item()),
-                    float(next_learner_time[e].item()),
+                    float(learner_time_values[e]),
+                    float(next_learner_time_values[e]),
                 )
                 episode_return[e] += step_reward
 

@@ -86,11 +86,11 @@ class OrbitPolicyConfig:
     # and are masked at episode tails.
     value_hidden: int = 64
     value_num_bins: int = 153
-    value_sigma_to_bin_ratio: float = 0.5
+    value_sigma_to_bin_ratio: float = 2.0
     critic_mtp_horizon: int = 6
-    value_min: float = -100_000.0
-    value_max: float = 100_000.0
-    value_symlog: bool = True
+    value_min: float = -64.0
+    value_max: float = 64.0
+    value_symlog: bool = False
     # Real-units bound on the per-planet SAC advantage heads: each head emits
     # `adv_scale·tanh(raw/adv_scale)`, so a single planet's launch/no-launch
     # advantage is confined to ±adv_scale ship-margin units and the summed

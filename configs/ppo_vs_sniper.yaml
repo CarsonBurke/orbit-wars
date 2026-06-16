@@ -8,7 +8,7 @@
 #     minibatch advantage normalization.
 #   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
-#   - Distributional value head (symlog HL-Gauss CE on ±100k raw margin / 153 bins), unclipped.
+#   - Distributional value head (linear HL-Gauss CE on normalized returns / 153 bins), unclipped.
 
 run:
   name: ppo_vs_sniper
@@ -43,12 +43,12 @@ model:
   encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
-  value_min: -100000.0
-  value_max: 100000.0
+  value_min: -64.0
+  value_max: 64.0
   value_num_bins: 153
   value_sigma_to_bin_ratio: 2.0
   critic_mtp_horizon: 6
-  value_symlog: true
+  value_symlog: false
   action_logit_softcap: 8.0
 
 optim:
@@ -89,6 +89,8 @@ ppo:
   value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
 
   target_entropy_coef: 0.0      # no explicit entropy bonus; exploration comes from stochastic sampling
+  critic_return_norm: discounted_return_rms
+  critic_return_norm_clip: 10.0
   fraction_entropy_coef: 0.0
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`

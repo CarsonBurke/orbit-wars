@@ -23,8 +23,8 @@ the encoded batch so destination-conditioned attention has no fixed fleet cap.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -45,6 +45,7 @@ MAX_PLANETS: int = 64
 FLEET_WIDTH_BUCKETS: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048)
 PLANET_FEAT_DIM: int = 19
 FLEET_FEAT_DIM: int = 20
+PLANET_INBOUND_FEAT_DIM: int = 13
 GLOBAL_PLAYER_SLOTS: int = 4
 GLOBAL_PLAYER_FEATS: int = 5
 GLOBAL_NEUTRAL_FEATS: int = 3
@@ -517,6 +518,7 @@ class EncodedObs:
     fleet_mask: torch.Tensor        # [F_max] bool
     global_feats: torch.Tensor | None = None  # [global_dim] or [B, global_dim]
     fleet_target_planet_idx: torch.Tensor | None = None  # [F_max] or [B, F_max], -1 if none/pad
+    planet_inbound_feats: torch.Tensor | None = None  # [P_max, inbound_dim] or [B, P_max, inbound_dim]
 
     def to(self, device: str | torch.device) -> EncodedObs:
         return EncodedObs(
@@ -533,6 +535,9 @@ class EncodedObs:
             fleet_target_planet_idx=None
             if self.fleet_target_planet_idx is None
             else self.fleet_target_planet_idx.to(device),
+            planet_inbound_feats=None
+            if self.planet_inbound_feats is None
+            else self.planet_inbound_feats.to(device),
         )
 
 
@@ -542,6 +547,18 @@ def fleet_target_planet_idx_or_empty(feats: EncodedObs) -> torch.Tensor:
     if feats.fleet_mask.dim() == 1:
         return feats.fleet_mask.new_empty(0, dtype=torch.long)
     return feats.fleet_mask.new_empty(feats.fleet_mask.shape[0], 0, dtype=torch.long)
+
+
+def planet_inbound_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
+    if feats.planet_inbound_feats is not None:
+        return feats.planet_inbound_feats
+    if feats.planet_feats.dim() == 2:
+        return feats.planet_feats.new_empty(0, PLANET_INBOUND_FEAT_DIM)
+    return feats.planet_feats.new_empty(
+        feats.planet_feats.shape[0],
+        0,
+        PLANET_INBOUND_FEAT_DIM,
+    )
 
 
 def active_fleet_width(fleet_mask: torch.Tensor) -> int:
@@ -589,7 +606,7 @@ def pad_fleet_tensor(
 
 
 def slice_encoded_fleet_width(feats: EncodedObs, width: int) -> EncodedObs:
-    width = max(1, int(width))
+    width = max(0, int(width))
     current = int(feats.fleet_feats.shape[-2])
     if width == current:
         return feats
@@ -629,6 +646,7 @@ def slice_encoded_fleet_width(feats: EncodedObs, width: int) -> EncodedObs:
         fleet_mask=fleet_mask,
         global_feats=feats.global_feats,
         fleet_target_planet_idx=fleet_targets,
+        planet_inbound_feats=feats.planet_inbound_feats,
     )
 
 
@@ -671,6 +689,7 @@ def _fill_encoded_arrays(
     f_feats: np.ndarray,
     f_mask: np.ndarray,
     f_target: np.ndarray | None,
+    planet_inbound: np.ndarray | None,
     row: int | None = None,
 ) -> None:
     if row is None:
@@ -683,6 +702,7 @@ def _fill_encoded_arrays(
         f_feats_r = f_feats
         f_mask_r = f_mask
         f_target_r = f_target
+        planet_inbound_r = planet_inbound
     else:
         g_feats_r = g_feats[row]
         p_feats_r = p_feats[row]
@@ -693,6 +713,7 @@ def _fill_encoded_arrays(
         f_feats_r = f_feats[row]
         f_mask_r = f_mask[row]
         f_target_r = None if f_target is None else f_target[row]
+        planet_inbound_r = None if planet_inbound is None else planet_inbound[row]
 
     comet_motion = _comet_motion_by_id(o)
     planet_pos = {p.id: (p.x, p.y) for p in o.planets}
@@ -717,11 +738,34 @@ def _fill_encoded_arrays(
     for j, f in enumerate(o.fleets[: f_feats_r.shape[0]]):
         f_feats_r[j] = _fleet_features(f, o.player, num_players, planet_pos)
         f_mask_r[j] = True
-    if f_target_r is not None:
+    if f_target_r is not None or planet_inbound_r is not None:
         dest_idx, _eta, status = _infer_fleet_target_planet_idx(o)
-        n = min(len(dest_idx), f_target_r.shape[0])
-        if n:
-            f_target_r[:n] = np.where(status[:n] == 1, dest_idx[:n], -1)
+        summary_feats = f_feats_r
+        summary_mask = f_mask_r
+        if planet_inbound_r is not None and f_feats_r.shape[0] == 0 and o.fleets:
+            summary_feats = np.zeros((len(o.fleets), FLEET_FEAT_DIM), dtype=np.float32)
+            summary_mask = np.zeros(len(o.fleets), dtype=bool)
+            for j, f in enumerate(o.fleets):
+                summary_feats[j] = _fleet_features(f, o.player, num_players, planet_pos)
+                summary_mask[j] = True
+        n = min(len(dest_idx), summary_feats.shape[0])
+        if f_target_r is not None:
+            n_target = min(len(dest_idx), f_target_r.shape[0])
+            if n_target:
+                f_target_r[:n_target] = np.where(
+                    status[:n_target] == 1,
+                    dest_idx[:n_target],
+                    -1,
+                )
+        if planet_inbound_r is not None and n:
+            _fill_planet_inbound_summary(
+                planet_inbound_r,
+                summary_feats,
+                summary_mask,
+                dest_idx[:n],
+                _eta[:n],
+                status[:n],
+            )
 
 
 def _fill_encoded_arrays_raw(
@@ -735,6 +779,7 @@ def _fill_encoded_arrays_raw(
     f_feats: np.ndarray,
     f_mask: np.ndarray,
     f_target: np.ndarray | None,
+    planet_inbound: np.ndarray | None,
     row: int | None = None,
 ) -> None:
     if row is None:
@@ -747,6 +792,7 @@ def _fill_encoded_arrays_raw(
         f_feats_r = f_feats
         f_mask_r = f_mask
         f_target_r = f_target
+        planet_inbound_r = planet_inbound
     else:
         g_feats_r = g_feats[row]
         p_feats_r = p_feats[row]
@@ -757,6 +803,7 @@ def _fill_encoded_arrays_raw(
         f_feats_r = f_feats[row]
         f_mask_r = f_mask[row]
         f_target_r = None if f_target is None else f_target[row]
+        planet_inbound_r = None if planet_inbound is None else planet_inbound[row]
 
     planets = _get_raw(o, "planets", [])
     fleets = _get_raw(o, "fleets", [])
@@ -798,11 +845,130 @@ def _fill_encoded_arrays_raw(
             target_meta,
         )
         f_mask_r[j] = True
-    if f_target_r is not None:
+    if f_target_r is not None or planet_inbound_r is not None:
         dest_idx, _eta, status = _infer_fleet_target_planet_idx_raw(o)
-        n = min(len(dest_idx), f_target_r.shape[0])
-        if n:
-            f_target_r[:n] = np.where(status[:n] == 1, dest_idx[:n], -1)
+        if fleet_targets:
+            if len(dest_idx) != len(fleets):
+                dest_idx = np.full(len(fleets), -1, dtype=np.int64)
+                _eta = np.zeros(len(fleets), dtype=np.float64)
+                status = np.zeros(len(fleets), dtype=np.int64)
+            planet_id_to_col = {
+                int(p[0]): col for col, p in enumerate(planets[:MAX_PLANETS])
+            }
+            for col, f in enumerate(fleets):
+                target_meta = fleet_targets.get(int(f[0]))
+                if target_meta is None or int(f[1]) != player:
+                    continue
+                target_id = int(target_meta[0])
+                exact_dest = planet_id_to_col.get(target_id, -1)
+                if exact_dest >= 0:
+                    dest_idx[col] = exact_dest
+                    _eta[col] = float(target_meta[1])
+                    status[col] = 1
+        summary_feats = f_feats_r
+        summary_mask = f_mask_r
+        if planet_inbound_r is not None and f_feats_r.shape[0] == 0 and fleets:
+            summary_feats = np.zeros((len(fleets), FLEET_FEAT_DIM), dtype=np.float32)
+            summary_mask = np.zeros(len(fleets), dtype=bool)
+            for j, f in enumerate(fleets):
+                target_meta = fleet_targets.get(int(f[0])) if int(f[1]) == player else None
+                summary_feats[j] = _fleet_features_raw(
+                    f,
+                    player,
+                    num_players,
+                    planet_pos,
+                    target_meta,
+                )
+                summary_mask[j] = True
+        n = min(len(dest_idx), summary_feats.shape[0])
+        if f_target_r is not None:
+            n_target = min(len(dest_idx), f_target_r.shape[0])
+            if n_target:
+                f_target_r[:n_target] = np.where(
+                    status[:n_target] == 1,
+                    dest_idx[:n_target],
+                    -1,
+                )
+        if planet_inbound_r is not None and n:
+            _fill_planet_inbound_summary(
+                planet_inbound_r,
+                summary_feats,
+                summary_mask,
+                dest_idx[:n],
+                _eta[:n],
+                status[:n],
+            )
+
+
+def _fill_planet_inbound_summary(
+    out: np.ndarray,
+    fleet_feats: np.ndarray,
+    fleet_mask: np.ndarray,
+    dest_idx: np.ndarray,
+    eta: np.ndarray,
+    status: np.ndarray,
+) -> None:
+    out.fill(0.0)
+    width = min(fleet_feats.shape[0], dest_idx.shape[0], eta.shape[0], status.shape[0])
+    if width <= 0:
+        return
+    total_count = np.zeros(MAX_PLANETS, dtype=np.float64)
+    self_count = np.zeros(MAX_PLANETS, dtype=np.float64)
+    enemy_count = np.zeros(MAX_PLANETS, dtype=np.float64)
+    total_ship = np.zeros(MAX_PLANETS, dtype=np.float64)
+    self_ship = np.zeros(MAX_PLANETS, dtype=np.float64)
+    enemy_ship = np.zeros(MAX_PLANETS, dtype=np.float64)
+    max_ship = np.zeros(MAX_PLANETS, dtype=np.float64)
+    max_self_ship = np.zeros(MAX_PLANETS, dtype=np.float64)
+    max_enemy_ship = np.zeros(MAX_PLANETS, dtype=np.float64)
+    speed_sum = np.zeros(MAX_PLANETS, dtype=np.float64)
+    max_speed = np.zeros(MAX_PLANETS, dtype=np.float64)
+    eta_sum = np.zeros(MAX_PLANETS, dtype=np.float64)
+    known_eta_count = np.zeros(MAX_PLANETS, dtype=np.float64)
+
+    valid = (
+        fleet_mask[:width].astype(bool, copy=False)
+        & (status[:width] == 1)
+        & (dest_idx[:width] >= 0)
+        & (dest_idx[:width] < MAX_PLANETS)
+    )
+    for col in np.nonzero(valid)[0]:
+        dest = int(dest_idx[col])
+        ship_log = float(max(0.0, fleet_feats[col, 4]))
+        ship_mass = math.expm1(min(20.0, ship_log * 8.0))
+        speed = float(min(1.0, max(0.0, fleet_feats[col, 8])))
+        self_f = float(min(1.0, max(0.0, fleet_feats[col, 14])))
+        enemy_f = float(min(1.0, max(0.0, fleet_feats[col, 16:19].sum())))
+
+        total_count[dest] += 1.0
+        self_count[dest] += self_f
+        enemy_count[dest] += enemy_f
+        total_ship[dest] += ship_mass
+        self_ship[dest] += ship_mass * self_f
+        enemy_ship[dest] += ship_mass * enemy_f
+        max_ship[dest] = max(max_ship[dest], ship_log)
+        if self_f > 0.0:
+            max_self_ship[dest] = max(max_self_ship[dest], ship_log)
+        if enemy_f > 0.0:
+            max_enemy_ship[dest] = max(max_enemy_ship[dest], ship_log)
+        speed_sum[dest] += speed
+        max_speed[dest] = max(max_speed[dest], speed)
+        known_eta_count[dest] += 1.0
+        eta_sum[dest] += min(1.0, max(0.0, float(eta[col]) / float(EPISODE_STEPS)))
+
+    out[:, 0] = np.clip(total_count / 64.0, 0.0, 1.0)
+    out[:, 1] = np.clip(self_count / 64.0, 0.0, 1.0)
+    out[:, 2] = np.clip(enemy_count / 64.0, 0.0, 1.0)
+    out[:, 3] = np.clip(np.log1p(total_ship) / 8.0, 0.0, 1.0)
+    out[:, 4] = np.clip(np.log1p(self_ship) / 8.0, 0.0, 1.0)
+    out[:, 5] = np.clip(np.log1p(enemy_ship) / 8.0, 0.0, 1.0)
+    out[:, 6] = max_ship
+    out[:, 7] = max_self_ship
+    out[:, 8] = max_enemy_ship
+    out[:, 9] = speed_sum / np.maximum(total_count, 1.0)
+    out[:, 10] = max_speed
+    out[:, 11] = eta_sum / np.maximum(known_eta_count, 1.0)
+    out[:, 12] = np.clip(known_eta_count / 64.0, 0.0, 1.0)
 
 
 def _infer_fleet_target_planet_idx(
@@ -852,7 +1018,7 @@ def encode_observation(
     pin_memory: bool = False,
     include_fleet_targets: bool = False,
 ) -> EncodedObs:
-    fleet_width = max(1, len(o.fleets))
+    fleet_width = 0 if include_fleet_targets else max(1, len(o.fleets))
     g_feats = np.zeros(GLOBAL_FEAT_DIM, dtype=np.float32)
     p_feats = np.zeros((MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
     p_mask = np.zeros(MAX_PLANETS, dtype=bool)
@@ -863,6 +1029,11 @@ def encode_observation(
     f_mask = np.zeros(fleet_width, dtype=bool)
     f_target = (
         -np.ones(fleet_width, dtype=np.int64) if include_fleet_targets else None
+    )
+    planet_inbound = (
+        np.zeros((MAX_PLANETS, PLANET_INBOUND_FEAT_DIM), dtype=np.float32)
+        if include_fleet_targets
+        else None
     )
 
     _fill_encoded_arrays(
@@ -876,6 +1047,7 @@ def encode_observation(
         f_feats,
         f_mask,
         f_target,
+        planet_inbound,
     )
 
     return EncodedObs(
@@ -890,6 +1062,9 @@ def encode_observation(
         fleet_target_planet_idx=None
         if f_target is None
         else _tensor_from_numpy(f_target, device, pin_memory=pin_memory),
+        planet_inbound_feats=None
+        if planet_inbound is None
+        else _tensor_from_numpy(planet_inbound, device, pin_memory=pin_memory),
     )
 
 
@@ -907,7 +1082,11 @@ def encode_observations(
     largest fleet count in this batch.
     """
     b = len(observations)
-    fleet_width = max(1, *(len(o.fleets) for o in observations))
+    fleet_width = (
+        0
+        if include_fleet_targets
+        else max(1, *(len(o.fleets) for o in observations))
+    )
     g_feats = np.zeros((b, GLOBAL_FEAT_DIM), dtype=np.float32)
     p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
     p_mask = np.zeros((b, MAX_PLANETS), dtype=bool)
@@ -918,6 +1097,11 @@ def encode_observations(
     f_mask = np.zeros((b, fleet_width), dtype=bool)
     f_target = (
         -np.ones((b, fleet_width), dtype=np.int64)
+        if include_fleet_targets
+        else None
+    )
+    planet_inbound = (
+        np.zeros((b, MAX_PLANETS, PLANET_INBOUND_FEAT_DIM), dtype=np.float32)
         if include_fleet_targets
         else None
     )
@@ -934,6 +1118,7 @@ def encode_observations(
             f_feats,
             f_mask,
             f_target,
+            planet_inbound,
             row=row,
         )
 
@@ -949,6 +1134,9 @@ def encode_observations(
         fleet_target_planet_idx=None
         if f_target is None
         else _tensor_from_numpy(f_target, device, pin_memory=pin_memory),
+        planet_inbound_feats=None
+        if planet_inbound is None
+        else _tensor_from_numpy(planet_inbound, device, pin_memory=pin_memory),
     )
 
 
@@ -966,9 +1154,10 @@ def encode_raw_observations(
     tick while preserving the exact tensor contract of `encode_observations`.
     """
     b = len(observations)
-    fleet_width = max(
-        1,
-        *(len(_get_raw(o, "fleets", []) or []) for o in observations),
+    fleet_width = (
+        0
+        if include_fleet_targets
+        else max(1, *(len(_get_raw(o, "fleets", []) or []) for o in observations))
     )
     g_feats = np.zeros((b, GLOBAL_FEAT_DIM), dtype=np.float32)
     p_feats = np.zeros((b, MAX_PLANETS, PLANET_FEAT_DIM), dtype=np.float32)
@@ -980,6 +1169,11 @@ def encode_raw_observations(
     f_mask = np.zeros((b, fleet_width), dtype=bool)
     f_target = (
         -np.ones((b, fleet_width), dtype=np.int64)
+        if include_fleet_targets
+        else None
+    )
+    planet_inbound = (
+        np.zeros((b, MAX_PLANETS, PLANET_INBOUND_FEAT_DIM), dtype=np.float32)
         if include_fleet_targets
         else None
     )
@@ -996,6 +1190,7 @@ def encode_raw_observations(
             f_feats,
             f_mask,
             f_target,
+            planet_inbound,
             row=row,
         )
 
@@ -1011,6 +1206,9 @@ def encode_raw_observations(
         fleet_target_planet_idx=None
         if f_target is None
         else _tensor_from_numpy(f_target, device, pin_memory=pin_memory),
+        planet_inbound_feats=None
+        if planet_inbound is None
+        else _tensor_from_numpy(planet_inbound, device, pin_memory=pin_memory),
     )
 
 
@@ -1031,6 +1229,9 @@ def unbind_encoded(feats: EncodedObs) -> list[EncodedObs]:
             fleet_target_planet_idx=None
             if feats.fleet_target_planet_idx is None
             else feats.fleet_target_planet_idx[i],
+            planet_inbound_feats=None
+            if feats.planet_inbound_feats is None
+            else feats.planet_inbound_feats[i],
         )
         for i in range(feats.planet_feats.shape[0])
     ]
@@ -1057,6 +1258,9 @@ def select_encoded(feats: EncodedObs, index: int, *, clone: bool = False) -> Enc
         fleet_target_planet_idx=None
         if feats.fleet_target_planet_idx is None
         else row(feats.fleet_target_planet_idx),
+        planet_inbound_feats=None
+        if feats.planet_inbound_feats is None
+        else row(feats.planet_inbound_feats),
     )
 
 
@@ -1067,8 +1271,12 @@ def stack_encoded(feats_list: list[EncodedObs]) -> EncodedObs:
     output tensors gain a leading batch dim. Used by the vectorized
     rollout to produce one big batch per env-step.
     """
-    fleet_width = max(1, *(int(f.fleet_feats.shape[0]) for f in feats_list))
-    gf, pf, pm, pom, pid, pg, ff, fm, ft = [], [], [], [], [], [], [], [], []
+    fleet_width = (
+        0
+        if all(f.planet_inbound_feats is not None for f in feats_list)
+        else max(1, *(int(f.fleet_feats.shape[0]) for f in feats_list))
+    )
+    gf, pf, pm, pom, pid, pg, ff, fm, ft, pi = [], [], [], [], [], [], [], [], [], []
     for f in feats_list:
         gf.append(f.global_feats)
         pf.append(f.planet_feats)
@@ -1083,6 +1291,7 @@ def stack_encoded(feats_list: list[EncodedObs]) -> EncodedObs:
             if f.fleet_target_planet_idx is None
             else pad_fleet_tensor(f.fleet_target_planet_idx, fleet_width, fill=-1)
         )
+        pi.append(f.planet_inbound_feats)
     return EncodedObs(
         planet_feats=torch.stack(pf),
         planet_mask=torch.stack(pm),
@@ -1093,4 +1302,5 @@ def stack_encoded(feats_list: list[EncodedObs]) -> EncodedObs:
         fleet_mask=torch.stack(fm),
         global_feats=None if any(g is None for g in gf) else torch.stack(gf),
         fleet_target_planet_idx=None if any(t is None for t in ft) else torch.stack(ft),
+        planet_inbound_feats=None if any(t is None for t in pi) else torch.stack(pi),
     )
