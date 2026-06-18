@@ -12,6 +12,7 @@ from owars.policies.sampling import (
     ActionContext,
     SampleBatchRecord,
     SampleRecord,
+    _batch_record_from_materialized_launch,
     _categorical_action_log_probs,
     _record_from_materialized_launch,
     sample_actions,
@@ -55,6 +56,22 @@ def _sun_crossing_only_obs():
     obs["planets"] = obs["planets"][:2]
     obs["initial_planets"] = obs["initial_planets"][:2]
     return obs
+
+
+def test_categorical_action_log_probs_ignore_nonfinite_targets():
+    noop_logits = torch.tensor([[0.0]])
+    target_logits = torch.tensor([[[float("inf"), 1.0, float("-inf")]]])
+
+    log_probs = _categorical_action_log_probs(
+        noop_logits,
+        target_logits,
+        action_logit_softcap=8.0,
+    )
+
+    assert not torch.isnan(log_probs).any()
+    assert log_probs[0, 0, 1].isneginf()
+    assert log_probs[0, 0, 3].isneginf()
+    assert torch.allclose(log_probs.exp().sum(dim=-1), torch.ones(1, 1))
 
 
 def _blocked_los_obs(*, fallback: bool = True):
@@ -401,6 +418,172 @@ def test_categorical_record_keeps_sampled_launch_when_materialization_fails():
     assert record.launch[0].item() == 1.0
     assert torch.allclose(record.log_prob[0], expected, atol=1e-6)
     assert record.launch[1].item() == 0.0
+
+
+def test_categorical_noop_record_ignores_invalid_fraction_log_prob():
+    launch = torch.tensor([0.0])
+    target_idx = torch.tensor([0])
+    frac = torch.tensor([0.5])
+    launch_logits = torch.zeros(1)
+    target_logits = torch.full((1, 2), float("-inf"))
+    alpha = torch.tensor([float("nan")])
+    beta = torch.tensor([2.0])
+
+    record = _record_from_materialized_launch(
+        launch,
+        target_idx,
+        frac,
+        launch_logits,
+        None,
+        8.0,
+        target_logits,
+        alpha,
+        beta,
+        "beta",
+        materialized=[False],
+    )
+
+    assert record.launch.item() == 0.0
+    assert torch.isfinite(record.log_prob).all()
+    assert torch.allclose(record.log_prob, torch.zeros_like(record.log_prob), atol=1e-6)
+
+
+def test_categorical_batch_noop_record_ignores_invalid_fraction_log_prob():
+    launch = torch.tensor([[0.0]])
+    target_idx = torch.tensor([[0]])
+    frac = torch.tensor([[0.5]])
+    launch_logits = torch.zeros(1, 1)
+    target_logits = torch.full((1, 1, 2), float("-inf"))
+    alpha = torch.tensor([[float("nan")]])
+    beta = torch.tensor([[2.0]])
+
+    record = _batch_record_from_materialized_launch(
+        launch,
+        target_idx,
+        frac,
+        launch_logits,
+        None,
+        8.0,
+        target_logits,
+        alpha,
+        beta,
+        "beta",
+        materialized=[[False]],
+        rows=[0],
+    )
+
+    assert record.launch[0, 0].item() == 0.0
+    assert torch.isfinite(record.log_prob).all()
+    assert torch.allclose(record.log_prob, torch.zeros_like(record.log_prob), atol=1e-6)
+
+
+def test_categorical_launched_invalid_fraction_log_prob_stays_nonfinite():
+    launch = torch.tensor([1.0])
+    target_idx = torch.tensor([0])
+    frac = torch.tensor([0.5])
+    launch_logits = torch.zeros(1)
+    target_logits = torch.tensor([[0.0, float("-inf")]])
+    alpha = torch.tensor([float("nan")])
+    beta = torch.tensor([2.0])
+
+    record = _record_from_materialized_launch(
+        launch,
+        target_idx,
+        frac,
+        launch_logits,
+        None,
+        8.0,
+        target_logits,
+        alpha,
+        beta,
+        "beta",
+        materialized=[True],
+    )
+
+    assert record.launch.item() == 1.0
+    assert not torch.isfinite(record.log_prob).all()
+
+
+def test_categorical_launched_invalid_action_log_prob_stays_nonfinite():
+    launch = torch.tensor([1.0])
+    target_idx = torch.tensor([0])
+    frac = torch.tensor([0.5])
+    launch_logits = torch.tensor([float("nan")])
+    target_logits = torch.tensor([[0.0, float("-inf")]])
+    alpha = torch.tensor([2.0])
+    beta = torch.tensor([2.0])
+
+    record = _record_from_materialized_launch(
+        launch,
+        target_idx,
+        frac,
+        launch_logits,
+        None,
+        None,
+        target_logits,
+        alpha,
+        beta,
+        "beta",
+        materialized=[True],
+    )
+
+    assert record.launch.item() == 1.0
+    assert not torch.isfinite(record.log_prob).all()
+
+
+def test_categorical_softcap_launched_invalid_action_log_prob_stays_nonfinite():
+    launch = torch.tensor([1.0])
+    target_idx = torch.tensor([0])
+    frac = torch.tensor([0.5])
+    launch_logits = torch.tensor([0.0])
+    target_logits = torch.tensor([[float("nan"), float("-inf")]])
+    alpha = torch.tensor([2.0])
+    beta = torch.tensor([2.0])
+
+    record = _record_from_materialized_launch(
+        launch,
+        target_idx,
+        frac,
+        launch_logits,
+        None,
+        8.0,
+        target_logits,
+        alpha,
+        beta,
+        "beta",
+        materialized=[True],
+    )
+
+    assert record.launch.item() == 1.0
+    assert not torch.isfinite(record.log_prob).all()
+
+
+def test_categorical_noop_invalid_action_log_prob_uses_rust_fallback_score():
+    launch = torch.tensor([0.0])
+    target_idx = torch.tensor([0])
+    frac = torch.tensor([0.5])
+    launch_logits = torch.tensor([float("nan")])
+    target_logits = torch.tensor([[0.0, float("-inf")]])
+    alpha = torch.tensor([2.0])
+    beta = torch.tensor([2.0])
+
+    record = _record_from_materialized_launch(
+        launch,
+        target_idx,
+        frac,
+        launch_logits,
+        None,
+        8.0,
+        target_logits,
+        alpha,
+        beta,
+        "beta",
+        materialized=[False],
+    )
+
+    assert record.launch.item() == 0.0
+    assert torch.isfinite(record.log_prob).all()
+    assert record.log_prob.item() < -1.0e8
 
 
 def test_moves_only_sampler_matches_record_path_deterministic():

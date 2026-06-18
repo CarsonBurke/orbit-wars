@@ -51,12 +51,13 @@ is bounded by 1 (CE) instead of unbounded (MSE on a possibly-misscaled
 scalar), which makes the critic dramatically more robust to early
 mis-prediction.
 
-We use Dreamer4's symlog HL-Gauss value encoding over a wide raw support by
-default. Raw projected-margin rewards can move by tens of thousands over an
-episode, but symlog bucket placement preserves resolution near zero while
-still representing decisive endgame margins. σ = 0.5 × bin_size (Dreamer4
-default), and `target_probs` clips out-of-range targets to the boundary bin so
-the head degrades gracefully rather than producing NaN.
+We use a CleanRL v162-style Dreamer3 HL-Gauss bucket by default: odd bins over
+symmetric symlog-coordinate support, symexp bin centers for scalar decode, and
+Gaussian CDF projection. The PPO default is 255 bins over [-8, 8] with
+σ = 0.75 × coordinate-bin width, sized to the normalized clipped-return
+horizon rather than HalfCheetah's much wider [-20, 20]. Legacy library-backed
+HL-Gauss is kept for configs that intentionally use raw/symlog supports such
+as SAC.
 
 **Critic still shares the encoder backbone.** Value-loss gradients flow
 through the same transformer the actor uses. This is tamed by
@@ -74,7 +75,9 @@ action space wants.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -1271,64 +1274,99 @@ BETA_SAMPLE_EPS: float = 1e-6
 class HLGaussLoss(nn.Module):
     """Histogram-loss-Gaussian distributional regression head.
 
-    Thin adapter around `hl_gauss_pytorch.HLGaussLoss`, the same package used
-    by Dreamer4's `SymExpHLGauss` wrapper. The adapter preserves the small API
-    the rest of this repo expects: scalar target encoding via `target_probs`
-    and scalar value recovery via `bins_to_scalar`.
+    The default `dreamer3` bucket matches CleanRL v162's HalfCheetah
+    Dreamer3-bucket HL-Gauss critic: targets are symlogged into a symmetric
+    coordinate support, projected with a Gaussian CDF over bucket edges, and
+    decoded as the expected symexp-center scalar. `legacy` keeps the old
+    `hl_gauss_pytorch.HLGaussLoss` adapter for raw/symlog support configs.
 
     Forward semantics:
       - `target_probs(value)` encodes a scalar to a per-bin probability
         vector via the truncated-Gaussian CDF over the bin support, with
         renormalization so the truncated tails don't bias the target.
       - `bins_to_scalar(logits)` recovers the expected raw scalar over bin
-        centers. With symlog support this is E[symexp(c_i)], matching the
-        CleanRL v149 Bellman scalar path, not symexp(E[c_i]).
+        centers. With nonlinear support this is E[symexp(c_i)], not
+        symexp(E[c_i]).
       - `loss(logits, target_probs)` is just F.cross_entropy on a per-element
         basis (caller is responsible for masking/reduction).
 
-    With `symlog=True`, `min_value` / `max_value` are raw values. The library
-    transforms those endpoints to symlog space for the histogram support and
-    applies symlog when encoding scalar targets. Scalar decode maps each
-    symlog-space bin center back to raw space before taking the expectation.
+    In `dreamer3`, `min_value` / `max_value` are symlog-coordinate bounds and
+    must be symmetric with an odd number of bins. In `legacy`, they are raw
+    values; `symlog=True` applies the library transform/inverse-transform path.
     """
 
     def __init__(
         self,
-        min_value: float = -1.0,
-        max_value: float = 1.0,
-        num_bins: int = 41,
-        sigma_to_bin_ratio: float = 0.5,
+        min_value: float = -8.0,
+        max_value: float = 8.0,
+        num_bins: int = 255,
+        sigma_to_bin_ratio: float = 0.75,
         symlog: bool = False,
+        bucket: Literal["dreamer3", "legacy"] = "dreamer3",
     ):
         super().__init__()
         if num_bins < 2:
             raise ValueError(f"num_bins must be ≥ 2, got {num_bins}")
         if min_value >= max_value:
             raise ValueError("min_value must be less than max_value")
+        if bucket not in {"dreamer3", "legacy"}:
+            raise ValueError(f"unknown HLGauss bucket: {bucket!r}")
         self.num_bins = num_bins
         self.min_value = min_value
         self.max_value = max_value
         self.symlog = bool(symlog)
-        transform = _symlog if self.symlog else None
-        inverse_transform = _symexp if self.symlog else None
-        self.encoder = _LibraryHLGaussLoss(
-            min_value=min_value,
-            max_value=max_value,
-            num_bins=num_bins,
-            sigma_to_bin_ratio=sigma_to_bin_ratio,
-            clamp_to_range=True,
-            transform=transform,
-            inverse_transform=inverse_transform,
-        )
+        self.bucket = bucket
+        self.encoder: _LibraryHLGaussLoss | None = None
+        if self.bucket == "legacy":
+            transform = _symlog if self.symlog else None
+            inverse_transform = _symexp if self.symlog else None
+            self.encoder = _LibraryHLGaussLoss(
+                min_value=min_value,
+                max_value=max_value,
+                num_bins=num_bins,
+                sigma_to_bin_ratio=sigma_to_bin_ratio,
+                clamp_to_range=True,
+                transform=transform,
+                inverse_transform=inverse_transform,
+            )
+            return
+
+        if self.symlog:
+            raise ValueError("dreamer3 HL-Gauss always symlogs targets; set value_symlog=false")
+        if num_bins % 2 != 1:
+            raise ValueError("dreamer3 HL-Gauss requires an odd num_bins")
+        if not math.isclose(abs(min_value), abs(max_value), rel_tol=1e-6, abs_tol=1e-6):
+            raise ValueError("dreamer3 HL-Gauss requires symmetric coordinate bounds")
+        half = torch.linspace(min_value, 0.0, (num_bins - 1) // 2 + 1)
+        coord_support = torch.cat([half, -half[:-1].flip(0)])
+        coord_step = torch.abs(coord_support[1] - coord_support[0])
+        coord_edges = torch.empty(num_bins + 1)
+        coord_edges[1:-1] = 0.5 * (coord_support[:-1] + coord_support[1:])
+        coord_edges[0] = coord_support[0] - 0.5 * coord_step
+        coord_edges[-1] = coord_support[-1] + 0.5 * coord_step
+        support = _symexp(coord_support)
+
+        self.coord_bin_width = float(coord_step)
+        self.sigma = float(sigma_to_bin_ratio * coord_step)
+        self.eps = 1e-10
+        # `centers` is kept as an alias for older tests/debugging code; under
+        # Dreamer3 it is the raw scalar center, while `coord_support` is the
+        # symlog-coordinate center.
+        self.register_buffer("coord_support", coord_support)
+        self.register_buffer("coord_edges", coord_edges)
+        self.register_buffer("support", support)
+        self.register_buffer("centers", support)
 
     def _apply(self, fn):  # type: ignore[no-untyped-def]
         out = super()._apply(fn)
         # `model.bfloat16()` casts buffers too. The histogram support defines
         # target placement and scalar decoding, so keep it in fp32 like the
         # previous local implementation did.
-        for name, buffer in self.encoder.named_buffers(recurse=False):
-            if buffer.is_floating_point() and buffer.dtype != torch.float32:
-                self.encoder._buffers[name] = buffer.float()
+        modules: tuple[nn.Module, ...] = (self,) if self.encoder is None else (self.encoder,)
+        for module in modules:
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer.is_floating_point() and buffer.dtype != torch.float32:
+                    module._buffers[name] = buffer.float()
         return out
 
     def target_probs(self, values: torch.Tensor) -> torch.Tensor:
@@ -1339,14 +1377,34 @@ class HLGaussLoss(nn.Module):
         targets concentrate mass at the boundary instead of producing a
         near-zero target distribution and a silent value-loss no-op.
         """
-        return self.encoder.transform_to_probs(values.float())
+        values = values.float()
+        if self.encoder is not None:
+            return self.encoder.transform_to_probs(values)
+        coord_targets = _symlog(values).clamp(self.coord_edges[0], self.coord_edges[-1])
+        erf_arg = (self.coord_edges - coord_targets.unsqueeze(-1)) / (
+            self.sigma * math.sqrt(2.0)
+        )
+        cdf_evals = torch.erf(erf_arg)
+        z = cdf_evals[..., -1:] - cdf_evals[..., :1]
+        probs = cdf_evals[..., 1:] - cdf_evals[..., :-1]
+        return probs / z.clamp(min=self.eps)
 
     def bins_to_scalar(self, logits: torch.Tensor) -> torch.Tensor:
         probs = logits.float().softmax(dim=-1)
-        centers = self.encoder.centers.float()
-        if self.symlog:
-            centers = _symexp(centers)
-        return (probs * centers).sum(dim=-1).clamp(self.min_value, self.max_value)
+        if self.encoder is not None:
+            centers = self.encoder.centers.float()
+            if self.symlog:
+                centers = _symexp(centers)
+            return (probs * centers).sum(dim=-1).clamp(self.min_value, self.max_value)
+        m = (self.num_bins - 1) // 2
+        p_left = probs[..., :m]
+        p_zero = probs[..., m : m + 1]
+        p_right = probs[..., m + 1 :]
+        s_left = self.support[:m]
+        s_zero = self.support[m : m + 1]
+        s_right = self.support[m + 1 :]
+        paired = (p_left * s_left).flip(-1) + p_right * s_right
+        return (p_zero * s_zero).sum(dim=-1) + paired.sum(dim=-1)
 
 
 def _symlog(x: torch.Tensor) -> torch.Tensor:
@@ -1513,6 +1571,7 @@ class OrbitPolicy(nn.Module):
             num_bins=cfg.value_num_bins,
             sigma_to_bin_ratio=cfg.value_sigma_to_bin_ratio,
             symlog=cfg.value_symlog,
+            bucket=cfg.value_bucket,
         )
         self.value_head = nn.Sequential(
             CastedLinear(cfg.dim, cfg.value_hidden, bias=False),

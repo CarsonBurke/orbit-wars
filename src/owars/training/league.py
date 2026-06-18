@@ -190,12 +190,14 @@ class OpponentPool:
         top_k: int = 8,
         self_play_prob: float = 0.8,
         device: str = "cpu",
+        compile_mode: str | None = None,
         rng: random.Random | None = None,
     ):
         self.elo = elo
         self.top_k = top_k
         self.self_play_prob = self_play_prob
         self.device = device
+        self.compile_mode = compile_mode
         self.rng = rng or random.Random()
         self._frozen: dict[str, AgentFn] = {}
         self._frozen_paths: dict[str, Path] = {}
@@ -236,6 +238,7 @@ class OpponentPool:
             ckpt_path,
             device=self.device,
             deterministic=False,
+            compile_mode=self.compile_mode,
         )
         self._frozen_paths[name] = ckpt_path
         if seed_rating is None:
@@ -408,7 +411,7 @@ class NoBuiltinTrainingPool:
         self,
         *,
         active_pool_size: int = 16,
-        active_sample_panel_size: int = 2,
+        active_sample_panel_size: int = 8,
         historical_training_archive_size: int = 128,
         current_learner_prob: float = 0.4,
         active_pool_prob: float = 0.3,
@@ -420,11 +423,12 @@ class NoBuiltinTrainingPool:
         recency_half_life_updates: float = 50.0,
         min_games_before_eviction: int = 16,
         stats_ema_decay: float = 0.95,
-        historical_sample_panel_size: int = 2,
+        historical_sample_panel_size: int = 8,
         historical_agent_cache_size: int = 8,
         recent_eviction_archive_size: int | None = None,
         notable_archive_size: int | None = None,
         device: str = "cpu",
+        compile_mode: str | None = None,
         rng: random.Random | None = None,
     ):
         if active_pool_size <= 0:
@@ -505,6 +509,7 @@ class NoBuiltinTrainingPool:
         self.recent_eviction_archive_size = recent_eviction_archive_size
         self.notable_archive_size = notable_archive_size
         self.device = device
+        self.compile_mode = compile_mode
         self.rng = rng or random.Random()
         self.current_update = 0
         self._snapshots: dict[str, TrainingSnapshot] = {}
@@ -518,6 +523,8 @@ class NoBuiltinTrainingPool:
         self._recent_evictions: list[str] = []
         self._historical_panel: set[str] = set()
         self._historical_panel_update: int | None = None
+        self._sample_panel: OpponentSamplePanel | None = None
+        self._sample_panel_update: int | None = None
 
     # --- snapshot management -------------------------------------------------
 
@@ -555,6 +562,7 @@ class NoBuiltinTrainingPool:
                 ckpt_path,
                 device=self.device,
                 deterministic=False,
+                compile_mode=self.compile_mode,
             )
             if enter_active
             else self._lazy_agent(ckpt_path)
@@ -638,12 +646,15 @@ class NoBuiltinTrainingPool:
         self._historical_buckets = buckets
         self._discard_unretained()
         self._historical_panel_update = None
+        self._sample_panel = None
+        self._sample_panel_update = None
 
     def _lazy_agent(self, ckpt_path: str | Path) -> LazyLearnedAgent:
         return LazyLearnedAgent(
             ckpt_path,
             device=self.device,
             deterministic=False,
+            compile_mode=self.compile_mode,
             cache_size=self.historical_agent_cache_size,
         )
 
@@ -796,6 +807,8 @@ class NoBuiltinTrainingPool:
         self._historical_panel = {
             name for name in self._historical_panel if name in self._snapshots
         }
+        if self._sample_panel is not None:
+            self._sample_panel = self._sanitize_panel(self._sample_panel)
 
     # --- statistics / utility ------------------------------------------------
 
@@ -883,15 +896,24 @@ class NoBuiltinTrainingPool:
         """Sample a bounded learned-opponent panel for one rollout wave."""
         if current_update is not None and int(current_update) != self.current_update:
             self.set_current_update(int(current_update))
+        if (
+            self._sample_panel is not None
+            and self._sample_panel_update == self.current_update
+        ):
+            return self._sample_panel
         active = self._sample_name_panel(
             self.active_snapshot_names(),
             self.active_sample_panel_size,
         )
-        historical = self._choose_historical_panel()
-        return OpponentSamplePanel(
+        self._ensure_historical_panel()
+        historical = set(self._historical_panel)
+        panel = OpponentSamplePanel(
             active=tuple(active),
             historical=tuple(sorted(historical)),
         )
+        self._sample_panel = panel
+        self._sample_panel_update = self.current_update
+        return panel
 
     def _sample_name_panel(self, names: Sequence[str], size: int) -> list[str]:
         if len(names) <= size:

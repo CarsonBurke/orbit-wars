@@ -80,7 +80,9 @@ model:
   value_min: -1000.0
   value_max: 1000.0
   value_num_bins: 153
+  value_sigma_to_bin_ratio: 0.75
   value_symlog: true
+  value_bucket: legacy
   # Real-units bound on the per-planet advantage heads: each emits
   # adv_scale·tanh(raw/adv_scale), so the summed advantage is ±n_owned·adv_scale
   # ship-margin units. 40 gives headroom over the per-capture margin tail

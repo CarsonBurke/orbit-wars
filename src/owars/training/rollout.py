@@ -106,14 +106,20 @@ def _obs_reward_signal(
 
 
 @dataclass
+class TrajectoryRecordRef:
+    """Reference one row in a batched rollout record chunk."""
+
+    chunk: dict[str, Any]
+    row: int
+
+
+@dataclass
 class Trajectory:
     """Per-step records for the *learning* agent only.
 
-    Per-step tensors stay on the *rollout device* (i.e. wherever the
-    policy ran). Pulling them to CPU per-step would force a stream
-    sync per env-step — at 16 envs × 500 steps that's 8000 syncs per
-    PPO update on GPU. Instead we accumulate device tensors and
-    `.cpu()` the whole list once when building the PPO batch.
+    Scalar rollout keeps per-step tensors on the rollout device. The vectorized
+    PPO path can instead store CPU-side batched record chunks plus lightweight
+    row refs; `_stack_trajectories` materializes the final episode-major batch.
     """
 
     encoded: list[EncodedObs]
@@ -130,6 +136,7 @@ class Trajectory:
     drawn: bool = False
     seat_rewards: list[float] = field(default_factory=list)  # all seats, in seat order
     learner_seat: int = 0
+    record_refs: list[TrajectoryRecordRef] = field(default_factory=list)
 
 
 def make_env(num_players: int, episode_steps: int, ship_speed: float, debug: bool = False):

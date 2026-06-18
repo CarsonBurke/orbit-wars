@@ -66,8 +66,9 @@ def test_policy_forward_shapes():
     assert out.value.shape == (1,)
     # Distributional MTP value head: per-horizon, per-bin logits.
     assert out.value_logits.shape == (1, cfg.critic_mtp_horizon, cfg.value_num_bins)
-    # Recovered scalar value lives inside the bin support.
-    assert cfg.value_min <= float(out.value.item()) <= cfg.value_max
+    # Recovered scalar value lives inside the decoded raw support.
+    assert float(model.value_encoder.support.min()) <= float(out.value.item())
+    assert float(out.value.item()) <= float(model.value_encoder.support.max())
 
 
 def test_planet_rope_frequency_buffer_stays_fp32_after_bfloat16():
@@ -106,9 +107,89 @@ def test_value_histogram_buffers_stay_fp32_after_bfloat16():
 
     model.bfloat16()
 
-    buffers = dict(model.value_encoder.encoder.named_buffers())
+    buffers = dict(model.value_encoder.named_buffers())
     assert buffers["support"].dtype == torch.float32
     assert buffers["centers"].dtype == torch.float32
+    assert buffers["coord_support"].dtype == torch.float32
+    assert buffers["coord_edges"].dtype == torch.float32
+
+
+def test_dreamer3_hl_gauss_support_matches_cleanrl_symexp_centers():
+    encoder = HLGaussLoss(
+        min_value=-8.0,
+        max_value=8.0,
+        num_bins=255,
+        sigma_to_bin_ratio=0.75,
+        bucket="dreamer3",
+    )
+
+    half = torch.linspace(-8.0, 0.0, 128)
+    expected_coord = torch.cat([half, -half[:-1].flip(0)])
+
+    assert torch.allclose(encoder.coord_support, expected_coord)
+    assert torch.allclose(encoder.support, _symexp(expected_coord))
+    assert float(encoder.coord_support[127]) == pytest.approx(0.0)
+    assert float(encoder.support[127]) == pytest.approx(0.0)
+    assert encoder.sigma == pytest.approx(0.75 * encoder.coord_bin_width)
+    assert encoder.eps == pytest.approx(1e-10)
+
+
+def test_dreamer3_hl_gauss_default_bucket_matches_orbit_wars_return_envelope():
+    encoder = HLGaussLoss()
+
+    assert encoder.bucket == "dreamer3"
+    assert encoder.num_bins == 255
+    assert encoder.min_value == pytest.approx(-8.0)
+    assert encoder.max_value == pytest.approx(8.0)
+    assert encoder.sigma == pytest.approx(0.75 * encoder.coord_bin_width)
+
+
+def test_dreamer3_hl_gauss_projection_normalizes_and_decodes_zero_logits():
+    encoder = HLGaussLoss(
+        min_value=-8.0,
+        max_value=8.0,
+        num_bins=255,
+        sigma_to_bin_ratio=0.75,
+        bucket="dreamer3",
+    )
+    targets = torch.tensor([-1.0e12, -1000.0, 0.0, 1000.0, 1.0e12])
+
+    probs = encoder.target_probs(targets)
+    values = encoder.bins_to_scalar(torch.zeros(3, 6, 255))
+
+    assert probs.shape == (5, 255)
+    assert torch.isfinite(probs).all()
+    assert torch.allclose(probs.sum(dim=-1), torch.ones(5), atol=1e-5)
+    assert torch.allclose(values, torch.zeros(3, 6), atol=1e-4)
+
+
+def test_dreamer3_hl_gauss_projection_matches_cleanrl_formula():
+    encoder = HLGaussLoss()
+    targets = torch.tensor([-100.0, -1.25, 0.0, 3.5, 100.0])
+
+    got = encoder.target_probs(targets)
+    coord_targets = _symlog(targets).clamp(
+        encoder.coord_edges[0],
+        encoder.coord_edges[-1],
+    )
+    cdf_evals = torch.erf(
+        (encoder.coord_edges - coord_targets.unsqueeze(-1))
+        / (encoder.sigma * torch.sqrt(torch.tensor(2.0)))
+    )
+    z = cdf_evals[..., -1:] - cdf_evals[..., :1]
+    expected = (cdf_evals[..., 1:] - cdf_evals[..., :-1]) / z.clamp(min=1e-10)
+
+    assert torch.allclose(got, expected)
+
+
+def test_dreamer3_hl_gauss_decodes_expected_symexp_scalar():
+    encoder = HLGaussLoss()
+    logits = -0.5 * ((encoder.coord_support - _symlog(torch.tensor(7.0))) / 0.5).square()
+
+    got = encoder.bins_to_scalar(logits.unsqueeze(0))
+    expected = (logits.softmax(dim=-1) * encoder.support).sum().unsqueeze(0)
+
+    assert torch.allclose(got, expected, atol=1e-4)
 
 
 def test_symlog_hl_gauss_encodes_wide_raw_margin_targets():
@@ -117,6 +198,7 @@ def test_symlog_hl_gauss_encodes_wide_raw_margin_targets():
         max_value=100_000.0,
         num_bins=153,
         symlog=True,
+        bucket="legacy",
     )
     assert encoder.encoder.min_value == torch.log1p(torch.tensor(100_000.0)).neg().item()
     assert encoder.encoder.max_value == torch.log1p(torch.tensor(100_000.0)).item()
@@ -139,6 +221,7 @@ def test_symlog_hl_gauss_decodes_expected_raw_scalar():
         max_value=100_000.0,
         num_bins=153,
         symlog=True,
+        bucket="legacy",
     )
     centers = encoder.encoder.centers
     logits = -0.5 * ((centers - _symlog(torch.tensor(1000.0))) / 2.0).square()
@@ -160,6 +243,7 @@ def test_policy_value_encoder_uses_configured_hl_gauss_sigma():
         value_num_bins=153,
         value_sigma_to_bin_ratio=2.0,
         value_symlog=True,
+        value_bucket="legacy",
     )
     model = OrbitPolicy(cfg)
     bin_width = (

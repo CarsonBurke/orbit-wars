@@ -85,6 +85,7 @@ def test_win_terminal_reward_normalizes_terminal_only_mc_defaults():
     assert cfg.model.value_max == 1.0
     assert cfg.model.value_num_bins == 41
     assert cfg.model.value_symlog is False
+    assert cfg.model.value_bucket == "legacy"
     assert cfg.ppo.critic_return_norm == "none"
     assert not cfg.reward.uses_dense_potential()
 
@@ -98,6 +99,7 @@ def test_win_terminal_reward_preserves_explicit_value_support():
                 "value_max": 2.0,
                 "value_num_bins": 81,
                 "value_symlog": True,
+                "value_bucket": "legacy",
             },
         }
     )
@@ -106,6 +108,7 @@ def test_win_terminal_reward_preserves_explicit_value_support():
     assert cfg.model.value_max == 2.0
     assert cfg.model.value_num_bins == 81
     assert cfg.model.value_symlog is True
+    assert cfg.model.value_bucket == "legacy"
 
 
 def test_win_terminal_reward_rejects_discounted_ppo_returns():
@@ -165,8 +168,8 @@ def test_no_builtins_opponent_mode_loads():
     assert cfg.opponents.current_learner_prob == 0.4
     assert cfg.opponents.active_pool_prob == 0.3
     assert cfg.opponents.historical_archive_prob == 0.3
-    assert cfg.opponents.active_sample_panel_size == 2
-    assert cfg.opponents.historical_sample_panel_size == 2
+    assert cfg.opponents.active_sample_panel_size == 8
+    assert cfg.opponents.historical_sample_panel_size == 8
     assert cfg.opponents.fixed_opponents == ["sniper_v17"]
 
 
@@ -220,6 +223,15 @@ def test_invalid_no_builtins_pool_config_raises(opponents_cfg):
 def test_invalid_rollout_compile_width_raises():
     with pytest.raises(ValueError, match="compile_fleet_width"):
         RunConfig.from_dict({"rollout": {"compile_fleet_width": 0}})
+    cfg = RunConfig.from_dict(
+        {
+            "model": {"encoder_backend": "destination_conditioned"},
+            "rollout": {"compile_fleet_width": 0},
+        }
+    )
+    assert cfg.rollout.compile_fleet_width == 0
+    with pytest.raises(ValueError, match="snapshot_compile_rows"):
+        RunConfig.from_dict({"rollout": {"snapshot_compile_rows": 0}})
 
 
 def test_rollout_compile_defaults_enabled():
@@ -227,6 +239,7 @@ def test_rollout_compile_defaults_enabled():
 
     assert cfg.rollout.compile_policy is True
     assert cfg.rollout.compile_fleet_width == 1024
+    assert cfg.rollout.snapshot_compile_rows == 64
     assert cfg.rollout.detail_timing is False
     assert cfg.rollout.sample_detail_timing is False
 
@@ -318,6 +331,28 @@ def test_invalid_value_support_raises():
 def test_invalid_value_sigma_to_bin_ratio_raises():
     with pytest.raises(ValueError, match="value_sigma_to_bin_ratio"):
         RunConfig.from_dict({"model": {"value_sigma_to_bin_ratio": 0.0}})
+
+
+def test_invalid_value_bucket_raises():
+    with pytest.raises(ValueError, match="value_bucket"):
+        RunConfig.from_dict({"model": {"value_bucket": "not_real"}})
+
+
+def test_dreamer3_value_bucket_requires_odd_bins_and_symmetric_bounds():
+    with pytest.raises(ValueError, match="odd"):
+        RunConfig.from_dict({"model": {"value_bucket": "dreamer3", "value_num_bins": 510}})
+    with pytest.raises(ValueError, match="symmetric"):
+        RunConfig.from_dict(
+            {
+                "model": {
+                    "value_bucket": "dreamer3",
+                    "value_min": -8.0,
+                    "value_max": 9.0,
+                }
+            }
+        )
+    with pytest.raises(ValueError, match="value_symlog"):
+        RunConfig.from_dict({"model": {"value_bucket": "dreamer3", "value_symlog": True}})
 
 
 def test_invalid_critic_mtp_horizon_raises():

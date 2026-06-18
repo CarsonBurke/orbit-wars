@@ -34,12 +34,13 @@ model:
   encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
-  value_min: -64.0
-  value_max: 64.0
-  value_num_bins: 153
-  value_sigma_to_bin_ratio: 2.0
+  value_min: -8.0
+  value_max: 8.0
+  value_num_bins: 255
+  value_sigma_to_bin_ratio: 0.75
   critic_mtp_horizon: 6
   value_symlog: false
+  value_bucket: dreamer3
 
 optim:
   muon_lr: 0.022
@@ -79,7 +80,7 @@ ppo:
   clip_coef: 0.2
   clip_coef_high: 0.28
   value_coef: 1.0
-  target_entropy_coef: 0.01
+  target_entropy_coef: 0.0
   critic_return_norm: discounted_return_rms
   critic_return_norm_clip: 10.0
   fraction_entropy_coef: 0.0
@@ -89,9 +90,12 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 128
+  num_envs: 1024
   num_workers: 0
   env_backend: rust
+  compile_fleet_width: 0
+  snapshot_compile_rows: 64
+  strict_target_legality: false
 
 opponents:
   mode: fixed              # stationary: no self-play, no snapshot pool

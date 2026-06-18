@@ -30,6 +30,8 @@ from typing import Any
 import torch
 
 from ..policies.features import (
+    MAX_PLANETS,
+    PLANET_INBOUND_FEAT_DIM,
     EncodedObs,
     active_fleet_width,
     bucket_encoded_fleet_width,
@@ -49,7 +51,7 @@ from ..policies.sampling import (
 )
 from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
-from .rollout import Trajectory, _obs_production_margin
+from .rollout import Trajectory, TrajectoryRecordRef, _obs_production_margin
 from .vec_env import VecEnv
 
 
@@ -66,20 +68,72 @@ def _add_timing(timings: dict[str, float] | None, key: str, seconds: float) -> N
         timings[key] = timings.get(key, 0.0) + float(seconds)
 
 
+def _sync_cuda_timing(device: torch.device, enabled: bool) -> None:
+    if enabled and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _scoped_timings(
+    timings: dict[str, float] | None,
+    prefix: str | None,
+) -> dict[str, float] | None:
+    if timings is None or prefix is None:
+        return timings
+    return {}
+
+
+def _flush_scoped_timings(
+    timings: dict[str, float] | None,
+    scoped: dict[str, float] | None,
+    prefix: str | None,
+) -> None:
+    if timings is None or scoped is None or prefix is None:
+        return
+    for key, value in scoped.items():
+        _add_timing(timings, key, value)
+        _add_timing(timings, f"{prefix}/{key}", value)
+
+
+def _policy_batch_kwargs(policy_batch: Any, **kwargs: Any) -> dict[str, Any]:
+    owner = getattr(policy_batch, "__self__", None)
+    if hasattr(owner, "_feature_stage"):
+        kwargs["reuse_pinned_buffers"] = True
+    return kwargs
+
+
 def _next_power_of_two(n: int) -> int:
     n = max(1, int(n))
     return 1 << (n - 1).bit_length()
 
 
+def _capped_graph_rows(rows: int, *, max_rows: int) -> int:
+    """Use static row buckets with power-of-two overflow."""
+    rows = max(1, int(rows))
+    cap = max(1, int(max_rows))
+    return cap if rows <= cap else _next_power_of_two(rows)
+
+
 def _snapshot_graph_rows(rows: int, *, max_rows: int = 64) -> int:
     """Use small static row buckets for frozen snapshots.
 
-    The live learner benefits from one full-row CUDA graph because most seats
-    usually share the current model. Snapshot buckets are often tiny; padding
-    each snapshot to the full learner row count burns GPU work and graph memory
-    for rows that do not exist.
+    Snapshot buckets are often tiny; padding each snapshot to the full learner
+    row count burns GPU work and graph memory for rows that do not exist.
     """
-    return min(max_rows, _next_power_of_two(max(1, int(rows))))
+    rows = max(1, int(rows))
+    cap = max(1, int(max_rows))
+    bucket = _next_power_of_two(rows)
+    return min(bucket, cap) if rows <= cap else bucket
+
+
+def _snapshot_rollout_graph_rows(
+    rows: int,
+    *,
+    snapshot_compile_rows: int,
+    compile_mode: str | None,
+) -> int:
+    if compile_mode is not None:
+        return _capped_graph_rows(rows, max_rows=snapshot_compile_rows)
+    return _snapshot_graph_rows(rows)
 
 
 def _kernel_cache(model: torch.nn.Module) -> dict:
@@ -198,6 +252,39 @@ def _pad_encoded_rows(feats: EncodedObs, rows: int) -> EncodedObs:
         planet_inbound_feats=None
         if feats.planet_inbound_feats is None
         else _pad_rows(feats.planet_inbound_feats, rows),
+        compact_source_rows=feats.compact_source_rows,
+        compact_source_cols=feats.compact_source_cols,
+        compact_target_planets=feats.compact_target_planets,
+    )
+
+
+def _narrow_encoded_rows(feats: EncodedObs, start: int, length: int) -> EncodedObs:
+    compact_source_rows = feats.compact_source_rows
+    compact_source_cols = feats.compact_source_cols
+    if compact_source_rows is not None and compact_source_cols is not None:
+        keep = (compact_source_rows >= start) & (compact_source_rows < start + length)
+        compact_source_rows = (compact_source_rows[keep] - start).astype("int64", copy=False)
+        compact_source_cols = compact_source_cols[keep].astype("int64", copy=False)
+    return EncodedObs(
+        planet_feats=feats.planet_feats.narrow(0, start, length),
+        planet_mask=feats.planet_mask.narrow(0, start, length),
+        planet_owned_mask=feats.planet_owned_mask.narrow(0, start, length),
+        planet_ids=feats.planet_ids.narrow(0, start, length),
+        planet_garrison=feats.planet_garrison.narrow(0, start, length),
+        fleet_feats=feats.fleet_feats.narrow(0, start, length),
+        fleet_mask=feats.fleet_mask.narrow(0, start, length),
+        global_feats=None
+        if feats.global_feats is None
+        else feats.global_feats.narrow(0, start, length),
+        fleet_target_planet_idx=None
+        if feats.fleet_target_planet_idx is None
+        else feats.fleet_target_planet_idx.narrow(0, start, length),
+        planet_inbound_feats=None
+        if feats.planet_inbound_feats is None
+        else feats.planet_inbound_feats.narrow(0, start, length),
+        compact_source_rows=compact_source_rows,
+        compact_source_cols=compact_source_cols,
+        compact_target_planets=feats.compact_target_planets,
     )
 
 
@@ -228,6 +315,19 @@ def _bucket_fleets_for_graph(
         else bucket_fleet_width(used)
     )
     return slice_encoded_fleet_width(feats, width)
+
+
+def _assert_destination_compiled_shape(feats: EncodedObs) -> None:
+    inbound = feats.planet_inbound_feats
+    if inbound is None:
+        raise RuntimeError("destination-conditioned compiled rollout requires inbound summaries")
+    if tuple(inbound.shape[-2:]) != (MAX_PLANETS, PLANET_INBOUND_FEAT_DIM):
+        raise RuntimeError(
+            "destination-conditioned compiled rollout requires inbound summary "
+            f"shape (*, {MAX_PLANETS}, {PLANET_INBOUND_FEAT_DIM}), got {tuple(inbound.shape)}"
+        )
+    if int(feats.fleet_feats.shape[-2]) != 0:
+        raise RuntimeError("destination-conditioned compiled rollout must use fleet width 0")
 
 
 def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
@@ -451,8 +551,10 @@ def rollout_episodes_batched(
     compile_mode: str | None = None,
     compile_fleet_width: int | None = None,
     policy_graph_rows: int | None = None,
+    snapshot_compile_rows: int = 64,
     learner_action_agent: Callable[[Any], list[list]] | None = None,
     defer_log_prob: bool = False,
+    chunk_records: bool = False,
     timings: dict[str, float] | None = None,
     sample_timings: dict[str, float] | None = None,
 ) -> list[Trajectory]:
@@ -485,6 +587,7 @@ def rollout_episodes_batched(
 
     states = vec.reset()
     dones = [False] * num_envs
+    active_envs = list(range(num_envs))
     episode_steps = int(getattr(vec, "episode_steps", 500))
     dense_potential = record_trajectories and reward_cfg.uses_dense_potential()
     previous_potential = [0.0] * num_envs
@@ -502,7 +605,10 @@ def rollout_episodes_batched(
     fast_observation = getattr(vec, "observation", None)
     fast_observations = getattr(vec, "observations", None)
     fast_step_subset = getattr(vec, "step_subset_fast", None)
+    fast_step_flat = getattr(vec, "step_subset_flat_actions", None)
+    fast_step_pending = getattr(vec, "step_subset_pending_actions", None)
     fast_builtin_actions = getattr(vec, "builtin_actions", None)
+    fast_enqueue_builtin_actions = getattr(vec, "enqueue_builtin_actions", None)
     native_builtin_opponents = set(getattr(vec, "native_builtin_opponents", ()))
     use_fast_numpy_path = (
         bool(getattr(vec, "fast_rollout", False))
@@ -510,9 +616,11 @@ def rollout_episodes_batched(
         and callable(fast_observation)
         and callable(fast_step_subset)
     )
+    use_pending_step = use_fast_numpy_path and callable(fast_step_pending)
+    use_flat_step = use_fast_numpy_path and (use_pending_step or callable(fast_step_flat))
     max_policy_rows = max(1, num_envs * num_players)
 
-    while not all(dones):
+    while active_envs:
         phase_t0 = perf_counter()
         # 1. Bucket (env, seat, obs) tuples by agent identity.
         learner_bucket: list[tuple[int, int, Any]] = []
@@ -522,9 +630,7 @@ def rollout_episodes_batched(
         )
         pending_opp_obs: list[tuple[int, int]] = []
         pending_opp_slots: list[tuple[int, int, OpponentSlot]] = []
-        for env_idx in range(num_envs):
-            if dones[env_idx]:
-                continue
+        for env_idx in active_envs:
             state = None if use_fast_numpy_path else states[env_idx]
             for seat in range(num_players):
                 slot = seat_agents[env_idx][seat]
@@ -591,9 +697,80 @@ def rollout_episodes_batched(
                 learner_bucket[bucket_idx] = (env_idx, seat, obs)
         _add_timing(timings, "bucket_s", perf_counter() - phase_t0)
 
-        actions_per_env: dict[int, list[Any]] = {
-            i: [None] * num_players for i in range(num_envs) if not dones[i]
-        }
+        if record_trajectories and len(learner_bucket) > 1:
+            learner_bucket.sort(
+                key=lambda row: 0 if row[1] == learner_seats[row[0]] else 1
+            )
+
+        actions_per_env: dict[int, list[Any]] | None = None
+        flat_env_rows: list[int] | None = None
+        flat_player_rows: list[int] | None = None
+        flat_actions: list[Any] | None = None
+        if use_flat_step:
+            flat_env_rows = []
+            flat_player_rows = []
+            flat_actions = []
+        else:
+            actions_per_env = {
+                i: [None] * num_players for i in active_envs
+            }
+
+        prefetched_learner: EncodedObs | None = None
+        prefetched_snapshots: dict[str, EncodedObs] = {}
+        can_prefetch_features = (
+            use_fast_numpy_path
+            and callable(fast_policy_batch_no_context)
+            and learner_action_agent is None
+        )
+        if can_prefetch_features:
+            include_fleet_targets = (
+                getattr(getattr(model, "cfg", None), "encoder_backend", None)
+                == "destination_conditioned"
+            )
+            feature_requests: list[tuple[str, list[tuple[int, int, Any]]]] = []
+            if learner_bucket:
+                feature_requests.append((LEARNER_NAME, learner_bucket))
+            for name, bucket in opp_buckets.items():
+                agent_model = getattr(bucket[0][3].agent, "model", None)
+                if (
+                    agent_model is not None
+                    and callable(getattr(vec, "sample_batch_actions", None))
+                    and getattr(getattr(agent_model, "cfg", None), "encoder_backend", None)
+                    == getattr(getattr(model, "cfg", None), "encoder_backend", None)
+                ):
+                    feature_requests.append(
+                        (
+                            name,
+                            [
+                                (env_idx, seat, None)
+                                for env_idx, seat, _obs, _slot in bucket
+                            ],
+                        )
+                    )
+            if len(feature_requests) > 1:
+                phase_t0 = perf_counter()
+                all_rows: list[tuple[int, int]] = []
+                spans: dict[str, tuple[int, int]] = {}
+                for key, bucket in feature_requests:
+                    start = len(all_rows)
+                    all_rows.extend((env_idx, seat) for env_idx, seat, _obs in bucket)
+                    spans[key] = (start, len(bucket))
+                prefetched, _contexts = fast_policy_batch_no_context(
+                    all_rows,
+                    **_policy_batch_kwargs(
+                        fast_policy_batch_no_context,
+                        device="cpu",
+                        pin_memory=torch.device(device).type == "cuda",
+                        include_fleet_targets=include_fleet_targets,
+                    ),
+                )
+                _add_timing(timings, "policy_feature_s", perf_counter() - phase_t0)
+                for key, (start, length) in spans.items():
+                    narrowed = _narrow_encoded_rows(prefetched, start, length)
+                    if key == LEARNER_NAME:
+                        prefetched_learner = narrowed
+                    else:
+                        prefetched_snapshots[key] = narrowed
 
         # 2. One batched forward for the learner identity.
         if learner_bucket:
@@ -602,6 +779,9 @@ def rollout_episodes_batched(
                 model,
                 learner_bucket,
                 actions_per_env,
+                flat_env_rows,
+                flat_player_rows,
+                flat_actions,
                 trajectories,
                 learner_seats,
                 device,
@@ -617,8 +797,12 @@ def rollout_episodes_batched(
                 policy_graph_rows or max_policy_rows,
                 learner_action_agent,
                 defer_log_prob=defer_log_prob,
+                chunk_records=chunk_records,
+                enqueue_native_actions=use_pending_step and learner_action_agent is None,
                 timings=timings,
                 sample_timings=sample_timings,
+                sample_timing_prefix="current_sample",
+                preencoded_cpu=prefetched_learner,
             )
             _add_timing(timings, "learner_bucket_s", perf_counter() - phase_t0)
 
@@ -633,6 +817,10 @@ def rollout_episodes_batched(
             ):
                 phase_t0 = perf_counter()
                 rows = [(env_idx, seat) for env_idx, seat, _obs, _slot in bucket]
+                if use_pending_step and callable(fast_enqueue_builtin_actions):
+                    fast_enqueue_builtin_actions(_name, rows)
+                    _add_timing(timings, "builtin_policy_s", perf_counter() - phase_t0)
+                    continue
                 batched_actions = fast_builtin_actions(
                     _name,
                     rows,
@@ -641,7 +829,12 @@ def rollout_episodes_batched(
                 for (env_idx, seat, _obs, _slot), acts in zip(
                     bucket, batched_actions, strict=True
                 ):
-                    actions_per_env[env_idx][seat] = acts
+                    if actions_per_env is not None:
+                        actions_per_env[env_idx][seat] = acts
+                    if flat_env_rows is not None and flat_player_rows is not None and flat_actions is not None:
+                        flat_env_rows.append(env_idx)
+                        flat_player_rows.append(seat)
+                        flat_actions.append(acts)
                 _add_timing(timings, "builtin_policy_s", perf_counter() - phase_t0)
                 continue
             agent_model = getattr(agent, "model", None)
@@ -655,22 +848,34 @@ def rollout_episodes_batched(
                     (env_idx, seat, None)
                     for env_idx, seat, _obs, _slot in bucket
                 ]
+                snapshot_compile_mode = getattr(agent, "compile_mode", None)
+                snapshot_graph_rows = _snapshot_rollout_graph_rows(
+                    len(snapshot_bucket),
+                    snapshot_compile_rows=snapshot_compile_rows,
+                    compile_mode=snapshot_compile_mode,
+                )
                 phase_t0 = perf_counter()
                 _step_learner_bucket(
                     agent_model,
                     snapshot_bucket,
                     actions_per_env,
+                    flat_env_rows,
+                    flat_player_rows,
+                    flat_actions,
                     trajectories,
                     learner_seats,
                     str(getattr(agent, "device", device)),
                     bool(getattr(agent, "deterministic", deterministic)),
                     False,
                     fast_policy_batch_no_context,
-                    getattr(agent, "compile_mode", None),
+                    snapshot_compile_mode,
                     None,
-                    _snapshot_graph_rows(len(snapshot_bucket)),
+                    snapshot_graph_rows,
+                    enqueue_native_actions=use_pending_step,
                     timings=timings,
                     sample_timings=sample_timings,
+                    sample_timing_prefix="snapshot_sample",
+                    preencoded_cpu=prefetched_snapshots.get(_name),
                 )
                 _add_timing(timings, "snapshot_bucket_s", perf_counter() - phase_t0)
                 continue
@@ -682,18 +887,39 @@ def rollout_episodes_batched(
                 for (env_idx, seat, _obs, _slot), acts in zip(
                     bucket, batched_actions, strict=True
                 ):
-                    actions_per_env[env_idx][seat] = acts
+                    if actions_per_env is not None:
+                        actions_per_env[env_idx][seat] = acts
+                    if flat_env_rows is not None and flat_player_rows is not None and flat_actions is not None:
+                        flat_env_rows.append(env_idx)
+                        flat_player_rows.append(seat)
+                        flat_actions.append(acts)
             else:
                 for env_idx, seat, obs, slot in bucket:
-                    actions_per_env[env_idx][seat] = slot.agent(obs)
+                    acts = slot.agent(obs)
+                    if actions_per_env is not None:
+                        actions_per_env[env_idx][seat] = acts
+                    if flat_env_rows is not None and flat_player_rows is not None and flat_actions is not None:
+                        flat_env_rows.append(env_idx)
+                        flat_player_rows.append(seat)
+                        flat_actions.append(acts)
             _add_timing(timings, "python_policy_s", perf_counter() - phase_t0)
 
         # 4. Step alive envs in parallel.
-        active = [i for i in range(num_envs) if not dones[i]]
-        actions_list = [actions_per_env[i] for i in active]
-        step_subset = fast_step_subset if use_fast_numpy_path else vec.step_subset
+        active = active_envs
         phase_t0 = perf_counter()
-        results = step_subset(active, actions_list)
+        if use_flat_step:
+            if flat_env_rows is None or flat_player_rows is None or flat_actions is None:
+                raise RuntimeError("flat rollout step missing action rows")
+            if use_pending_step:
+                results = fast_step_pending(active, flat_env_rows, flat_player_rows, flat_actions)
+            else:
+                results = fast_step_flat(active, flat_env_rows, flat_player_rows, flat_actions)
+        else:
+            if actions_per_env is None:
+                raise RuntimeError("nested rollout step missing action rows")
+            actions_list = [actions_per_env[i] for i in active]
+            step_subset = fast_step_subset if use_fast_numpy_path else vec.step_subset
+            results = step_subset(active, actions_list)
         _add_timing(timings, "env_step_s", perf_counter() - phase_t0)
         for i, (state, done, final) in results.items():
             if state is not None:
@@ -701,6 +927,7 @@ def rollout_episodes_batched(
             if done:
                 dones[i] = True
                 finals[i] = final
+        active_envs = [idx for idx in active_envs if not dones[idx]]
         if dense_potential:
             phase_t0 = perf_counter()
             rows = [
@@ -735,7 +962,10 @@ def rollout_episodes_batched(
 def _step_learner_bucket(
     model: OrbitPolicy,
     bucket: list[tuple[int, int, Any]],
-    actions_per_env: dict[int, list[Any]],
+    actions_per_env: dict[int, list[Any]] | None,
+    flat_env_rows: list[int] | None,
+    flat_player_rows: list[int] | None,
+    flat_actions: list[Any] | None,
     trajectories: list[Trajectory],
     learner_seats: Sequence[int],
     device: str,
@@ -747,8 +977,12 @@ def _step_learner_bucket(
     graph_rows: int | None = None,
     learner_action_agent: Callable[[Any], list[list]] | None = None,
     defer_log_prob: bool = False,
+    chunk_records: bool = False,
+    enqueue_native_actions: bool = False,
     timings: dict[str, float] | None = None,
     sample_timings: dict[str, float] | None = None,
+    sample_timing_prefix: str | None = None,
+    preencoded_cpu: EncodedObs | None = None,
 ) -> None:
     """Encode + batch-forward the learner identity across (env, seat) pairs.
 
@@ -765,25 +999,69 @@ def _step_learner_bucket(
         if graph_enabled and compile_fleet_width is not None
         else None
     )
-    graph_rows = max(int(graph_rows or len(bucket)), len(bucket))
+    if graph_enabled and graph_rows is not None:
+        graph_rows = _capped_graph_rows(len(bucket), max_rows=int(graph_rows))
+    else:
+        graph_rows = max(int(graph_rows or len(bucket)), len(bucket))
     include_fleet_targets = (
         getattr(getattr(model, "cfg", None), "encoder_backend", None)
         == "destination_conditioned"
     )
+    if graph_enabled and include_fleet_targets:
+        fixed_graph_fleet_width = 0
+    sync_timing = sample_timings is not None
     action_contexts: list[ActionContext] | None = None
     policy_rows: list[tuple[int, int]] | None = None
+    source_index_stacked: EncodedObs | None = None
     fast_sampler = getattr(getattr(policy_batch, "__self__", None), "sample_batch_with_records", None)
     fast_actions_sampler = getattr(getattr(policy_batch, "__self__", None), "sample_batch_actions", None)
     phase_t0 = perf_counter()
-    if callable(policy_batch):
+    if preencoded_cpu is not None:
+        if preencoded_cpu.planet_feats.shape[0] != len(bucket):
+            raise ValueError("preencoded rollout batch row count must match bucket")
+        if callable(policy_batch):
+            policy_rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
+        if target_device.type == "cuda":
+            cpu_stacked = preencoded_cpu
+            source_index_stacked = cpu_stacked
+            device_source = (
+                _bucket_fleets_for_graph(cpu_stacked, fixed_width=fixed_graph_fleet_width)
+                if graph_enabled
+                else _trim_fleets_for_forward(cpu_stacked)
+            )
+            if graph_enabled:
+                device_source = _pad_encoded_rows(device_source, graph_rows)
+            stacked = _encoded_to_device(device_source, target_device)
+            if not record_on_cpu:
+                cpu_stacked = None
+        else:
+            stacked = preencoded_cpu
+            if stacked.planet_feats.device != target_device:
+                stacked = _encoded_to_device(stacked, target_device)
+            cpu_stacked = stacked if record_trajectories else None
+            if stacked.planet_feats.device.type == "cpu":
+                source_index_stacked = stacked
+            if graph_enabled:
+                stacked = _bucket_fleets_for_graph(
+                    stacked,
+                    fixed_width=fixed_graph_fleet_width,
+                )
+                stacked = _pad_encoded_rows(stacked, graph_rows)
+            else:
+                stacked = _trim_fleets_for_forward(stacked)
+    elif callable(policy_batch):
         policy_rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
         if target_device.type == "cuda":
             cpu_stacked, action_contexts = policy_batch(
                 policy_rows,
-                device="cpu",
-                pin_memory=False,
-                include_fleet_targets=include_fleet_targets,
+                **_policy_batch_kwargs(
+                    policy_batch,
+                    device="cpu",
+                    pin_memory=True,
+                    include_fleet_targets=include_fleet_targets,
+                ),
             )
+            source_index_stacked = cpu_stacked
             device_source = (
                 _bucket_fleets_for_graph(cpu_stacked, fixed_width=fixed_graph_fleet_width)
                 if graph_enabled
@@ -797,13 +1075,18 @@ def _step_learner_bucket(
         else:
             stacked, action_contexts = policy_batch(
                 policy_rows,
-                device=device,
-                pin_memory=target_device.type == "cuda",
-                include_fleet_targets=include_fleet_targets,
+                **_policy_batch_kwargs(
+                    policy_batch,
+                    device=device,
+                    pin_memory=target_device.type == "cuda",
+                    include_fleet_targets=include_fleet_targets,
+                ),
             )
             if stacked.planet_feats.device != target_device:
                 stacked = _encoded_to_device(stacked, target_device)
             cpu_stacked = stacked if record_trajectories else None
+            if stacked.planet_feats.device.type == "cpu":
+                source_index_stacked = stacked
             if not graph_enabled:
                 stacked = _trim_fleets_for_forward(stacked)
     else:
@@ -817,6 +1100,7 @@ def _step_learner_bucket(
             else None
         )
         if cpu_stacked is not None:
+            source_index_stacked = cpu_stacked
             device_source = (
                 _bucket_fleets_for_graph(cpu_stacked, fixed_width=fixed_graph_fleet_width)
                 if graph_enabled
@@ -837,6 +1121,8 @@ def _step_learner_bucket(
                 if record_trajectories and target_device.type == "cpu"
                 else None
             )
+            if stacked.planet_feats.device.type == "cpu":
+                source_index_stacked = stacked
             if graph_enabled:
                 stacked = _bucket_fleets_for_graph(
                     stacked,
@@ -845,6 +1131,7 @@ def _step_learner_bucket(
                 stacked = _pad_encoded_rows(stacked, graph_rows)
             else:
                 stacked = _trim_fleets_for_forward(stacked)
+    _sync_cuda_timing(target_device, sync_timing)
     _add_timing(timings, "policy_feature_s", perf_counter() - phase_t0)
     if cpu_stacked is not None:
         real_rows = cpu_stacked.planet_feats.shape[0]
@@ -861,14 +1148,49 @@ def _step_learner_bucket(
             if seat == learner_seats[env_idx]
         ]
         learner_envs = [bucket[k][0] for k in learner_rows]
+    record_source_mask_full = None
+    compact_source_rows = None
+    compact_source_cols = None
+    compact_target_planets = None
+    if (
+        source_index_stacked is not None
+        and source_index_stacked.planet_feats.device.type == "cpu"
+        and policy_rows is not None
+    ):
+        record_source_mask_full = (
+            source_index_stacked.planet_owned_mask & source_index_stacked.planet_mask
+        )
+        compact_source_rows = source_index_stacked.compact_source_rows
+        compact_source_cols = source_index_stacked.compact_source_cols
+        compact_target_planets = source_index_stacked.compact_target_planets
+        if compact_target_planets is None:
+            compact_target_planets = int(source_index_stacked.planet_mask.shape[1])
+            live_planet_cols = torch.nonzero(
+                source_index_stacked.planet_mask.any(dim=0),
+                as_tuple=False,
+            )
+            if live_planet_cols.numel():
+                compact_target_planets = int(live_planet_cols[-1].item()) + 1
+        if compact_source_rows is None or compact_source_cols is None:
+            source_mask_for_sampling = (
+                record_source_mask_full & (source_index_stacked.planet_garrison >= 2.0)
+            )
+            source_rows, source_cols = torch.nonzero(source_mask_for_sampling, as_tuple=True)
+            compact_source_rows = source_rows.numpy()
+            compact_source_cols = source_cols.numpy()
+    record_value_only = record_trajectories and learner_action_agent is not None
+    record_values = record_trajectories and (record_value_only or not defer_log_prob)
+
     # CUDA rollout uses a fixed padded batch so Inductor can reuse one static
     # graph even as envs finish and the real learner bucket shrinks.
     graph_stacked = _pad_encoded_rows(stacked, graph_rows) if graph_enabled else stacked
+    if graph_enabled and include_fleet_targets:
+        _assert_destination_compiled_shape(graph_stacked)
     kernel = _get_rollout_kernel(
         model,
         target_device,
         compile_mode if graph_enabled else None,
-        include_value=record_trajectories,
+        include_value=record_values,
         shape_key=(
             int(graph_stacked.planet_feats.shape[0]),
             int(graph_stacked.planet_feats.shape[1]),
@@ -884,6 +1206,7 @@ def _step_learner_bucket(
         with torch.no_grad():
             if graph_enabled:
                 _mark_cuda_graph_step(target_device)
+            _sync_cuda_timing(target_device, sync_timing)
             phase_t0 = perf_counter()
             out = kernel(
                 _global_feats_or_empty(graph_stacked),
@@ -897,21 +1220,19 @@ def _step_learner_bucket(
                 fleet_target_planet_idx_or_empty(graph_stacked),
                 planet_inbound_feats_or_empty(graph_stacked),
             )
+            _sync_cuda_timing(target_device, sync_timing)
             _add_timing(timings, "policy_forward_s", perf_counter() - phase_t0)
     finally:
         model.train(was_training)
     out = _slice_policy_output(out, real_rows)
 
-    record_value_only = record_trajectories and learner_action_agent is not None
+    scoped_sample_timings = _scoped_timings(sample_timings, sample_timing_prefix)
     phase_t0 = perf_counter()
     if record_trajectories and not record_value_only:
         if callable(fast_sampler) and policy_rows is not None:
             record_source_mask = None
-            if cpu_stacked is not None and learner_rows:
-                record_source_mask = (
-                    cpu_stacked.planet_owned_mask[learner_rows]
-                    & cpu_stacked.planet_mask[learner_rows]
-                ).numpy()
+            if record_source_mask_full is not None and learner_rows:
+                record_source_mask = record_source_mask_full[learner_rows].numpy()
             actions_list, records = fast_sampler(
                 out,
                 policy_rows,
@@ -919,8 +1240,13 @@ def _step_learner_bucket(
                 record_rows=learner_rows,
                 record_source_mask=record_source_mask,
                 native_actions=True,
+                enqueue_actions=enqueue_native_actions,
                 compute_log_prob=not defer_log_prob,
-                timings=sample_timings,
+                compact_legal_records=chunk_records,
+                compact_source_rows=compact_source_rows,
+                compact_source_cols=compact_source_cols,
+                compact_target_planets=compact_target_planets,
+                timings=scoped_sample_timings,
             )
         elif action_contexts is not None:
             actions_list, records = sample_batch_with_records_context(
@@ -943,7 +1269,11 @@ def _step_learner_bucket(
                 policy_rows,
                 deterministic=deterministic,
                 native_actions=True,
-                timings=sample_timings,
+                enqueue_actions=enqueue_native_actions,
+                timings=scoped_sample_timings,
+                compact_source_rows=compact_source_rows,
+                compact_source_cols=compact_source_cols,
+                compact_target_planets=compact_target_planets,
             )
         elif action_contexts is not None:
             actions_list = sample_batch_actions_context(
@@ -958,6 +1288,8 @@ def _step_learner_bucket(
                 deterministic=deterministic,
             )
         records = []
+    _flush_scoped_timings(sample_timings, scoped_sample_timings, sample_timing_prefix)
+    _sync_cuda_timing(target_device, sync_timing)
     _add_timing(timings, "policy_sample_s", perf_counter() - phase_t0)
 
     if learner_action_agent is not None and learner_rows:
@@ -1015,39 +1347,61 @@ def _step_learner_bucket(
                 records,
                 row_idx,
                 learner_rows,
+                include_log_prob=not defer_log_prob,
+                include_value=record_values,
+                timings=timings,
             )
-            for j, env_idx in enumerate(learner_envs):
-                traj = trajectories[env_idx]
-                traj.encoded.append(
-                    EncodedObs(
-                        planet_feats=rec["planet_feats"][j],
-                        planet_mask=rec["planet_mask"][j],
-                        planet_owned_mask=rec["planet_owned_mask"][j],
-                        planet_ids=rec["planet_ids"][j],
-                        planet_garrison=rec["planet_garrison"][j],
-                        fleet_feats=rec["fleet_feats"][j],
-                        fleet_mask=rec["fleet_mask"][j],
-                        global_feats=rec["global_feats"][j],
-                        fleet_target_planet_idx=None
-                        if rec["fleet_target_planet_idx"] is None
-                        else rec["fleet_target_planet_idx"][j],
-                        planet_inbound_feats=None
-                        if rec["planet_inbound_feats"] is None
-                        else rec["planet_inbound_feats"][j],
+            if chunk_records:
+                for j, env_idx in enumerate(learner_envs):
+                    traj = trajectories[env_idx]
+                    traj.record_refs.append(TrajectoryRecordRef(rec, j))
+                    traj.reward.append(0.0)
+            else:
+                for j, env_idx in enumerate(learner_envs):
+                    traj = trajectories[env_idx]
+                    traj.encoded.append(
+                        EncodedObs(
+                            planet_feats=rec["planet_feats"][j],
+                            planet_mask=rec["planet_mask"][j],
+                            planet_owned_mask=rec["planet_owned_mask"][j],
+                            planet_ids=rec["planet_ids"][j],
+                            planet_garrison=rec["planet_garrison"][j],
+                            fleet_feats=rec["fleet_feats"][j],
+                            fleet_mask=rec["fleet_mask"][j],
+                            global_feats=rec["global_feats"][j],
+                            fleet_target_planet_idx=None
+                            if rec["fleet_target_planet_idx"] is None
+                            else rec["fleet_target_planet_idx"][j],
+                            planet_inbound_feats=None
+                            if rec["planet_inbound_feats"] is None
+                            else rec["planet_inbound_feats"][j],
+                        )
                     )
-                )
-                traj.launch.append(rec["launch"][j])
-                traj.target_idx.append(rec["target_idx"][j])
-                traj.fraction.append(rec["fraction"][j])
-                traj.log_prob.append(rec["log_prob"][j])
-                traj.value.append(rec["value"][j])
-                traj.owned_mask.append(rec["owned_mask"][j])
-                traj.target_legal_mask.append(rec["target_legal_mask"][j])
-                traj.reward.append(0.0)
+                    traj.launch.append(rec["launch"][j])
+                    traj.target_idx.append(rec["target_idx"][j])
+                    traj.fraction.append(rec["fraction"][j])
+                    if rec["log_prob"] is not None:
+                        traj.log_prob.append(rec["log_prob"][j])
+                    if rec["value"] is not None:
+                        traj.value.append(rec["value"][j])
+                    traj.owned_mask.append(rec["planet_owned_mask"][j] & rec["planet_mask"][j])
+                    traj.target_legal_mask.append(rec["target_legal_mask"][j])
+                    traj.reward.append(0.0)
         _add_timing(timings, "policy_record_s", perf_counter() - phase_t0)
 
-    for k, (env_idx, seat, _obs) in enumerate(bucket):
-        actions_per_env[env_idx][seat] = actions_list[k]
+    if actions_list is not None:
+        for k, (env_idx, seat, _obs) in enumerate(bucket):
+            acts = actions_list[k]
+            if actions_per_env is not None:
+                actions_per_env[env_idx][seat] = acts
+            if (
+                flat_env_rows is not None
+                and flat_player_rows is not None
+                and flat_actions is not None
+            ):
+                flat_env_rows.append(env_idx)
+                flat_player_rows.append(seat)
+                flat_actions.append(acts)
 
 
 def _materialize_value_records_cpu(
@@ -1059,50 +1413,64 @@ def _materialize_value_records_cpu(
 ) -> dict[str, torch.Tensor]:
     """Copy value-pretrain rollout records to CPU without action sidecars."""
     feature_source = cpu_stacked if cpu_stacked is not None else stacked
-    feature_rows = (
-        torch.as_tensor(rows, dtype=torch.long)
-        if feature_source.planet_feats.device.type == "cpu"
-        else row_idx
-    )
+    feature_rows = _feature_row_index(feature_source, row_idx, rows)
     value_cpu = out.value.index_select(0, row_idx).detach().cpu()
     return {
-        "planet_feats": feature_source.planet_feats.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "planet_mask": feature_source.planet_mask.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "planet_owned_mask": feature_source.planet_owned_mask.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "planet_ids": feature_source.planet_ids.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "planet_garrison": feature_source.planet_garrison.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "fleet_feats": feature_source.fleet_feats.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "fleet_mask": feature_source.fleet_mask.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
+        "planet_feats": _materialize_feature_field(feature_source.planet_feats, feature_rows),
+        "planet_mask": _materialize_feature_field(feature_source.planet_mask, feature_rows),
+        "planet_owned_mask": _materialize_feature_field(
+            feature_source.planet_owned_mask,
+            feature_rows,
+        ),
+        "planet_ids": _materialize_feature_field(feature_source.planet_ids, feature_rows),
+        "planet_garrison": _materialize_feature_field(
+            feature_source.planet_garrison,
+            feature_rows,
+        ),
+        "fleet_feats": _materialize_feature_field(feature_source.fleet_feats, feature_rows),
+        "fleet_mask": _materialize_feature_field(feature_source.fleet_mask, feature_rows),
         "fleet_target_planet_idx": None
         if feature_source.fleet_target_planet_idx is None
-        else feature_source.fleet_target_planet_idx.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
+        else _materialize_feature_field(
+            feature_source.fleet_target_planet_idx,
+            feature_rows,
+        ),
         "planet_inbound_feats": None
         if feature_source.planet_inbound_feats is None
-        else feature_source.planet_inbound_feats.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "global_feats": _global_feats_or_empty(feature_source)
-        .index_select(0, feature_rows)
-        .detach()
-        .cpu(),
+        else _materialize_feature_field(feature_source.planet_inbound_feats, feature_rows),
+        "global_feats": _materialize_feature_field(
+            _global_feats_or_empty(feature_source),
+            feature_rows,
+        ),
         "value": value_cpu,
     }
+
+
+def _feature_row_index(
+    feature_source: EncodedObs,
+    row_idx: torch.Tensor,
+    rows: list[int],
+) -> tuple[int, int] | torch.Tensor:
+    if feature_source.planet_feats.device.type != "cpu":
+        return row_idx
+    if rows:
+        start = int(rows[0])
+        if all(int(row) == start + idx for idx, row in enumerate(rows)):
+            return (start, len(rows))
+    return torch.as_tensor(rows, dtype=torch.long)
+
+
+def _materialize_feature_field(
+    field: torch.Tensor,
+    rows: tuple[int, int] | torch.Tensor,
+) -> torch.Tensor:
+    if isinstance(rows, tuple):
+        start, length = rows
+        selected = field.narrow(0, start, length)
+        if field.device.type == "cpu":
+            return selected.detach().clone()
+        return selected.detach().cpu()
+    return field.index_select(0, rows).detach().cpu()
 
 
 def _materialize_records_cpu(
@@ -1112,6 +1480,10 @@ def _materialize_records_cpu(
     records: list[Any],
     row_idx: torch.Tensor,
     rows: list[int],
+    *,
+    include_log_prob: bool = True,
+    include_value: bool = True,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Copy learner rollout records to CPU once per field per env step.
 
@@ -1121,11 +1493,7 @@ def _materialize_records_cpu(
     moves trajectory storage off VRAM at the same loop boundary.
     """
     feature_source = cpu_stacked if cpu_stacked is not None else stacked
-    feature_rows = (
-        torch.as_tensor(rows, dtype=torch.long)
-        if feature_source.planet_feats.device.type == "cpu"
-        else row_idx
-    )
+    feature_rows = _feature_row_index(feature_source, row_idx, rows)
     if isinstance(records, list):
         launch = torch.stack([records[k].launch for k in rows])
         target_idx = torch.stack([records[k].target_idx for k in rows])
@@ -1138,46 +1506,71 @@ def _materialize_records_cpu(
         fraction = records.fraction
         log_prob = records.log_prob
         target_legal_mask = records.target_legal_mask
-    owned_mask = out.planet_owned_mask.index_select(0, row_idx)
-    value = out.value.index_select(0, row_idx)
+    compact_target_legal = hasattr(records, "target_legal_source_mask")
+    if target_legal_mask is None and not compact_target_legal:
+        raise RuntimeError("rollout records are missing dense target legality")
+    keep_log_prob = include_log_prob or bool(
+        getattr(records, "old_log_prob_computed", False)
+    )
     b, p = target_idx.shape
-    mask_is_cpu = target_legal_mask.device.type == "cpu"
+    value = out.value.index_select(0, row_idx) if include_value else None
+    launch_is_cpu = launch.device.type == "cpu"
+    fraction_is_cpu = fraction.device.type == "cpu"
+    mask_is_cpu = target_legal_mask is None or target_legal_mask.device.type == "cpu"
+    log_prob_is_cpu = log_prob.device.type == "cpu"
     record_is_cpu = target_idx.device.type == "cpu"
+    phase_t0 = perf_counter()
     if record_is_cpu:
-        value_cpu = value.detach().cpu()
-        owned_mask_cpu = owned_mask.detach().cpu().bool()
+        value_cpu = value.detach().cpu() if value is not None else None
         target_idx_cpu = target_idx.detach().cpu().long()
         launch_cpu = launch.detach().cpu()
         fraction_cpu = fraction.detach().cpu()
-        log_prob_cpu = log_prob.detach().cpu()
-        target_legal_mask_cpu = target_legal_mask.detach().cpu().bool()
+        log_prob_cpu = log_prob.detach().cpu() if keep_log_prob else None
+        target_legal_mask_cpu = (
+            None if target_legal_mask is None else target_legal_mask.detach().cpu()
+        )
     else:
-        flat_parts = [
-            target_idx.float(),
-            launch.float(),
-            fraction.float(),
-            log_prob.float(),
-            value.float().unsqueeze(1),
-            owned_mask.float(),
-        ]
-        if not mask_is_cpu:
+        flat_parts = [target_idx.float()]
+        if not launch_is_cpu:
+            flat_parts.append(launch.float())
+        if not fraction_is_cpu:
+            flat_parts.append(fraction.float())
+        if value is not None:
+            flat_parts.append(value.float().unsqueeze(1))
+        if keep_log_prob and not log_prob_is_cpu:
+            flat_parts.append(log_prob.float())
+        if target_legal_mask is not None and not mask_is_cpu:
             flat_parts.append(target_legal_mask.float().reshape(b, -1))
         flat = torch.cat(tuple(flat_parts), dim=1).detach().cpu()
         pos = 0
         target_idx_cpu = flat[:, pos : pos + p].long()
         pos += p
-        launch_cpu = flat[:, pos : pos + p]
-        pos += p
-        fraction_cpu = flat[:, pos : pos + p]
-        pos += p
-        log_prob_cpu = flat[:, pos : pos + p]
-        pos += p
-        value_cpu = flat[:, pos]
-        pos += 1
-        owned_mask_cpu = flat[:, pos : pos + p].bool()
-        pos += p
-        if mask_is_cpu:
-            target_legal_mask_cpu = target_legal_mask.detach().cpu().bool()
+        if launch_is_cpu:
+            launch_cpu = launch.detach().cpu()
+        else:
+            launch_cpu = flat[:, pos : pos + p]
+            pos += p
+        if fraction_is_cpu:
+            fraction_cpu = fraction.detach().cpu()
+        else:
+            fraction_cpu = flat[:, pos : pos + p]
+            pos += p
+        if value is None:
+            value_cpu = None
+        else:
+            value_cpu = flat[:, pos]
+            pos += 1
+        if keep_log_prob and log_prob_is_cpu:
+            log_prob_cpu = log_prob.detach().cpu()
+        elif keep_log_prob:
+            log_prob_cpu = flat[:, pos : pos + p]
+            pos += p
+        else:
+            log_prob_cpu = None
+        if target_legal_mask is None:
+            target_legal_mask_cpu = None
+        elif mask_is_cpu:
+            target_legal_mask_cpu = target_legal_mask.detach().cpu()
         else:
             target_legal_width = p * p
             target_legal_mask_cpu = flat[:, pos : pos + target_legal_width].reshape(
@@ -1185,51 +1578,59 @@ def _materialize_records_cpu(
                 p,
                 p,
             ).bool()
+    _add_timing(timings, "policy_record/action_fields_s", perf_counter() - phase_t0)
 
-    return {
-        "planet_feats": feature_source.planet_feats.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "planet_mask": feature_source.planet_mask.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "planet_owned_mask": feature_source.planet_owned_mask.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "planet_ids": feature_source.planet_ids.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "planet_garrison": feature_source.planet_garrison.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "fleet_feats": feature_source.fleet_feats.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "fleet_mask": feature_source.fleet_mask.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
+    phase_t0 = perf_counter()
+    out = {
+        "planet_feats": _materialize_feature_field(feature_source.planet_feats, feature_rows),
+        "planet_mask": _materialize_feature_field(feature_source.planet_mask, feature_rows),
+        "planet_owned_mask": _materialize_feature_field(
+            feature_source.planet_owned_mask,
+            feature_rows,
+        ),
+        "planet_ids": _materialize_feature_field(feature_source.planet_ids, feature_rows),
+        "planet_garrison": _materialize_feature_field(
+            feature_source.planet_garrison,
+            feature_rows,
+        ),
+        "fleet_feats": _materialize_feature_field(feature_source.fleet_feats, feature_rows),
+        "fleet_mask": _materialize_feature_field(feature_source.fleet_mask, feature_rows),
         "fleet_target_planet_idx": None
         if feature_source.fleet_target_planet_idx is None
-        else feature_source.fleet_target_planet_idx.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
+        else _materialize_feature_field(
+            feature_source.fleet_target_planet_idx,
+            feature_rows,
+        ),
         "planet_inbound_feats": None
         if feature_source.planet_inbound_feats is None
-        else feature_source.planet_inbound_feats.index_select(0, feature_rows)
-        .detach()
-        .cpu(),
-        "global_feats": _global_feats_or_empty(feature_source)
-        .index_select(0, feature_rows)
-        .detach()
-        .cpu(),
+        else _materialize_feature_field(feature_source.planet_inbound_feats, feature_rows),
+        "global_feats": _materialize_feature_field(
+            _global_feats_or_empty(feature_source),
+            feature_rows,
+        ),
         "target_idx": target_idx_cpu,
         "launch": launch_cpu,
         "fraction": fraction_cpu,
         "log_prob": log_prob_cpu,
         "value": value_cpu,
-        "owned_mask": owned_mask_cpu,
         "target_legal_mask": target_legal_mask_cpu,
     }
+    _add_timing(timings, "policy_record/features_s", perf_counter() - phase_t0)
+    out["old_log_prob_computed"] = bool(
+        getattr(records, "old_log_prob_computed", False)
+    )
+    out["values_computed"] = bool(include_value)
+    if compact_target_legal:
+        phase_t0 = perf_counter()
+        out["target_legal_row_idx"] = records.target_legal_row_idx.detach().cpu().long()
+        out["target_legal_source_idx"] = (
+            records.target_legal_source_idx.detach().cpu().long()
+        )
+        out["target_legal_source_mask"] = (
+            records.target_legal_source_mask.detach().cpu().bool()
+        )
+        _add_timing(timings, "policy_record/compact_legal_s", perf_counter() - phase_t0)
+    return out
 
 
 def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
@@ -1240,7 +1641,9 @@ def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
         if t.device == device:
             return t
         if t.device.type == "cpu":
-            return t.pin_memory().to(device, non_blocking=True)
+            if not t.is_pinned():
+                t = t.pin_memory()
+            return t.to(device, non_blocking=True)
         return t.to(device, non_blocking=True)
 
     return EncodedObs(
@@ -1258,4 +1661,7 @@ def _encoded_to_device(feats: EncodedObs, device: torch.device) -> EncodedObs:
         planet_inbound_feats=None
         if feats.planet_inbound_feats is None
         else move(feats.planet_inbound_feats),
+        compact_source_rows=feats.compact_source_rows,
+        compact_source_cols=feats.compact_source_cols,
+        compact_target_planets=feats.compact_target_planets,
     )

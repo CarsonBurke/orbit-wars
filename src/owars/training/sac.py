@@ -1313,6 +1313,7 @@ def _build_policy_cfg(cfg: RunConfig) -> OrbitPolicyConfig:
         value_min=m.value_min,
         value_max=m.value_max,
         value_symlog=m.value_symlog,
+        value_bucket=m.value_bucket,
         action_logit_softcap=m.action_logit_softcap,
         adv_scale=m.adv_scale,
     )

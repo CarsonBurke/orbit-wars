@@ -44,7 +44,7 @@ ppo:
   clip_coef: 0.2
   clip_coef_high: 0.28
   value_coef: 1.0
-  target_entropy_coef: 0.01
+  target_entropy_coef: 0.0
   fraction_entropy_coef: 0.0
   pretrain_updates: 0
 
@@ -52,6 +52,7 @@ rollout:
   num_envs: 128
   num_workers: 0
   env_backend: rust
+  strict_target_legality: false
 
 opponents:
   snapshot_every: 50

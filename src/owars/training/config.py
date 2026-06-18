@@ -50,12 +50,13 @@ class ModelCfg:
     num_fleet_latents: int = 64
     fleet_tokenizer_depth: int = 1
     value_hidden: int = 64
-    value_num_bins: int = 153
-    value_sigma_to_bin_ratio: float = 2.0
+    value_num_bins: int = 255
+    value_sigma_to_bin_ratio: float = 0.75
     critic_mtp_horizon: int = 6
-    value_min: float = -64.0
-    value_max: float = 64.0
+    value_min: float = -8.0
+    value_max: float = 8.0
     value_symlog: bool = False
+    value_bucket: Literal["dreamer3", "legacy"] = "dreamer3"
     action_logit_softcap: float = 8.0
     # Real-units bound on the per-planet SAC advantage heads (see
     # OrbitPolicyConfig.adv_scale): each head emits adv_scale·tanh(raw/adv_scale).
@@ -203,7 +204,7 @@ class PPOCfg:
     # Categorical target entropy has no structural floor, so keep it from
     # collapsing. Fraction entropy uses the policy's native Beta distribution
     # but is left off by default for PPO.
-    target_entropy_coef: float = 0.01
+    target_entropy_coef: float = 0.0
     fraction_entropy_coef: float = 0.0
     # No value clipping. dreamer4-style clipping (`max(ce, ce_of_clipped_v)`)
     # only behaves sensibly when the HL-Gauss σ is wide enough that the
@@ -339,6 +340,8 @@ class RolloutCfg:
     env_backend: str = "rust"  # "rust", "numpy", "numpy_mp", or "kaggle"
     compile_policy: bool = True
     compile_fleet_width: int = 1024
+    snapshot_compile_rows: int = 64
+    strict_target_legality: bool = False
     detail_timing: bool = False
     sample_detail_timing: bool = False
 
@@ -370,7 +373,7 @@ class OpponentsCfg:
     initial_rating: float = 1500.0
     k_factor: float = 32.0
     active_pool_size: int = 16
-    active_sample_panel_size: int = 2
+    active_sample_panel_size: int = 8
     historical_training_archive_size: int = 128
     current_learner_prob: float = 0.4
     active_pool_prob: float = 0.3
@@ -382,7 +385,7 @@ class OpponentsCfg:
     active_recency_half_life_updates: float = 50.0
     min_games_before_active_eviction: int = 16
     active_stats_ema_decay: float = 0.95
-    historical_sample_panel_size: int = 2
+    historical_sample_panel_size: int = 8
     historical_agent_cache_size: int = 8
     recent_eviction_archive_size: int | None = None
     notable_archive_size: int | None = None
@@ -491,6 +494,8 @@ class RunConfig:
                 cfg.model.value_num_bins = 41
             if "value_symlog" not in model_section:
                 cfg.model.value_symlog = False
+            if "value_bucket" not in model_section:
+                cfg.model.value_bucket = "legacy"
             if "critic_return_norm" not in ppo_section:
                 cfg.ppo.critic_return_norm = "none"
         if not 0.0 <= cfg.ppo.gae_lambda <= 1.0:
@@ -567,8 +572,16 @@ class RunConfig:
             raise ValueError("rollout.num_envs must be positive")
         if cfg.rollout.games_per_env_per_update <= 0:
             raise ValueError("rollout.games_per_env_per_update must be positive")
-        if cfg.rollout.compile_fleet_width <= 0:
-            raise ValueError("rollout.compile_fleet_width must be positive")
+        if cfg.rollout.compile_fleet_width < 0 or (
+            cfg.rollout.compile_fleet_width == 0
+            and cfg.model.encoder_backend != "destination_conditioned"
+        ):
+            raise ValueError(
+                "rollout.compile_fleet_width must be positive unless "
+                "model.encoder_backend='destination_conditioned'"
+            )
+        if cfg.rollout.snapshot_compile_rows <= 0:
+            raise ValueError("rollout.snapshot_compile_rows must be positive")
         if not 0.0 <= cfg.model.planet_rope_fraction <= 1.0:
             raise ValueError("model.planet_rope_fraction must be in [0, 1]")
         if cfg.model.planet_rope_base <= 0.0:
@@ -585,6 +598,24 @@ class RunConfig:
             raise ValueError("model.value_min must be less than model.value_max")
         if cfg.model.value_sigma_to_bin_ratio <= 0.0:
             raise ValueError("model.value_sigma_to_bin_ratio must be positive")
+        if cfg.model.value_bucket not in {"dreamer3", "legacy"}:
+            raise ValueError("model.value_bucket must be 'dreamer3' or 'legacy'")
+        if cfg.model.value_bucket == "dreamer3":
+            if cfg.model.value_symlog:
+                raise ValueError(
+                    "model.value_symlog must be false when model.value_bucket='dreamer3'"
+                )
+            if cfg.model.value_num_bins % 2 != 1:
+                raise ValueError("model.value_num_bins must be odd for dreamer3")
+            if not math.isclose(
+                abs(cfg.model.value_min),
+                abs(cfg.model.value_max),
+                rel_tol=1e-6,
+                abs_tol=1e-6,
+            ):
+                raise ValueError(
+                    "model.value_min/value_max must be symmetric for dreamer3"
+                )
         if cfg.model.critic_mtp_horizon <= 0:
             raise ValueError("model.critic_mtp_horizon must be positive")
         if cfg.model.adv_scale <= 0.0:

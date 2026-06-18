@@ -519,6 +519,9 @@ class EncodedObs:
     global_feats: torch.Tensor | None = None  # [global_dim] or [B, global_dim]
     fleet_target_planet_idx: torch.Tensor | None = None  # [F_max] or [B, F_max], -1 if none/pad
     planet_inbound_feats: torch.Tensor | None = None  # [P_max, inbound_dim] or [B, P_max, inbound_dim]
+    compact_source_rows: np.ndarray | None = None
+    compact_source_cols: np.ndarray | None = None
+    compact_target_planets: int | None = None
 
     def to(self, device: str | torch.device) -> EncodedObs:
         return EncodedObs(
@@ -538,6 +541,9 @@ class EncodedObs:
             planet_inbound_feats=None
             if self.planet_inbound_feats is None
             else self.planet_inbound_feats.to(device),
+            compact_source_rows=self.compact_source_rows,
+            compact_source_cols=self.compact_source_cols,
+            compact_target_planets=self.compact_target_planets,
         )
 
 
@@ -647,6 +653,9 @@ def slice_encoded_fleet_width(feats: EncodedObs, width: int) -> EncodedObs:
         global_feats=feats.global_feats,
         fleet_target_planet_idx=fleet_targets,
         planet_inbound_feats=feats.planet_inbound_feats,
+        compact_source_rows=feats.compact_source_rows,
+        compact_source_cols=feats.compact_source_cols,
+        compact_target_planets=feats.compact_target_planets,
     )
 
 
@@ -739,6 +748,10 @@ def _fill_encoded_arrays(
         f_feats_r[j] = _fleet_features(f, o.player, num_players, planet_pos)
         f_mask_r[j] = True
     if f_target_r is not None or planet_inbound_r is not None:
+        if not o.fleets:
+            if planet_inbound_r is not None:
+                planet_inbound_r.fill(0.0)
+            return
         dest_idx, _eta, status = _infer_fleet_target_planet_idx(o)
         summary_feats = f_feats_r
         summary_mask = f_mask_r
@@ -846,6 +859,10 @@ def _fill_encoded_arrays_raw(
         )
         f_mask_r[j] = True
     if f_target_r is not None or planet_inbound_r is not None:
+        if not fleets:
+            if planet_inbound_r is not None:
+                planet_inbound_r.fill(0.0)
+            return
         dest_idx, _eta, status = _infer_fleet_target_planet_idx_raw(o)
         if fleet_targets:
             if len(dest_idx) != len(fleets):

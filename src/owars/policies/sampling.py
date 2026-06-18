@@ -117,9 +117,25 @@ def _categorical_action_logits(
         target_logits_f = torch.where(
             target_finite,
             softcap * torch.tanh(target_logits_f / softcap),
-            target_logits_f,
+            torch.full_like(target_logits_f, float("-inf")),
         )
-        noop_logits_f = softcap * torch.tanh(noop_logits_f / softcap)
+        noop_finite = torch.isfinite(noop_logits_f)
+        noop_logits_f = torch.where(
+            noop_finite,
+            softcap * torch.tanh(noop_logits_f / softcap),
+            torch.full_like(noop_logits_f, -1.0e9),
+        )
+    else:
+        target_logits_f = torch.where(
+            target_finite,
+            target_logits_f,
+            torch.full_like(target_logits_f, float("-inf")),
+        )
+        noop_logits_f = torch.where(
+            torch.isfinite(noop_logits_f),
+            noop_logits_f,
+            torch.full_like(noop_logits_f, -1.0e9),
+        )
     target_count = target_finite.sum(dim=-1, keepdim=True).clamp_min(1)
     target_logits_f = torch.where(
         target_finite,
@@ -130,11 +146,7 @@ def _categorical_action_logits(
         (noop_logits_f.unsqueeze(-1), target_logits_f),
         dim=-1,
     )
-    return torch.where(
-        torch.isfinite(action_logits),
-        action_logits,
-        torch.full_like(action_logits, -1e9),
-    )
+    return action_logits
 
 
 def _categorical_action_log_probs(
@@ -277,6 +289,52 @@ def _fraction_log_prob(
     raise ValueError(f"unknown fraction_dist={fraction_dist!r}")
 
 
+def _launched_fraction_log_prob(
+    fraction_param1: torch.Tensor,
+    fraction_param2: torch.Tensor,
+    fraction: torch.Tensor,
+    fraction_dist: str,
+    launch: torch.Tensor,
+) -> torch.Tensor:
+    launch_mask = launch.float() > 0.5
+    if fraction_dist == "beta":
+        safe_param1 = torch.where(
+            launch_mask,
+            fraction_param1,
+            torch.full_like(fraction_param1, 2.0),
+        )
+        safe_param2 = torch.where(
+            launch_mask,
+            fraction_param2,
+            torch.full_like(fraction_param2, 2.0),
+        )
+    elif fraction_dist == "squashed_normal":
+        safe_param1 = torch.where(
+            launch_mask,
+            fraction_param1,
+            torch.zeros_like(fraction_param1),
+        )
+        safe_param2 = torch.where(
+            launch_mask,
+            fraction_param2,
+            torch.zeros_like(fraction_param2),
+        )
+    else:
+        raise ValueError(f"unknown fraction_dist={fraction_dist!r}")
+    safe_fraction = torch.where(
+        launch_mask,
+        fraction,
+        torch.full_like(fraction, 0.5),
+    )
+    frac_lp = _fraction_log_prob(safe_param1, safe_param2, safe_fraction, fraction_dist)
+    return torch.where(launch_mask, frac_lp, torch.zeros_like(frac_lp))
+
+
+def _action_log_prob_for_action(action_lp: torch.Tensor, launch: torch.Tensor) -> torch.Tensor:
+    del launch
+    return action_lp
+
+
 def _fraction_entropy(
     fraction_param1: torch.Tensor,
     fraction_param2: torch.Tensor,
@@ -355,7 +413,7 @@ class SampleBatchRecord:
     target_idx: torch.Tensor
     fraction: torch.Tensor
     log_prob: torch.Tensor
-    target_legal_mask: torch.Tensor
+    target_legal_mask: torch.Tensor | None
 
 
 @dataclass(slots=True)
@@ -1354,22 +1412,6 @@ def _sample_fraction(
     raise ValueError(f"unknown fraction_dist={fraction_dist!r}")
 
 
-def _categorical_support_launch_fraction(
-    fraction_param1: torch.Tensor,
-    fraction_param2: torch.Tensor,
-    owned: torch.Tensor,
-    pmask: torch.Tensor,
-    fraction_dist: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    support_frac = _deterministic_fraction(
-        fraction_param1,
-        fraction_param2,
-        fraction_dist=fraction_dist,
-    )
-    support_launch = (owned & pmask).to(dtype=support_frac.dtype, device=support_frac.device)
-    return support_launch, support_frac
-
-
 def _sample_target(
     target_logits: torch.Tensor,
     deterministic: bool,
@@ -1454,12 +1496,9 @@ def _prepare_batch_action_fields(
             deterministic,
             fraction_dist,
         )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            out.planet_owned_mask,
-            out.planet_mask,
-            fraction_dist,
+        support_launch = (out.planet_owned_mask & out.planet_mask).to(
+            dtype=frac.dtype,
+            device=frac.device,
         )
         legality_launch = support_launch
 
@@ -1979,13 +2018,15 @@ def _record_from_materialized_launch(
             torch.zeros_like(target_idx),
         )
         action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
-    frac_lp = _fraction_log_prob(
+    action_lp = _action_log_prob_for_action(action_lp, record_launch.float())
+    fraction_action_lp = _launched_fraction_log_prob(
         fraction_param1.detach().float(),
         fraction_param2.detach().float(),
         frac.detach().float(),
         fraction_dist,
+        record_launch.float(),
     )
-    log_prob = action_lp + record_launch.float() * frac_lp
+    log_prob = action_lp + fraction_action_lp
     return SampleRecord(
         launch=record_launch,
         raw_launch=raw_launch,
@@ -2059,13 +2100,15 @@ def _batch_record_from_materialized_launch(
             torch.zeros_like(target_idx_r),
         )
         action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
-    frac_lp = _fraction_log_prob(
+    action_lp = _action_log_prob_for_action(action_lp, record_launch.float())
+    fraction_action_lp = _launched_fraction_log_prob(
         fraction_param1_r.detach().float(),
         fraction_param2_r.detach().float(),
         frac_r.detach().float(),
         fraction_dist,
+        record_launch.float(),
     )
-    log_prob = action_lp + record_launch.float() * frac_lp
+    log_prob = action_lp + fraction_action_lp
     return SampleBatchRecord(
         launch=record_launch,
         raw_launch=raw_launch_r,
@@ -2113,12 +2156,9 @@ def sample_with_record(
             deterministic,
             fraction_dist,
         )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            owned,
-            pmask,
-            fraction_dist,
+        support_launch = (owned & pmask).to(
+            dtype=frac.dtype,
+            device=frac.device,
         )
     target_legal_mask = _target_legal_mask_from_observation(
         frac,
@@ -2203,12 +2243,9 @@ def sample_actions(
             deterministic,
             fraction_dist,
         )
-        support_launch, _support_frac = _categorical_support_launch_fraction(
-            fraction_param1,
-            fraction_param2,
-            owned,
-            pmask,
-            fraction_dist,
+        support_launch = (owned & pmask).to(
+            dtype=frac.dtype,
+            device=frac.device,
         )
     target_legal_mask = _target_legal_mask_from_observation(
         frac,

@@ -8,7 +8,7 @@
 #     minibatch advantage normalization.
 #   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
-#   - Distributional value head (linear HL-Gauss CE on normalized returns / 153 bins), unclipped.
+#   - Distributional value head (Dreamer3 HL-Gauss bucket on normalized returns / 255 bins), unclipped.
 
 run:
   name: ppo_base
@@ -44,12 +44,13 @@ model:
   encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
-  value_min: -64.0
-  value_max: 64.0
-  value_num_bins: 153
-  value_sigma_to_bin_ratio: 2.0
+  value_min: -8.0
+  value_max: 8.0
+  value_num_bins: 255
+  value_sigma_to_bin_ratio: 0.75
   critic_mtp_horizon: 6
   value_symlog: false
+  value_bucket: dreamer3
 
 optim:
   # Muon (transformer block matrix params). Matches parameter-golf
@@ -85,7 +86,7 @@ ppo:
   critic_return_norm: discounted_return_rms
   critic_return_norm_clip: 10.0
 
-  target_entropy_coef: 0.01     # categorical target distribution has no structural floor, so keep it from collapsing
+  target_entropy_coef: 0.0
   fraction_entropy_coef: 0.0    # native Beta entropy; keep off by default
   pretrain_updates: 0   # PMA critic token gives the value head a dedicated
                         # representation, and pretraining against `heuristic`
@@ -97,11 +98,13 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 128             # parallel envs (= episodes per update)
+  num_envs: 1024            # parallel envs (= episodes per update)
   num_workers: 0            # only used by numpy_mp
   env_backend: rust
   compile_policy: true
-  compile_fleet_width: 1024
+  compile_fleet_width: 0
+  snapshot_compile_rows: 128
+  strict_target_legality: false
 
 opponents:
   mode: no_builtins
@@ -114,10 +117,10 @@ opponents:
   active_pool_prob: 0.3
   historical_archive_prob: 0.3
   active_pool_size: 16
-  active_sample_panel_size: 2
+  active_sample_panel_size: 1
   historical_training_archive_size: 128
   historical_sample_panel_size: 2
-  historical_agent_cache_size: 8
+  historical_agent_cache_size: 4
   min_games_before_active_eviction: 16
   initial_rating: 1500.0
   k_factor: 32.0

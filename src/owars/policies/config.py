@@ -83,14 +83,20 @@ class OrbitPolicyConfig:
 
     # Distributional critic. The first horizon predicts V(s_t); additional
     # MTP horizons predict future-row lambda returns from the same critic token
-    # and are masked at episode tails.
+    # and are masked at episode tails. `dreamer3` uses a CleanRL v162-style
+    # coordinate-space symlog bucket: symmetric odd bins in coord space,
+    # symexp centers for scalar decode, and Gaussian CDF target projection.
+    # PPO defaults fit the normalized clipped-return envelope:
+    # symlog(10 * (1 - 0.997**500) / (1 - 0.997)) ~= 7.86, so [-8, 8]
+    # covers the hard horizon while preserving resolution near zero.
     value_hidden: int = 64
-    value_num_bins: int = 153
-    value_sigma_to_bin_ratio: float = 2.0
+    value_num_bins: int = 255
+    value_sigma_to_bin_ratio: float = 0.75
     critic_mtp_horizon: int = 6
-    value_min: float = -64.0
-    value_max: float = 64.0
+    value_min: float = -8.0
+    value_max: float = 8.0
     value_symlog: bool = False
+    value_bucket: Literal["dreamer3", "legacy"] = "dreamer3"
     # Real-units bound on the per-planet SAC advantage heads: each head emits
     # `adv_scale·tanh(raw/adv_scale)`, so a single planet's launch/no-launch
     # advantage is confined to ±adv_scale ship-margin units and the summed

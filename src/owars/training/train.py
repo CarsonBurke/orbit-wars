@@ -29,6 +29,7 @@ import argparse
 import json
 import math
 import random
+from collections.abc import Sequence
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,11 +61,11 @@ from .muon import MultiOptimizer, Muon
 from .numpy_env import NumpyVecEnv
 from .ppo import (
     compute_gae,
-    compute_old_log_probs,
+    compute_old_log_probs_and_values,
     ppo_update,
     value_only_update,
 )
-from .rollout import Trajectory
+from .rollout import Trajectory, TrajectoryRecordRef
 from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
 from .vec_rollout import alternating_learner_seats, rollout_episodes_batched
@@ -380,6 +381,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         value_min=cfg.model.value_min,
         value_max=cfg.model.value_max,
         value_symlog=cfg.model.value_symlog,
+        value_bucket=cfg.model.value_bucket,
         action_logit_softcap=cfg.model.action_logit_softcap,
         global_features=cfg.model.global_features,
     )
@@ -439,15 +441,262 @@ def _rollout_compile_mode_for_model(_model: OrbitPolicy, cfg: RunConfig) -> str 
     return cfg.run.compile_mode or None
 
 
-def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
+def _trajectory_record_refs(trajs: list[Trajectory]) -> list[TrajectoryRecordRef]:
+    refs: list[TrajectoryRecordRef] = []
+    for traj in trajs:
+        refs.extend(getattr(traj, "record_refs", ()))
+    return refs
+
+
+def _record_ref_chunks_and_positions(
+    refs: list[TrajectoryRecordRef],
+) -> tuple[list[dict[str, object]], torch.Tensor]:
+    chunks: list[dict[str, object]] = []
+    chunk_offsets: dict[int, int] = {}
+    positions: list[int] = []
+    offset = 0
+    for ref in refs:
+        key = id(ref.chunk)
+        if key not in chunk_offsets:
+            chunk_offsets[key] = offset
+            chunks.append(ref.chunk)
+            offset += int(ref.chunk["planet_feats"].shape[0])
+        positions.append(chunk_offsets[key] + int(ref.row))
+    return chunks, torch.as_tensor(positions, dtype=torch.long)
+
+
+def _cat_chunk_field(
+    chunks: list[dict[str, object]],
+    key: str,
+    *,
+    pad_width: int | None = None,
+    fill: int | float | bool = 0,
+) -> torch.Tensor | None:
+    values = [chunk[key] for chunk in chunks]
+    if any(value is None for value in values):
+        return None
+    tensors = [value for value in values if isinstance(value, torch.Tensor)]
+    if len(tensors) != len(values):
+        raise TypeError(f"record chunk field {key!r} is not a tensor")
+    if pad_width is None:
+        return torch.cat(tensors, dim=0)
+    padded = []
+    for tensor in tensors:
+        current = int(tensor.shape[1])
+        if current == pad_width:
+            padded.append(tensor)
+            continue
+        out = tensor.new_full((tensor.shape[0], pad_width, *tensor.shape[2:]), fill)
+        out[:, :current] = tensor
+        padded.append(out)
+    return torch.cat(padded, dim=0)
+
+
+def _stack_chunk_field(
+    chunks: list[dict[str, object]],
+    positions: torch.Tensor,
+    key: str,
+    *,
+    pad_width: int | None = None,
+    fill: int | float | bool = 0,
+) -> torch.Tensor | None:
+    field = _cat_chunk_field(chunks, key, pad_width=pad_width, fill=fill)
+    if field is None:
+        return None
+    return field.index_select(0, positions)
+
+
+def _stack_encoded_record_refs(
+    chunks: list[dict[str, object]],
+    positions: torch.Tensor,
+) -> dict[str, torch.Tensor | None]:
+    inbound = [chunk["planet_inbound_feats"] for chunk in chunks]
+    fleet_width = max(int(chunk["fleet_feats"].shape[1]) for chunk in chunks)
+    if any(value is None for value in inbound):
+        fleet_width = max(1, fleet_width)
+
+    return {
+        "global_feats": _stack_chunk_field(chunks, positions, "global_feats"),
+        "planet_feats": _stack_chunk_field(chunks, positions, "planet_feats"),
+        "planet_mask": _stack_chunk_field(chunks, positions, "planet_mask"),
+        "planet_owned_mask": _stack_chunk_field(
+            chunks,
+            positions,
+            "planet_owned_mask",
+        ),
+        "planet_ids": _stack_chunk_field(chunks, positions, "planet_ids"),
+        "planet_garrison": _stack_chunk_field(chunks, positions, "planet_garrison"),
+        "fleet_feats": _stack_chunk_field(
+            chunks,
+            positions,
+            "fleet_feats",
+            pad_width=fleet_width,
+        ),
+        "fleet_mask": _stack_chunk_field(
+            chunks,
+            positions,
+            "fleet_mask",
+            pad_width=fleet_width,
+            fill=False,
+        ),
+        "fleet_target_planet_idx": _stack_chunk_field(
+            chunks,
+            positions,
+            "fleet_target_planet_idx",
+            pad_width=fleet_width,
+            fill=-1,
+        ),
+        "planet_inbound_feats": _stack_chunk_field(
+            chunks,
+            positions,
+            "planet_inbound_feats",
+        ),
+    }
+
+
+def _stack_target_legal_record_refs(
+    chunks: list[dict[str, object]],
+    positions: torch.Tensor,
+) -> torch.Tensor | None:
+    if not any("target_legal_source_mask" in chunk for chunk in chunks):
+        dense = _stack_chunk_field(chunks, positions, "target_legal_mask")
+        return dense.bool() if dense is not None else None
+
+    planets = None
+    for chunk in chunks:
+        if "target_legal_source_mask" in chunk:
+            planets = int(chunk["planet_owned_mask"].shape[1])
+            break
+        dense = chunk["target_legal_mask"]
+        if dense is not None and dense.numel() > 0:
+            planets = int(dense.shape[1])
+            break
+    if planets is None:
+        return None
+
+    final = torch.empty(int(positions.numel()), planets, planets, dtype=torch.bool)
+    offset = 0
+    for chunk in chunks:
+        chunk_rows = int(chunk["planet_feats"].shape[0])
+        keep = (positions >= offset) & (positions < offset + chunk_rows)
+        if not bool(keep.any()):
+            offset += chunk_rows
+            continue
+        out_rows = torch.nonzero(keep, as_tuple=False).flatten()
+        local_rows = positions.index_select(0, out_rows) - offset
+        if "target_legal_source_mask" not in chunk:
+            dense = chunk["target_legal_mask"].bool()
+            if dense.numel() == 0:
+                raise RuntimeError("chunked PPO trajectory records are missing target legality")
+            final[out_rows] = dense.index_select(0, local_rows)
+            offset += chunk_rows
+            continue
+        owned = chunk["planet_owned_mask"].bool() & chunk["planet_mask"].bool()
+        expanded = torch.ones(int(local_rows.numel()), planets, planets, dtype=torch.bool)
+        selected_owned = owned.index_select(0, local_rows)
+        owned_rows, owned_cols = torch.nonzero(selected_owned, as_tuple=True)
+        if owned_rows.numel():
+            expanded[owned_rows, owned_cols] = False
+        row_idx = chunk["target_legal_row_idx"].long()
+        if row_idx.numel():
+            source_idx = chunk["target_legal_source_idx"].long()
+            row_to_output = torch.full((chunk_rows,), -1, dtype=torch.long)
+            row_to_output[local_rows] = torch.arange(local_rows.numel(), dtype=torch.long)
+            compact_rows = row_to_output.index_select(0, row_idx)
+            compact_keep = compact_rows >= 0
+            if bool(compact_keep.any()):
+                expanded[compact_rows[compact_keep], source_idx[compact_keep]] = chunk[
+                    "target_legal_source_mask"
+                ].bool()[compact_keep]
+        final[out_rows] = expanded
+        offset += chunk_rows
+    return final
+
+
+def _stack_target_legal_record_ref_fields(
+    chunks: list[dict[str, object]],
+    positions: torch.Tensor,
+) -> dict[str, torch.Tensor | None]:
+    if not chunks:
+        return {"target_legal_mask": None}
+    if not all("target_legal_source_mask" in chunk for chunk in chunks):
+        return {"target_legal_mask": _stack_target_legal_record_refs(chunks, positions)}
+
+    planet_owned = _stack_chunk_field(chunks, positions, "planet_owned_mask")
+    planet_mask = _stack_chunk_field(chunks, positions, "planet_mask")
+    if planet_owned is None or planet_mask is None:
+        return {"target_legal_mask": _stack_target_legal_record_refs(chunks, positions)}
+    owned = planet_owned.bool() & planet_mask.bool()
+
+    row_parts: list[torch.Tensor] = []
+    source_parts: list[torch.Tensor] = []
+    mask_parts: list[torch.Tensor] = []
+    offset = 0
+    for chunk in chunks:
+        chunk_rows = int(chunk["planet_feats"].shape[0])
+        keep = (positions >= offset) & (positions < offset + chunk_rows)
+        if not bool(keep.any()):
+            offset += chunk_rows
+            continue
+        out_rows = torch.nonzero(keep, as_tuple=False).flatten()
+        local_rows = positions.index_select(0, out_rows) - offset
+        row_idx = chunk["target_legal_row_idx"].long()
+        if row_idx.numel():
+            row_to_output = torch.full((chunk_rows,), -1, dtype=torch.long)
+            row_to_output[local_rows] = out_rows
+            compact_rows = row_to_output.index_select(0, row_idx)
+            compact_keep = compact_rows >= 0
+            if bool(compact_keep.any()):
+                row_parts.append(compact_rows[compact_keep])
+                source_parts.append(
+                    chunk["target_legal_source_idx"].long()[compact_keep]
+                )
+                mask_parts.append(
+                    chunk["target_legal_source_mask"].bool()[compact_keep]
+                )
+        offset += chunk_rows
+
+    if row_parts:
+        row_idx = torch.cat(row_parts, dim=0)
+        source_idx = torch.cat(source_parts, dim=0)
+        source_mask = torch.cat(mask_parts, dim=0)
+        order = torch.argsort(row_idx, stable=True)
+        row_idx = row_idx.index_select(0, order)
+        source_idx = source_idx.index_select(0, order)
+        source_mask = source_mask.index_select(0, order)
+    else:
+        planets = int(owned.shape[1])
+        row_idx = torch.empty(0, dtype=torch.long)
+        source_idx = torch.empty(0, dtype=torch.long)
+        source_mask = torch.empty(0, planets, dtype=torch.bool)
+    counts = torch.bincount(row_idx, minlength=int(positions.numel()))
+    row_offsets = torch.empty(int(positions.numel()) + 1, dtype=torch.long)
+    row_offsets[0] = 0
+    row_offsets[1:] = counts.cumsum(0)
+    return {
+        "target_legal_mask": None,
+        "target_legal_source_owned_mask": owned,
+        "target_legal_row_offsets": row_offsets,
+        "target_legal_row_idx": row_idx,
+        "target_legal_source_idx": source_idx,
+        "target_legal_source_mask": source_mask,
+    }
+
+
+def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor | None]:
     """Walk every (traj, step) once and emit stacked EncodedObs tensors.
 
-    Per-step records on Trajectory are already device tensors (see the
-    Trajectory docstring) — we just gather and stack here. Encoder-only:
-    the actor-side records (launch / target_idx / fraction / old_log_prob /
-    owned_mask) are added by `_stack_trajectories`, which lets
+    Encoder-only: actor-side records (launch / target_idx / fraction /
+    old_log_prob / owned_mask) are added by `_stack_trajectories`, which lets
     `_pretrain_value_batch` skip them entirely.
     """
+    refs = _trajectory_record_refs(trajs)
+    if refs:
+        if any(t.encoded for t in trajs):
+            raise RuntimeError("cannot mix chunked and row-wise trajectory records")
+        chunks, positions = _record_ref_chunks_and_positions(refs)
+        return _stack_encoded_record_refs(chunks, positions)
+
     gf, pf, pm, pom, pid, pg, ff, fm, ft, pi = [], [], [], [], [], [], [], [], [], []
     fleet_width = 0
     saw_without_inbound = False
@@ -492,54 +741,39 @@ def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor]:
     }
 
 
-def _stack_trajectories(
+def _normalized_reward_arrays(
     trajs: list[Trajectory],
-    gamma: float,
-    gae_lambda: float,
-    value_gae_lambda: float | None = None,
-    critic_mtp_horizon: int = 1,
-    reward_normalizer: DiscountedReturnNormalizer | None = None,
-) -> dict[str, torch.Tensor]:
-    """Flatten per-step records into one PPO batch with optional decoupled GAE."""
-    batch = _stack_encoded(trajs)
-
-    launch, tidx, frac, lp, owned, target_legal = [], [], [], [], [], []
-    for t in trajs:
-        launch.extend(t.launch)
-        tidx.extend(t.target_idx)
-        frac.extend(t.fraction)
-        lp.extend(t.log_prob)
-        owned.extend(t.owned_mask)
-        target_legal.extend(t.target_legal_mask)
-    batch["launch"] = torch.stack(launch).float()
-    batch["target_idx"] = torch.stack(tidx).long()
-    batch["fraction"] = torch.stack(frac).float()
-    batch["old_log_prob"] = torch.stack(lp).float()
-    batch["owned_mask"] = torch.stack(owned).bool()
-    batch["target_legal_mask"] = torch.stack(target_legal).bool()
-
-    # Single global CPU pull of every per-step value across the batch —
-    # one sync instead of one per trajectory.
-    value_tensors = [torch.stack(t.value) for t in trajs if t.value]
-    if value_tensors:
-        all_values = torch.cat(value_tensors).detach().to(torch.float32).cpu().numpy()
-    else:
-        all_values = np.zeros(0, dtype=np.float32)
-
-    target_lam = gae_lambda if value_gae_lambda is None else value_gae_lambda
-    mtp_h = max(1, int(critic_mtp_horizon))
-    advs_all, rets_all, mtp_all, mtp_mask_all = [], [], [], []
+    reward_normalizer: DiscountedReturnNormalizer | None,
+) -> list[np.ndarray]:
     rewards_by_traj = [np.asarray(t.reward, dtype=np.float32) for t in trajs]
     if reward_normalizer is not None:
         rewards_by_traj = reward_normalizer.normalize_episodes(rewards_by_traj)
+    return rewards_by_traj
+
+
+def _gae_batch_fields(
+    rewards_by_traj: list[np.ndarray],
+    values: np.ndarray,
+    *,
+    gamma: float,
+    gae_lambda: float,
+    value_gae_lambda: float | None,
+    critic_mtp_horizon: int,
+) -> dict[str, torch.Tensor]:
+    target_lam = gae_lambda if value_gae_lambda is None else value_gae_lambda
+    mtp_h = max(1, int(critic_mtp_horizon))
+    total_steps = sum(len(rewards) for rewards in rewards_by_traj)
+    if int(values.shape[0]) != total_steps:
+        values = np.zeros(total_steps, dtype=np.float32)
+    advs_all, rets_all, mtp_all, mtp_mask_all = [], [], [], []
     offset = 0
     for rewards in rewards_by_traj:
         horizon = len(rewards)
-        values = all_values[offset : offset + horizon]
+        traj_values = values[offset : offset + horizon]
         offset += horizon
-        adv, ret = compute_gae(rewards, values, gamma, gae_lambda)
+        adv, ret = compute_gae(rewards, traj_values, gamma, gae_lambda)
         if target_lam != gae_lambda:
-            _target_adv, ret = compute_gae(rewards, values, gamma, target_lam)
+            _target_adv, ret = compute_gae(rewards, traj_values, gamma, target_lam)
         advs_all.append(adv)
         rets_all.append(ret)
         mtp = np.zeros((horizon, mtp_h), dtype=np.float32)
@@ -552,19 +786,202 @@ def _stack_trajectories(
         mtp_all.append(mtp)
         mtp_mask_all.append(mtp_mask)
 
-    advs = torch.from_numpy(np.concatenate(advs_all)).float()
-    rets = torch.from_numpy(np.concatenate(rets_all)).float()
-    values = torch.from_numpy(all_values).float()
-    if values.numel() != rets.numel():
-        values = torch.zeros_like(rets)
-    batch["advantage"] = advs
-    batch["return"] = rets
-    batch["return_mtp"] = torch.from_numpy(np.concatenate(mtp_all)).float()
-    batch["return_mtp_mask"] = torch.from_numpy(np.concatenate(mtp_mask_all)).bool()
-    batch["value"] = values
-    batch["raw_advantage_abs_mean"] = torch.tensor(
-        float(advs.abs().mean()) if advs.numel() else 0.0,
-        dtype=torch.float32,
+    advs = (
+        torch.from_numpy(np.concatenate(advs_all)).float()
+        if advs_all
+        else torch.empty(0, dtype=torch.float32)
+    )
+    rets = (
+        torch.from_numpy(np.concatenate(rets_all)).float()
+        if rets_all
+        else torch.empty(0, dtype=torch.float32)
+    )
+    return_mtp = (
+        torch.from_numpy(np.concatenate(mtp_all)).float()
+        if mtp_all
+        else torch.empty(0, mtp_h, dtype=torch.float32)
+    )
+    return_mtp_mask = (
+        torch.from_numpy(np.concatenate(mtp_mask_all)).bool()
+        if mtp_mask_all
+        else torch.empty(0, mtp_h, dtype=torch.bool)
+    )
+    values_t = torch.from_numpy(values).float()
+    if values_t.numel() != rets.numel():
+        values_t = torch.zeros_like(rets)
+    return {
+        "advantage": advs,
+        "return": rets,
+        "return_mtp": return_mtp,
+        "return_mtp_mask": return_mtp_mask,
+        "value": values_t,
+        "raw_advantage_abs_mean": torch.tensor(
+            float(advs.abs().mean()) if advs.numel() else 0.0,
+            dtype=torch.float32,
+        ),
+    }
+
+
+def _refresh_batch_advantages_from_values(
+    batch: dict[str, torch.Tensor],
+    values: torch.Tensor,
+    *,
+    gamma: float,
+    gae_lambda: float,
+    value_gae_lambda: float | None,
+    critic_mtp_horizon: int,
+) -> None:
+    lengths = batch["_trajectory_lengths"].to(dtype=torch.long).tolist()
+    rewards_flat = batch["_normalized_rewards"].detach().to(torch.float32).cpu().numpy()
+    rewards_by_traj = []
+    offset = 0
+    for length in lengths:
+        end = offset + int(length)
+        rewards_by_traj.append(rewards_flat[offset:end])
+        offset = end
+    fields = _gae_batch_fields(
+        rewards_by_traj,
+        values.detach().to(torch.float32).cpu().numpy(),
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        value_gae_lambda=value_gae_lambda,
+        critic_mtp_horizon=critic_mtp_horizon,
+    )
+    batch.update(fields)
+    batch["values_computed"] = torch.tensor(True, dtype=torch.bool)
+
+
+def _stack_trajectories(
+    trajs: list[Trajectory],
+    gamma: float,
+    gae_lambda: float,
+    value_gae_lambda: float | None = None,
+    critic_mtp_horizon: int = 1,
+    reward_normalizer: DiscountedReturnNormalizer | None = None,
+    include_old_log_prob: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Flatten per-step records into one PPO batch with optional decoupled GAE."""
+    batch = _stack_encoded(trajs)
+    refs = _trajectory_record_refs(trajs)
+
+    if refs:
+        if any(t.launch or t.target_idx or t.fraction or t.value for t in trajs):
+            raise RuntimeError("cannot mix chunked and row-wise trajectory records")
+        chunks, positions = _record_ref_chunks_and_positions(refs)
+        launch = _stack_chunk_field(chunks, positions, "launch")
+        target_idx = _stack_chunk_field(chunks, positions, "target_idx")
+        fraction = _stack_chunk_field(chunks, positions, "fraction")
+        value = _stack_chunk_field(chunks, positions, "value")
+        target_legal_fields = _stack_target_legal_record_ref_fields(chunks, positions)
+        target_legal_mask = target_legal_fields.get("target_legal_mask")
+        values_computed = all(bool(chunk.get("values_computed", True)) for chunk in chunks)
+        if (
+            launch is None
+            or target_idx is None
+            or fraction is None
+            or (values_computed and value is None)
+            or (
+                target_legal_mask is None
+                and target_legal_fields.get("target_legal_source_mask") is None
+            )
+        ):
+            raise RuntimeError("chunked PPO trajectory records are missing required fields")
+        batch["launch"] = launch.float()
+        batch["target_idx"] = target_idx.long()
+        batch["fraction"] = fraction.float()
+        if include_old_log_prob:
+            old_log_prob = _stack_chunk_field(chunks, positions, "log_prob")
+            old_log_prob_computed = old_log_prob is not None and all(
+                bool(chunk.get("old_log_prob_computed", False)) for chunk in chunks
+            )
+            batch["old_log_prob"] = (
+                old_log_prob.float() if old_log_prob is not None else torch.zeros_like(launch)
+            )
+            batch["old_log_prob_computed"] = torch.tensor(
+                old_log_prob_computed,
+                dtype=torch.bool,
+            )
+        else:
+            batch["old_log_prob"] = torch.zeros_like(batch["launch"])
+            batch["old_log_prob_computed"] = torch.tensor(False)
+        batch["values_computed"] = torch.tensor(values_computed, dtype=torch.bool)
+        batch["owned_mask"] = batch["planet_owned_mask"].bool() & batch["planet_mask"].bool()
+        if target_legal_mask is not None:
+            batch["target_legal_mask"] = target_legal_mask.bool()
+        else:
+            batch["target_legal_mask"] = None
+            batch["target_legal_source_owned_mask"] = target_legal_fields[
+                "target_legal_source_owned_mask"
+            ].bool()
+            batch["target_legal_row_offsets"] = target_legal_fields[
+                "target_legal_row_offsets"
+            ].long()
+            batch["target_legal_row_idx"] = target_legal_fields[
+                "target_legal_row_idx"
+            ].long()
+            batch["target_legal_source_idx"] = target_legal_fields[
+                "target_legal_source_idx"
+            ].long()
+            batch["target_legal_source_mask"] = target_legal_fields[
+                "target_legal_source_mask"
+            ].bool()
+        if value is None:
+            all_values = np.zeros(int(positions.numel()), dtype=np.float32)
+        else:
+            all_values = value.detach().to(torch.float32).cpu().numpy()
+    else:
+        launch, tidx, frac, lp, owned, target_legal, values_flat = [], [], [], [], [], [], []
+        for t in trajs:
+            launch.extend(t.launch)
+            tidx.extend(t.target_idx)
+            frac.extend(t.fraction)
+            if include_old_log_prob:
+                lp.extend(t.log_prob)
+            owned.extend(t.owned_mask)
+            target_legal.extend(t.target_legal_mask)
+            values_flat.extend(t.value)
+        batch["launch"] = torch.stack(launch).float()
+        batch["target_idx"] = torch.stack(tidx).long()
+        batch["fraction"] = torch.stack(frac).float()
+        old_log_prob_computed = include_old_log_prob and len(lp) == len(launch)
+        batch["old_log_prob"] = (
+            torch.stack(lp).float()
+            if old_log_prob_computed
+            else torch.zeros_like(batch["launch"])
+        )
+        batch["old_log_prob_computed"] = torch.tensor(
+            old_log_prob_computed,
+            dtype=torch.bool,
+        )
+        batch["values_computed"] = torch.tensor(bool(values_flat), dtype=torch.bool)
+        batch["owned_mask"] = torch.stack(owned).bool()
+        batch["target_legal_mask"] = torch.stack(target_legal).bool()
+
+        # Single global CPU pull of every per-step value across the batch.
+        if values_flat:
+            all_values = torch.stack(values_flat).detach().to(torch.float32).cpu().numpy()
+        else:
+            all_values = np.zeros(0, dtype=np.float32)
+
+    rewards_by_traj = _normalized_reward_arrays(trajs, reward_normalizer)
+    batch["_trajectory_lengths"] = torch.tensor(
+        [len(rewards) for rewards in rewards_by_traj],
+        dtype=torch.long,
+    )
+    batch["_normalized_rewards"] = (
+        torch.from_numpy(np.concatenate(rewards_by_traj)).float()
+        if rewards_by_traj
+        else torch.empty(0, dtype=torch.float32)
+    )
+    batch.update(
+        _gae_batch_fields(
+            rewards_by_traj,
+            all_values,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            value_gae_lambda=value_gae_lambda,
+            critic_mtp_horizon=critic_mtp_horizon,
+        )
     )
     return batch
 
@@ -753,6 +1170,7 @@ def pretrain_value(
                     compile_mode=_rollout_compile_mode_for_model(model, cfg),
                     compile_fleet_width=cfg.rollout.compile_fleet_width,
                     policy_graph_rows=cfg.rollout.num_envs,
+                    snapshot_compile_rows=cfg.rollout.snapshot_compile_rows,
                     learner_action_agent=behavior,
                 )
             )
@@ -893,6 +1311,7 @@ def _build_training_vec(cfg: RunConfig, num_players: int, num_envs: int) -> VecE
             **vec_kwargs,
             replay_env_idx=None,
             random_seed=cfg.run.seed,
+            strict_target_legality=cfg.rollout.strict_target_legality,
         )
     return VecEnv(**vec_kwargs, replay_env_idx=0)
 
@@ -929,6 +1348,60 @@ def _training_vec_counts(cfg: RunConfig) -> dict[int, int]:
             counts.get(cfg.game.num_players, 0),
         )
     return counts
+
+
+def _policy_compile_rows_for_rollout(
+    cfg: RunConfig,
+    *,
+    num_envs: int,
+    num_players: int,
+    bucket_multiple: int = 64,
+) -> int:
+    full_rows = int(num_envs) * int(num_players)
+    if cfg.opponents.mode == "no_builtins":
+        available_weight = cfg.opponents.current_learner_prob + cfg.opponents.active_pool_prob
+        current_prob = (
+            cfg.opponents.current_learner_prob / available_weight
+            if available_weight > 0.0
+            else 1.0
+        )
+    elif cfg.opponents.mode == "league":
+        current_prob = cfg.opponents.self_play_prob
+    else:
+        current_prob = 0.0
+    expected_rows = int(num_envs) * (1.0 + current_prob * max(0, int(num_players) - 1))
+    bucket = max(1, int(bucket_multiple))
+    capped = int(math.ceil(expected_rows / bucket) * bucket)
+    return min(full_rows, max(1, capped))
+
+
+def _policy_compile_rows_for_sampled_rollout(
+    opponents_per_env: Sequence[Sequence[OpponentSlot]],
+    *,
+    learner_seats: Sequence[int],
+    num_players: int,
+    bucket_multiple: int = 64,
+) -> int:
+    """Static graph row cap from the actual first-step learner-model rows.
+
+    The learner forward covers each env's learner seat plus any opponent seat
+    assigned to the current learner identity. Rounding keeps compile-shape
+    variety bounded while avoiding the larger conservative expectation used
+    before opponents are sampled.
+    """
+    rows = 0
+    for env_idx, slots in enumerate(opponents_per_env):
+        learner_seat = int(learner_seats[env_idx])
+        rows += 1
+        slot_idx = 0
+        for seat in range(int(num_players)):
+            if seat == learner_seat:
+                continue
+            if slot_idx < len(slots) and slots[slot_idx].name == LEARNER_NAME:
+                rows += 1
+            slot_idx += 1
+    bucket = max(1, int(bucket_multiple))
+    return max(1, int(math.ceil(rows / bucket) * bucket))
 
 
 def _ppo_minibatch_size_for_fleet_width(cfg: RunConfig, fleet_width: int) -> int:
@@ -1015,6 +1488,11 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     snapshot_device = (
         str(device) if cfg.opponents.snapshot_device == "train" else cfg.opponents.snapshot_device
     )
+    snapshot_compile_mode = (
+        _rollout_compile_mode_for_model(model, cfg)
+        if torch.device(snapshot_device).type == "cuda"
+        else None
+    )
     if cfg.opponents.mode == "fixed":
         for name in cfg.opponents.fixed_opponents:
             elo.set(name, cfg.opponents.initial_rating)
@@ -1042,6 +1520,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             recent_eviction_archive_size=cfg.opponents.recent_eviction_archive_size,
             notable_archive_size=cfg.opponents.notable_archive_size,
             device=snapshot_device,
+            compile_mode=snapshot_compile_mode,
             rng=random.Random(cfg.run.seed),
         )
     else:
@@ -1050,6 +1529,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             top_k=cfg.opponents.top_k,
             self_play_prob=cfg.opponents.self_play_prob,
             device=snapshot_device,
+            compile_mode=snapshot_compile_mode,
             rng=random.Random(cfg.run.seed),
         )
     logger = TBLogger(cfg.run.name, root=cfg.run.log_root)
@@ -1212,6 +1692,11 @@ def _ppo_loop(
                 learner_seats = alternating_learner_seats(
                     rollout_envs, num_players, offset=seat_offset
                 )
+                policy_graph_rows = _policy_compile_rows_for_sampled_rollout(
+                    opponents_per_env,
+                    learner_seats=learner_seats,
+                    num_players=num_players,
+                )
                 phase_t0 = perf_counter()
                 batch_trajs = rollout_episodes_batched(
                     model,
@@ -1223,8 +1708,10 @@ def _ppo_loop(
                     reward_cfg=cfg.reward,
                     compile_mode=_rollout_compile_mode_for_model(model, cfg),
                     compile_fleet_width=cfg.rollout.compile_fleet_width,
-                    policy_graph_rows=vec.num_envs * num_players,
+                    policy_graph_rows=policy_graph_rows,
+                    snapshot_compile_rows=cfg.rollout.snapshot_compile_rows,
                     defer_log_prob=True,
+                    chunk_records=True,
                     timings=rollout_timings,
                     sample_timings=sample_timings,
                 )
@@ -1262,7 +1749,9 @@ def _ppo_loop(
             value_gae_lambda=cfg.ppo.value_gae_lambda,
             critic_mtp_horizon=cfg.model.critic_mtp_horizon,
             reward_normalizer=reward_normalizer,
+            include_old_log_prob=True,
         )
+        target_legal_compact = batch.get("target_legal_mask") is None
         stack_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
@@ -1284,14 +1773,28 @@ def _ppo_loop(
             cfg,
             int(batch["fleet_feats"].shape[1]),
         )
-        batch["old_log_prob"] = compute_old_log_probs(
-            model,
-            batch,
-            minibatch_size=ppo_minibatch_size,
-            minibatch_count=cfg.optim.minibatch_count,
-            compile_mode=compile_mode,
-            output_device=device,
-        )
+        old_log_prob_native = bool(batch.get("old_log_prob_computed", False))
+        values_native = bool(batch.get("values_computed", False))
+        old_log_prob_t0 = perf_counter()
+        if not old_log_prob_native or not values_native:
+            old_log_prob, behavior_values = compute_old_log_probs_and_values(
+                model,
+                batch,
+                minibatch_size=ppo_minibatch_size,
+                minibatch_count=cfg.optim.minibatch_count,
+                compile_mode=compile_mode,
+            )
+            batch["old_log_prob"] = old_log_prob
+            batch["old_log_prob_computed"] = torch.tensor(True)
+            _refresh_batch_advantages_from_values(
+                batch,
+                behavior_values,
+                gamma=cfg.ppo.gamma,
+                gae_lambda=cfg.ppo.gae_lambda,
+                value_gae_lambda=cfg.ppo.value_gae_lambda,
+                critic_mtp_horizon=cfg.model.critic_mtp_horizon,
+            )
+        old_log_prob_s = perf_counter() - old_log_prob_t0
         log = ppo_update(
             model,
             optimizer,
@@ -1383,6 +1886,14 @@ def _ppo_loop(
             update,
         )
         if reward_normalizer is not None:
+            target_edge_mass = 0.0
+            if bool(batch["return_mtp_mask"].any()):
+                with torch.no_grad():
+                    return_mtp = batch["return_mtp"].to(device, non_blocking=True)
+                    return_mtp_mask = batch["return_mtp_mask"].to(device, non_blocking=True)
+                    target_probs = model.value_encoder.target_probs(return_mtp)
+                    edge_mass = target_probs[..., 0] + target_probs[..., -1]
+                    target_edge_mass = float(edge_mass.masked_select(return_mtp_mask).mean().item())
             logger.scalars(
                 "reward_norm",
                 {
@@ -1402,17 +1913,8 @@ def _ppo_loop(
                     "return_min": float(batch["return"].min()),
                     "return_max": float(batch["return"].max()),
                     "return_absmax": float(batch["return"].abs().max()),
-                    "return_edge_frac": float(
-                        (
-                            (batch["return_mtp"] <= cfg.model.value_min)
-                            | (batch["return_mtp"] >= cfg.model.value_max)
-                        )
-                        .masked_select(batch["return_mtp_mask"])
-                        .float()
-                        .mean()
-                    )
-                    if bool(batch["return_mtp_mask"].any())
-                    else 0.0,
+                    "return_edge_frac": target_edge_mass,
+                    "target_edge_mass": target_edge_mass,
                 },
                 update,
             )
@@ -1656,6 +2158,10 @@ def _ppo_loop(
                 "bookkeeping_s": bookkeeping_s,
                 "stack_s": stack_s,
                 "batch_prepare_s": batch_prepare_s,
+                "target_legal_compact": float(target_legal_compact),
+                "old_log_prob_s": old_log_prob_s,
+                "old_log_prob_native": float(old_log_prob_native),
+                "values_native": float(values_native),
                 "ppo_s": ppo_s,
                 "metrics_s": metrics_s,
                 "logging_s": logging_s,
@@ -1714,6 +2220,16 @@ def main() -> None:
         help="Override run.compile_mode; use 'none' to disable torch.compile.",
     )
     p.add_argument(
+        "--rollout-detail-timing",
+        action="store_true",
+        help="Log rollout_detail/* scalars for rollout bucketing, policy, reward, and env stepping.",
+    )
+    p.add_argument(
+        "--sample-detail-timing",
+        action="store_true",
+        help="Log rollout_detail/* scalars for Rust sampler legality, transfer, and materialization phases.",
+    )
+    p.add_argument(
         "--load",
         default=None,
         help="Path to a .pt checkpoint whose `model` state_dict should be "
@@ -1736,6 +2252,11 @@ def main() -> None:
         cfg.rollout.env_backend = args.env_backend
     if args.compile_mode is not None:
         cfg.run.compile_mode = "" if args.compile_mode.lower() == "none" else args.compile_mode
+    if args.rollout_detail_timing:
+        cfg.rollout.detail_timing = True
+    if args.sample_detail_timing:
+        cfg.rollout.detail_timing = True
+        cfg.rollout.sample_detail_timing = True
     summary = train_one_run(cfg, load_weights=args.load)
     print({k: v for k, v in summary.items() if k != "updates"})
 

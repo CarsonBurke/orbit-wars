@@ -434,6 +434,30 @@ def test_no_builtin_evicted_historical_snapshot_uses_lazy_agent(tmp_path: Path):
     assert slot.agent.model is not None
 
 
+def test_no_builtin_lazy_snapshot_retains_compile_mode(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=1,
+        historical_training_archive_size=8,
+        recent_eviction_archive_size=0,
+        notable_archive_size=0,
+        min_games_before_eviction=0,
+        current_learner_prob=0.0,
+        active_pool_prob=0.0,
+        historical_archive_prob=1.0,
+        compile_mode="reduce-overhead",
+        rng=random.Random(0),
+    )
+    model = _tiny_model()
+    pool.add_snapshot("u0", model, tmp_path / "u0.pt")
+    pool.set_current_update(1)
+    pool.add_snapshot("u1", model, tmp_path / "u1.pt")
+
+    slot = pool.sample(1)[0]
+
+    assert type(slot.agent).__name__ == "LazyLearnedAgent"
+    assert slot.agent.compile_mode == "reduce-overhead"
+
+
 def test_no_builtin_historical_sampling_uses_per_update_panel(tmp_path: Path):
     pool = NoBuiltinTrainingPool(
         active_pool_size=1,
@@ -479,6 +503,30 @@ def test_no_builtin_panel_caps_active_snapshot_identities(tmp_path: Path):
 
     assert len(panel.active) == 2
     assert {slot.name for slot in slots} <= set(panel.active)
+
+
+def test_no_builtin_sample_panel_is_stable_within_update(tmp_path: Path):
+    pool = NoBuiltinTrainingPool(
+        active_pool_size=8,
+        active_sample_panel_size=2,
+        historical_training_archive_size=8,
+        historical_sample_panel_size=2,
+        min_games_before_eviction=0,
+        rng=random.Random(11),
+    )
+    model = _tiny_model()
+    for update in range(6):
+        pool.set_current_update(update)
+        pool.add_snapshot(f"u{update}", model, tmp_path / f"u{update}.pt")
+
+    pool.set_current_update(6)
+    panel = pool.sample_panel()
+
+    assert pool.sample_panel() == panel
+    assert pool.sample_panel(current_update=6) == panel
+
+    pool.set_current_update(7)
+    assert pool.sample_panel() == pool.sample_panel()
 
 
 def test_no_builtin_panel_keeps_source_probabilities(tmp_path: Path):
@@ -541,7 +589,8 @@ def test_no_builtin_historical_panel_samples_weighted_buckets_when_capped(
     assert pool.historical_snapshot_names("log")
 
     seen_buckets: set[str] = set()
-    for _ in range(200):
+    for update in range(4, 204):
+        pool.set_current_update(update)
         panel = pool.sample_panel()
         for bucket in ("log", "recent_eviction", "notable"):
             if set(panel.historical) & set(pool.historical_snapshot_names(bucket)):

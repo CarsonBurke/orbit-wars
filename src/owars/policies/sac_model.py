@@ -662,9 +662,9 @@ class QComponents:
     historical (not normalized).
     """
 
-    nV: torch.Tensor    # [B, num_bins]  value-distribution logits
-    nA0: torch.Tensor   # [B, P]         scalar no-launch advantage
-    nAL: torch.Tensor   # [B, P, P]      scalar launch advantage (at the fraction)
+    nV: torch.Tensor    # noqa: N815  [B, num_bins]  value-distribution logits
+    nA0: torch.Tensor   # noqa: N815  [B, P]         scalar no-launch advantage
+    nAL: torch.Tensor   # noqa: N815  [B, P, P]      scalar launch advantage (at the fraction)
 
 
 class SACSoftQ(nn.Module):
@@ -709,7 +709,9 @@ class SACSoftQ(nn.Module):
             min_value=cfg.value_min,
             max_value=cfg.value_max,
             num_bins=cfg.value_num_bins,
+            sigma_to_bin_ratio=cfg.value_sigma_to_bin_ratio,
             symlog=cfg.value_symlog,
+            bucket=cfg.value_bucket,
         )
 
         # Dueling state-value DISTRIBUTION (logits over the bins).
@@ -784,7 +786,7 @@ class SACSoftQ(nn.Module):
         # S[b,i,t,k] = (q[b,i,k]·k[b,t,k]) / sqrt(d)
         scores = torch.einsum("bikd,btkd->bitk", q, k) / (d**0.5)  # [B,P,P,K]
         phi = _fraction_basis(fraction)  # [B,P,K]
-        nAL = torch.einsum("bitk,bik->bit", scores, phi).float()  # [B,P,P]
+        nAL = torch.einsum("bitk,bik->bit", scores, phi).float()  # noqa: N806  [B,P,P]
         # Same tanh bound as noop_adv: per-(source,target) head confined to
         # ±adv_scale, so the launch advantage shares the no-launch head's units.
         return self.adv_scale * torch.tanh(nAL / self.adv_scale)

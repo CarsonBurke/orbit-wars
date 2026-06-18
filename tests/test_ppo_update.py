@@ -39,11 +39,14 @@ from owars.training.ppo import (
     _fixed_minibatches_by_count,
     _minibatch_loss_scale,
     _rank_gaussian_advantage,
+    _stage_target_legal_mask,
     compute_gae,
     compute_old_log_probs,
+    compute_old_log_probs_and_values,
     ppo_update,
     value_only_update,
 )
+from owars.training.rollout import TrajectoryRecordRef
 
 # A non-degenerate 8-planet position. Player 0 owns the first three; the rest
 # are enemy/neutral so owned planets have legal targets. Every planet sits in
@@ -121,6 +124,7 @@ def _toy_batch(
         "target_idx": target_idx,
         "fraction": fraction,
         "old_log_prob": log_prob,
+        "old_log_prob_computed": torch.tensor(True),
         "owned_mask": feats.planet_owned_mask,
         "advantage": torch.randn(batch_size),
         # Returns stay inside the default value-head support [-2, 2].
@@ -176,6 +180,35 @@ def test_ppo_update_runs_and_returns_finite_metrics():
     assert 0.0 <= log.ratio_clip_frac_high <= 1.0, log.ratio_clip_frac_high
     assert 0.0 <= log.pos_frac <= 1.0, log.pos_frac
     assert log.value_loss >= 0.0, log.value_loss
+
+
+def test_ppo_update_reports_entropy_diagnostics_when_coef_zero():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=8)
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    log = ppo_update(
+        model,
+        optim,
+        batch,
+        value_coef=0.5,
+        target_entropy_coef=0.0,
+        fraction_entropy_coef=0.0,
+        norm_advantage=True,
+        advantage_transform="rankgauss",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        epochs=1,
+        minibatch_size=4,
+        grad_clip=0.5,
+    )
+
+    assert math.isfinite(log.entropy)
+    assert math.isfinite(log.target_entropy)
+    assert math.isfinite(log.fraction_entropy)
+    assert log.entropy > 0.0
+    assert log.target_entropy > 0.0
 
 
 def test_deferred_old_log_probs_match_sampler_records():
@@ -305,6 +338,67 @@ def test_training_vec_counts_keep_full_pretrain_vec_when_needed():
 
     assert train_mod._training_vec_counts(cfg)[2] == 128
     assert train_mod._training_vec_counts(cfg)[4] == 64
+
+
+def test_policy_compile_rows_follow_expected_current_model_seats():
+    cfg = RunConfig.from_dict(
+        {
+            "opponents": {
+                "mode": "no_builtins",
+                "current_learner_prob": 0.4,
+            },
+        }
+    )
+
+    assert train_mod._policy_compile_rows_for_rollout(
+        cfg,
+        num_envs=128,
+        num_players=2,
+    ) == 256
+    assert train_mod._policy_compile_rows_for_rollout(
+        cfg,
+        num_envs=128,
+        num_players=4,
+    ) == 384
+    assert train_mod._policy_compile_rows_for_rollout(
+        cfg,
+        num_envs=64,
+        num_players=4,
+    ) == 192
+
+
+def test_policy_compile_rows_for_sampled_rollout_counts_actual_current_slots():
+    current = train_mod.OpponentSlot(name=train_mod.LEARNER_NAME, agent=None)
+    snapshot = train_mod.OpponentSlot(name="snapshot_1", agent=None)
+
+    assert (
+        train_mod._policy_compile_rows_for_sampled_rollout(
+            [[snapshot] for _ in range(128)],
+            learner_seats=[0] * 128,
+            num_players=2,
+        )
+        == 128
+    )
+    assert (
+        train_mod._policy_compile_rows_for_sampled_rollout(
+            [[current] if i % 2 == 0 else [snapshot] for i in range(128)],
+            learner_seats=[0] * 128,
+            num_players=2,
+        )
+        == 192
+    )
+    assert (
+        train_mod._policy_compile_rows_for_sampled_rollout(
+            [
+                [current, snapshot, current],
+                [snapshot, current, snapshot],
+            ],
+            learner_seats=[0, 2],
+            num_players=4,
+            bucket_multiple=4,
+        )
+        == 8
+    )
 
 
 def test_ppo_minibatch_size_caps_only_high_fleet_bucket():
@@ -534,6 +628,394 @@ def test_stack_trajectories_can_decouple_policy_and_value_lambdas(monkeypatch):
     assert torch.allclose(batch["return"], torch.from_numpy(expected_return))
 
 
+def test_stack_trajectories_can_defer_old_log_prob(monkeypatch):
+    monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
+    rewards = np.asarray([0.0, 1.0], dtype=np.float32)
+    traj = SimpleNamespace(
+        reward=rewards.tolist(),
+        value=[torch.tensor(0.0) for _ in rewards],
+        launch=[torch.ones(2) for _ in rewards],
+        target_idx=[torch.zeros(2, dtype=torch.long) for _ in rewards],
+        fraction=[torch.full((2,), 0.5) for _ in rewards],
+        log_prob=[],
+        owned_mask=[torch.ones(2, dtype=torch.bool) for _ in rewards],
+        target_legal_mask=[torch.ones(2, 2, dtype=torch.bool) for _ in rewards],
+    )
+
+    batch = train_mod._stack_trajectories(
+        [traj],
+        gamma=1.0,
+        gae_lambda=1.0,
+        include_old_log_prob=False,
+    )
+
+    assert torch.equal(batch["old_log_prob"], torch.zeros_like(batch["launch"]))
+
+    fallback = train_mod._stack_trajectories(
+        [traj],
+        gamma=1.0,
+        gae_lambda=1.0,
+        include_old_log_prob=True,
+    )
+
+    assert torch.equal(fallback["old_log_prob"], torch.zeros_like(fallback["launch"]))
+    assert not bool(fallback["old_log_prob_computed"])
+
+
+def test_refresh_batch_advantages_uses_recomputed_values(monkeypatch):
+    monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
+    rewards = np.asarray([1.0, -0.25, 0.5], dtype=np.float32)
+    traj = SimpleNamespace(
+        reward=rewards.tolist(),
+        value=[torch.tensor(0.0) for _ in rewards],
+        launch=[torch.ones(2) for _ in rewards],
+        target_idx=[torch.zeros(2, dtype=torch.long) for _ in rewards],
+        fraction=[torch.full((2,), 0.5) for _ in rewards],
+        log_prob=[],
+        owned_mask=[torch.ones(2, dtype=torch.bool) for _ in rewards],
+        target_legal_mask=[torch.ones(2, 2, dtype=torch.bool) for _ in rewards],
+    )
+    batch = train_mod._stack_trajectories(
+        [traj],
+        gamma=0.9,
+        gae_lambda=0.8,
+        value_gae_lambda=1.0,
+        include_old_log_prob=False,
+    )
+    recomputed_values = torch.tensor([0.25, -0.1, 0.4])
+
+    train_mod._refresh_batch_advantages_from_values(
+        batch,
+        recomputed_values,
+        gamma=0.9,
+        gae_lambda=0.8,
+        value_gae_lambda=1.0,
+        critic_mtp_horizon=2,
+    )
+
+    expected_adv, _policy_return = compute_gae(
+        rewards,
+        recomputed_values.numpy(),
+        gamma=0.9,
+        lam=0.8,
+    )
+    _value_adv, expected_return = compute_gae(
+        rewards,
+        recomputed_values.numpy(),
+        gamma=0.9,
+        lam=1.0,
+    )
+    torch.testing.assert_close(batch["advantage"], torch.from_numpy(expected_adv))
+    torch.testing.assert_close(batch["return"], torch.from_numpy(expected_return))
+    torch.testing.assert_close(batch["value"], recomputed_values)
+    assert bool(batch["values_computed"])
+
+
+def test_refresh_batch_advantages_does_not_update_reward_normalizer(monkeypatch):
+    monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
+    rewards = np.asarray([1.0, 2.0, -0.5], dtype=np.float32)
+    traj = SimpleNamespace(
+        reward=rewards.tolist(),
+        value=[torch.tensor(0.0) for _ in rewards],
+        launch=[torch.ones(1) for _ in rewards],
+        target_idx=[torch.zeros(1, dtype=torch.long) for _ in rewards],
+        fraction=[torch.full((1,), 0.5) for _ in rewards],
+        log_prob=[],
+        owned_mask=[torch.ones(1, dtype=torch.bool) for _ in rewards],
+        target_legal_mask=[torch.ones(1, 1, dtype=torch.bool) for _ in rewards],
+    )
+    normalizer = train_mod.DiscountedReturnNormalizer(gamma=0.9, clip=None)
+    batch = train_mod._stack_trajectories(
+        [traj],
+        gamma=0.9,
+        gae_lambda=0.8,
+        reward_normalizer=normalizer,
+        include_old_log_prob=False,
+    )
+    state = normalizer.state_dict().copy()
+
+    train_mod._refresh_batch_advantages_from_values(
+        batch,
+        torch.tensor([0.25, -0.1, 0.4]),
+        gamma=0.9,
+        gae_lambda=0.8,
+        value_gae_lambda=None,
+        critic_mtp_horizon=1,
+    )
+
+    assert normalizer.state_dict() == state
+
+
+def test_compute_old_log_probs_and_values_matches_separate_old_log_prob():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=4)
+
+    old_log_prob, values = compute_old_log_probs_and_values(
+        model,
+        batch,
+        minibatch_size=2,
+        compile_mode=None,
+    )
+    expected_old_log_prob = compute_old_log_probs(
+        model,
+        batch,
+        minibatch_size=2,
+        compile_mode=None,
+    )
+
+    torch.testing.assert_close(old_log_prob, expected_old_log_prob)
+    assert values.shape == (batch["planet_feats"].shape[0],)
+    assert torch.isfinite(values).all()
+
+
+def test_stack_trajectories_chunked_records_match_row_records():
+    planets = 3
+
+    def chunk(offset: int, rows: int, fleets: int) -> dict[str, torch.Tensor | None]:
+        row_base = torch.arange(offset, offset + rows, dtype=torch.float32)
+        return {
+            "global_feats": row_base[:, None].repeat(1, 2),
+            "planet_feats": (row_base[:, None, None] + torch.arange(planets * 4).view(1, planets, 4)),
+            "planet_mask": torch.ones(rows, planets, dtype=torch.bool),
+            "planet_owned_mask": torch.tensor(
+                [[True, False, True], [True, True, False], [False, True, True]][:rows],
+            ),
+            "planet_ids": torch.arange(planets, dtype=torch.long).repeat(rows, 1) + offset,
+            "planet_garrison": row_base[:, None] + torch.arange(planets, dtype=torch.float32),
+            "fleet_feats": row_base[:, None, None] + torch.arange(max(fleets, 1) * 5).view(
+                1,
+                max(fleets, 1),
+                5,
+            )[:, :fleets],
+            "fleet_mask": torch.ones(rows, fleets, dtype=torch.bool),
+            "fleet_target_planet_idx": torch.arange(fleets, dtype=torch.long).repeat(rows, 1),
+            "planet_inbound_feats": (
+                row_base[:, None, None] + torch.arange(planets * 3).view(1, planets, 3)
+            ),
+            "launch": row_base[:, None] + torch.arange(planets, dtype=torch.float32),
+            "target_idx": torch.arange(planets, dtype=torch.long).repeat(rows, 1),
+            "fraction": torch.full((rows, planets), 0.5) + row_base[:, None] * 0.01,
+            "log_prob": torch.full((rows, planets), -0.25) - row_base[:, None] * 0.01,
+            "value": row_base * 0.1,
+            "owned_mask": torch.tensor(
+                [[True, False, True], [True, True, False], [False, True, True]][:rows],
+            ),
+            "target_legal_mask": torch.ones(rows, planets, planets, dtype=torch.bool),
+            "old_log_prob_computed": True,
+        }
+
+    chunks = [chunk(10, rows=2, fleets=0), chunk(20, rows=1, fleets=2)]
+    layout = [[(chunks[0], 1), (chunks[1], 0)], [(chunks[0], 0)]]
+    rewards = [[1.0, -0.5], [0.25]]
+
+    def encoded_from(chunk_: dict[str, torch.Tensor | None], row: int) -> EncodedObs:
+        return EncodedObs(
+            planet_feats=chunk_["planet_feats"][row],
+            planet_mask=chunk_["planet_mask"][row],
+            planet_owned_mask=chunk_["planet_owned_mask"][row],
+            planet_ids=chunk_["planet_ids"][row],
+            planet_garrison=chunk_["planet_garrison"][row],
+            fleet_feats=chunk_["fleet_feats"][row],
+            fleet_mask=chunk_["fleet_mask"][row],
+            global_feats=chunk_["global_feats"][row],
+            fleet_target_planet_idx=chunk_["fleet_target_planet_idx"][row],
+            planet_inbound_feats=chunk_["planet_inbound_feats"][row],
+        )
+
+    row_trajs = []
+    chunk_trajs = []
+    for rows_, rewards_ in zip(layout, rewards, strict=True):
+        row_trajs.append(
+            SimpleNamespace(
+                encoded=[encoded_from(chunk_, row) for chunk_, row in rows_],
+                launch=[chunk_["launch"][row] for chunk_, row in rows_],
+                target_idx=[chunk_["target_idx"][row] for chunk_, row in rows_],
+                fraction=[chunk_["fraction"][row] for chunk_, row in rows_],
+                log_prob=[chunk_["log_prob"][row] for chunk_, row in rows_],
+                value=[chunk_["value"][row] for chunk_, row in rows_],
+                reward=list(rewards_),
+                owned_mask=[chunk_["owned_mask"][row] for chunk_, row in rows_],
+                target_legal_mask=[chunk_["target_legal_mask"][row] for chunk_, row in rows_],
+            )
+        )
+        chunk_trajs.append(
+            SimpleNamespace(
+                encoded=[],
+                launch=[],
+                target_idx=[],
+                fraction=[],
+                log_prob=[],
+                value=[],
+                reward=list(rewards_),
+                owned_mask=[],
+                target_legal_mask=[],
+                record_refs=[
+                    TrajectoryRecordRef(chunk_, row) for chunk_, row in rows_
+                ],
+            )
+        )
+
+    row_batch = train_mod._stack_trajectories(
+        row_trajs,
+        gamma=0.9,
+        gae_lambda=0.8,
+        critic_mtp_horizon=3,
+    )
+    chunk_batch = train_mod._stack_trajectories(
+        chunk_trajs,
+        gamma=0.9,
+        gae_lambda=0.8,
+        critic_mtp_horizon=3,
+    )
+
+    assert row_batch.keys() == chunk_batch.keys()
+    for key, expected in row_batch.items():
+        got = chunk_batch[key]
+        if expected is None:
+            assert got is None
+        elif expected.dtype.is_floating_point:
+            torch.testing.assert_close(got, expected)
+        else:
+            assert torch.equal(got, expected), key
+
+    deferred = train_mod._stack_trajectories(
+        chunk_trajs,
+        gamma=0.9,
+        gae_lambda=0.8,
+        include_old_log_prob=False,
+    )
+    assert torch.equal(deferred["old_log_prob"], torch.zeros_like(deferred["launch"]))
+
+    fallback_chunks = [
+        {**chunk_, "log_prob": None, "old_log_prob_computed": False}
+        for chunk_ in chunks
+    ]
+    fallback_by_id = {
+        id(chunk_): fallback_chunk
+        for chunk_, fallback_chunk in zip(chunks, fallback_chunks, strict=True)
+    }
+    fallback_trajs = []
+    for rows_, rewards_ in zip(layout, rewards, strict=True):
+        fallback_trajs.append(
+            SimpleNamespace(
+                encoded=[],
+                launch=[],
+                target_idx=[],
+                fraction=[],
+                log_prob=[],
+                value=[],
+                reward=list(rewards_),
+                owned_mask=[],
+                target_legal_mask=[],
+                record_refs=[
+                    TrajectoryRecordRef(fallback_by_id[id(chunk_)], row)
+                    for chunk_, row in rows_
+                ],
+            )
+        )
+    fallback = train_mod._stack_trajectories(
+        fallback_trajs,
+        gamma=0.9,
+        gae_lambda=0.8,
+        include_old_log_prob=True,
+    )
+    assert torch.equal(fallback["old_log_prob"], torch.zeros_like(fallback["launch"]))
+    assert not bool(fallback["old_log_prob_computed"])
+
+
+def test_stack_trajectories_preserves_compact_target_legality():
+    planets = 3
+    chunk = {
+        "global_feats": torch.zeros(2, 2),
+        "planet_feats": torch.zeros(2, planets, 4),
+        "planet_mask": torch.ones(2, planets, dtype=torch.bool),
+        "planet_owned_mask": torch.tensor(
+            [[True, False, True], [False, True, True]],
+        ),
+        "planet_ids": torch.arange(planets, dtype=torch.long).repeat(2, 1),
+        "planet_garrison": torch.zeros(2, planets),
+        "fleet_feats": torch.zeros(2, 0, 5),
+        "fleet_mask": torch.zeros(2, 0, dtype=torch.bool),
+        "fleet_target_planet_idx": torch.zeros(2, 0, dtype=torch.long),
+        "planet_inbound_feats": torch.zeros(2, planets, 3),
+        "launch": torch.zeros(2, planets),
+        "target_idx": torch.zeros(2, planets, dtype=torch.long),
+        "fraction": torch.full((2, planets), 0.5),
+        "log_prob": torch.zeros(2, planets),
+        "value": torch.zeros(2),
+        "target_legal_mask": None,
+        "target_legal_row_idx": torch.tensor([0, 0, 1, 1]),
+        "target_legal_source_idx": torch.tensor([0, 2, 1, 2]),
+        "target_legal_source_mask": torch.tensor(
+            [
+                [False, True, True],
+                [True, True, False],
+                [True, False, True],
+                [False, True, True],
+            ],
+        ),
+        "old_log_prob_computed": True,
+    }
+    traj = SimpleNamespace(
+        encoded=[],
+        launch=[],
+        target_idx=[],
+        fraction=[],
+        log_prob=[],
+        value=[],
+        reward=[0.0, 0.0],
+        owned_mask=[],
+        target_legal_mask=[],
+        record_refs=[TrajectoryRecordRef(chunk, 1), TrajectoryRecordRef(chunk, 0)],
+    )
+
+    batch = train_mod._stack_trajectories(
+        [traj],
+        gamma=1.0,
+        gae_lambda=1.0,
+    )
+
+    assert batch["target_legal_mask"] is None
+    assert torch.equal(
+        batch["target_legal_source_owned_mask"],
+        torch.tensor([[False, True, True], [True, False, True]]),
+    )
+    assert torch.equal(batch["target_legal_row_offsets"], torch.tensor([0, 2, 4]))
+    dense = _stage_target_legal_mask(
+        batch,
+        torch.tensor([0, 1]),
+        torch.device("cpu"),
+    )
+    expected = torch.ones(2, planets, planets, dtype=torch.bool)
+    expected[0, 1] = torch.tensor([True, False, True])
+    expected[0, 2] = torch.tensor([False, True, True])
+    expected[1, 0] = torch.tensor([False, True, True])
+    expected[1, 2] = torch.tensor([True, True, False])
+    assert torch.equal(dense, expected)
+
+
+def test_compact_target_legality_keeps_owned_sources_without_rows_illegal():
+    batch = {
+        "target_legal_mask": None,
+        "target_legal_source_owned_mask": torch.tensor([[True, True, False]]),
+        "target_legal_row_idx": torch.tensor([0]),
+        "target_legal_source_idx": torch.tensor([0]),
+        "target_legal_source_mask": torch.tensor([[False, True, True]]),
+    }
+
+    dense = _stage_target_legal_mask(
+        batch,
+        torch.tensor([0]),
+        torch.device("cpu"),
+    )
+
+    expected = torch.ones(1, 3, 3, dtype=torch.bool)
+    expected[0, 0] = torch.tensor([False, True, True])
+    expected[0, 1] = False
+    assert torch.equal(dense, expected)
+
+
 def test_stack_trajectories_builds_masked_critic_mtp_targets(monkeypatch):
     monkeypatch.setattr(train_mod, "_stack_encoded", lambda _trajs: {})
     rewards = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
@@ -751,11 +1233,75 @@ def test_log_prob_recompute_matches_sample_time():
     action_idx = torch.where(launch_f > 0.5, target + 1, torch.zeros_like(target))
     action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
     frac_lp = _beta_log_prob(out.fraction_alpha, out.fraction_beta, batch["fraction"])
-    chosen = action_lp + launch_f * frac_lp
+    chosen = action_lp + torch.where(
+        launch_f > 0.5,
+        frac_lp,
+        torch.zeros_like(frac_lp),
+    )
 
     diff = (chosen - batch["old_log_prob"]) * owned.float()
     # Should be exactly zero up to numerical noise — same params, same action.
     assert diff.abs().max().item() < 1e-4, diff.abs().max().item()
+
+
+def test_ppo_update_rejects_deferred_placeholder_old_log_probs():
+    torch.manual_seed(0)
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=4)
+    batch["old_log_prob"] = torch.zeros_like(batch["old_log_prob"])
+    batch["old_log_prob_computed"] = torch.tensor(False)
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    with pytest.raises(ValueError, match="requires real old_log_prob"):
+        ppo_update(
+            model,
+            optim,
+            batch,
+            value_coef=0.5,
+            target_entropy_coef=0.01,
+            fraction_entropy_coef=0.0,
+            norm_advantage=True,
+            advantage_transform="rankgauss",
+            clip_coef=0.2,
+            clip_coef_high=0.28,
+            epochs=1,
+            minibatch_size=2,
+            grad_clip=0.5,
+        )
+
+
+def test_ppo_update_sanitizes_masked_deferred_log_ratio():
+    torch.manual_seed(0)
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=4)
+    launched = (batch["owned_mask"] & (batch["launch"] > 0.5)).nonzero(as_tuple=False)
+    assert launched.numel() > 0
+    for row, source in launched.tolist():
+        target = int(batch["target_idx"][row, source].clamp_min(0).item())
+        batch["target_legal_mask"][row, source, target] = False
+        batch["old_log_prob"][row, source] = float("-inf")
+    batch["old_log_prob_computed"] = torch.tensor(True)
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    log = ppo_update(
+        model,
+        optim,
+        batch,
+        value_coef=0.5,
+        target_entropy_coef=0.01,
+        fraction_entropy_coef=0.0,
+        norm_advantage=True,
+        advantage_transform="rankgauss",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        epochs=1,
+        minibatch_size=2,
+        grad_clip=0.5,
+    )
+
+    assert math.isfinite(log.policy_loss)
 
 
 def test_categorical_flat_logits_balance_noop_against_target_group():
@@ -1031,6 +1577,7 @@ def _fixed_policy_batch(
         "target_idx": torch.ones(1, 2, dtype=torch.long),
         "fraction": torch.full((1, 2), 0.5),
         "old_log_prob": old_log_prob,
+        "old_log_prob_computed": torch.tensor(True),
         "owned_mask": owned_mask,
         "advantage": torch.tensor([advantage]),
         "return": torch.zeros(1),
@@ -1153,6 +1700,7 @@ def test_approx_kl_reports_latest_minibatch_not_epoch_mean():
                 torch.tensor([new_log_prob - torch.log(ratios[1]), 0.0]),
             )
         ),
+        "old_log_prob_computed": torch.tensor(True),
         "owned_mask": torch.tensor([[True, False], [True, False]]),
         "advantage": torch.ones(2),
         "return": torch.zeros(2),

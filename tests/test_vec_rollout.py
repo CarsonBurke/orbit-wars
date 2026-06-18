@@ -9,6 +9,7 @@ from owars.agents.learned import _FleetTargetTracker
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.features import EncodedObs
 from owars.policies.model import OrbitPolicy
+from owars.training import train as train_mod
 from owars.training.config import RewardCfg
 from owars.training.league import LEARNER_NAME, OpponentSlot
 from owars.training.numpy_env import NumpyVecEnv
@@ -20,12 +21,17 @@ from owars.training.vec_env import (
 )
 from owars.training.vec_rollout import (
     _bucket_fleets_for_graph,
+    _capped_graph_rows,
     _empty_traj,
     _finalize_trajectory,
+    _flush_scoped_timings,
+    _materialize_records_cpu,
     _normalize_learner_seats,
     _obs_reward_potential,
     _resolve_seat_agents,
     _reward_potentials,
+    _scoped_timings,
+    _snapshot_rollout_graph_rows,
     _state_reward_potential,
     _trim_fleets_for_forward,
     alternating_learner_seats,
@@ -168,6 +174,38 @@ def test_bucket_fleets_for_graph_uses_inbound_summary_without_fleet_padding():
     assert padded.fleet_feats.shape[1] == 0
     assert padded.planet_inbound_feats is not None
     assert padded.planet_inbound_feats.shape == (2, 64, 13)
+
+
+def test_snapshot_rollout_graph_rows_use_fixed_capacity_when_compiled():
+    assert _capped_graph_rows(44, max_rows=64) == 64
+    assert _capped_graph_rows(65, max_rows=64) == 128
+    assert _snapshot_rollout_graph_rows(
+        7,
+        snapshot_compile_rows=64,
+        compile_mode="reduce-overhead",
+    ) == 64
+    assert _snapshot_rollout_graph_rows(
+        65,
+        snapshot_compile_rows=64,
+        compile_mode="reduce-overhead",
+    ) == 128
+    assert _snapshot_rollout_graph_rows(
+        7,
+        snapshot_compile_rows=64,
+        compile_mode=None,
+    ) == 8
+
+
+def test_scoped_timings_preserve_aggregate_and_prefix():
+    timings = {"native_action_s": 1.0}
+    scoped = _scoped_timings(timings, "current_sample")
+
+    assert scoped is not None
+    scoped["native_action_s"] = 2.5
+    _flush_scoped_timings(timings, scoped, "current_sample")
+
+    assert timings["native_action_s"] == pytest.approx(3.5)
+    assert timings["current_sample/native_action_s"] == pytest.approx(2.5)
 
 
 def test_projected_population_potential_uses_best_enemy_and_remaining_horizon():
@@ -351,6 +389,139 @@ def test_numpy_fast_rollout_records_configured_learner_seats():
             assert owned.equal(obs.planet_owned_mask)
             assert obs.global_feats is not None
             assert obs.global_feats.shape == (model.cfg.global_features,)
+
+
+def test_numpy_fast_rollout_can_defer_log_prob_storage():
+    model = OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
+    opponent = OpponentSlot("noop", agent=lambda _obs: [])
+    vec = NumpyVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=8,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+
+    with vec:
+        [traj] = rollout_episodes_batched(
+            model,
+            vec,
+            [[opponent]],
+            num_players=2,
+            learner_seat=0,
+            device="cpu",
+            defer_log_prob=True,
+        )
+
+    assert traj.encoded
+    assert len(traj.launch) == len(traj.target_idx) == len(traj.fraction) == len(traj.reward)
+    assert traj.log_prob == []
+
+
+def test_numpy_fast_rollout_can_record_chunked_ppo_records():
+    model = OrbitPolicy(
+        OrbitPolicyConfig(
+            dim=16,
+            ff_dim=32,
+            depth=1,
+            n_heads=2,
+            encoder_backend="destination_conditioned",
+        )
+    )
+    opponent = OpponentSlot("noop", agent=lambda _obs: [])
+    vec = NumpyVecEnv(
+        num_envs=2,
+        num_players=2,
+        episode_steps=8,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+
+    with vec:
+        trajs = rollout_episodes_batched(
+            model,
+            vec,
+            [[opponent], [opponent]],
+            num_players=2,
+            learner_seat=[0, 1],
+            device="cpu",
+            defer_log_prob=True,
+            chunk_records=True,
+        )
+
+    assert [traj.learner_seat for traj in trajs] == [0, 1]
+    assert all(traj.record_refs for traj in trajs)
+    assert all(len(traj.record_refs) == len(traj.reward) for traj in trajs)
+    for traj in trajs:
+        assert traj.encoded == []
+        assert traj.launch == []
+        assert traj.target_idx == []
+        assert traj.fraction == []
+        assert traj.log_prob == []
+        assert traj.value == []
+        assert traj.owned_mask == []
+        assert traj.target_legal_mask == []
+        assert all(ref.chunk["log_prob"] is None for ref in traj.record_refs)
+        assert all(ref.chunk["planet_inbound_feats"] is not None for ref in traj.record_refs)
+        assert all(ref.chunk["fleet_target_planet_idx"] is not None for ref in traj.record_refs)
+
+    batch = train_mod._stack_trajectories(
+        trajs,
+        gamma=1.0,
+        gae_lambda=1.0,
+        include_old_log_prob=False,
+    )
+
+    assert int(batch["launch"].shape[0]) == sum(len(traj.reward) for traj in trajs)
+    assert batch["planet_inbound_feats"] is not None
+    assert batch["fleet_target_planet_idx"] is not None
+    assert torch.equal(batch["old_log_prob"], torch.zeros_like(batch["launch"]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_materialize_records_cpu_handles_mixed_record_devices():
+    batch = 2
+    planets = 3
+    cpu_stacked = EncodedObs(
+        planet_feats=torch.randn(batch, planets, 4),
+        planet_mask=torch.ones(batch, planets, dtype=torch.bool),
+        planet_owned_mask=torch.tensor([[True, False, True], [False, True, True]]),
+        planet_ids=torch.arange(planets).expand(batch, -1),
+        planet_garrison=torch.ones(batch, planets),
+        fleet_feats=torch.zeros(batch, 0, 2),
+        fleet_mask=torch.zeros(batch, 0, dtype=torch.bool),
+        global_feats=torch.randn(batch, 2),
+    )
+    stacked = cpu_stacked.to("cuda")
+    records = SimpleNamespace(
+        launch=torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            device="cuda",
+        ),
+        target_idx=torch.tensor([[2, 0, 0], [0, 2, 0]], device="cuda"),
+        fraction=torch.full((batch, planets), 0.5, device="cuda"),
+        log_prob=torch.full((batch, planets), -0.25),
+        target_legal_mask=torch.ones(batch, planets, planets, dtype=torch.bool),
+    )
+    out = SimpleNamespace(value=torch.tensor([1.5, -0.5], device="cuda"))
+
+    got = _materialize_records_cpu(
+        stacked,
+        cpu_stacked,
+        out,
+        records,
+        torch.arange(batch, device="cuda"),
+        [0, 1],
+        include_log_prob=True,
+    )
+
+    assert got["target_idx"].device.type == "cpu"
+    assert torch.equal(got["target_idx"], records.target_idx.cpu())
+    assert torch.allclose(got["launch"], records.launch.cpu())
+    assert torch.allclose(got["fraction"], records.fraction.cpu())
+    assert torch.allclose(got["log_prob"], records.log_prob)
+    assert torch.equal(got["target_legal_mask"], records.target_legal_mask)
+    assert torch.allclose(got["value"], out.value.cpu())
 
 
 def test_numpy_fast_rollout_behavior_override_records_value_only_sidecars():

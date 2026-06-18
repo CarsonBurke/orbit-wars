@@ -210,7 +210,9 @@ def _fixed_order_minibatches(
 
 def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     weights = weights.to(device=values.device, dtype=values.dtype)
-    return (values * weights).sum() / weights.sum().clamp_min(1.0)
+    active = weights > 0
+    safe_values = torch.where(active, values, torch.zeros_like(values))
+    return (safe_values * weights).sum() / weights.sum().clamp_min(1.0)
 
 
 def _weighted_max(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -279,6 +281,43 @@ def _safe_target_logits(target_logits: torch.Tensor) -> torch.Tensor:
     return torch.where(finite, target_logits, torch.zeros_like(target_logits))
 
 
+def _raise_if_nonfinite_tensor(name: str, tensor: torch.Tensor) -> None:
+    if bool(torch.isfinite(tensor).all()):
+        return
+    finite = torch.isfinite(tensor)
+    bad = int((~finite).sum().item())
+    if bool(finite.any()):
+        finite_vals = tensor.detach()[finite]
+        detail = (
+            f" finite_min={float(finite_vals.min().item()):.6g}"
+            f" finite_max={float(finite_vals.max().item()):.6g}"
+        )
+    else:
+        detail = " no_finite_values"
+    if tensor.numel() <= 128:
+        bad_idx = (~finite).nonzero(as_tuple=False).detach().cpu().tolist()
+        detail = f"{detail} bad_indices={bad_idx}"
+    raise FloatingPointError(
+        f"{name} contains {bad}/{tensor.numel()} non-finite values; "
+        f"shape={tuple(tensor.shape)}{detail}"
+    )
+
+
+def _raise_if_nonfinite_model_tensors(
+    model: torch.nn.Module,
+    *,
+    what: str,
+    gradients: bool,
+) -> None:
+    for name, param in model.named_parameters():
+        tensor = param.grad if gradients else param
+        if tensor is None:
+            continue
+        if bool(torch.isfinite(tensor).all()):
+            continue
+        _raise_if_nonfinite_tensor(f"{what}:{name}", tensor)
+
+
 def _bernoulli_log_probs(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     log_p1 = -F.softplus(-logits)
     log_p0 = -F.softplus(logits)
@@ -331,6 +370,31 @@ def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
         - (beta - 1.0) * torch.digamma(beta)
         + (total - 2.0) * torch.digamma(total)
     )
+
+
+def _launched_beta_log_prob(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    fraction: torch.Tensor,
+    launch: torch.Tensor,
+) -> torch.Tensor:
+    launch_mask = launch.float() > 0.5
+    safe_alpha = torch.where(launch_mask, alpha, torch.full_like(alpha, 2.0))
+    safe_beta = torch.where(launch_mask, beta, torch.full_like(beta, 2.0))
+    safe_fraction = torch.where(launch_mask, fraction, torch.full_like(fraction, 0.5))
+    frac_lp = _beta_log_prob(safe_alpha, safe_beta, safe_fraction)
+    return torch.where(launch_mask, frac_lp, torch.zeros_like(frac_lp))
+
+
+def _action_log_prob_for_action(action_lp: torch.Tensor, launch: torch.Tensor) -> torch.Tensor:
+    launch_mask = launch.float() > 0.5
+    safe_noop_lp = torch.nan_to_num(
+        action_lp.float(),
+        nan=0.0,
+        neginf=-1.0e9,
+        posinf=0.0,
+    )
+    return torch.where(launch_mask, action_lp, safe_noop_lp)
 
 
 def _deterministic_beta_fraction(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -493,6 +557,105 @@ def _batch_encoded_view(batch: dict[str, torch.Tensor]) -> EncodedObs:
     )
 
 
+def _stage_target_legal_mask(
+    batch: dict[str, Any],
+    mb: torch.Tensor,
+    device: torch.device,
+    *,
+    pinned_cache: PinnedSliceCache | None = None,
+    slot: int = 0,
+) -> torch.Tensor:
+    dense = batch.get("target_legal_mask")
+    if dense is not None:
+        return _slice_to_device(
+            dense,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="target_legal_mask",
+        )
+
+    mb_cpu = mb.detach().to(device="cpu", dtype=torch.long)
+    owned = batch["target_legal_source_owned_mask"].index_select(0, mb_cpu).bool()
+    rows = int(owned.shape[0])
+    planets = int(owned.shape[1])
+    cache_key = (int(slot), "target_legal_mask_compact", torch.bool, (rows, planets, planets))
+    event = None
+    if pinned_cache is not None and device.type == "cuda":
+        cached = pinned_cache.get(cache_key)
+        if cached is None:
+            out = torch.empty(
+                rows,
+                planets,
+                planets,
+                dtype=torch.bool,
+                device="cpu",
+                pin_memory=True,
+            )
+        else:
+            out, event = cached
+            if event is not None:
+                event.synchronize()
+        out.fill_(True)
+    else:
+        out = torch.ones(rows, planets, planets, dtype=torch.bool)
+    owned_rows, owned_cols = torch.nonzero(owned, as_tuple=True)
+    if owned_rows.numel():
+        out[owned_rows, owned_cols] = False
+
+    row_idx = batch["target_legal_row_idx"].long()
+    row_offsets = batch.get("target_legal_row_offsets")
+    if row_offsets is not None:
+        row_offsets = row_offsets.long()
+        starts = row_offsets.index_select(0, mb_cpu)
+        stops = row_offsets.index_select(0, mb_cpu + 1)
+        counts = stops - starts
+        total = int(counts.sum().item())
+        if total:
+            out_rows = torch.repeat_interleave(
+                torch.arange(rows, dtype=torch.long),
+                counts,
+            )
+            segment_starts = counts.cumsum(0) - counts
+            gather_idx = torch.arange(total, dtype=torch.long) + torch.repeat_interleave(
+                starts - segment_starts,
+                counts,
+            )
+            out[
+                out_rows,
+                batch["target_legal_source_idx"].long().index_select(0, gather_idx),
+            ] = batch["target_legal_source_mask"].bool().index_select(0, gather_idx)
+    elif row_idx.numel():
+        row_to_mb = torch.full(
+            (int(batch["target_legal_source_owned_mask"].shape[0]),),
+            -1,
+            dtype=torch.long,
+        )
+        row_to_mb[mb_cpu] = torch.arange(rows, dtype=torch.long)
+        compact_rows = row_to_mb.index_select(0, row_idx)
+        keep = compact_rows >= 0
+        if bool(keep.any()):
+            out[
+                compact_rows[keep],
+                batch["target_legal_source_idx"].long()[keep],
+            ] = batch["target_legal_source_mask"].bool()[keep]
+
+    if device.type == "cuda":
+        if not out.is_pinned():
+            out = out.pin_memory()
+        moved = out.to(device, non_blocking=True)
+        if pinned_cache is not None:
+            if event is None:
+                event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            pinned_cache[cache_key] = (out, event)
+        out = moved
+    elif out.device != device:
+        out = out.to(device)
+    return out
+
+
 def _stage_ppo_minibatch(
     batch: dict[str, torch.Tensor],
     global_feats: torch.Tensor,
@@ -614,13 +777,12 @@ def _stage_ppo_minibatch(
         _slice_to_device(
             batch["owned_mask"], mb, device, pinned_cache=pinned_cache, slot=slot, name="owned_mask"
         ),
-        _slice_to_device(
-            batch["target_legal_mask"],
+        _stage_target_legal_mask(
+            batch,
             mb,
             device,
             pinned_cache=pinned_cache,
             slot=slot,
-            name="target_legal_mask",
         ),
     )
 
@@ -987,8 +1149,14 @@ class _PPOMinibatchKernel(torch.nn.Module):
             action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
             target_log_probs = action_log_probs[..., 1:]
             target_dist_probs = action_probs[..., 1:]
-        frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
-        chosen = action_lp + launch_f * frac_lp
+        action_lp = _action_log_prob_for_action(action_lp, launch_f)
+        fraction_action_lp = _launched_beta_log_prob(
+            fraction_alpha,
+            fraction_beta,
+            fraction.float(),
+            launch_f,
+        )
+        chosen = action_lp + fraction_action_lp
 
         adv_b = advantage.float().unsqueeze(-1).expand_as(chosen)
         row_w = row_weight.to(device=owned_f.device, dtype=owned_f.dtype)
@@ -1001,6 +1169,13 @@ class _PPOMinibatchKernel(torch.nn.Module):
             chosen - old_log_prob.float(),
             torch.zeros_like(chosen),
         )
+        log_ratio = torch.nan_to_num(
+            log_ratio,
+            nan=0.0,
+            neginf=-60.0,
+            posinf=60.0,
+        )
+        log_ratio = log_ratio.clamp(-60.0, 60.0)
         ratio = log_ratio.exp()
         adv_actor = adv_b
         if self.norm_advantage:
@@ -1028,44 +1203,81 @@ class _PPOMinibatchKernel(torch.nn.Module):
         else:
             value_loss = policy_loss * 0.0
 
-        frac_entropy_per_planet = _beta_entropy(fraction_alpha, fraction_beta)
+        use_entropy_bonus = (
+            self.target_entropy_coef != 0.0 or self.fraction_entropy_coef != 0.0
+        )
         if action_logit_softcap is None:
             p_move_current = _threshold_normal_launch_prob(
                 launch_logits,
                 launch_log_std,
                 launch_prob_floor,
             )
+        else:
+            p_move_current = target_dist_probs.sum(dim=-1)
+        entropy_fraction_alpha = fraction_alpha if use_entropy_bonus else fraction_alpha.detach()
+        entropy_fraction_beta = fraction_beta if use_entropy_bonus else fraction_beta.detach()
+        entropy_owned_w = owned_w if use_entropy_bonus else owned_w.detach()
+        entropy_p_move_current = p_move_current if use_entropy_bonus else p_move_current.detach()
+        raw_frac_entropy_per_planet = _beta_entropy(
+            entropy_fraction_alpha,
+            entropy_fraction_beta,
+        )
+        frac_entropy_per_planet = torch.where(
+            torch.isfinite(raw_frac_entropy_per_planet),
+            raw_frac_entropy_per_planet,
+            torch.zeros_like(raw_frac_entropy_per_planet),
+        )
+        if action_logit_softcap is None:
+            entropy_target_log_probs = (
+                target_log_probs if use_entropy_bonus else target_log_probs.detach()
+            )
+            entropy_target_dist_probs = (
+                target_dist_probs if use_entropy_bonus else target_dist_probs.detach()
+            )
+            entropy_launch_logits = launch_logits if use_entropy_bonus else launch_logits.detach()
+            entropy_launch_log_std = (
+                None
+                if launch_log_std is None
+                else launch_log_std if use_entropy_bonus else launch_log_std.detach()
+            )
             planet_entropy = _conditional_action_entropy(
-                torch.logit(p_move_current.clamp(1e-7, 1.0 - 1e-7)),
-                target_log_probs,
+                torch.logit(entropy_p_move_current.clamp(1e-7, 1.0 - 1e-7)),
+                entropy_target_log_probs,
                 frac_entropy_per_planet,
             )
             launch_entropy = (
                 _threshold_normal_launch_entropy(
-                    launch_logits,
-                    launch_log_std,
+                    entropy_launch_logits,
+                    entropy_launch_log_std,
                     launch_prob_floor,
                 )
-                * owned_w
+                * entropy_owned_w
             ).sum() / denom
-            min_real = torch.finfo(target_log_probs.dtype).min
+            min_real = torch.finfo(entropy_target_log_probs.dtype).min
             target_entropy_per_planet = -(
-                target_dist_probs * target_log_probs.clamp_min(min_real)
+                entropy_target_dist_probs * entropy_target_log_probs.clamp_min(min_real)
             ).sum(dim=-1)
-            target_entropy = ((p_move_current * target_entropy_per_planet) * owned_w).sum() / denom
+            target_entropy = (
+                (entropy_p_move_current * target_entropy_per_planet) * entropy_owned_w
+            ).sum() / denom
         else:
-            safe_action_log_probs = torch.where(
-                torch.isfinite(action_log_probs),
-                action_log_probs,
-                torch.zeros_like(action_log_probs),
+            entropy_action_log_probs = (
+                action_log_probs if use_entropy_bonus else action_log_probs.detach()
             )
-            action_entropy = -(action_probs * safe_action_log_probs).sum(dim=-1)
-            p_move_current = target_dist_probs.sum(dim=-1)
-            planet_entropy = action_entropy + p_move_current * frac_entropy_per_planet
-            target_entropy = (action_entropy * owned_w).sum() / denom
+            entropy_action_probs = action_probs if use_entropy_bonus else action_probs.detach()
+            safe_action_log_probs = torch.where(
+                torch.isfinite(entropy_action_log_probs),
+                entropy_action_log_probs,
+                torch.zeros_like(entropy_action_log_probs),
+            )
+            action_entropy = -(entropy_action_probs * safe_action_log_probs).sum(dim=-1)
+            planet_entropy = action_entropy + entropy_p_move_current * frac_entropy_per_planet
+            target_entropy = (action_entropy * entropy_owned_w).sum() / denom
             launch_entropy = target_entropy * 0.0
-        entropy = (planet_entropy * owned_w).sum() / denom
-        fraction_entropy = ((p_move_current * frac_entropy_per_planet) * owned_w).sum() / denom
+        entropy = (planet_entropy * entropy_owned_w).sum() / denom
+        fraction_entropy = (
+            (entropy_p_move_current * frac_entropy_per_planet) * entropy_owned_w
+        ).sum() / denom
         move_prob = (p_move_current * owned_w).sum() / denom
         legal_target_count = target_legal_mask.to(dtype=owned_f.dtype).sum(dim=-1)
         legal_target_count_mean = (legal_target_count * owned_w).sum() / denom
@@ -1076,9 +1288,15 @@ class _PPOMinibatchKernel(torch.nn.Module):
         if action_logit_softcap is not None:
             launch_log_std_mean = launch_logits.sum() * 0.0
             action_logit_softcap_metric = launch_logits.new_tensor(float(action_logit_softcap))
+            has_finite_target = torch.isfinite(target_logits).any(dim=-1)
             target_best = target_logits.amax(dim=-1)
-            target_best = torch.where(has_legal_target, target_best, launch_logits)
-            launch_score_mean = ((launch_logits - target_best) * owned_w).sum() / denom
+            target_best = torch.where(has_finite_target, target_best, launch_logits)
+            launch_score = torch.where(
+                has_finite_target,
+                launch_logits - target_best,
+                torch.zeros_like(launch_logits),
+            )
+            launch_score_mean = (launch_score * owned_w).sum() / denom
         elif launch_log_std is None:
             launch_log_std_mean = launch_logits.sum() * 0.0
             action_logit_softcap_metric = launch_logits.sum() * 0.0
@@ -1098,10 +1316,13 @@ class _PPOMinibatchKernel(torch.nn.Module):
         fraction_skew_abs_mean = ((fraction_alpha - fraction_beta).abs() * owned_w).sum() / denom
         deterministic_fraction = _deterministic_beta_fraction(fraction_alpha, fraction_beta)
         deterministic_fraction_mean = (deterministic_fraction * owned_w).sum() / denom
-        entropy_bonus = (
-            self.target_entropy_coef * (launch_entropy + target_entropy)
-            + self.fraction_entropy_coef * fraction_entropy
-        )
+        entropy_bonus = launch_entropy.sum() * 0.0
+        if self.target_entropy_coef != 0.0:
+            entropy_bonus = entropy_bonus + self.target_entropy_coef * (
+                launch_entropy + target_entropy
+            )
+        if self.fraction_entropy_coef != 0.0:
+            entropy_bonus = entropy_bonus + self.fraction_entropy_coef * fraction_entropy
 
         actor_loss = policy_loss - entropy_bonus
         critic_loss = self.value_coef * value_loss
@@ -1124,7 +1345,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
 
         row_log_ratio = (log_ratio * owned_f).sum(dim=-1)
         row_log_ratio = torch.where(row_w > 0.0, row_log_ratio, row_log_ratio * 0.0)
-        row_ratio = row_log_ratio.exp()
+        row_ratio = row_log_ratio.clamp(-60.0, 60.0).exp()
         row_denom = row_w.sum().clamp_min(1.0)
         row_launch_count = (launch_f * owned_w).sum(dim=-1)
         turn_no_action_frac = ((row_launch_count <= 0.0).to(row_w.dtype) * row_w).sum() / row_denom
@@ -1224,6 +1445,72 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
         return value_loss, value_loss.detach().float()
 
 
+def _old_log_prob_from_output(
+    out: Any,
+    launch: torch.Tensor,
+    target_idx: torch.Tensor,
+    fraction: torch.Tensor,
+    target_legal_mask: torch.Tensor,
+) -> torch.Tensor:
+    target_legal_mask = target_legal_mask.bool()
+    has_legal_target = target_legal_mask.any(dim=-1)
+    launch_logits = out.launch_logits.float()
+    out_action_logit_softcap = getattr(out, "action_logit_softcap", None)
+    action_logit_softcap = (
+        None if out_action_logit_softcap is None else float(out_action_logit_softcap)
+    )
+    if action_logit_softcap is None:
+        launch_logits = launch_logits.masked_fill(~has_legal_target, -20.0)
+    out_launch_log_std = getattr(out, "launch_log_std", None)
+    launch_log_std = None if out_launch_log_std is None else out_launch_log_std.float()
+    launch_prob_floor = float(getattr(out, "launch_prob_floor", 0.0))
+    target_logits = out.target_logits.float().masked_fill(
+        ~target_legal_mask,
+        float("-inf"),
+    )
+    if out.fraction_alpha is None or out.fraction_beta is None:
+        raise ValueError("PPO OrbitPolicy output must include Beta fraction params")
+    fraction_alpha = out.fraction_alpha.float()
+    fraction_beta = out.fraction_beta.float()
+    p = target_logits.shape[1]
+    launch_f = launch.float().clamp(0.0, 1.0)
+    target = target_idx.clamp(0, p - 1)
+    if action_logit_softcap is None:
+        target_logits = _safe_target_logits(target_logits)
+        launch_lp = _threshold_normal_launch_log_prob(
+            launch_logits,
+            launch_log_std,
+            launch_f,
+            launch_prob_floor,
+        )
+        target_log_probs = F.log_softmax(target_logits, dim=-1)
+        target_lp = target_log_probs.gather(
+            -1,
+            target.unsqueeze(-1),
+        ).squeeze(-1)
+        action_lp = launch_lp + launch_f * target_lp
+    else:
+        action_log_probs = _categorical_action_log_probs(
+            launch_logits,
+            target_logits,
+            action_logit_softcap,
+        )
+        action_idx = torch.where(
+            launch_f > 0.5,
+            target + 1,
+            torch.zeros_like(target),
+        )
+        action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
+    action_lp = _action_log_prob_for_action(action_lp, launch_f)
+    fraction_action_lp = _launched_beta_log_prob(
+        fraction_alpha,
+        fraction_beta,
+        fraction.float(),
+        launch_f,
+    )
+    return action_lp + fraction_action_lp
+
+
 class _OldLogProbKernel(torch.nn.Module):
     def __init__(self, model: torch.nn.Module, *, autocast_enabled: bool) -> None:
         super().__init__()
@@ -1268,57 +1555,64 @@ class _OldLogProbKernel(torch.nn.Module):
             else:
                 out = self.model(feats)
 
-        target_legal_mask = target_legal_mask.bool()
-        has_legal_target = target_legal_mask.any(dim=-1)
-        launch_logits = out.launch_logits.float()
-        out_action_logit_softcap = getattr(out, "action_logit_softcap", None)
-        action_logit_softcap = (
-            None if out_action_logit_softcap is None else float(out_action_logit_softcap)
+        return _old_log_prob_from_output(
+            out,
+            launch,
+            target_idx,
+            fraction,
+            target_legal_mask,
         )
-        if action_logit_softcap is None:
-            launch_logits = launch_logits.masked_fill(~has_legal_target, -20.0)
-        out_launch_log_std = getattr(out, "launch_log_std", None)
-        launch_log_std = None if out_launch_log_std is None else out_launch_log_std.float()
-        launch_prob_floor = float(getattr(out, "launch_prob_floor", 0.0))
-        target_logits = out.target_logits.float().masked_fill(
-            ~target_legal_mask,
-            float("-inf"),
+
+
+class _OldLogProbValueKernel(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, *, autocast_enabled: bool) -> None:
+        super().__init__()
+        self.model = model
+        self.autocast_enabled = bool(autocast_enabled)
+        self._model_accepts_head_flags = isinstance(model, OrbitPolicy)
+
+    def forward(
+        self,
+        global_feats: torch.Tensor,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
+        launch: torch.Tensor,
+        target_idx: torch.Tensor,
+        fraction: torch.Tensor,
+        target_legal_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+            global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
         )
-        if out.fraction_alpha is None or out.fraction_beta is None:
-            raise ValueError("PPO OrbitPolicy output must include Beta fraction params")
-        fraction_alpha = out.fraction_alpha.float()
-        fraction_beta = out.fraction_beta.float()
-        p = target_logits.shape[1]
-        launch_f = launch.float().clamp(0.0, 1.0)
-        target = target_idx.clamp(0, p - 1)
-        if action_logit_softcap is None:
-            target_logits = _safe_target_logits(target_logits)
-            launch_lp = _threshold_normal_launch_log_prob(
-                launch_logits,
-                launch_log_std,
-                launch_f,
-                launch_prob_floor,
-            )
-            target_log_probs = F.log_softmax(target_logits, dim=-1)
-            target_lp = target_log_probs.gather(
-                -1,
-                target.unsqueeze(-1),
-            ).squeeze(-1)
-            action_lp = launch_lp + launch_f * target_lp
-        else:
-            action_log_probs = _categorical_action_log_probs(
-                launch_logits,
-                target_logits,
-                action_logit_softcap,
-            )
-            action_idx = torch.where(
-                launch_f > 0.5,
-                target + 1,
-                torch.zeros_like(target),
-            )
-            action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
-        frac_lp = _beta_log_prob(fraction_alpha, fraction_beta, fraction.float())
-        return action_lp + launch_f * frac_lp
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            out = self.model(feats)
+
+        old_log_prob = _old_log_prob_from_output(
+            out,
+            launch,
+            target_idx,
+            fraction,
+            target_legal_mask,
+        )
+        return old_log_prob, out.value.float()
 
 
 def _kernel_cache(model: torch.nn.Module) -> dict:
@@ -1428,6 +1722,28 @@ def _get_old_log_prob_kernel(
     if cached is not None:
         return cached
     kernel = _OldLogProbKernel(
+        model,
+        autocast_enabled=device.type == "cuda",
+    )
+    kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
+    cache[key] = kernel
+    return kernel
+
+
+def _get_old_log_prob_value_kernel(
+    model: torch.nn.Module,
+    *,
+    compile_mode: str | None,
+    shape_key: tuple[int, int, int, int, int, int],
+) -> torch.nn.Module:
+    device = _module_device(model)
+    mode = compile_mode if device.type == "cuda" else None
+    key = ("old_log_prob_value", mode, shape_key)
+    cache = _kernel_cache(model)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    kernel = _OldLogProbValueKernel(
         model,
         autocast_enabled=device.type == "cuda",
     )
@@ -1606,13 +1922,12 @@ def _stage_old_log_prob_minibatch(
         _slice_to_device(
             batch["fraction"], mb, device, pinned_cache=pinned_cache, slot=slot, name="fraction"
         ),
-        _slice_to_device(
-            batch["target_legal_mask"],
+        _stage_target_legal_mask(
+            batch,
             mb,
             device,
             pinned_cache=pinned_cache,
             slot=slot,
-            name="target_legal_mask",
         ),
     )
 
@@ -1678,13 +1993,104 @@ def compute_old_log_probs(
                 if compile_mode is not None:
                     _mark_cuda_graph_step(device)
                 old_lp = kernel(*staged)
-                retained = old_lp[:real].detach()
-                if retained.device == out_device:
-                    retained = retained.clone()
-                else:
-                    retained = retained.to(out_device, non_blocking=True)
+                # `reduce-overhead` may return views into CUDA-graph replay
+                # buffers. Clone on the producing device before any transfer so
+                # the next replay cannot overwrite an in-flight CPU copy.
+                retained = old_lp[:real].detach().clone()
+                if retained.device != out_device:
+                    retained = retained.to(
+                        out_device,
+                        non_blocking=out_device.type != "cpu",
+                    )
                 chunks.append(retained)
         return torch.cat(chunks, dim=0).float()
+    finally:
+        model.train(was_training)
+
+
+def compute_old_log_probs_and_values(
+    model: OrbitPolicy,
+    batch: dict[str, torch.Tensor],
+    *,
+    minibatch_size: int,
+    minibatch_count: int | None = None,
+    compile_mode: str | None = None,
+    output_device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute behavior log-probs and critic values for stacked learner rows."""
+    n = int(batch["planet_feats"].shape[0])
+    if n <= 0:
+        return (
+            batch["launch"].new_empty(batch["launch"].shape).float(),
+            batch["launch"].new_empty(0).float(),
+        )
+    batch_device = batch["planet_feats"].device
+    batch_view = _batch_encoded_view(batch)
+    global_feats = _global_feats_or_empty(batch)
+    fleet_target_planet_idx = fleet_target_planet_idx_or_empty(batch_view)
+    planet_inbound_feats = planet_inbound_feats_or_empty(batch_view)
+    device = _module_device(model)
+    out_device = torch.device(output_device) if output_device is not None else batch_device
+    if minibatch_count is not None:
+        static_minibatch_rows = math.ceil(n / max(1, min(int(minibatch_count), n)))
+    else:
+        static_minibatch_rows = max(1, int(minibatch_size))
+    was_training = model.training
+    model.eval()
+    try:
+        kernel = _get_old_log_prob_value_kernel(
+            model,
+            compile_mode=compile_mode,
+            shape_key=(
+                static_minibatch_rows,
+                int(batch["planet_feats"].shape[1]),
+                int(batch["fleet_feats"].shape[1]),
+                int(global_feats.shape[1]),
+                int(planet_inbound_feats.shape[-2]),
+                int(planet_inbound_feats.shape[-1]),
+            ),
+        )
+        logprob_chunks: list[torch.Tensor] = []
+        value_chunks: list[torch.Tensor] = []
+        pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
+        with torch.no_grad():
+            for mb, _row_weight, real in _fixed_order_minibatches(
+                n,
+                minibatch_size,
+                batch_device,
+                minibatch_count=minibatch_count,
+                weight_device=device,
+            ):
+                staged = _stage_old_log_prob_minibatch(
+                    batch,
+                    global_feats,
+                    fleet_target_planet_idx,
+                    planet_inbound_feats,
+                    mb,
+                    device,
+                    pinned_cache=pinned_cache,
+                )
+                if compile_mode is not None:
+                    _mark_cuda_graph_step(device)
+                old_lp, value = kernel(*staged)
+                retained_lp = old_lp[:real].detach().clone()
+                retained_value = value[:real].detach().clone()
+                if retained_lp.device != out_device:
+                    retained_lp = retained_lp.to(
+                        out_device,
+                        non_blocking=out_device.type != "cpu",
+                    )
+                if retained_value.device != out_device:
+                    retained_value = retained_value.to(
+                        out_device,
+                        non_blocking=out_device.type != "cpu",
+                    )
+                logprob_chunks.append(retained_lp)
+                value_chunks.append(retained_value)
+        return (
+            torch.cat(logprob_chunks, dim=0).float(),
+            torch.cat(value_chunks, dim=0).float(),
+        )
     finally:
         model.train(was_training)
 
@@ -1727,6 +2133,11 @@ def ppo_update(
     Distributional value loss: cross-entropy against HL-Gauss-encoded
     returns (`value_encoder.target_probs(returns)`). No value clipping.
     """
+    if "old_log_prob_computed" not in batch or not bool(batch["old_log_prob_computed"]):
+        raise ValueError(
+            "ppo_update requires real old_log_prob values; recompute deferred "
+            "old log-probs with compute_old_log_probs before calling ppo_update"
+        )
     n = batch["planet_feats"].shape[0]
     batch_device = batch["planet_feats"].device
     batch_view = _batch_encoded_view(batch)
@@ -1823,6 +2234,9 @@ def ppo_update(
             if compile_mode is not None:
                 _mark_cuda_graph_step(device)
             actor_loss, critic_loss, metrics = kernel(*staged)
+            _raise_if_nonfinite_tensor(f"ppo_step_{n_steps}:metrics", metrics)
+            _raise_if_nonfinite_tensor(f"ppo_step_{n_steps}:actor_loss", actor_loss)
+            _raise_if_nonfinite_tensor(f"ppo_step_{n_steps}:critic_loss", critic_loss)
             metrics_for_step = metrics.detach().clone()
 
             optimizer.zero_grad(set_to_none=True)
@@ -1845,7 +2259,17 @@ def ppo_update(
                 critic_loss * loss_scale,
                 grad_clip,
             )
+            _raise_if_nonfinite_model_tensors(
+                model,
+                what=f"ppo_step_{n_steps}:grad",
+                gradients=True,
+            )
             optimizer.step()
+            _raise_if_nonfinite_model_tensors(
+                model,
+                what=f"ppo_step_{n_steps}:param_after_step",
+                gradients=False,
+            )
             # nGPT: re-project the encoder-trunk matrices onto the unit
             # hypersphere after EVERY optimizer step (the actual nGPT invariant;
             # `ngpt/train.py:499-500`, and `normalize_matrices`' own contract).
@@ -1856,6 +2280,11 @@ def ppo_update(
             # within-update KL that ratio clipping cannot constrain. Eager —
             # outside the compiled kernel.
             normalize_matrices(model)
+            _raise_if_nonfinite_model_tensors(
+                model,
+                what=f"ppo_step_{n_steps}:param_after_normalize",
+                gradients=False,
+            )
             del actor_loss, critic_loss, metrics
             actor_grad_norm_sum += actor_grad_norm.detach()
             critic_grad_norm_sum += critic_grad_norm.detach()

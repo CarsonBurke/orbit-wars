@@ -8,7 +8,7 @@
 #     minibatch advantage normalization.
 #   - Dense reward = delta of raw projected population margin.
 #   - Conventional GAE: γ = 0.997, λ = 0.95.
-#   - Distributional value head (linear HL-Gauss CE on normalized returns / 153 bins), unclipped.
+#   - Distributional value head (Dreamer3 HL-Gauss CE on normalized returns / 255 bins), unclipped.
 
 run:
   name: ppo_vs_sniper
@@ -43,12 +43,13 @@ model:
   encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
-  value_min: -64.0
-  value_max: 64.0
-  value_num_bins: 153
-  value_sigma_to_bin_ratio: 2.0
+  value_min: -8.0
+  value_max: 8.0
+  value_num_bins: 255
+  value_sigma_to_bin_ratio: 0.75
   critic_mtp_horizon: 6
   value_symlog: false
+  value_bucket: dreamer3
   action_logit_softcap: 8.0
 
 optim:
@@ -102,10 +103,13 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 128             # parallel envs
-  games_per_env_per_update: 1  # 128 full games per PPO update
+  num_envs: 1024            # parallel envs
+  games_per_env_per_update: 1  # 1024 full games per PPO update
   num_workers: 0            # only used by numpy_mp
   env_backend: rust
+  compile_fleet_width: 0
+  snapshot_compile_rows: 64
+  strict_target_legality: false
 
 opponents:
   mode: fixed
