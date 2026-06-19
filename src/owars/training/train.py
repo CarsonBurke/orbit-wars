@@ -683,6 +683,104 @@ def _stack_target_legal_record_ref_fields(
     }
 
 
+def _stack_source_actor_record_ref_fields(
+    chunks: list[dict[str, object]],
+    positions: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if not chunks or not all("source_row_idx" in chunk for chunk in chunks):
+        return {}
+
+    row_parts: list[torch.Tensor] = []
+    col_parts: list[torch.Tensor] = []
+    launch_parts: list[torch.Tensor] = []
+    raw_launch_parts: list[torch.Tensor] = []
+    target_parts: list[torch.Tensor] = []
+    fraction_parts: list[torch.Tensor] = []
+    log_prob_parts: list[torch.Tensor] = []
+    legal_parts: list[torch.Tensor] = []
+    have_log_prob = all("source_log_prob" in chunk for chunk in chunks)
+    have_legal = all("source_target_legal_mask" in chunk for chunk in chunks)
+    offset = 0
+    for chunk in chunks:
+        chunk_rows = int(chunk["planet_feats"].shape[0])
+        keep = (positions >= offset) & (positions < offset + chunk_rows)
+        if not bool(keep.any()):
+            offset += chunk_rows
+            continue
+        out_rows = torch.nonzero(keep, as_tuple=False).flatten()
+        local_rows = positions.index_select(0, out_rows) - offset
+        source_row_idx = chunk["source_row_idx"].long()
+        if source_row_idx.numel():
+            row_to_output = torch.full((chunk_rows,), -1, dtype=torch.long)
+            row_to_output[local_rows] = out_rows
+            actor_rows = row_to_output.index_select(0, source_row_idx)
+            actor_keep = actor_rows >= 0
+            if bool(actor_keep.any()):
+                row_parts.append(actor_rows[actor_keep])
+                col_parts.append(chunk["source_col_idx"].long()[actor_keep])
+                launch_parts.append(chunk["source_launch"].float()[actor_keep])
+                raw_launch_parts.append(chunk["source_raw_launch"].float()[actor_keep])
+                target_parts.append(chunk["source_target_idx"].long()[actor_keep])
+                fraction_parts.append(chunk["source_fraction"].float()[actor_keep])
+                if have_log_prob:
+                    log_prob_parts.append(chunk["source_log_prob"].float()[actor_keep])
+                if have_legal:
+                    legal_parts.append(
+                        chunk["source_target_legal_mask"].bool()[actor_keep]
+                    )
+        offset += chunk_rows
+
+    if row_parts:
+        row_idx = torch.cat(row_parts, dim=0)
+        order = torch.argsort(row_idx, stable=True)
+        row_idx = row_idx.index_select(0, order)
+        out = {
+            "actor_source_row_idx": row_idx,
+            "actor_source_col_idx": torch.cat(col_parts, dim=0).index_select(0, order),
+            "actor_launch": torch.cat(launch_parts, dim=0).index_select(0, order),
+            "actor_raw_launch": torch.cat(raw_launch_parts, dim=0).index_select(0, order),
+            "actor_target_idx": torch.cat(target_parts, dim=0).index_select(0, order),
+            "actor_fraction": torch.cat(fraction_parts, dim=0).index_select(0, order),
+        }
+        if have_log_prob:
+            out["actor_old_log_prob"] = torch.cat(log_prob_parts, dim=0).index_select(
+                0,
+                order,
+            )
+        if have_legal:
+            out["actor_target_legal_mask"] = torch.cat(legal_parts, dim=0).index_select(
+                0,
+                order,
+            )
+    else:
+        out = {
+            "actor_source_row_idx": torch.empty(0, dtype=torch.long),
+            "actor_source_col_idx": torch.empty(0, dtype=torch.long),
+            "actor_launch": torch.empty(0, dtype=torch.float32),
+            "actor_raw_launch": torch.empty(0, dtype=torch.float32),
+            "actor_target_idx": torch.empty(0, dtype=torch.long),
+            "actor_fraction": torch.empty(0, dtype=torch.float32),
+        }
+        if have_log_prob:
+            out["actor_old_log_prob"] = torch.empty(0, dtype=torch.float32)
+        if have_legal:
+            planets = int(chunks[0]["planet_feats"].shape[1])
+            out["actor_target_legal_mask"] = torch.empty(0, planets, dtype=torch.bool)
+
+    counts = torch.bincount(
+        out["actor_source_row_idx"],
+        minlength=int(positions.numel()),
+    )
+    out["actor_source_row_offsets"] = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.long),
+            counts.cumsum(0).to(torch.long),
+        ),
+        dim=0,
+    )
+    return out
+
+
 def _stack_encoded(trajs: list[Trajectory]) -> dict[str, torch.Tensor | None]:
     """Walk every (traj, step) once and emit stacked EncodedObs tensors.
 
@@ -906,6 +1004,7 @@ def _stack_trajectories(
             batch["old_log_prob_computed"] = torch.tensor(False)
         batch["values_computed"] = torch.tensor(values_computed, dtype=torch.bool)
         batch["owned_mask"] = batch["planet_owned_mask"].bool() & batch["planet_mask"].bool()
+        batch.update(_stack_source_actor_record_ref_fields(chunks, positions))
         if target_legal_mask is not None:
             batch["target_legal_mask"] = target_legal_mask.bool()
         else:

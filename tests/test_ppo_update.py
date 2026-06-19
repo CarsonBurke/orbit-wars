@@ -39,6 +39,8 @@ from owars.training.ppo import (
     _fixed_minibatches_by_count,
     _minibatch_loss_scale,
     _rank_gaussian_advantage,
+    _source_capacity_for_minibatch,
+    _source_planet_bucket,
     _stage_target_legal_mask,
     compute_gae,
     compute_old_log_probs,
@@ -133,6 +135,29 @@ def _toy_batch(
     }
 
 
+def _with_source_actor_keys(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    out = dict(batch)
+    source_rows, source_cols = torch.nonzero(
+        batch["owned_mask"].bool(),
+        as_tuple=True,
+    )
+    counts = torch.bincount(source_rows, minlength=int(batch["owned_mask"].shape[0]))
+    out["actor_source_row_idx"] = source_rows.long()
+    out["actor_source_col_idx"] = source_cols.long()
+    out["actor_source_row_offsets"] = torch.cat(
+        (torch.zeros(1, dtype=torch.long), counts.cumsum(0).long()),
+    )
+    out["actor_launch"] = batch["launch"][source_rows, source_cols].float()
+    out["actor_raw_launch"] = out["actor_launch"].clone()
+    out["actor_target_idx"] = batch["target_idx"][source_rows, source_cols].long()
+    out["actor_fraction"] = batch["fraction"][source_rows, source_cols].float()
+    out["actor_target_legal_mask"] = batch["target_legal_mask"][
+        source_rows,
+        source_cols,
+    ].bool()
+    return out
+
+
 def test_ppo_update_runs_and_returns_finite_metrics():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
     model = OrbitPolicy(cfg)
@@ -180,6 +205,91 @@ def test_ppo_update_runs_and_returns_finite_metrics():
     assert 0.0 <= log.ratio_clip_frac_high <= 1.0, log.ratio_clip_frac_high
     assert 0.0 <= log.pos_frac <= 1.0, log.pos_frac
     assert log.value_loss >= 0.0, log.value_loss
+
+
+def test_ppo_update_runs_with_source_major_actor_records():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _with_source_actor_keys(_toy_batch(model, batch_size=8))
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    log = ppo_update(
+        model,
+        optim,
+        batch,
+        value_coef=0.5,
+        target_entropy_coef=0.0,
+        fraction_entropy_coef=0.0,
+        norm_advantage=True,
+        advantage_transform="rankgauss",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        epochs=1,
+        minibatch_size=4,
+        grad_clip=0.5,
+    )
+
+    assert math.isfinite(log.policy_loss)
+    assert math.isfinite(log.value_loss)
+    assert math.isfinite(log.approx_kl)
+    assert 0.0 <= log.ratio_clip_frac_high <= 1.0
+
+
+def test_source_major_ppo_capacity_uses_log_spaced_source_buckets():
+    assert _source_planet_bucket(1, 64) == 8
+    assert _source_planet_bucket(9, 64) == 12
+    assert _source_planet_bucket(23, 64) == 24
+    assert _source_planet_bucket(33, 64) == 48
+    assert _source_planet_bucket(80, 64) == 64
+    assert _source_capacity_for_minibatch(1024, 64, 23) == 1024 * 24
+    assert _source_capacity_for_minibatch(1024, 24, 23) == 1024 * 24
+    assert _source_capacity_for_minibatch(0, 0, 0) == 1
+
+
+def test_source_major_ppo_metrics_match_dense_path_with_stale_actor_old_log_prob():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    base = OrbitPolicy(cfg)
+    dense_model = OrbitPolicy(cfg)
+    source_model = OrbitPolicy(cfg)
+    dense_model.load_state_dict(base.state_dict())
+    source_model.load_state_dict(base.state_dict())
+    batch = _toy_batch(base, batch_size=8)
+    source_batch = _with_source_actor_keys(batch)
+    source_batch["actor_old_log_prob"] = torch.zeros_like(source_batch["actor_launch"]) + 123.0
+    dense_optim = torch.optim.AdamW(dense_model.parameters(), lr=0.0)
+    source_optim = torch.optim.AdamW(source_model.parameters(), lr=0.0)
+    kwargs = dict(
+        value_coef=0.5,
+        target_entropy_coef=0.0,
+        fraction_entropy_coef=0.0,
+        norm_advantage=True,
+        advantage_transform="rankgauss",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        epochs=1,
+        minibatch_size=4,
+        grad_clip=0.5,
+    )
+
+    dense_log = ppo_update(dense_model, dense_optim, batch, **kwargs)
+    source_log = ppo_update(source_model, source_optim, source_batch, **kwargs)
+
+    for name in (
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "approx_kl",
+        "ratio_clip_frac_high",
+        "target_entropy",
+        "fraction_entropy",
+        "move_prob",
+        "target_confidence",
+        "owned_planets_mean",
+        "executed_launch_frac",
+        "turn_no_action_frac",
+        "legal_target_count_mean",
+    ):
+        assert getattr(source_log, name) == pytest.approx(getattr(dense_log, name), abs=1e-5)
 
 
 def test_ppo_update_reports_entropy_diagnostics_when_coef_zero():
@@ -1014,6 +1124,79 @@ def test_compact_target_legality_keeps_owned_sources_without_rows_illegal():
     expected[0, 0] = torch.tensor([False, True, True])
     expected[0, 1] = False
     assert torch.equal(dense, expected)
+
+
+def test_stack_trajectories_preserves_source_actor_records():
+    planets = 3
+    chunk = {
+        "global_feats": torch.zeros(2, 2),
+        "planet_feats": torch.zeros(2, planets, 4),
+        "planet_mask": torch.ones(2, planets, dtype=torch.bool),
+        "planet_owned_mask": torch.tensor(
+            [[True, False, True], [False, True, False]],
+        ),
+        "planet_ids": torch.arange(planets, dtype=torch.long).repeat(2, 1),
+        "planet_garrison": torch.zeros(2, planets),
+        "fleet_feats": torch.zeros(2, 0, 5),
+        "fleet_mask": torch.zeros(2, 0, dtype=torch.bool),
+        "fleet_target_planet_idx": torch.zeros(2, 0, dtype=torch.long),
+        "planet_inbound_feats": torch.zeros(2, planets, 3),
+        "launch": torch.zeros(2, planets),
+        "target_idx": torch.zeros(2, planets, dtype=torch.long),
+        "fraction": torch.full((2, planets), 0.5),
+        "log_prob": torch.zeros(2, planets),
+        "value": torch.zeros(2),
+        "target_legal_mask": torch.ones(2, planets, planets, dtype=torch.bool),
+        "old_log_prob_computed": True,
+        "source_row_idx": torch.tensor([0, 0, 1]),
+        "source_col_idx": torch.tensor([0, 2, 1]),
+        "source_launch": torch.tensor([1.0, 0.0, 1.0]),
+        "source_raw_launch": torch.tensor([1.0, 0.0, 1.0]),
+        "source_target_idx": torch.tensor([2, 1, 0]),
+        "source_fraction": torch.tensor([0.25, 0.5, 0.75]),
+        "source_log_prob": torch.tensor([-0.1, -0.2, -0.3]),
+        "source_target_legal_mask": torch.tensor(
+            [
+                [False, True, True],
+                [True, False, True],
+                [True, True, False],
+            ],
+        ),
+    }
+    traj = SimpleNamespace(
+        encoded=[],
+        launch=[],
+        target_idx=[],
+        fraction=[],
+        log_prob=[],
+        value=[],
+        reward=[0.0, 0.0],
+        owned_mask=[],
+        target_legal_mask=[],
+        record_refs=[TrajectoryRecordRef(chunk, 1), TrajectoryRecordRef(chunk, 0)],
+    )
+
+    batch = train_mod._stack_trajectories([traj], gamma=1.0, gae_lambda=1.0)
+
+    assert torch.equal(batch["actor_source_row_idx"], torch.tensor([0, 1, 1]))
+    assert torch.equal(batch["actor_source_col_idx"], torch.tensor([1, 0, 2]))
+    assert torch.equal(batch["actor_source_row_offsets"], torch.tensor([0, 1, 3]))
+    torch.testing.assert_close(batch["actor_launch"], torch.tensor([1.0, 1.0, 0.0]))
+    torch.testing.assert_close(batch["actor_fraction"], torch.tensor([0.75, 0.25, 0.5]))
+    torch.testing.assert_close(
+        batch["actor_old_log_prob"],
+        torch.tensor([-0.3, -0.1, -0.2]),
+    )
+    assert torch.equal(
+        batch["actor_target_legal_mask"],
+        torch.tensor(
+            [
+                [True, True, False],
+                [False, True, True],
+                [True, False, True],
+            ],
+        ),
+    )
 
 
 def test_stack_trajectories_builds_masked_critic_mtp_targets(monkeypatch):

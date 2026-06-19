@@ -1829,6 +1829,77 @@ def test_rust_compact_categorical_record_crop_pads_to_full_width():
     assert records.target_legal_source_mask.shape[1] == p
     assert torch.all(records.fraction[:, live_planets:] == 0.5)
     assert not records.target_legal_source_mask[:, live_planets:].any()
+    assert torch.equal(records.source_row_idx, torch.from_numpy(source_rows))
+    assert torch.equal(records.source_col_idx, torch.from_numpy(source_cols))
+    assert records.source_launch.shape == (len(source_rows),)
+    assert records.source_raw_launch.shape == (len(source_rows),)
+    assert records.source_target_idx.shape == (len(source_rows),)
+    assert records.source_fraction.shape == (len(source_rows),)
+    assert records.source_target_legal_mask.shape == (len(source_rows), p)
+    assert not records.source_target_legal_mask[:, live_planets:].any()
+    assert records.source_row_offsets[0].item() == 0
+    assert records.source_row_offsets[-1].item() == len(source_rows)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_source_major_categorical_uses_compact_sampler_on_cpu_deterministic():
+    _build_rust_extension()
+    from owars.policies.model import PolicyOutput
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=80,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust.reset()
+    rust._core.load_observation(0, _fixture_obs())
+    rows = [(0, 0), (0, 1)]
+    fast, _contexts = rust.policy_batch(rows, device="cpu")
+    b, p = fast.planet_ids.shape
+    source_indices = torch.nonzero(
+        fast.planet_owned_mask & fast.planet_mask,
+        as_tuple=False,
+    )
+    source_rows = source_indices[:, 0].long()
+    source_cols = source_indices[:, 1].long()
+    source_count = int(source_rows.numel())
+    target_rank = torch.arange(p, dtype=torch.float32).view(1, p).expand(source_count, p)
+    out = PolicyOutput(
+        launch_logits=torch.full((source_count,), 7.0),
+        target_logits=target_rank.clone(),
+        value=torch.zeros(b),
+        value_logits=torch.zeros(b, 51),
+        planet_owned_mask=fast.planet_owned_mask,
+        planet_mask=fast.planet_mask,
+        planet_ids=fast.planet_ids,
+        actor_source_rows=source_rows,
+        actor_source_cols=source_cols,
+        actor_source_valid=torch.ones(source_count, dtype=torch.bool),
+        target_planets=p,
+        action_logit_softcap=8.0,
+        fraction_alpha=torch.full((source_count,), 9.0),
+        fraction_beta=torch.full((source_count,), 2.0),
+    )
+
+    actions, records = rust.sample_batch_with_records(
+        out,
+        rows,
+        deterministic=True,
+        record_rows=[0, 1],
+        native_actions=True,
+        enqueue_actions=False,
+        compute_log_prob=False,
+        compact_legal_records=True,
+    )
+
+    assert len(actions) == len(rows)
+    assert torch.equal(records.source_row_idx, source_rows)
+    assert torch.equal(records.source_col_idx, source_cols)
+    assert records.source_launch.shape == (source_count,)
+    assert records.source_target_legal_mask.shape[1] == p
 
 
 @pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")

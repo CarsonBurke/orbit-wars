@@ -787,6 +787,233 @@ def _stage_ppo_minibatch(
     )
 
 
+def _source_indices_for_minibatch(
+    batch: dict[str, torch.Tensor],
+    mb_cpu: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    offsets = batch["actor_source_row_offsets"].long()
+    starts = offsets.index_select(0, mb_cpu)
+    stops = offsets.index_select(0, mb_cpu + 1)
+    counts = stops - starts
+    total = int(counts.sum().item())
+    if total == 0:
+        return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
+    local_rows = torch.repeat_interleave(
+        torch.arange(int(mb_cpu.numel()), dtype=torch.long),
+        counts,
+    )
+    segment_starts = counts.cumsum(0) - counts
+    source_idx = torch.arange(total, dtype=torch.long) + torch.repeat_interleave(
+        starts - segment_starts,
+        counts,
+    )
+    return source_idx, local_rows
+
+
+def _source_planet_bucket(observed_sources_per_row: int, planet_width: int) -> int:
+    """Log-spaced static source rows for source-major PPO graphs."""
+    width = max(1, int(planet_width))
+    observed = max(1, int(observed_sources_per_row))
+    for bucket in (8, 12, 16, 24, 32, 48, 64):
+        capped = min(bucket, width)
+        if observed <= capped:
+            return capped
+    return width
+
+
+def _source_capacity_for_minibatch(
+    static_minibatch_rows: int,
+    planet_width: int,
+    observed_sources_per_row: int,
+) -> int:
+    """Bucketed source-major PPO capacity for one compiled minibatch.
+
+    Owned source planets vary over training. Using the exact observed width in
+    the compiled kernel shape causes Dynamo to specialize on many adjacent
+    counts and eventually hit the fullgraph recompile limit; padding all the way
+    to planet width avoids recompiles but makes the graph much larger than the
+    actual source-major workload. A small log-spaced bucket schedule keeps graph
+    variants bounded while staying close to the current source count.
+    """
+    return max(1, int(static_minibatch_rows)) * _source_planet_bucket(
+        observed_sources_per_row,
+        planet_width,
+    )
+
+
+def _pad_first_dim_cpu(
+    tensor: torch.Tensor,
+    rows: int,
+    *,
+    fill: int | float | bool = 0,
+) -> torch.Tensor:
+    current = int(tensor.shape[0])
+    if current == rows:
+        return tensor.contiguous()
+    if current > rows:
+        raise RuntimeError("source-major PPO minibatch exceeded static source capacity")
+    out = tensor.new_full((rows, *tensor.shape[1:]), fill)
+    if current:
+        out[:current] = tensor
+    return out
+
+
+def _move_staged_source_field(
+    tensor: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    if device.type == "cuda" and tensor.device.type == "cpu" and not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+    return tensor.to(device, non_blocking=device.type == "cuda")
+
+
+def _stage_source_ppo_minibatch(
+    batch: dict[str, torch.Tensor],
+    global_feats: torch.Tensor,
+    fleet_target_planet_idx: torch.Tensor,
+    planet_inbound_feats: torch.Tensor,
+    policy_advantage: torch.Tensor,
+    return_mtp: torch.Tensor,
+    return_mtp_mask: torch.Tensor,
+    mb: torch.Tensor,
+    row_weight: torch.Tensor,
+    device: torch.device,
+    *,
+    source_capacity: int,
+    pinned_cache: PinnedSliceCache | None = None,
+    slot: int = 0,
+) -> tuple[torch.Tensor, ...]:
+    mb_cpu = mb.detach().to(device="cpu", dtype=torch.long)
+    source_idx, source_row_local = _source_indices_for_minibatch(batch, mb_cpu)
+    source_count = int(source_idx.numel())
+    source_exists = torch.zeros(source_capacity, dtype=torch.bool)
+    if source_count:
+        source_exists[:source_count] = True
+    row_weight_cpu = row_weight.detach().to(device="cpu", dtype=torch.float32)
+    source_weight = torch.zeros(source_capacity, dtype=torch.float32)
+    if source_count:
+        source_weight[:source_count] = row_weight_cpu.index_select(0, source_row_local)
+    source_row_local = _pad_first_dim_cpu(source_row_local, source_capacity)
+    source_col_idx = _pad_first_dim_cpu(
+        batch["actor_source_col_idx"].long().index_select(0, source_idx),
+        source_capacity,
+    )
+    launch = _pad_first_dim_cpu(
+        batch["actor_launch"].float().index_select(0, source_idx),
+        source_capacity,
+    )
+    target_idx = _pad_first_dim_cpu(
+        batch["actor_target_idx"].long().index_select(0, source_idx),
+        source_capacity,
+    )
+    fraction = _pad_first_dim_cpu(
+        batch["actor_fraction"].float().index_select(0, source_idx),
+        source_capacity,
+        fill=0.5,
+    )
+    source_global_rows = batch["actor_source_row_idx"].long().index_select(0, source_idx)
+    source_global_cols = batch["actor_source_col_idx"].long().index_select(0, source_idx)
+    old_log_prob_src = batch["old_log_prob"].float()[source_global_rows, source_global_cols]
+    old_log_prob = _pad_first_dim_cpu(old_log_prob_src, source_capacity)
+    target_legal_mask = _pad_first_dim_cpu(
+        batch["actor_target_legal_mask"].bool().index_select(0, source_idx),
+        source_capacity,
+        fill=False,
+    )
+    source_valid = source_exists & (source_weight > 0.0)
+    return (
+        _slice_to_device(
+            global_feats, mb, device, pinned_cache=pinned_cache, slot=slot, name="global_feats"
+        ),
+        _slice_to_device(
+            batch["planet_feats"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_feats",
+        ),
+        _slice_to_device(
+            batch["planet_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_mask",
+        ),
+        _slice_to_device(
+            batch["planet_owned_mask"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_owned_mask",
+        ),
+        _slice_to_device(
+            batch["planet_ids"], mb, device, pinned_cache=pinned_cache, slot=slot, name="planet_ids"
+        ),
+        _slice_to_device(
+            batch["planet_garrison"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_garrison",
+        ),
+        _slice_to_device(
+            batch["fleet_feats"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="fleet_feats",
+        ),
+        _slice_to_device(
+            batch["fleet_mask"], mb, device, pinned_cache=pinned_cache, slot=slot, name="fleet_mask"
+        ),
+        _slice_to_device(
+            fleet_target_planet_idx,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="fleet_target_planet_idx",
+        ),
+        _slice_to_device(
+            planet_inbound_feats,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="planet_inbound_feats",
+        ),
+        (row_weight if row_weight.device == device else row_weight.to(device, non_blocking=True)),
+        _move_staged_source_field(source_row_local, device),
+        _move_staged_source_field(source_col_idx, device),
+        _move_staged_source_field(source_valid, device),
+        _move_staged_source_field(source_weight, device),
+        _move_staged_source_field(launch, device),
+        _move_staged_source_field(target_idx, device),
+        _move_staged_source_field(fraction, device),
+        _move_staged_source_field(old_log_prob, device),
+        _slice_to_device(
+            policy_advantage, mb, device, pinned_cache=pinned_cache, slot=slot, name="advantage"
+        ),
+        _slice_to_device(
+            return_mtp, mb, device, pinned_cache=pinned_cache, slot=slot, name="return_mtp"
+        ),
+        _slice_to_device(
+            return_mtp_mask,
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="return_mtp_mask",
+        ),
+        _move_staged_source_field(target_legal_mask, device),
+    )
+
+
 def _stage_value_minibatch(
     batch: dict[str, torch.Tensor],
     global_feats: torch.Tensor,
@@ -1182,11 +1409,6 @@ class _PPOMinibatchKernel(torch.nn.Module):
             adv_mean = (adv_actor * owned_w).sum() / denom
             adv_var = (((adv_actor - adv_mean).square()) * owned_w).sum() / denom
             adv_actor = (adv_actor - adv_mean) * torch.rsqrt(adv_var + 1e-8)
-        # Asymmetric PPO "clip-higher" (DAPO / cleanRL iterthink_v24_beta): the
-        # pessimistic max of the unclipped and ratio-clamped surrogates, with a
-        # looser upper bound (`clip_coef_high`) than lower (`clip_coef`). The
-        # clamp caps how far one update can push an already-favored action while
-        # still letting the policy recover an under-weighted one.
         ratio_clamped = ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef_high)
         pg_unclipped = -adv_actor * ratio
         pg_clipped = -adv_actor * ratio_clamped
@@ -1334,9 +1556,6 @@ class _PPOMinibatchKernel(torch.nn.Module):
         per_planet_kl = (((ratio - 1.0) - log_ratio) * owned_w).sum() / denom
         log_ratio_abs_mean = (log_ratio.abs() * owned_w).sum() / denom
         log_ratio_abs_max = _weighted_max(log_ratio.abs(), owned_w)
-        # Trust-region diagnostics: fraction of owned-planet ratios outside the
-        # asymmetric clip band, and the subset hitting the looser upper bound
-        # (the side `clip_coef_high` deliberately relaxes).
         clipped_low = ratio < (1.0 - self.clip_coef)
         clipped_high = ratio > (1.0 + self.clip_coef_high)
         ratio_clip_frac = ((clipped_low | clipped_high).to(owned_f.dtype) * owned_w).sum() / denom
@@ -1354,6 +1573,361 @@ class _PPOMinibatchKernel(torch.nn.Module):
         owned_planets_mean = owned_w.sum() / row_denom
         pos_count = (owned_w * (adv_b >= 0.0).to(owned_f.dtype)).sum()
         total_owned = owned_w.sum().clamp_min(1.0)
+        pos_frac = pos_count / total_owned
+        metrics = torch.stack(
+            [
+                policy_loss.detach(),
+                value_loss.detach(),
+                entropy.detach(),
+                kl.detach(),
+                ratio_clip_frac_high.detach(),
+                pos_frac.detach(),
+                target_entropy.detach(),
+                fraction_entropy.detach(),
+                move_prob.detach(),
+                target_confidence.detach(),
+                fraction_alpha_mean.detach(),
+                fraction_beta_mean.detach(),
+                fraction_concentration_mean.detach(),
+                fraction_concentration_max.detach(),
+                fraction_skew_abs_mean.detach(),
+                deterministic_fraction_mean.detach(),
+                per_planet_kl.detach(),
+                log_ratio_abs_mean.detach(),
+                log_ratio_abs_max.detach(),
+                ratio_clip_frac.detach(),
+                owned_planets_mean.detach(),
+                executed_launch_frac.detach(),
+                row_log_ratio_abs_mean.detach(),
+                launch_mean.detach(),
+                launch_log_std_mean.detach(),
+                launch_score_mean.detach(),
+                action_logit_softcap_metric.detach(),
+                turn_no_action_frac.detach(),
+                legal_target_count_mean.detach(),
+                uniform_move_prior.detach(),
+            ]
+        ).float()
+        return actor_loss, critic_loss, metrics
+
+
+class _PPOSourceMinibatchKernel(torch.nn.Module):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        value_coef: float,
+        target_entropy_coef: float,
+        fraction_entropy_coef: float,
+        norm_advantage: bool,
+        clip_coef: float,
+        clip_coef_high: float,
+        autocast_enabled: bool,
+        include_value: bool,
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.value_coef = float(value_coef)
+        self.target_entropy_coef = float(target_entropy_coef)
+        self.fraction_entropy_coef = float(fraction_entropy_coef)
+        self.norm_advantage = bool(norm_advantage)
+        self.clip_coef = float(clip_coef)
+        self.clip_coef_high = float(clip_coef_high)
+        self.autocast_enabled = bool(autocast_enabled)
+        self.include_value = bool(include_value)
+
+    def forward(
+        self,
+        global_feats: torch.Tensor,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
+        row_weight: torch.Tensor,
+        source_row_local: torch.Tensor,
+        source_col_idx: torch.Tensor,
+        source_valid: torch.Tensor,
+        source_weight: torch.Tensor,
+        launch: torch.Tensor,
+        target_idx: torch.Tensor,
+        fraction: torch.Tensor,
+        old_log_prob: torch.Tensor,
+        advantage: torch.Tensor,
+        ret_mtp: torch.Tensor,
+        ret_mtp_mask: torch.Tensor,
+        target_legal_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+            global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
+        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            out = self.model(
+                feats,
+                include_value=self.include_value,
+                actor_source_rows=source_row_local,
+                actor_source_cols=source_col_idx,
+                actor_source_valid=source_valid,
+                target_planets=int(target_legal_mask.shape[1]),
+            )
+
+        target_legal_mask = target_legal_mask.bool()
+        has_legal_target = target_legal_mask.any(dim=-1)
+        launch_logits = out.launch_logits.float()
+        out_action_logit_softcap = getattr(out, "action_logit_softcap", None)
+        action_logit_softcap = (
+            None if out_action_logit_softcap is None else float(out_action_logit_softcap)
+        )
+        if action_logit_softcap is None:
+            launch_logits = launch_logits.masked_fill(~has_legal_target, -20.0)
+        out_launch_log_std = getattr(out, "launch_log_std", None)
+        launch_log_std = None if out_launch_log_std is None else out_launch_log_std.float()
+        launch_prob_floor = float(getattr(out, "launch_prob_floor", 0.0))
+        target_logits = out.target_logits.float().masked_fill(~target_legal_mask, float("-inf"))
+        if out.fraction_alpha is None or out.fraction_beta is None:
+            raise ValueError("PPO OrbitPolicy output must include Beta fraction params")
+        fraction_alpha = out.fraction_alpha.float()
+        fraction_beta = out.fraction_beta.float()
+        value_logits = out.value_logits.float()
+
+        source_w = source_weight.float()
+        source_valid_f = source_valid.to(dtype=source_w.dtype)
+        denom = source_w.sum().clamp_min(1.0)
+        p = target_logits.shape[1]
+        launch_f = launch.float().clamp(0.0, 1.0)
+        target = target_idx.clamp(0, p - 1)
+        if action_logit_softcap is None:
+            target_logits = _safe_target_logits(target_logits)
+            launch_lp = _threshold_normal_launch_log_prob(
+                launch_logits,
+                launch_log_std,
+                launch_f,
+                launch_prob_floor,
+            )
+            target_log_probs = F.log_softmax(target_logits, dim=-1)
+            target_dist_probs = target_log_probs.exp()
+            target_lp = target_log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            action_lp = launch_lp + launch_f * target_lp
+        else:
+            action_log_probs = _categorical_action_log_probs(
+                launch_logits,
+                target_logits,
+                action_logit_softcap,
+            )
+            action_probs = action_log_probs.exp()
+            action_idx = torch.where(
+                launch_f > 0.5,
+                target + 1,
+                torch.zeros_like(target),
+            )
+            action_lp = action_log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
+            target_log_probs = action_log_probs[..., 1:]
+            target_dist_probs = action_probs[..., 1:]
+        action_lp = _action_log_prob_for_action(action_lp, launch_f)
+        fraction_action_lp = _launched_beta_log_prob(
+            fraction_alpha,
+            fraction_beta,
+            fraction.float(),
+            launch_f,
+        )
+        chosen = action_lp + fraction_action_lp
+
+        adv_actor = advantage.float().index_select(0, source_row_local)
+        log_ratio = torch.where(
+            source_valid,
+            chosen - old_log_prob.float(),
+            torch.zeros_like(chosen),
+        )
+        log_ratio = torch.nan_to_num(
+            log_ratio,
+            nan=0.0,
+            neginf=-60.0,
+            posinf=60.0,
+        ).clamp(-60.0, 60.0)
+        ratio = log_ratio.exp()
+        if self.norm_advantage:
+            adv_mean = (adv_actor * source_w).sum() / denom
+            adv_var = (((adv_actor - adv_mean).square()) * source_w).sum() / denom
+            adv_actor = (adv_actor - adv_mean) * torch.rsqrt(adv_var + 1e-8)
+        ratio_clamped = ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef_high)
+        pg_unclipped = -adv_actor * ratio
+        pg_clipped = -adv_actor * ratio_clamped
+        policy_loss = _weighted_mean(torch.maximum(pg_unclipped, pg_clipped), source_w)
+
+        row_w = row_weight.to(device=value_logits.device, dtype=value_logits.dtype)
+        if self.include_value:
+            value_loss = _distributional_value_loss(
+                self.model.value_encoder,
+                value_logits,
+                ret_mtp,
+                row_w,
+                ret_mtp_mask,
+            )
+        else:
+            value_loss = policy_loss * 0.0
+
+        use_entropy_bonus = (
+            self.target_entropy_coef != 0.0 or self.fraction_entropy_coef != 0.0
+        )
+        if action_logit_softcap is None:
+            p_move_current = _threshold_normal_launch_prob(
+                launch_logits,
+                launch_log_std,
+                launch_prob_floor,
+            )
+        else:
+            p_move_current = target_dist_probs.sum(dim=-1)
+        entropy_fraction_alpha = fraction_alpha if use_entropy_bonus else fraction_alpha.detach()
+        entropy_fraction_beta = fraction_beta if use_entropy_bonus else fraction_beta.detach()
+        entropy_source_w = source_w if use_entropy_bonus else source_w.detach()
+        entropy_p_move_current = p_move_current if use_entropy_bonus else p_move_current.detach()
+        raw_frac_entropy_per_planet = _beta_entropy(
+            entropy_fraction_alpha,
+            entropy_fraction_beta,
+        )
+        frac_entropy_per_planet = torch.where(
+            torch.isfinite(raw_frac_entropy_per_planet),
+            raw_frac_entropy_per_planet,
+            torch.zeros_like(raw_frac_entropy_per_planet),
+        )
+        if action_logit_softcap is None:
+            entropy_target_log_probs = (
+                target_log_probs if use_entropy_bonus else target_log_probs.detach()
+            )
+            entropy_target_dist_probs = (
+                target_dist_probs if use_entropy_bonus else target_dist_probs.detach()
+            )
+            entropy_launch_logits = launch_logits if use_entropy_bonus else launch_logits.detach()
+            entropy_launch_log_std = (
+                None
+                if launch_log_std is None
+                else launch_log_std if use_entropy_bonus else launch_log_std.detach()
+            )
+            planet_entropy = _conditional_action_entropy(
+                torch.logit(entropy_p_move_current.clamp(1e-7, 1.0 - 1e-7)),
+                entropy_target_log_probs,
+                frac_entropy_per_planet,
+            )
+            launch_entropy = (
+                _threshold_normal_launch_entropy(
+                    entropy_launch_logits,
+                    entropy_launch_log_std,
+                    launch_prob_floor,
+                )
+                * entropy_source_w
+            ).sum() / denom
+            min_real = torch.finfo(entropy_target_log_probs.dtype).min
+            target_entropy_per_planet = -(
+                entropy_target_dist_probs * entropy_target_log_probs.clamp_min(min_real)
+            ).sum(dim=-1)
+            target_entropy = (
+                (entropy_p_move_current * target_entropy_per_planet) * entropy_source_w
+            ).sum() / denom
+        else:
+            entropy_action_log_probs = (
+                action_log_probs if use_entropy_bonus else action_log_probs.detach()
+            )
+            entropy_action_probs = action_probs if use_entropy_bonus else action_probs.detach()
+            safe_action_log_probs = torch.where(
+                torch.isfinite(entropy_action_log_probs),
+                entropy_action_log_probs,
+                torch.zeros_like(entropy_action_log_probs),
+            )
+            action_entropy = -(entropy_action_probs * safe_action_log_probs).sum(dim=-1)
+            planet_entropy = action_entropy + entropy_p_move_current * frac_entropy_per_planet
+            target_entropy = (action_entropy * entropy_source_w).sum() / denom
+            launch_entropy = target_entropy * 0.0
+        entropy = (planet_entropy * entropy_source_w).sum() / denom
+        fraction_entropy = (
+            (entropy_p_move_current * frac_entropy_per_planet) * entropy_source_w
+        ).sum() / denom
+        move_prob = (p_move_current * source_w).sum() / denom
+        legal_target_count = target_legal_mask.to(dtype=source_w.dtype).sum(dim=-1)
+        legal_target_count_mean = (legal_target_count * source_w).sum() / denom
+        uniform_move_prior = (
+            (legal_target_count > 0.0).to(dtype=source_w.dtype) * 0.5 * source_w
+        ).sum() / denom
+        launch_mean = (launch_logits * source_w).sum() / denom
+        if action_logit_softcap is not None:
+            launch_log_std_mean = launch_logits.sum() * 0.0
+            action_logit_softcap_metric = launch_logits.new_tensor(float(action_logit_softcap))
+            has_finite_target = torch.isfinite(target_logits).any(dim=-1)
+            target_best = target_logits.amax(dim=-1)
+            target_best = torch.where(has_finite_target, target_best, launch_logits)
+            launch_score = torch.where(
+                has_finite_target,
+                launch_logits - target_best,
+                torch.zeros_like(launch_logits),
+            )
+            launch_score_mean = (launch_score * source_w).sum() / denom
+        elif launch_log_std is None:
+            launch_log_std_mean = launch_logits.sum() * 0.0
+            action_logit_softcap_metric = launch_logits.sum() * 0.0
+            launch_score_mean = launch_logits.sum() * 0.0
+        else:
+            launch_log_std_f = launch_log_std.float()
+            launch_log_std_mean = (launch_log_std_f * source_w).sum() / denom
+            action_logit_softcap_metric = launch_logits.sum() * 0.0
+            launch_score = launch_logits * torch.exp(-launch_log_std_f)
+            launch_score_mean = (launch_score * source_w).sum() / denom
+        target_confidence = (target_dist_probs.amax(dim=-1) * source_w).sum() / denom
+        fraction_alpha_mean = (fraction_alpha * source_w).sum() / denom
+        fraction_beta_mean = (fraction_beta * source_w).sum() / denom
+        concentration = fraction_alpha + fraction_beta
+        fraction_concentration_mean = (concentration * source_w).sum() / denom
+        fraction_concentration_max = _weighted_max(concentration, source_w)
+        fraction_skew_abs_mean = ((fraction_alpha - fraction_beta).abs() * source_w).sum() / denom
+        deterministic_fraction = _deterministic_beta_fraction(fraction_alpha, fraction_beta)
+        deterministic_fraction_mean = (deterministic_fraction * source_w).sum() / denom
+        entropy_bonus = launch_entropy.sum() * 0.0
+        if self.target_entropy_coef != 0.0:
+            entropy_bonus = entropy_bonus + self.target_entropy_coef * (
+                launch_entropy + target_entropy
+            )
+        if self.fraction_entropy_coef != 0.0:
+            entropy_bonus = entropy_bonus + self.fraction_entropy_coef * fraction_entropy
+
+        actor_loss = policy_loss - entropy_bonus
+        critic_loss = self.value_coef * value_loss
+
+        per_planet_kl = (((ratio - 1.0) - log_ratio) * source_w).sum() / denom
+        log_ratio_abs_mean = (log_ratio.abs() * source_w).sum() / denom
+        log_ratio_abs_max = _weighted_max(log_ratio.abs(), source_w)
+        clipped_low = ratio < (1.0 - self.clip_coef)
+        clipped_high = ratio > (1.0 + self.clip_coef_high)
+        ratio_clip_frac = ((clipped_low | clipped_high).to(source_w.dtype) * source_w).sum() / denom
+        ratio_clip_frac_high = (clipped_high.to(source_w.dtype) * source_w).sum() / denom
+        executed_launch_frac = (launch_f * source_w).sum() / denom
+
+        rows = int(row_weight.shape[0])
+        row_log_ratio = torch.zeros(rows, dtype=log_ratio.dtype, device=log_ratio.device)
+        row_log_ratio.scatter_add_(0, source_row_local, log_ratio * source_valid_f)
+        row_log_ratio = torch.where(row_w > 0.0, row_log_ratio, row_log_ratio * 0.0)
+        row_ratio = row_log_ratio.clamp(-60.0, 60.0).exp()
+        row_denom = row_w.sum().clamp_min(1.0)
+        row_launch_count = torch.zeros(rows, dtype=source_w.dtype, device=source_w.device)
+        row_launch_count.scatter_add_(0, source_row_local, launch_f * source_w)
+        turn_no_action_frac = ((row_launch_count <= 0.0).to(row_w.dtype) * row_w).sum() / row_denom
+        kl = (((row_ratio - 1.0) - row_log_ratio) * row_w).sum() / row_denom
+        row_log_ratio_abs_mean = (row_log_ratio.abs() * row_w).sum() / row_denom
+        owned_planets_mean = source_w.sum() / row_denom
+        pos_count = (source_w * (adv_actor >= 0.0).to(source_w.dtype)).sum()
+        total_owned = source_w.sum().clamp_min(1.0)
         pos_frac = pos_count / total_owned
         metrics = torch.stack(
             [
@@ -1671,6 +2245,53 @@ def _get_ppo_kernel(
     if cached is not None:
         return cached
     kernel = _PPOMinibatchKernel(
+        model,
+        value_coef=value_coef,
+        target_entropy_coef=target_entropy_coef,
+        fraction_entropy_coef=fraction_entropy_coef,
+        norm_advantage=norm_advantage,
+        clip_coef=clip_coef,
+        clip_coef_high=clip_coef_high,
+        autocast_enabled=device.type == "cuda",
+        include_value=include_value,
+    )
+    kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
+    cache[key] = kernel
+    return kernel
+
+
+def _get_source_ppo_kernel(
+    model: torch.nn.Module,
+    *,
+    value_coef: float,
+    target_entropy_coef: float,
+    fraction_entropy_coef: float,
+    norm_advantage: bool,
+    clip_coef: float,
+    clip_coef_high: float,
+    compile_mode: str | None,
+    include_value: bool,
+    shape_key: tuple[int, ...],
+) -> torch.nn.Module:
+    device = _module_device(model)
+    mode = compile_mode if device.type == "cuda" else None
+    key = (
+        "ppo_source",
+        mode,
+        float(value_coef),
+        float(target_entropy_coef),
+        float(fraction_entropy_coef),
+        bool(norm_advantage),
+        float(clip_coef),
+        float(clip_coef_high),
+        bool(include_value),
+        shape_key,
+    )
+    cache = _kernel_cache(model)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    kernel = _PPOSourceMinibatchKernel(
         model,
         value_coef=value_coef,
         target_entropy_coef=target_entropy_coef,
@@ -2174,26 +2795,63 @@ def ppo_update(
         static_minibatch_rows = math.ceil(n / max(1, min(int(minibatch_count), n)))
     else:
         static_minibatch_rows = max(1, int(minibatch_size))
-    kernel = _get_ppo_kernel(
-        model,
-        value_coef=value_coef,
-        target_entropy_coef=target_entropy_coef,
-        fraction_entropy_coef=fraction_entropy_coef,
-        norm_advantage=norm_advantage,
-        clip_coef=clip_coef,
-        clip_coef_high=clip_coef_high,
-        compile_mode=compile_mode,
-        include_value=True,
-        shape_key=(
+    use_source_actor = (
+        isinstance(model, OrbitPolicy)
+        and "actor_source_row_idx" in batch
+        and "actor_target_legal_mask" in batch
+    )
+    source_capacity = 0
+    if use_source_actor:
+        actor_offsets = batch["actor_source_row_offsets"].long()
+        max_sources_per_row = int((actor_offsets[1:] - actor_offsets[:-1]).max().item())
+        source_capacity = _source_capacity_for_minibatch(
             static_minibatch_rows,
             int(batch["planet_feats"].shape[1]),
-            int(batch["fleet_feats"].shape[1]),
-            int(global_feats.shape[1]),
-            int(return_mtp.shape[1]),
-            int(planet_inbound_feats.shape[-2]),
-            int(planet_inbound_feats.shape[-1]),
-        ),
-    )
+            max_sources_per_row,
+        )
+        kernel = _get_source_ppo_kernel(
+            model,
+            value_coef=value_coef,
+            target_entropy_coef=target_entropy_coef,
+            fraction_entropy_coef=fraction_entropy_coef,
+            norm_advantage=norm_advantage,
+            clip_coef=clip_coef,
+            clip_coef_high=clip_coef_high,
+            compile_mode=compile_mode,
+            include_value=True,
+            shape_key=(
+                static_minibatch_rows,
+                source_capacity,
+                int(batch["planet_feats"].shape[1]),
+                int(batch["fleet_feats"].shape[1]),
+                int(global_feats.shape[1]),
+                int(return_mtp.shape[1]),
+                int(planet_inbound_feats.shape[-2]),
+                int(planet_inbound_feats.shape[-1]),
+                int(batch["actor_target_legal_mask"].shape[1]),
+            ),
+        )
+    else:
+        kernel = _get_ppo_kernel(
+            model,
+            value_coef=value_coef,
+            target_entropy_coef=target_entropy_coef,
+            fraction_entropy_coef=fraction_entropy_coef,
+            norm_advantage=norm_advantage,
+            clip_coef=clip_coef,
+            clip_coef_high=clip_coef_high,
+            compile_mode=compile_mode,
+            include_value=True,
+            shape_key=(
+                static_minibatch_rows,
+                int(batch["planet_feats"].shape[1]),
+                int(batch["fleet_feats"].shape[1]),
+                int(global_feats.shape[1]),
+                int(return_mtp.shape[1]),
+                int(planet_inbound_feats.shape[-2]),
+                int(planet_inbound_feats.shape[-1]),
+            ),
+        )
     epochs_run = 0
     pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
     for _ in range(epochs):
@@ -2214,6 +2872,22 @@ def ppo_update(
             row_weight: torch.Tensor,
             slot: int,
         ) -> tuple[torch.Tensor, ...]:
+            if use_source_actor:
+                return _stage_source_ppo_minibatch(
+                    batch,
+                    global_feats,
+                    fleet_target_planet_idx,
+                    planet_inbound_feats,
+                    policy_advantage,
+                    return_mtp,
+                    return_mtp_mask,
+                    mb,
+                    row_weight,
+                    device,
+                    source_capacity=source_capacity,
+                    pinned_cache=pinned_cache,
+                    slot=slot,
+                )
             return _stage_ppo_minibatch(
                 batch,
                 global_feats,

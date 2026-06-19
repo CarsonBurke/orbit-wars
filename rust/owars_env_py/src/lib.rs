@@ -292,6 +292,16 @@ struct CategoricalBetaRecordPayload {
     log_prob: Option<Vec<f32>>,
     target_legal_mask: Option<Vec<bool>>,
     target_legal_sources: Option<Vec<CompactTargetLegalRecord>>,
+    source_records: Option<Vec<CategoricalBetaSourceRecord>>,
+}
+
+struct CategoricalBetaSourceRecord {
+    source_col: usize,
+    launch: f32,
+    target_idx: i64,
+    fraction: f32,
+    log_prob: Option<f32>,
+    legal: Vec<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -5669,6 +5679,25 @@ fn build_categorical_beta_actions_dict<'py>(
     });
     let mut log_prob = include_log_prob.then(|| Array2::<f32>::zeros((records, planets)));
     let mut target_legal_mask = Array3::<bool>::from_elem((records, planets, planets), true);
+    let include_source_records = record_rows.iter().any(|&row| {
+        results
+            .get(row)
+            .and_then(|result| result.records.as_ref())
+            .and_then(|record| record.source_records.as_ref())
+            .is_some()
+    });
+    let mut source_row_idx = Vec::new();
+    let mut source_col_idx = Vec::new();
+    let mut source_launch = Vec::new();
+    let mut source_raw_launch = Vec::new();
+    let mut source_target_idx = Vec::new();
+    let mut source_fraction = Vec::new();
+    let mut source_log_prob = (include_source_records && include_log_prob).then(Vec::new);
+    let mut source_legal_flat = Vec::new();
+    let mut source_row_offsets = Vec::with_capacity(records + 1);
+    if include_source_records {
+        source_row_offsets.push(0_i64);
+    }
     for (record_pos, &row) in record_rows.iter().enumerate() {
         let result = &results[row];
         let Some(record) = result.records.as_ref() else {
@@ -5696,6 +5725,23 @@ fn build_categorical_beta_actions_dict<'py>(
                     row_target_legal_mask[offset + target];
             }
         }
+        if include_source_records {
+            if let Some(sources) = record.source_records.as_ref() {
+                for source in sources {
+                    source_row_idx.push(record_pos as i64);
+                    source_col_idx.push(source.source_col as i64);
+                    source_launch.push(source.launch);
+                    source_raw_launch.push(source.launch);
+                    source_target_idx.push(source.target_idx);
+                    source_fraction.push(source.fraction);
+                    if let Some(out) = source_log_prob.as_mut() {
+                        out.push(source.log_prob.unwrap_or(0.0));
+                    }
+                    source_legal_flat.extend(source.legal.iter().copied());
+                }
+            }
+            source_row_offsets.push(source_row_idx.len() as i64);
+        }
     }
 
     out.set_item("launch", launch.into_pyarray(py))?;
@@ -5706,6 +5752,53 @@ fn build_categorical_beta_actions_dict<'py>(
         out.set_item("log_prob", log_prob.into_pyarray(py))?;
     }
     out.set_item("target_legal_mask", target_legal_mask.into_pyarray(py))?;
+    if include_source_records {
+        let source_count = source_row_idx.len();
+        let source_legal_mask = Array2::from_shape_vec((source_count, planets), source_legal_flat)
+            .map_err(|err| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to build source-major categorical beta records: {err}"
+                ))
+            })?;
+        out.set_item(
+            "source_row_idx",
+            Array1::from_vec(source_row_idx).into_pyarray(py),
+        )?;
+        out.set_item(
+            "source_col_idx",
+            Array1::from_vec(source_col_idx).into_pyarray(py),
+        )?;
+        out.set_item(
+            "source_row_offsets",
+            Array1::from_vec(source_row_offsets).into_pyarray(py),
+        )?;
+        out.set_item(
+            "source_launch",
+            Array1::from_vec(source_launch).into_pyarray(py),
+        )?;
+        out.set_item(
+            "source_raw_launch",
+            Array1::from_vec(source_raw_launch).into_pyarray(py),
+        )?;
+        out.set_item(
+            "source_target_idx",
+            Array1::from_vec(source_target_idx).into_pyarray(py),
+        )?;
+        out.set_item(
+            "source_fraction",
+            Array1::from_vec(source_fraction).into_pyarray(py),
+        )?;
+        if let Some(source_log_prob) = source_log_prob {
+            out.set_item(
+                "source_log_prob",
+                Array1::from_vec(source_log_prob).into_pyarray(py),
+            )?;
+        }
+        out.set_item(
+            "source_target_legal_mask",
+            source_legal_mask.into_pyarray(py),
+        )?;
+    }
     Ok(out)
 }
 
@@ -5732,9 +5825,16 @@ fn build_categorical_beta_compact_records_dict<'py>(
             .is_some()
     });
     let mut log_prob = include_log_prob.then(|| Array2::<f32>::zeros((records, planets)));
-    let mut legal_row_idx = Vec::new();
-    let mut legal_source_idx = Vec::new();
-    let mut legal_flat = Vec::new();
+    let mut source_row_idx = Vec::new();
+    let mut source_col_idx = Vec::new();
+    let mut source_launch = Vec::new();
+    let mut source_raw_launch = Vec::new();
+    let mut source_target_idx = Vec::new();
+    let mut source_fraction = Vec::new();
+    let mut source_log_prob = include_log_prob.then(Vec::new);
+    let mut source_legal_flat = Vec::new();
+    let mut source_row_offsets = Vec::with_capacity(records + 1);
+    source_row_offsets.push(0_i64);
     for (record_pos, &row) in record_rows.iter().enumerate() {
         let result = &results[row];
         let Some(record) = result.records.as_ref() else {
@@ -5753,21 +5853,46 @@ fn build_categorical_beta_compact_records_dict<'py>(
                 out[[record_pos, col]] = record_log_prob[col];
             }
         }
-        let Some(sources) = record.target_legal_sources.as_ref() else {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "recorded categorical beta row is missing compact target legal mask",
-            ));
-        };
-        for source in sources {
-            legal_row_idx.push(record_pos as i64);
-            legal_source_idx.push(source.source_col as i64);
-            legal_flat.extend(source.legal.iter().copied());
+        if let Some(sources) = record.source_records.as_ref() {
+            for source in sources {
+                source_row_idx.push(record_pos as i64);
+                source_col_idx.push(source.source_col as i64);
+                source_launch.push(source.launch);
+                source_raw_launch.push(source.launch);
+                source_target_idx.push(source.target_idx);
+                source_fraction.push(source.fraction);
+                if let Some(out) = source_log_prob.as_mut() {
+                    out.push(source.log_prob.unwrap_or(0.0));
+                }
+                source_legal_flat.extend(source.legal.iter().copied());
+            }
+        } else {
+            let Some(sources) = record.target_legal_sources.as_ref() else {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "recorded categorical beta row is missing compact target legal mask",
+                ));
+            };
+            for source in sources {
+                source_row_idx.push(record_pos as i64);
+                source_col_idx.push(source.source_col as i64);
+                source_launch.push(record.launch[source.source_col]);
+                source_raw_launch.push(record.launch[source.source_col]);
+                source_target_idx.push(record.target_idx[source.source_col]);
+                source_fraction.push(record.fraction[source.source_col]);
+                if let (Some(out), Some(record_log_prob)) =
+                    (source_log_prob.as_mut(), record.log_prob.as_ref())
+                {
+                    out.push(record_log_prob[source.source_col]);
+                }
+                source_legal_flat.extend(source.legal.iter().copied());
+            }
         }
+        source_row_offsets.push(source_row_idx.len() as i64);
     }
 
-    let active_sources = legal_row_idx.len();
+    let active_sources = source_row_idx.len();
     let legal_mask =
-        Array2::from_shape_vec((active_sources, planets), legal_flat).map_err(|err| {
+        Array2::from_shape_vec((active_sources, planets), source_legal_flat).map_err(|err| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "failed to build compact categorical beta records: {err}"
             ))
@@ -5781,13 +5906,47 @@ fn build_categorical_beta_compact_records_dict<'py>(
     }
     out.set_item(
         "target_legal_row_idx",
-        Array1::from_vec(legal_row_idx).into_pyarray(py),
+        Array1::from_vec(source_row_idx.clone()).into_pyarray(py),
     )?;
     out.set_item(
         "target_legal_source_idx",
-        Array1::from_vec(legal_source_idx).into_pyarray(py),
+        Array1::from_vec(source_col_idx.clone()).into_pyarray(py),
     )?;
     out.set_item("target_legal_source_mask", legal_mask.into_pyarray(py))?;
+    out.set_item(
+        "source_row_idx",
+        Array1::from_vec(source_row_idx).into_pyarray(py),
+    )?;
+    out.set_item(
+        "source_col_idx",
+        Array1::from_vec(source_col_idx).into_pyarray(py),
+    )?;
+    out.set_item(
+        "source_row_offsets",
+        Array1::from_vec(source_row_offsets).into_pyarray(py),
+    )?;
+    out.set_item(
+        "source_launch",
+        Array1::from_vec(source_launch).into_pyarray(py),
+    )?;
+    out.set_item(
+        "source_raw_launch",
+        Array1::from_vec(source_raw_launch).into_pyarray(py),
+    )?;
+    out.set_item(
+        "source_target_idx",
+        Array1::from_vec(source_target_idx).into_pyarray(py),
+    )?;
+    out.set_item(
+        "source_fraction",
+        Array1::from_vec(source_fraction).into_pyarray(py),
+    )?;
+    if let Some(source_log_prob) = source_log_prob {
+        out.set_item(
+            "source_log_prob",
+            Array1::from_vec(source_log_prob).into_pyarray(py),
+        )?;
+    }
     Ok(out)
 }
 
@@ -5922,6 +6081,7 @@ fn categorical_beta_action_row_from_state(
         log_prob: None,
         target_legal_mask,
         target_legal_sources: None,
+        source_records: None,
     });
     CategoricalBetaRowResult { actions, records }
 }
@@ -5987,25 +6147,66 @@ fn categorical_beta_action_row_from_state_compact_sources(
         });
     let mut target_legal_sources =
         (record_target_legal_mask && compact_target_legal_record).then(Vec::new);
+    let mut source_records = record_target_legal_mask.then(Vec::new);
 
     let mut action_rng = (!deterministic)
         .then(|| row_sample_rng(random_seed, reset_count, game.step, env_idx, player, 2));
     for source_ref in sources {
         let source_col = source_ref.source_col;
         if source_col >= planet_limit {
+            if let Some(records) = source_records.as_mut() {
+                records.push(CategoricalBetaSourceRecord {
+                    source_col,
+                    launch: 0.0,
+                    target_idx: 0,
+                    fraction: fraction[source_col],
+                    log_prob: None,
+                    legal: vec![false; planets],
+                });
+            }
             continue;
         }
         let source = game.planets[source_col];
         let source_ships = source.ships;
         if source.owner != player as i32 || source_ships < 2 {
+            if let Some(records) = source_records.as_mut() {
+                records.push(CategoricalBetaSourceRecord {
+                    source_col,
+                    launch: 0.0,
+                    target_idx: 0,
+                    fraction: fraction[source_col],
+                    log_prob: None,
+                    legal: vec![false; planets],
+                });
+            }
             continue;
         }
         let send = ships_to_send(source_ships, fraction[source_col] as f64);
         if send <= 0 {
+            if let Some(records) = source_records.as_mut() {
+                records.push(CategoricalBetaSourceRecord {
+                    source_col,
+                    launch: 0.0,
+                    target_idx: 0,
+                    fraction: fraction[source_col],
+                    log_prob: None,
+                    legal: vec![false; planets],
+                });
+            }
             continue;
         }
         let speed = fleet_speed_local(send, game.ship_speed);
         if speed <= 0.0 {
+            if let Some(records) = source_records.as_mut() {
+                records.push(CategoricalBetaSourceRecord {
+                    source_col,
+                    launch: 0.0,
+                    target_idx: 0,
+                    fraction: fraction[source_col],
+                    log_prob: None,
+                    legal: vec![false; planets],
+                });
+            }
             continue;
         }
         let spec = CompactLegalSource {
@@ -6038,6 +6239,23 @@ fn categorical_beta_action_row_from_state_compact_sources(
                 strict_target_legality,
                 legal_out,
             );
+        if let Some(records) = source_records.as_mut() {
+            let legal = if let Some(legal) = compact_legal.as_ref() {
+                legal.clone()
+            } else if let Some(mask) = target_legal_mask.as_ref() {
+                mask[mask_offset..mask_offset + planets].to_vec()
+            } else {
+                vec![false; planets]
+            };
+            records.push(CategoricalBetaSourceRecord {
+                source_col,
+                launch: launch_value,
+                target_idx: target_value as i64,
+                fraction: fraction[source_col],
+                log_prob: None,
+                legal,
+            });
+        }
         if let (Some(sources), Some(legal)) = (target_legal_sources.as_mut(), compact_legal) {
             sources.push(CompactTargetLegalRecord { source_col, legal });
         }
@@ -6072,6 +6290,7 @@ fn categorical_beta_action_row_from_state_compact_sources(
             log_prob: None,
             target_legal_mask,
             target_legal_sources,
+            source_records,
         })
     } else {
         None

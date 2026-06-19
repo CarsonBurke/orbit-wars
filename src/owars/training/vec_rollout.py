@@ -27,6 +27,7 @@ from collections.abc import Callable, Sequence
 from time import perf_counter
 from typing import Any
 
+import numpy as np
 import torch
 
 from ..policies.features import (
@@ -53,6 +54,8 @@ from .config import RewardCfg
 from .league import LEARNER_NAME, OpponentSlot
 from .rollout import Trajectory, TrajectoryRecordRef, _obs_production_margin
 from .vec_env import VecEnv
+
+_SOURCE_MAJOR_COMPILE_ROW_CAP = 32
 
 
 def _mark_cuda_graph_step(device: torch.device) -> None:
@@ -125,6 +128,18 @@ def _snapshot_graph_rows(rows: int, *, max_rows: int = 64) -> int:
     return min(bucket, cap) if rows <= cap else bucket
 
 
+def _source_graph_rows(
+    source_count: int,
+    *,
+    graph_rows: int,
+    planets: int,
+    max_sources_per_row: int,
+) -> int:
+    del source_count, max_sources_per_row
+    row_capacity = min(int(planets), _SOURCE_MAJOR_COMPILE_ROW_CAP)
+    return max(1, int(graph_rows) * row_capacity)
+
+
 def _snapshot_rollout_graph_rows(
     rows: int,
     *,
@@ -144,7 +159,7 @@ def _kernel_cache(model: torch.nn.Module) -> dict:
     return cache
 
 
-class _RolloutForwardKernel(torch.nn.Module):
+class _DenseRolloutForwardKernel(torch.nn.Module):
     def __init__(
         self,
         model: torch.nn.Module,
@@ -188,25 +203,91 @@ class _RolloutForwardKernel(torch.nn.Module):
             return self.model(feats, include_value=self.include_value)
 
 
+class _SourceMajorRolloutForwardKernel(torch.nn.Module):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        autocast_enabled: bool,
+        include_value: bool,
+        target_planets: int,
+    ) -> None:
+        super().__init__()
+        self.model = model
+        self.autocast_enabled = bool(autocast_enabled)
+        self.include_value = bool(include_value)
+        self.target_planets = int(target_planets)
+
+    def forward(
+        self,
+        global_feats: torch.Tensor,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
+        actor_source_rows: torch.Tensor,
+        actor_source_cols: torch.Tensor,
+        actor_source_valid: torch.Tensor,
+    ) -> PolicyOutput:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+            global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
+        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            return self.model(
+                feats,
+                include_value=self.include_value,
+                actor_source_rows=actor_source_rows,
+                actor_source_cols=actor_source_cols,
+                actor_source_valid=actor_source_valid,
+                target_planets=self.target_planets,
+            )
+
+
 def _get_rollout_kernel(
     model: torch.nn.Module,
     device: torch.device,
     compile_mode: str | None,
     *,
     include_value: bool,
-    shape_key: tuple[int, int, int, int],
+    source_major_actor: bool = False,
+    target_planets: int = 0,
+    shape_key: tuple[int, ...],
 ) -> torch.nn.Module:
     mode = compile_mode if device.type == "cuda" else None
-    key = ("rollout", mode, bool(include_value), shape_key)
+    key = ("rollout", mode, bool(include_value), bool(source_major_actor), shape_key)
     cache = _kernel_cache(model)
     cached = cache.get(key)
     if cached is not None:
         return cached
-    kernel = _RolloutForwardKernel(
-        model,
-        autocast_enabled=device.type == "cuda",
-        include_value=include_value,
-    )
+    if source_major_actor:
+        kernel = _SourceMajorRolloutForwardKernel(
+            model,
+            autocast_enabled=device.type == "cuda",
+            include_value=include_value,
+            target_planets=target_planets,
+        )
+    else:
+        kernel = _DenseRolloutForwardKernel(
+            model,
+            autocast_enabled=device.type == "cuda",
+            include_value=include_value,
+        )
     if mode is not None:
         kernel = torch.compile(
             kernel,
@@ -331,21 +412,44 @@ def _assert_destination_compiled_shape(feats: EncodedObs) -> None:
 
 
 def _slice_policy_output(out: PolicyOutput, rows: int) -> PolicyOutput:
-    if out.launch_logits.shape[0] == rows:
+    source_major = out.actor_source_rows is not None
+    if not source_major and out.launch_logits.shape[0] == rows:
         return out
     return PolicyOutput(
-        launch_logits=out.launch_logits[:rows],
-        target_logits=out.target_logits[:rows],
+        launch_logits=out.launch_logits if source_major else out.launch_logits[:rows],
+        target_logits=out.target_logits if source_major else out.target_logits[:rows],
         value=out.value[:rows],
         value_logits=out.value_logits[:rows],
         planet_owned_mask=out.planet_owned_mask[:rows],
         planet_mask=out.planet_mask[:rows],
         planet_ids=out.planet_ids[:rows],
+        actor_source_rows=out.actor_source_rows,
+        actor_source_cols=out.actor_source_cols,
+        actor_source_valid=out.actor_source_valid,
+        target_planets=out.target_planets,
         action_logit_softcap=out.action_logit_softcap,
-        launch_log_std=None if out.launch_log_std is None else out.launch_log_std[:rows],
+        launch_log_std=(
+            None
+            if out.launch_log_std is None
+            else out.launch_log_std
+            if source_major
+            else out.launch_log_std[:rows]
+        ),
         launch_prob_floor=out.launch_prob_floor,
-        fraction_alpha=None if out.fraction_alpha is None else out.fraction_alpha[:rows],
-        fraction_beta=None if out.fraction_beta is None else out.fraction_beta[:rows],
+        fraction_alpha=(
+            None
+            if out.fraction_alpha is None
+            else out.fraction_alpha
+            if source_major
+            else out.fraction_alpha[:rows]
+        ),
+        fraction_beta=(
+            None
+            if out.fraction_beta is None
+            else out.fraction_beta
+            if source_major
+            else out.fraction_beta[:rows]
+        ),
         fraction_mean=None if out.fraction_mean is None else out.fraction_mean[:rows],
         fraction_log_std=(
             None if out.fraction_log_std is None else out.fraction_log_std[:rows]
@@ -1152,6 +1256,7 @@ def _step_learner_bucket(
     compact_source_rows = None
     compact_source_cols = None
     compact_target_planets = None
+    compact_max_sources_per_row = 1
     if (
         source_index_stacked is not None
         and source_index_stacked.planet_feats.device.type == "cpu"
@@ -1160,8 +1265,14 @@ def _step_learner_bucket(
         record_source_mask_full = (
             source_index_stacked.planet_owned_mask & source_index_stacked.planet_mask
         )
-        compact_source_rows = source_index_stacked.compact_source_rows
-        compact_source_cols = source_index_stacked.compact_source_cols
+        source_rows, source_cols = torch.nonzero(record_source_mask_full, as_tuple=True)
+        compact_source_rows = source_rows.numpy()
+        compact_source_cols = source_cols.numpy()
+        if record_source_mask_full.shape[0] > 0:
+            compact_max_sources_per_row = max(
+                1,
+                int(record_source_mask_full.sum(dim=1).max().item()),
+            )
         compact_target_planets = source_index_stacked.compact_target_planets
         if compact_target_planets is None:
             compact_target_planets = int(source_index_stacked.planet_mask.shape[1])
@@ -1171,13 +1282,6 @@ def _step_learner_bucket(
             )
             if live_planet_cols.numel():
                 compact_target_planets = int(live_planet_cols[-1].item()) + 1
-        if compact_source_rows is None or compact_source_cols is None:
-            source_mask_for_sampling = (
-                record_source_mask_full & (source_index_stacked.planet_garrison >= 2.0)
-            )
-            source_rows, source_cols = torch.nonzero(source_mask_for_sampling, as_tuple=True)
-            compact_source_rows = source_rows.numpy()
-            compact_source_cols = source_cols.numpy()
     record_value_only = record_trajectories and learner_action_agent is not None
     record_values = record_trajectories and (record_value_only or not defer_log_prob)
 
@@ -1186,11 +1290,68 @@ def _step_learner_bucket(
     graph_stacked = _pad_encoded_rows(stacked, graph_rows) if graph_enabled else stacked
     if graph_enabled and include_fleet_targets:
         _assert_destination_compiled_shape(graph_stacked)
+    source_major_actor = (
+        policy_rows is not None
+        and compact_source_rows is not None
+        and compact_source_cols is not None
+        and callable(fast_sampler)
+        and getattr(model.cfg, "action_logit_softcap", None) is not None
+        and record_trajectories
+        and not record_value_only
+        and defer_log_prob
+        and (
+            not graph_enabled
+            or compact_max_sources_per_row <= _SOURCE_MAJOR_COMPILE_ROW_CAP
+        )
+    )
+    target_planets_for_actor = int(
+        compact_target_planets
+        if compact_target_planets is not None
+        else graph_stacked.planet_feats.shape[1]
+    )
+    if graph_enabled:
+        target_planets_for_actor = int(graph_stacked.planet_feats.shape[1])
+    actor_source_rows_t = torch.empty(0, dtype=torch.long, device=target_device)
+    actor_source_cols_t = torch.empty(0, dtype=torch.long, device=target_device)
+    actor_source_valid_t = torch.empty(0, dtype=torch.bool, device=target_device)
+    if source_major_actor:
+        source_count = int(np.asarray(compact_source_rows).shape[0])
+        source_rows_np = np.asarray(compact_source_rows, dtype=np.int64)
+        source_cols_np = np.asarray(compact_source_cols, dtype=np.int64)
+        source_rows_t = torch.as_tensor(source_rows_np, dtype=torch.long)
+        source_cols_t = torch.as_tensor(source_cols_np, dtype=torch.long)
+        source_valid_t = torch.ones(source_count, dtype=torch.bool)
+        if graph_enabled:
+            source_rows_cap = _source_graph_rows(
+                source_count,
+                graph_rows=int(graph_stacked.planet_feats.shape[0]),
+                planets=int(graph_stacked.planet_feats.shape[1]),
+                max_sources_per_row=compact_max_sources_per_row,
+            )
+            if source_count < source_rows_cap:
+                pad = source_rows_cap - source_count
+                source_rows_t = torch.cat(
+                    (source_rows_t, torch.zeros(pad, dtype=torch.long)),
+                    dim=0,
+                )
+                source_cols_t = torch.cat(
+                    (source_cols_t, torch.zeros(pad, dtype=torch.long)),
+                    dim=0,
+                )
+                source_valid_t = torch.cat(
+                    (source_valid_t, torch.zeros(pad, dtype=torch.bool)),
+                    dim=0,
+                )
+        actor_source_rows_t = source_rows_t.to(target_device, non_blocking=True)
+        actor_source_cols_t = source_cols_t.to(target_device, non_blocking=True)
+        actor_source_valid_t = source_valid_t.to(target_device, non_blocking=True)
     kernel = _get_rollout_kernel(
         model,
         target_device,
         compile_mode if graph_enabled else None,
         include_value=record_values,
+        source_major_actor=source_major_actor,
+        target_planets=target_planets_for_actor if source_major_actor else 0,
         shape_key=(
             int(graph_stacked.planet_feats.shape[0]),
             int(graph_stacked.planet_feats.shape[1]),
@@ -1198,6 +1359,8 @@ def _step_learner_bucket(
             int(_global_feats_or_empty(graph_stacked).shape[1]),
             int(planet_inbound_feats_or_empty(graph_stacked).shape[-2]),
             int(planet_inbound_feats_or_empty(graph_stacked).shape[-1]),
+            int(actor_source_rows_t.shape[0]) if source_major_actor else 0,
+            target_planets_for_actor if source_major_actor else 0,
         ),
     )
     was_training = model.training
@@ -1208,7 +1371,7 @@ def _step_learner_bucket(
                 _mark_cuda_graph_step(target_device)
             _sync_cuda_timing(target_device, sync_timing)
             phase_t0 = perf_counter()
-            out = kernel(
+            kernel_args = (
                 _global_feats_or_empty(graph_stacked),
                 graph_stacked.planet_feats,
                 graph_stacked.planet_mask,
@@ -1220,6 +1383,15 @@ def _step_learner_bucket(
                 fleet_target_planet_idx_or_empty(graph_stacked),
                 planet_inbound_feats_or_empty(graph_stacked),
             )
+            if source_major_actor:
+                out = kernel(
+                    *kernel_args,
+                    actor_source_rows_t,
+                    actor_source_cols_t,
+                    actor_source_valid_t,
+                )
+            else:
+                out = kernel(*kernel_args)
             _sync_cuda_timing(target_device, sync_timing)
             _add_timing(timings, "policy_forward_s", perf_counter() - phase_t0)
     finally:
@@ -1630,6 +1802,22 @@ def _materialize_records_cpu(
             records.target_legal_source_mask.detach().cpu().bool()
         )
         _add_timing(timings, "policy_record/compact_legal_s", perf_counter() - phase_t0)
+    if hasattr(records, "source_row_idx"):
+        phase_t0 = perf_counter()
+        out["source_row_idx"] = records.source_row_idx.detach().cpu().long()
+        out["source_col_idx"] = records.source_col_idx.detach().cpu().long()
+        out["source_row_offsets"] = records.source_row_offsets.detach().cpu().long()
+        out["source_launch"] = records.source_launch.detach().cpu().float()
+        out["source_raw_launch"] = records.source_raw_launch.detach().cpu().float()
+        out["source_target_idx"] = records.source_target_idx.detach().cpu().long()
+        out["source_fraction"] = records.source_fraction.detach().cpu().float()
+        if hasattr(records, "source_log_prob"):
+            out["source_log_prob"] = records.source_log_prob.detach().cpu().float()
+        if hasattr(records, "source_target_legal_mask"):
+            out["source_target_legal_mask"] = (
+                records.source_target_legal_mask.detach().cpu().bool()
+            )
+        _add_timing(timings, "policy_record/source_records_s", perf_counter() - phase_t0)
     return out
 
 

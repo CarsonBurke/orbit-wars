@@ -1416,18 +1416,22 @@ def _symexp(x: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class PolicyOutput:
-    launch_logits: torch.Tensor       # [B, P] noop column logits for PPO / legacy launch logits for SAC adapters
-    target_logits: torch.Tensor       # [B, P, P] masked target categorical logits
+    launch_logits: torch.Tensor       # [B, P] dense or [S] source-major noop logits
+    target_logits: torch.Tensor       # [B, P, P] dense or [S, T] source-major target logits
     value: torch.Tensor               # [B] — scalar value E[V] recovered from value_logits
     value_logits: torch.Tensor        # [B,H,num_bins] — distributional critic logits; H=critic_mtp_horizon
     planet_owned_mask: torch.Tensor   # [B, P] bool
     planet_mask: torch.Tensor         # [B, P] bool
     planet_ids: torch.Tensor          # [B, P] long
+    actor_source_rows: torch.Tensor | None = None  # [S] source-major obs row, if compact actor output
+    actor_source_cols: torch.Tensor | None = None  # [S] source-major planet col, if compact actor output
+    actor_source_valid: torch.Tensor | None = None # [S] bool, false only for padded compact actor rows
+    target_planets: int | None = None              # T for source-major target logits
     action_logit_softcap: float | None = None
     launch_log_std: torch.Tensor | None = None  # [B, P] state-dependent Normal log std
     launch_prob_floor: float = 0.0
-    fraction_alpha: torch.Tensor | None = None  # [B, P] Beta concentration α
-    fraction_beta: torch.Tensor | None = None   # [B, P] Beta concentration β
+    fraction_alpha: torch.Tensor | None = None  # [B, P] dense or [S] Beta concentration alpha
+    fraction_beta: torch.Tensor | None = None   # [B, P] dense or [S] Beta concentration beta
     # SAC's actor still adapts through this shared sampler as a squashed
     # Normal. PPO OrbitPolicy leaves these as None and uses the Beta fields.
     fraction_mean: torch.Tensor | None = None       # [B, P] Normal mean
@@ -1808,6 +1812,10 @@ class OrbitPolicy(nn.Module):
         *,
         include_value: bool = True,
         include_actor: bool = True,
+        actor_source_rows: torch.Tensor | None = None,
+        actor_source_cols: torch.Tensor | None = None,
+        actor_source_valid: torch.Tensor | None = None,
+        target_planets: int | None = None,
     ) -> PolicyOutput:
         planet_h, _fleet_h, h_actor, h_critic, _token_mask = self.encode(feats)
         b, p, d = planet_h.shape
@@ -1821,42 +1829,95 @@ class OrbitPolicy(nn.Module):
         planet_ids = _b(feats.planet_ids)
 
         if include_actor:
-            # Concatenate the actor token onto each per-planet rep — global
-            # context for the action heads. Broadcast: [B,1,d] → [B,P,d].
-            actor_ctx = h_actor.unsqueeze(1).expand(-1, p, -1)
-            planet_with_ctx = torch.cat([planet_h, actor_ctx], dim=-1)  # [B, P, 2d]
+            source_major = actor_source_rows is not None or actor_source_cols is not None
+            if source_major and (actor_source_rows is None or actor_source_cols is None):
+                raise ValueError(
+                    "actor_source_rows and actor_source_cols must be provided together"
+                )
+            if source_major:
+                if target_planets is None:
+                    target_planets = p
+                target_planets = max(1, min(int(target_planets), p))
+                source_rows = actor_source_rows.to(device=planet_h.device, dtype=torch.long)
+                source_cols = actor_source_cols.to(device=planet_h.device, dtype=torch.long)
+                if actor_source_valid is None:
+                    source_valid = torch.ones_like(source_rows, dtype=torch.bool)
+                else:
+                    source_valid = actor_source_valid.to(
+                        device=planet_h.device,
+                        dtype=torch.bool,
+                    )
+                safe_rows = source_rows.clamp(0, max(0, b - 1))
+                safe_cols = source_cols.clamp(0, max(0, p - 1))
+
+                source_h = planet_h[safe_rows, safe_cols]
+                source_actor = h_actor.index_select(0, safe_rows)
+                planet_with_ctx = torch.cat((source_h, source_actor), dim=-1)
+            else:
+                target_planets = p
+                source_rows = None
+                source_cols = None
+                source_valid = None
+                # Concatenate the actor token onto each per-planet rep — global
+                # context for the action heads. Broadcast: [B,1,d] → [B,P,d].
+                actor_ctx = h_actor.unsqueeze(1).expand(-1, p, -1)
+                planet_with_ctx = torch.cat([planet_h, actor_ctx], dim=-1)  # [B, P, 2d]
 
             # Target attention: query carries actor context (2d→d), key stays
             # plain (d→d). Putting the actor concat on the *key* side too would
             # add a column-constant term to `q·k` that cancels in the softmax.
             q = self.target_query(planet_with_ctx)
-            k = self.target_key(planet_h)
             # QK-RMSNorm + learnable gain — same pattern as `SelfAttention`.
             # `F.rms_norm` along the last dim pins ‖q‖ and ‖k‖ to √d regardless
             # of weight magnitude, so the post-softmax target distribution has
             # a magnitude bound that doesn't drift with the projection norms.
             q = F.rms_norm(q, (q.size(-1),))
-            k = F.rms_norm(k, (k.size(-1),))
             q = q * self.target_q_gain.to(q.dtype)
             noop_k = F.rms_norm(
-                self.target_noop_key.to(dtype=k.dtype, device=k.device),
-                (k.size(-1),),
+                self.target_noop_key.to(dtype=q.dtype, device=q.device),
+                (q.size(-1),),
             )
-            noop_logits = torch.einsum("bid,d->bi", q, noop_k) / (d**0.5)
-            # [B, P, P] — keep the canonical 1/√d divisor; `target_q_gain`
-            # multiplies on top, mirroring how trunk SDPA's auto-scale plus
-            # `q_gain` compose.
-            logits = torch.einsum("bid,bjd->bij", q, k) / (d**0.5)
-            # Mask out padded *targets*.
-            logits = logits.masked_fill(~planet_mask.unsqueeze(1), float("-inf"))
-            # Mask self-targets (diagonal). The simulator silently no-ops a
-            # send-to-self anyway; without this mask the policy can put
-            # probability mass on a meaningless action and the entropy term
-            # rewards it. Buffer is preallocated; slice for the actual P.
-            logits = logits.masked_fill(
-                self._self_target_mask[:p, :p].unsqueeze(0), float("-inf")
-            )
-            target_logits = logits  # [B, P, P]
+            if source_major:
+                noop_logits = torch.einsum("sd,d->s", q, noop_k) / (d**0.5)
+                target_h = planet_h[:, :target_planets]
+                k = self.target_key(target_h)
+                k = F.rms_norm(k, (k.size(-1),))
+                k = k.index_select(0, safe_rows)
+                # [S, T] — same q/k attention score as the dense path, but
+                # only for real owned source rows that PPO/sampling can use.
+                logits = torch.einsum("sd,std->st", q, k) / (d**0.5)
+                target_mask = planet_mask.index_select(0, safe_rows)[:, :target_planets]
+                logits = logits.masked_fill(~target_mask, float("-inf"))
+                target_cols = torch.arange(
+                    target_planets,
+                    device=planet_h.device,
+                    dtype=source_cols.dtype,
+                )
+                logits = logits.masked_fill(
+                    target_cols.unsqueeze(0) == safe_cols.unsqueeze(1),
+                    float("-inf"),
+                )
+                logits = logits.masked_fill(~source_valid.unsqueeze(1), float("-inf"))
+                noop_logits = noop_logits.masked_fill(~source_valid, 0.0)
+                target_logits = logits
+            else:
+                noop_logits = torch.einsum("bid,d->bi", q, noop_k) / (d**0.5)
+                k = self.target_key(planet_h)
+                k = F.rms_norm(k, (k.size(-1),))
+                # [B, P, P] — keep the canonical 1/√d divisor; `target_q_gain`
+                # multiplies on top, mirroring how trunk SDPA's auto-scale plus
+                # `q_gain` compose.
+                logits = torch.einsum("bid,bjd->bij", q, k) / (d**0.5)
+                # Mask out padded *targets*.
+                logits = logits.masked_fill(~planet_mask.unsqueeze(1), float("-inf"))
+                # Mask self-targets (diagonal). The simulator silently no-ops a
+                # send-to-self anyway; without this mask the policy can put
+                # probability mass on a meaningless action and the entropy term
+                # rewards it. Buffer is preallocated; slice for the actual P.
+                logits = logits.masked_fill(
+                    self._self_target_mask[:p, :p].unsqueeze(0), float("-inf")
+                )
+                target_logits = logits  # [B, P, P]
 
             # Fraction head: native-support unimodal Beta, matching the CleanRL
             # IterThink v24 / Dreamer4 beta path.
@@ -1887,6 +1948,10 @@ class OrbitPolicy(nn.Module):
         else:
             noop_logits = h_actor.new_empty((b, p), dtype=torch.float32)
             target_logits = h_actor.new_empty((b, p, 0), dtype=torch.float32)
+            source_rows = None
+            source_cols = None
+            source_valid = None
+            target_planets = None
             fraction_alpha = None
             fraction_beta = None
 
@@ -1918,6 +1983,10 @@ class OrbitPolicy(nn.Module):
             planet_owned_mask=planet_owned,
             planet_mask=planet_mask,
             planet_ids=planet_ids,
+            actor_source_rows=source_rows,
+            actor_source_cols=source_cols,
+            actor_source_valid=source_valid,
+            target_planets=target_planets,
             action_logit_softcap=float(self.cfg.action_logit_softcap),
             fraction_alpha=fraction_alpha,
             fraction_beta=fraction_beta,

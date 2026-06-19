@@ -71,6 +71,43 @@ def test_policy_forward_shapes():
     assert float(out.value.item()) <= float(model.value_encoder.support.max())
 
 
+def test_policy_source_major_actor_matches_dense_gather():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    o = parse_observation(_obs())
+    feats = encode_observation(o)
+
+    dense = model(feats)
+    source_rows = torch.tensor([0, 0], dtype=torch.long)
+    source_cols = torch.tensor([0, 2], dtype=torch.long)
+    compact = model(
+        feats,
+        actor_source_rows=source_rows,
+        actor_source_cols=source_cols,
+        target_planets=5,
+    )
+
+    assert compact.launch_logits.shape == (2,)
+    assert compact.target_logits.shape == (2, 5)
+    torch.testing.assert_close(
+        compact.launch_logits,
+        dense.launch_logits[source_rows, source_cols],
+    )
+    torch.testing.assert_close(
+        compact.target_logits,
+        dense.target_logits[source_rows, source_cols, :5],
+        equal_nan=True,
+    )
+    torch.testing.assert_close(
+        compact.fraction_alpha,
+        dense.fraction_alpha[source_rows, source_cols],
+    )
+    torch.testing.assert_close(
+        compact.fraction_beta,
+        dense.fraction_beta[source_rows, source_cols],
+    )
+
+
 def test_planet_rope_frequency_buffer_stays_fp32_after_bfloat16():
     cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=1, n_heads=2)
     model = OrbitPolicy(cfg)

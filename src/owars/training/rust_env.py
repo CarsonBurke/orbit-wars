@@ -328,6 +328,9 @@ def _pad_native_categorical_beta_records(
     padded_legal = pad_array("target_legal_source_mask", fill=False)
     if padded_legal is not None:
         out["target_legal_source_mask"] = padded_legal
+    padded_source_legal = pad_array("source_target_legal_mask", fill=False)
+    if padded_source_legal is not None:
+        out["source_target_legal_mask"] = padded_source_legal
     return out
 
 
@@ -910,6 +913,8 @@ class RustVecEnv:
         action_logit_softcap = out.action_logit_softcap
         target_logits = out.target_logits
         fraction_param1, fraction_param2, fraction_dist = _policy_fraction_params(out)
+        source_major_actor = getattr(out, "actor_source_rows", None) is not None
+        policy_planets = int(out.planet_mask.shape[1])
         active_fields_masker = getattr(
             self._core,
             "legal_target_mask_from_state_active_fields",
@@ -955,6 +960,8 @@ class RustVecEnv:
             can_native_categorical_beta_action
             and callable(compact_native_categorical_beta_sampler)
             and (
+                source_major_actor
+                or
                 (
                     target_logits.device.type == "cpu"
                     and (enqueue_actions or not deterministic)
@@ -965,6 +972,11 @@ class RustVecEnv:
         use_native_categorical_beta_action = can_native_categorical_beta_action and (
             target_logits.device.type == "cpu" or use_compact_native_categorical_beta_action
         )
+        if source_major_actor and not use_compact_native_categorical_beta_action:
+            raise RuntimeError(
+                "source-major policy outputs require the compact native "
+                "categorical-Beta sampler"
+            )
         if use_native_categorical_beta_action:
             phase_t0 = _timing_start(timings)
             native_launch_logits = None
@@ -972,7 +984,50 @@ class RustVecEnv:
             native_fraction_param1 = None
             native_fraction_param2 = None
             if use_compact_native_categorical_beta_action:
-                if compact_source_rows is not None or compact_source_cols is not None:
+                if source_major_actor:
+                    source_valid = getattr(out, "actor_source_valid", None)
+                    if source_valid is None:
+                        valid_idx = torch.arange(
+                            target_logits.shape[0],
+                            device=target_logits.device,
+                            dtype=torch.long,
+                        )
+                    else:
+                        valid_idx = torch.nonzero(
+                            source_valid.to(device=target_logits.device, dtype=torch.bool),
+                            as_tuple=False,
+                        ).flatten()
+                    source_rows_t = out.actor_source_rows.to(
+                        device=target_logits.device,
+                        dtype=torch.long,
+                    ).index_select(0, valid_idx)
+                    source_cols_t = out.actor_source_cols.to(
+                        device=target_logits.device,
+                        dtype=torch.long,
+                    ).index_select(0, valid_idx)
+                    native_source_rows = np.ascontiguousarray(
+                        source_rows_t.detach().cpu().numpy(),
+                        dtype=np.int64,
+                    )
+                    native_source_cols = np.ascontiguousarray(
+                        source_cols_t.detach().cpu().numpy(),
+                        dtype=np.int64,
+                    )
+                    compact_launch_logits = launch_logits.index_select(0, valid_idx)
+                    target_planets = int(
+                        getattr(out, "target_planets", None) or target_logits.shape[1]
+                    )
+                    if compact_target_planets is not None:
+                        target_planets = max(
+                            1,
+                            min(target_planets, int(compact_target_planets)),
+                        )
+                    compact_target_logits = target_logits.index_select(0, valid_idx)[
+                        :, :target_planets
+                    ]
+                    compact_fraction_param1 = fraction_param1.index_select(0, valid_idx)
+                    compact_fraction_param2 = fraction_param2.index_select(0, valid_idx)
+                elif compact_source_rows is not None or compact_source_cols is not None:
                     if compact_source_rows is None or compact_source_cols is None:
                         raise ValueError(
                             "compact_source_rows and compact_source_cols must be provided together"
@@ -1015,20 +1070,21 @@ class RustVecEnv:
                         source_cols.detach().cpu().numpy(),
                         dtype=np.int64,
                     )
-                compact_launch_logits = launch_logits[source_rows, source_cols]
-                target_planets = int(target_logits.shape[1])
-                if compact_target_planets is not None:
-                    target_planets = max(
-                        1,
-                        min(target_planets, int(compact_target_planets)),
-                    )
-                compact_target_logits = target_logits[
-                    source_rows,
-                    source_cols,
-                    :target_planets,
-                ]
-                compact_fraction_param1 = fraction_param1[source_rows, source_cols]
-                compact_fraction_param2 = fraction_param2[source_rows, source_cols]
+                if not source_major_actor:
+                    compact_launch_logits = launch_logits[source_rows, source_cols]
+                    target_planets = int(target_logits.shape[1])
+                    if compact_target_planets is not None:
+                        target_planets = max(
+                            1,
+                            min(target_planets, int(compact_target_planets)),
+                        )
+                    compact_target_logits = target_logits[
+                        source_rows,
+                        source_cols,
+                        :target_planets,
+                    ]
+                    compact_fraction_param1 = fraction_param1[source_rows, source_cols]
+                    compact_fraction_param2 = fraction_param2[source_rows, source_cols]
                 (
                     native_launch_logits,
                     native_target_logits,
@@ -1116,7 +1172,7 @@ class RustVecEnv:
 
             actions_list = None if enqueued_actions else native_result["actions"]
             if not record_rows:
-                planets = int(target_logits.shape[1])
+                planets = policy_planets
                 empty = target_logits.new_empty(0, planets)
                 empty_idx = torch.empty(
                     0,
@@ -1136,7 +1192,7 @@ class RustVecEnv:
             phase_t0 = _timing_start(timings)
             native_result = _pad_native_categorical_beta_records(
                 native_result,
-                planets=int(target_logits.shape[1]),
+                planets=policy_planets,
             )
             launch = torch.as_tensor(native_result["launch"], dtype=torch.float32)
             raw_launch = torch.as_tensor(native_result["raw_launch"], dtype=torch.float32)
@@ -1187,6 +1243,49 @@ class RustVecEnv:
                 target_legal_mask=target_legal_mask,
             )
             records.old_log_prob_computed = old_log_prob_computed
+            if "source_row_idx" in native_result:
+                records.source_row_idx = torch.as_tensor(
+                    native_result["source_row_idx"],
+                    dtype=torch.long,
+                )
+                records.source_col_idx = torch.as_tensor(
+                    native_result["source_col_idx"],
+                    dtype=torch.long,
+                )
+                records.source_row_offsets = torch.as_tensor(
+                    native_result["source_row_offsets"],
+                    dtype=torch.long,
+                )
+                records.source_launch = torch.as_tensor(
+                    native_result["source_launch"],
+                    dtype=torch.float32,
+                )
+                records.source_raw_launch = torch.as_tensor(
+                    native_result["source_raw_launch"],
+                    dtype=torch.float32,
+                )
+                records.source_target_idx = torch.as_tensor(
+                    native_result["source_target_idx"],
+                    dtype=torch.long,
+                )
+                records.source_fraction = torch.as_tensor(
+                    native_result["source_fraction"],
+                    dtype=torch.float32,
+                )
+                if "source_log_prob" in native_result:
+                    records.source_log_prob = torch.as_tensor(
+                        native_result["source_log_prob"],
+                        dtype=torch.float32,
+                    )
+                source_legal = native_result.get(
+                    "source_target_legal_mask",
+                    native_result.get("target_legal_source_mask"),
+                )
+                if source_legal is not None:
+                    records.source_target_legal_mask = torch.as_tensor(
+                        source_legal,
+                        dtype=torch.bool,
+                    )
             if compact_legal_records and "target_legal_source_mask" in native_result:
                 records.target_legal_row_idx = torch.as_tensor(
                     native_result["target_legal_row_idx"],
