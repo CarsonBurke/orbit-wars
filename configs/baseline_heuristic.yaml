@@ -52,7 +52,7 @@ rollout:
   num_envs: 128
   num_workers: 0
   env_backend: rust
-  strict_target_legality: false
+  strict_target_legality: true
 
 opponents:
   snapshot_every: 50

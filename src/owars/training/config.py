@@ -341,7 +341,7 @@ class RolloutCfg:
     compile_policy: bool = True
     compile_fleet_width: int = 1024
     snapshot_compile_rows: int = 64
-    strict_target_legality: bool = False
+    strict_target_legality: bool = True
     detail_timing: bool = False
     sample_detail_timing: bool = False
 

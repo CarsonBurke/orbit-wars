@@ -83,7 +83,7 @@ rollout:
   env_backend: rust
   compile_fleet_width: 0
   snapshot_compile_rows: 64
-  strict_target_legality: false
+  strict_target_legality: true
 
 opponents:
   mode: fixed

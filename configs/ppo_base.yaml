@@ -104,7 +104,7 @@ rollout:
   compile_policy: true
   compile_fleet_width: 0
   snapshot_compile_rows: 128
-  strict_target_legality: false
+  strict_target_legality: true
 
 opponents:
   mode: no_builtins
