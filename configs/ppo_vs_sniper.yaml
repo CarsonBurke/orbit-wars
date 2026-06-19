@@ -103,8 +103,8 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 1024            # parallel envs
-  games_per_env_per_update: 1  # 1024 full games per PPO update
+  num_envs: 128             # parallel envs
+  games_per_env_per_update: 1  # 128 full games per PPO update
   num_workers: 0            # only used by numpy_mp
   env_backend: rust
   compile_fleet_width: 0

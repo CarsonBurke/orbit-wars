@@ -71,7 +71,7 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 1024
+  num_envs: 128
   num_workers: 0
   env_backend: rust
   compile_policy: true

@@ -98,7 +98,7 @@ ppo:
   pretrain_behavior: heuristic
 
 rollout:
-  num_envs: 1024            # parallel envs (= episodes per update)
+  num_envs: 128             # parallel envs (= episodes per update)
   num_workers: 0            # only used by numpy_mp
   env_backend: rust
   compile_policy: true
