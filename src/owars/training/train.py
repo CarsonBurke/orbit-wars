@@ -1850,7 +1850,6 @@ def _ppo_loop(
             reward_normalizer=reward_normalizer,
             include_old_log_prob=True,
         )
-        target_legal_compact = batch.get("target_legal_mask") is None
         stack_s = perf_counter() - phase_t0
 
         phase_t0 = perf_counter()
@@ -1947,14 +1946,6 @@ def _ppo_loop(
 
         phase_t0 = perf_counter()
         logger.scalars(
-            "loss",
-            {
-                "policy": log.policy_loss,
-                "value": log.value_loss,
-            },
-            update,
-        )
-        logger.scalars(
             "losses",
             {
                 "policy_loss": log.policy_loss,
@@ -1999,10 +1990,6 @@ def _ppo_loop(
                     "mean": reward_normalizer.mean,
                     "std": math.sqrt(reward_normalizer.var),
                     "count": reward_normalizer.count,
-                    "gamma": reward_normalizer.gamma,
-                    "clip": reward_normalizer.clip
-                    if reward_normalizer.clip is not None
-                    else float("nan"),
                     "reward_clip_frac": reward_normalizer.batch_clip_frac,
                     "reward_absmax_preclip": reward_normalizer.batch_reward_absmax,
                     "return_mean": float(batch["return"].mean()),
@@ -2012,7 +1999,6 @@ def _ppo_loop(
                     "return_min": float(batch["return"].min()),
                     "return_max": float(batch["return"].max()),
                     "return_absmax": float(batch["return"].abs().max()),
-                    "return_edge_frac": target_edge_mass,
                     "target_edge_mass": target_edge_mass,
                 },
                 update,
@@ -2043,29 +2029,12 @@ def _ppo_loop(
                 "rows": batch_rows,
                 "fleet_width": fleet_width,
                 "logical_minibatch_size": logical_minibatch_size,
-                "minibatch_size": logical_minibatch_size,
-                "configured_minibatch_size": cfg.optim.minibatch_size,
-            },
-            update,
-        )
-        logger.scalars(
-            "kl",
-            {
-                "approx": log.approx_kl,
-                "per_planet_approx": log.per_planet_approx_kl,
-                "ratio_clip_frac_high": log.ratio_clip_frac_high,
-                "ratio_clip_frac": log.ratio_clip_frac,
-                "log_ratio_abs_mean": log.log_ratio_abs_mean,
-                "log_ratio_abs_max": log.log_ratio_abs_max,
-                "row_log_ratio_abs_mean": log.row_log_ratio_abs_mean,
             },
             update,
         )
         logger.scalars(
             "policy",
             {
-                "entropy": log.entropy,
-                "action_entropy": log.target_entropy,
                 "target_entropy": log.target_entropy,
                 "fraction_entropy": log.fraction_entropy,
                 "target_confidence": log.target_confidence,
@@ -2081,7 +2050,6 @@ def _ppo_loop(
                 "launch_log_std_mean": log.launch_log_std_mean,
                 "launch_score_mean": log.launch_score_mean,
                 "action_logit_softcap": log.action_logit_softcap,
-                "raw_advantage_abs_mean": float(batch["raw_advantage_abs_mean"]),
             },
             update,
         )
@@ -2129,43 +2097,16 @@ def _ppo_loop(
             historical_log_names = pool.historical_snapshot_names("log")
             historical_recent_names = pool.historical_snapshot_names("recent_eviction")
             historical_notable_names = pool.historical_snapshot_names("notable")
-            historical_archive_capacity = float(cfg.opponents.historical_training_archive_size)
-            historical_recent_capacity = (
-                pool.recent_eviction_archive_size
-                if isinstance(pool, NoBuiltinTrainingPool)
-                else cfg.opponents.recent_eviction_archive_size
-            )
-            historical_notable_capacity = (
-                pool.notable_archive_size
-                if isinstance(pool, NoBuiltinTrainingPool)
-                else cfg.opponents.notable_archive_size
-            )
-            historical_log_capacity = (
-                cfg.opponents.historical_training_archive_size
-                - int(historical_recent_capacity or 0)
-                - int(historical_notable_capacity or 0)
-            )
             active_stats = [pool.snapshot_stats(name) for name in active_names]
             learner_win_rates = [stats.learner_win_rate() for stats in active_stats]
             games_vs_current = [stats.games_vs_current for stats in active_stats]
             league_metrics.update(
                 {
                     "pool_size": float(len(active_names)),
-                    "active_pool_size": float(len(active_names)),
                     "historical_archive_size": float(len(historical_names)),
-                    "historical_archive_count": float(len(historical_names)),
-                    "historical_archive_capacity": historical_archive_capacity,
                     "historical_log_archive_size": float(len(historical_log_names)),
-                    "historical_log_archive_count": float(len(historical_log_names)),
-                    "historical_log_archive_capacity": float(historical_log_capacity),
                     "historical_recent_eviction_size": float(len(historical_recent_names)),
-                    "historical_recent_eviction_count": float(len(historical_recent_names)),
-                    "historical_recent_eviction_capacity": float(
-                        int(historical_recent_capacity or 0)
-                    ),
                     "historical_notable_size": float(len(historical_notable_names)),
-                    "historical_notable_count": float(len(historical_notable_names)),
-                    "historical_notable_capacity": float(int(historical_notable_capacity or 0)),
                     "all_snapshot_count": float(len(pool.all_snapshot_names())),
                     "active_games_vs_current_mean": (
                         float(np.mean(games_vs_current)) if games_vs_current else 0.0
@@ -2257,33 +2198,20 @@ def _ppo_loop(
                 "bookkeeping_s": bookkeeping_s,
                 "stack_s": stack_s,
                 "batch_prepare_s": batch_prepare_s,
-                "target_legal_compact": float(target_legal_compact),
                 "old_log_prob_s": old_log_prob_s,
-                "old_log_prob_native": float(old_log_prob_native),
-                "values_native": float(values_native),
                 "ppo_s": ppo_s,
                 "metrics_s": metrics_s,
                 "logging_s": logging_s,
                 "snapshot_s": snapshot_s,
                 "learner_steps_per_s": learner_steps_per_s,
-                "end_to_end_steps_per_s": end_to_end_steps_per_s,
-            },
-            update,
-        )
-        if rollout_timings is not None:
-            logger.scalars("rollout_detail", rollout_timings, update)
-        logger.scalars(
-            "charts",
-            {
-                "SPS": end_to_end_steps_per_s,
-                "episodic_return": episodic_return,
-                "episodic_length": episodic_length,
-                "rollout_SPS": learner_steps_per_s,
                 "games_per_minute": games_per_minute,
                 "rollout_games_per_minute": len(trajs) * 60.0 / max(rollout_s, 1e-9),
             },
             update,
         )
+        if rollout_timings is not None:
+            logger.scalars("rollout_detail", rollout_timings, update)
+        logger.scalars("charts", {"SPS": end_to_end_steps_per_s}, update)
 
     final_path = Path(cfg.run.ckpt_root) / cfg.run.name / "final.pt"
     _save_ppo_checkpoint(model, final_path, reward_normalizer)
