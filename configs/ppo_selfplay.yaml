@@ -1,0 +1,116 @@
+# Self-play continuation of the validated ppo_vs_sniper fix.
+#
+# Inherits the ENTIRE learning-stability recipe validated vs sniper (rankgauss
+# off + adv-norm, cleanrl HL-Gauss critic + critic_return_norm, KL-LR controller
+# on per-planet KL @0.02, epochs_per_update=2, grad_clip 0.5, wd 0). The ONLY
+# change is the opponent mode: `fixed [sniper]` -> `league` (self-play).
+#
+# Resume from the sniper-trained weights with:
+#   PYTHONPATH=src python scripts/train.py --config configs/ppo_selfplay.yaml \
+#       --name selfplay --load checkpoints/vs_sniper_ep2/best.pt
+# `--load` loads model weights + reward normalizer only; optimizer and opponent
+# pool start fresh (the pool can't reuse the old run's fixed-sniper history).
+#
+# league mode: per opponent slot, P(self_play_prob)=0.8 plays a no-grad copy of
+# the CURRENT learner; otherwise a top-K-by-Elo frozen snapshot from the pool
+# (saved every snapshot_every updates). Snapshot diversity is the anti-collapse
+# mechanism here — too-rare snapshots let the pool go stale, too-frequent grows
+# it unbounded (top_k caps live snapshots, lowest-Elo evicted).
+#
+# Reward stays PURE potential (validated). A terminal win/loss anchor is NOT
+# added: the projected-margin potential is O(±40k) (production_weight × ~500
+# turns), so a unit win/loss reward would be dwarfed; making it bite needs scale
+# tuning that hasn't been validated. Revisit as a separate ablation.
+
+run:
+  name: ppo_selfplay
+  seed: 0
+  device: cuda
+  compile_mode: reduce-overhead
+  log_root: runs
+  ckpt_root: checkpoints
+  total_updates: 500
+
+game:
+  num_players: 2
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  dim: 128
+  ff_dim: 256
+  depth: 3
+  n_heads: 4
+  n_kv_heads: 1
+  dropout: 0.0
+  planet_rope_fraction: 0.25
+  planet_rope_base: 10000.0
+  encoder_backend: destination_conditioned
+  num_fleet_latents: 64
+  fleet_tokenizer_depth: 1
+  value_min: -8.0
+  value_max: 8.0
+  value_num_bins: 101
+  value_sigma_to_bin_ratio: 0.75
+  critic_mtp_horizon: 6
+  value_symlog: false
+  value_bucket: dreamer3
+  action_logit_softcap: 8.0
+
+optim:
+  muon_lr: 0.022
+  lr: 3.0e-4
+  head_lr: 3.0e-4
+  weight_decay: 0.0
+  grad_clip: 0.5
+  kl_lr_target: 0.02
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
+  minibatch_size: 1024
+  epochs_per_update: 2
+
+ppo:
+  gamma: 0.997
+  gae_lambda: 0.95
+  advantage_transform: none
+  norm_advantage: true
+  clip_coef: 0.2
+  clip_coef_high: 0.28
+  value_coef: 1.0
+  target_entropy_coef: 0.0
+  critic_return_norm: discounted_return_rms
+  fraction_entropy_coef: 0.0
+  pretrain_updates: 0
+  pretrain_episodes: 32
+  pretrain_lr: 1.0e-3
+  pretrain_behavior: heuristic
+
+rollout:
+  num_envs: 128
+  games_per_env_per_update: 1
+  num_workers: 0
+  env_backend: rust
+  compile_fleet_width: 0
+  snapshot_compile_rows: 64
+  strict_target_legality: true
+
+opponents:
+  mode: league
+  fixed_opponents: [sniper]   # ignored in league mode; kept for reference
+  snapshot_every: 25          # save a frozen snapshot to the pool every 25 updates
+  top_k: 10                   # max live snapshots; lowest-Elo evicted past this
+  self_play_prob: 0.8         # P(opponent slot = current learner) per slot
+  snapshot_device: train
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+reward:
+  signal: projected_margin
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
+  draw_value: 0.0
+  margin_scale: 0.0
