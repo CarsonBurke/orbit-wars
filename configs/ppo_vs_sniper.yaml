@@ -1,14 +1,36 @@
-# PPO fixed-opponent config: train only against the tuned sniper_v17 bot.
+# PPO fixed-opponent config: train against the static `sniper` bot.
 #
 # 2-player PPO config.
 #
-# Defaults baked in:
-#   - CleanRL clip-higher surrogate with `clip_coef = 0.2`,
-#     `clip_coef_high = 0.28`, rank-Gaussian policy advantages, and
-#     minibatch advantage normalization.
-#   - Dense reward = delta of raw projected population margin.
-#   - Conventional GAE: γ = 0.997, λ = 0.95.
-#   - Distributional value head (Dreamer3 HL-Gauss CE on normalized returns / 255 bins), unclipped.
+# LEARNING-REGRESSION FIX (validated 2026-06-19). Training had stopped learning:
+# margin worsened and approx_kl exploded to 1000+. Root cause was the interaction
+# between `rankgauss` advantage shaping and a well-fit distributional critic over
+# a (near-)policy-invariant potential reward:
+#   - The dense reward is the per-step delta of the projected-margin POTENTIAL.
+#     It is only approximately policy-invariant (it uses an undiscounted phi'-phi
+#     while GAE discounts at gamma=0.997, so a small (1-gamma) residual remains as
+#     the genuine learnable signal), but a well-fit critic still cancels most of
+#     it, leaving a near-zero advantage that is mostly NOISE.
+#   - `rankgauss` maps advantages to unit-Gaussian quantiles BY RANK ONLY,
+#     discarding magnitude, so it rescales that noise residual to a full-confidence
+#     gradient. It also makes the per-update step size independent of LR, which
+#     left the KL-adaptive LR controller powerless. -> KL blowup, divergence.
+#
+# Fix: disable rankgauss and rely on plain minibatch advantage NORMALIZATION
+# (CleanRL base PPO). Whitening is NOT magnitude-immune in absolute terms, but it
+# preserves RELATIVE magnitudes within the batch, so a coherent signal accumulates
+# across minibatches/epochs while zero-mean noise cancels; and crucially it
+# restores the LR->step-size coupling, so the per-planet-KL LR controller (target
+# 0.02) can actually contain the trust region. Paired with a well-calibrated
+# symlog HL-Gauss critic (cleanrl dg_beta_v6 style) and epochs_per_update=2 (see
+# optim). Validated vs `sniper` over 400 updates: win_rate 0.016 -> ~0.89 (stable),
+# margin -5011 -> +5500 (stable), full-row approx_kl bounded ~0.08, EV ~0.86.
+#
+# NOTE on opponent: this learns against the beatable `sniper` (the untrained
+# policy already wins ~1.6% -> a bootstrap toehold). Against `sniper_v17` the
+# untrained policy wins 0.000, so it cannot bootstrap (no toehold -> stationary
+# returns -> critic over-fits to EV~0.997 -> no signal); reaching sniper_v17 needs
+# a curriculum (warm-start vs sniper first), not just this config.
 
 run:
   name: ppo_vs_sniper
@@ -43,9 +65,18 @@ model:
   encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
+  # cleanrl dg_beta_v6 HL-Gauss critic style: symlog distributional head, 101
+  # bins, sigma 0.75 of a bin width. dreamer3 bucket symlogs internally, so
+  # value_symlog MUST be false. Paired with critic_return_norm below, which
+  # normalizes returns to ~unit so they sit inside the support; the support is
+  # intentionally generous (±8 symlog-coord) rather than tightly matched — the
+  # resulting coarse resolution keeps the critic honestly under-resolved (EV
+  # settles ~0.86, not ~0.997), which preserves a usable advantage residual.
+  # A tighter support (±3-±4) is a sharper-critic ablation worth trying ONLY
+  # alongside a real terminal reward (see reward block).
   value_min: -8.0
   value_max: 8.0
-  value_num_bins: 255
+  value_num_bins: 101
   value_sigma_to_bin_ratio: 0.75
   critic_mtp_horizon: 6
   value_symlog: false
@@ -55,49 +86,64 @@ model:
 optim:
   # Muon (transformer block matrix params). Matches parameter-golf
   # `matrix_lr=0.022`.
-  # `muon_weight_decay` left at 0 — pg uses heavy WD because LM training is
-  # stationary; PPO is non-stationary (each update sees a new behavior
-  # distribution) and WD would bias the policy toward pre-update weights
-  # in a way the importance ratio doesn't account for.
-  muon_lr: 0.022   # parameter-golf's `matrix_lr` exactly.
+  muon_lr: 0.022
   # AdamW (input projections, task heads, biases, tokens).
   lr: 3.0e-4
   head_lr: 3.0e-4
-  kl_lr_target: 0.025
+  # No weight decay: PPO is non-stationary (each update sees a new behavior
+  # distribution), so AdamW WD would bias the policy toward stale pre-update
+  # weights in a way the importance ratio doesn't account for.
+  weight_decay: 0.0
+  grad_clip: 0.5   # actor and critic flows are clipped separately, including
+                   # each flow's task head plus shared-trunk components.
+  # KL-adaptive LR controller on per-planet KL (the per-source-planet factorized
+  # action's natural unit; full-row KL would couple the trust region to how many
+  # planets a player owns). EFFECTIVE only with rankgauss disabled, since then
+  # the per-update step scales with LR. Target 0.02 keeps the trust region tight.
+  # With epochs_per_update=2 the natural per-planet KL runs well below target
+  # (~0.005), so the controller lifts the LR scale toward max — the trust region
+  # is comfortable and full-row KL stays ~0.08.
+  kl_lr_target: 0.02
   kl_lr_ema_half_life: 20.0
   kl_lr_min_scale: 0.1
   kl_lr_max_scale: 10.0
-  weight_decay: 1.0e-4
-  grad_clip: 1.0   # actor and critic flows are clipped separately, including
-                   # each flow's task head plus shared-trunk components.
   # Fixed minibatch SIZE (no minibatch_count) so every optimizer step has the
-  # same leading dim across updates. `n` is the sum of full-episode trajectory
-  # lengths and swings widely per update, so a fixed COUNT would give a
-  # per-update-variable `ceil(n/count)` size — under `reduce-overhead` each new
-  # shape records a fresh CUDA-graph memory pool that is never freed, leaking
-  # VRAM and stalling on recompiles. A fixed size pads the tail to one constant
-  # shape, so a single cudagraph is captured once and replayed every update.
+  # same leading dim across updates — under `reduce-overhead` a variable shape
+  # records a fresh CUDA-graph pool that never frees, leaking VRAM.
   minibatch_size: 1024
-  epochs_per_update: 4
+  # 2, not 4. At 4 epochs the actor over-steps within an update: the joint
+  # (full-row) approx_kl spiked to 10-12 late in training and eroded a peak
+  # win-rate of 0.55 back down to ~0.37. Halving epochs bounds within-update
+  # drift -> full-row KL max drops to ~0.08, per-planet KL to ~0.005, and
+  # win-rate climbs monotonically to ~0.89 and HOLDS over 400 updates (margin
+  # -5011 -> +5500). This mirrors the cleanrl recipe's single-actor-epoch trust
+  # region. (A proper actor/critic epoch split — few actor, more critic — is the
+  # next refinement if more critic refit is ever needed.)
+  epochs_per_update: 2
 
 ppo:
   gamma: 0.997
   gae_lambda: 0.95
-  advantage_transform: rankgauss
+  # Disable rankgauss; keep CleanRL-base minibatch advantage normalization.
+  # rankgauss rescales a vanishing-potential noise residual to a full-confidence
+  # gradient AND decouples the step from LR (defeating the KL controller); plain
+  # whitening preserves relative magnitude so coherent signal survives and noise
+  # averages out, and keeps LR load-bearing.
+  advantage_transform: none
   norm_advantage: true
   clip_coef: 0.2
   clip_coef_high: 0.28
-  value_coef: 1.0               # distributional CE has bounded gradients; dreamer4 effectively runs at 1.0 via separate value_optim
-
+  value_coef: 1.0               # distributional CE has bounded gradients; the
+                                # actor/critic flows are clipped separately so the
+                                # critic CE can run at full weight.
   target_entropy_coef: 0.0      # no explicit entropy bonus; exploration comes from stochastic sampling
+  # Normalize returns to ~unit (orbit-wars analog of cleanrl's env reward
+  # normalization) so they land inside the symlog value support and the critic
+  # calibrates well.
   critic_return_norm: discounted_return_rms
-  critic_return_norm_clip: 10.0
   fraction_entropy_coef: 0.0
-  pretrain_updates: 0   # PMA critic token gives the value head a dedicated
-                        # representation, and pretraining against `heuristic`
-                        # warms V on a state distribution PPO immediately
-                        # leaves. Cold-start pain is brief; the wallclock cost
-                        # of pretraining wasn't paying for itself.
+  pretrain_updates: 0   # cold-start pain is brief; pretraining wasn't paying for
+                        # its wallclock.
   pretrain_episodes: 32
   pretrain_lr: 1.0e-3
   pretrain_behavior: heuristic
@@ -113,7 +159,7 @@ rollout:
 
 opponents:
   mode: fixed
-  fixed_opponents: [sniper_v17]
+  fixed_opponents: [sniper]
   snapshot_device: train
   snapshot_every: 1   # ignored in fixed mode
   top_k: 10           # ignored in fixed mode
@@ -122,6 +168,13 @@ opponents:
   k_factor: 32.0
 
 reward:
+  # Pure potential shaping (validated). The dense projected-margin potential is
+  # the only reward; with the fix above it learns well vs sniper. A real terminal
+  # anchor (win_value/loss_value, optional margin_scale) is the recommended
+  # de-risking for LONG (1000-update) runs and a sharper critic — it is the one
+  # term a well-fit critic cannot cancel — but it is inert when win-rate is ~0
+  # (e.g. cold-starting vs sniper_v17), so it must be paired with a beatable
+  # opponent or curriculum.
   signal: projected_margin
   potential_weight: 1.0
   production_weight: 1.0
