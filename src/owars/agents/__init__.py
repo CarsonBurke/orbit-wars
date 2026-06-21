@@ -19,6 +19,7 @@ from .sniper import (
     sniper_v15_agent,
     sniper_v16_agent,
     sniper_v17_agent,
+    sniper_v18_agent,
 )
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "sniper_v15_agent",
     "sniper_v16_agent",
     "sniper_v17_agent",
+    "sniper_v18_agent",
 ]
 
 

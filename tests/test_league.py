@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from owars.agents.sniper import sniper_agent
+from owars.agents.sniper import sniper_v18_agent
 from owars.policies.config import OrbitPolicyConfig
 from owars.policies.model import OrbitPolicy, normalize_matrices
 from owars.training.elo import EloTracker
@@ -157,10 +157,11 @@ def test_new_snapshot_inherits_learner_rating(tmp_path: Path):
 
 
 def test_fixed_opponent_pool_samples_static_builtin():
+    # "sniper" is the default and resolves to sniper_v18_agent.
     pool = FixedOpponentPool(["sniper"], rng=random.Random(0))
     slots = pool.sample(8)
     assert all(s.name == "sniper" for s in slots)
-    assert all(s.agent is sniper_agent for s in slots)
+    assert all(s.agent is sniper_v18_agent for s in slots)
     assert pool.snapshot_names() == []
 
 

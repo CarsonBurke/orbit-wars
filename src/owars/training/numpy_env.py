@@ -430,6 +430,7 @@ class NumpyOrbitWarsEnv:
         return {
             "remainingOverageTime": 60,
             "step": self._step,
+            "episode_steps": self.cfg.episode_steps,
             "planets": [_planet_row_to_list(row) for row in self.planets],
             "fleets": [_fleet_row_to_list(row) for row in self.fleets],
             "fleet_targets": _fleet_target_metadata(self.fleets),
@@ -1375,6 +1376,7 @@ class NumpyVecEnv:
         return {
             "remainingOverageTime": 60,
             "step": int(self.step_count[idx]),
+            "episode_steps": int(self.episode_steps),
             "planets": [
                 _planet_row_to_list(row)
                 for row in self.planets[idx, self.planet_mask[idx]]

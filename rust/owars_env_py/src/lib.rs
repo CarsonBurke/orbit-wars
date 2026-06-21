@@ -104,6 +104,7 @@ struct SniperProfile {
     global_assignment: bool,
     strict_defense: bool,
     shadow_capture: bool,
+    use_oracle_forecast: bool,
 }
 
 fn default_sniper_profile() -> SniperProfile {
@@ -142,6 +143,7 @@ fn default_sniper_profile() -> SniperProfile {
         global_assignment: false,
         strict_defense: false,
         shadow_capture: false,
+        use_oracle_forecast: false,
     }
 }
 
@@ -198,6 +200,8 @@ fn sniper_profile_from_dict(profile: &Bound<'_, PyDict>) -> PyResult<SniperProfi
     out.global_assignment = dict_bool(profile, "global_assignment", out.global_assignment)?;
     out.strict_defense = dict_bool(profile, "strict_defense", out.strict_defense)?;
     out.shadow_capture = dict_bool(profile, "shadow_capture", out.shadow_capture)?;
+    out.use_oracle_forecast =
+        dict_bool(profile, "use_oracle_forecast", out.use_oracle_forecast)?;
     Ok(out)
 }
 
@@ -2989,7 +2993,8 @@ fn parse_env_actions(obj: &Bound<'_, PyAny>, num_players: usize) -> PyResult<Vec
 
 fn builtin_action_fn(name: &str) -> PyResult<fn(&Game, usize) -> PlayerAction> {
     match name {
-        "sniper" => Ok(sniper_actions),
+        // "sniper" is the default and resolves to the oracle-forecast v18.
+        "sniper" => Ok(sniper_v18_actions),
         "sniper_v2" => Ok(sniper_v2_actions),
         "sniper_v3" => Ok(sniper_v3_actions),
         "sniper_v4" => Ok(sniper_v4_actions),
@@ -3006,6 +3011,7 @@ fn builtin_action_fn(name: &str) -> PyResult<fn(&Game, usize) -> PlayerAction> {
         "sniper_v15" => Ok(sniper_v15_actions),
         "sniper_v16" => Ok(sniper_v16_actions),
         "sniper_v17" => Ok(sniper_v17_actions),
+        "sniper_v18" => Ok(sniper_v18_actions),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unsupported native builtin opponent: {name}"
         ))),
@@ -3647,6 +3653,44 @@ fn sniper_v17_actions(game: &Game, player: usize) -> PlayerAction {
     )
 }
 
+fn sniper_v18_actions(game: &Game, player: usize) -> PlayerAction {
+    // sniper_v17's GA-tuned strategy verbatim, but with the canonical destination
+    // oracle driving fleet-pressure forecasting (see `oracle_fleet_pressure`).
+    scored_sniper_actions(
+        game,
+        player,
+        SniperProfile {
+            reserve_base: 0,
+            reserve_production: 0.35,
+            send_buffer: 1,
+            enemy_growth: true,
+            enemy_value: 3.55,
+            neutral_value: 1.45,
+            production_weight: 4.7243564847164325,
+            ship_cost_weight: 0.66,
+            time_cost_weight: 0.34358831285363617,
+            duplicate_penalty: 0.20,
+            net_defense_reserve: true,
+            defense_horizon: 41.30069766848027,
+            reinforce_owned: true,
+            defense_arrival_slack: 1.0,
+            defense_score_weight: 13.0,
+            chronological_forecast: true,
+            comet_max_eta: Some(5.067770406031305),
+            counter_recapture: true,
+            recapture_min_gap: 0.5,
+            recapture_max_gap: 14.0,
+            recapture_score_weight: 8.52469036246334,
+            recapture_gap_cost: 0.24472159101961058,
+            speed_bid: false,
+            speed_bid_max_factor: 1.2770669321193258,
+            speed_bid_tempo_weight: 0.47561154430408675,
+            use_oracle_forecast: true,
+            ..default_sniper_profile()
+        },
+    )
+}
+
 fn scored_sniper_actions(game: &Game, player: usize, profile: SniperProfile) -> PlayerAction {
     let player = player as i32;
     let mut targets = game
@@ -3699,7 +3743,11 @@ fn scored_sniper_actions(game: &Game, player: usize, profile: SniperProfile) -> 
         return Vec::new();
     }
 
-    let pressure = fleet_pressure(game, &blockers);
+    let pressure = if profile.use_oracle_forecast {
+        oracle_fleet_pressure(game)
+    } else {
+        fleet_pressure(game, &blockers)
+    };
     let mut planned_by_target: HashMap<usize, Vec<(f64, i32)>> = HashMap::new();
     let mut moves = Vec::new();
     if profile.global_assignment {
@@ -4684,6 +4732,37 @@ fn fleet_pressure(game: &Game, blockers: &[Option<TargetMotion>]) -> Vec<Vec<Pre
     pressure
 }
 
+/// Fleet pressure built from the canonical, simulator-exact destination oracle.
+///
+/// Same shape as `fleet_pressure` (one entry list per planet row, sorted by eta),
+/// but resolves destinations with `oracle::infer_fleet_destinations`, which correctly
+/// drops fleets that hit the sun, leave the board, or expire at the horizon, and
+/// tracks comet/orbital motion. `dest_idx` is already a planet row index. Only fleets
+/// that land on a planet (`STATUS_PLANET`) contribute pressure, mirroring the legacy
+/// builder which skips every non-hitting fleet.
+fn oracle_fleet_pressure(game: &Game) -> Vec<Vec<PressureEntry>> {
+    let mut pressure = vec![Vec::new(); game.planets.len()];
+    let dests = oracle::infer_fleet_destinations(game, game.fleets.len());
+    for (fleet, dest) in game.fleets.iter().zip(dests.iter()) {
+        if dest.status != oracle::STATUS_PLANET {
+            continue;
+        }
+        pressure[dest.dest_idx as usize].push(PressureEntry {
+            eta: dest.eta,
+            owner: fleet.owner,
+            ships: fleet.ships,
+        });
+    }
+    for entries in &mut pressure {
+        entries.sort_by(|a, b| {
+            a.eta
+                .partial_cmp(&b.eta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    pressure
+}
+
 fn inferred_fleet_target(
     game: &Game,
     fleet: &owars_env::Fleet,
@@ -4771,6 +4850,7 @@ fn observation_dict<'py>(
     let obs = PyDict::new(py);
     obs.set_item("remainingOverageTime", 60)?;
     obs.set_item("step", game.step)?;
+    obs.set_item("episode_steps", game.episode_steps)?;
     obs.set_item("player", player)?;
     obs.set_item("planets", planet_rows_list(py, game)?)?;
     obs.set_item("fleets", fleet_rows_list(py, game)?)?;

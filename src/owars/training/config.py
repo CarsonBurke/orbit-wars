@@ -339,7 +339,7 @@ class SACCfg:
     # Mixing in fixed baselines is the guard against self-play strategy collapse
     # (see AGENTS.md "Self-play strategy collapse").
     builtin_opponents: list[str] = field(
-        default_factory=lambda: ["random", "sniper_v17", "heuristic"]
+        default_factory=lambda: ["random", "sniper_v18", "heuristic"]
     )
     builtin_prob: float = 0.5
 
@@ -388,7 +388,7 @@ class OpponentsCfg:
     """
 
     mode: Literal["league", "fixed", "no_builtins"] = "league"
-    fixed_opponents: list[str] = field(default_factory=lambda: ["sniper_v17"])
+    fixed_opponents: list[str] = field(default_factory=lambda: ["sniper_v18"])
     snapshot_every: int = 25      # save a frozen snapshot for the pool every N updates
     top_k: int = 10               # max live snapshots; lowest-Elo evicted past this
     self_play_prob: float = 0.8   # P(opponent slot = current learner) per slot

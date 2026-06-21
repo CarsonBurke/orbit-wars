@@ -993,7 +993,7 @@ def _infer_fleet_target_planet_idx(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     from ..game.destination_oracle import infer_fleet_destinations
 
-    return infer_fleet_destinations(o, max_fleets=len(o.fleets))
+    return infer_fleet_destinations(o, episode_steps=o.episode_steps, max_fleets=len(o.fleets))
 
 
 def _infer_fleet_target_planet_idx_raw(
@@ -1011,7 +1011,9 @@ def _infer_fleet_target_planet_idx_raw(
             np.zeros(n, dtype=np.float64),
             np.zeros(n, dtype=np.int64),
         )
-    return infer_fleet_destinations(parsed, max_fleets=len(parsed.fleets))
+    return infer_fleet_destinations(
+        parsed, episode_steps=parsed.episode_steps, max_fleets=len(parsed.fleets)
+    )
 
 
 def _tensor_from_numpy(

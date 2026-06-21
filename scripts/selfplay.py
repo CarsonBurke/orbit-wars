@@ -6,13 +6,20 @@ from __future__ import annotations
 
 import argparse
 
-from owars.agents import HeuristicAgent, random_agent, sniper_agent, sniper_v17_agent
+from owars.agents import (
+    HeuristicAgent,
+    random_agent,
+    sniper_v17_agent,
+    sniper_v18_agent,
+)
 from owars.agents.learned import LearnedAgent
 
 REGISTRY = {
     "random": lambda _: random_agent,
-    "sniper": lambda _: sniper_agent,
+    # "sniper" is the default (v18).
+    "sniper": lambda _: sniper_v18_agent,
     "sniper_v17": lambda _: sniper_v17_agent,
+    "sniper_v18": lambda _: sniper_v18_agent,
     "heuristic": lambda _: HeuristicAgent(),
     "learned": lambda ckpt: LearnedAgent(ckpt),
 }
@@ -21,7 +28,7 @@ REGISTRY = {
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--p0", default="heuristic")
-    p.add_argument("--p1", default="sniper_v17")
+    p.add_argument("--p1", default="sniper_v18")
     p.add_argument("--p0-ckpt", default=None)
     p.add_argument("--p1-ckpt", default=None)
     p.add_argument("--episodes", type=int, default=10)

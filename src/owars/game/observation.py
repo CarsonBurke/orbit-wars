@@ -24,6 +24,10 @@ class Observation:
     comet_planet_ids: set[int]
     comets: list[dict[str, Any]] = field(default_factory=list)
     remaining_overage_time: float = 0.0
+    # Total episode length. Defaults to the competition's fixed 500 when the obs
+    # does not carry it; the destination oracle uses it to size its lookahead so
+    # Python forecasts match the simulator exactly at any episode length.
+    episode_steps: int = 500
     raw: dict[str, Any] | None = None
 
     def my_planets(self) -> list[Planet]:
@@ -62,5 +66,6 @@ def parse_observation(obs: Any) -> Observation:
         comet_planet_ids=set(_get(obs, "comet_planet_ids", []) or []),
         comets=list(_get(obs, "comets", []) or []),
         remaining_overage_time=float(_get(obs, "remainingOverageTime", 0.0) or 0.0),
+        episode_steps=int(_get(obs, "episode_steps", 500) or 500),
         raw=obs if isinstance(obs, dict) else None,
     )

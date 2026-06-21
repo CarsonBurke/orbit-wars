@@ -1,7 +1,7 @@
 # PPO vs. a fixed sniper opponent — low-noise, stationary baseline.
 #
 # Same model / optim / reward as `ppo_base`, but matchmaking is `mode: fixed`
-# against the tuned builtin `sniper_v17`: no self-play, no snapshot pool. This is the
+# against the tuned builtin `sniper_v18`: no self-play, no snapshot pool. This is the
 # low-variance setting for measuring learner progress against a stationary
 # opponent (see OpponentsCfg docstring). Train from scratch — pass no `--load`.
 
@@ -120,7 +120,7 @@ rollout:
 opponents:
   mode: fixed              # stationary: no self-play, no snapshot pool
   fixed_opponents:
-    - sniper_v17
+    - sniper_v18
   # snapshot_every / top_k / self_play_prob are ignored in fixed mode.
   snapshot_device: train
   initial_rating: 1500.0

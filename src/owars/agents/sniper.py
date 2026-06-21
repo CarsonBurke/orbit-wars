@@ -8,10 +8,11 @@ teaching the learner to exploit missed shots.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-from ..game import distance, fleet_speed, parse_observation
+from ..game import distance, fleet_speed, infer_fleet_destinations, parse_observation
+from ..game.destination_oracle import STATUS_PLANET
 from ..game.geometry import line_circle_intersects
 from ..game.types import CENTER, ROTATION_RADIUS_LIMIT, Fleet, Planet
 from ..policies.sampling import (
@@ -100,6 +101,7 @@ class _SniperProfile:
     global_assignment: bool = False
     strict_defense: bool = False
     shadow_capture: bool = False
+    use_oracle_forecast: bool = False
 
 
 _SNIPER_V2 = _SniperProfile(
@@ -411,6 +413,13 @@ _SNIPER_V17 = _SniperProfile(
 )
 
 
+# sniper_v18 == sniper_v17's GA-tuned strategy verbatim, but its fleet "pressure"
+# forecast is driven by the canonical, simulator-exact destination oracle instead
+# of the legacy brute-force scan (which ignores sun collisions, board exits, comet
+# motion, and caps the horizon). See `_oracle_fleet_pressure`.
+_SNIPER_V18 = replace(_SNIPER_V17, use_oracle_forecast=True)
+
+
 def sniper_v2_agent(obs: Any) -> list[list]:
     """Production-aware value sniper.
 
@@ -512,6 +521,12 @@ def sniper_v17_agent(obs: Any) -> list[list]:
     return _scored_sniper(obs, _SNIPER_V17)
 
 
+def sniper_v18_agent(obs: Any) -> list[list]:
+    """sniper_v17 strategy with oracle-driven fleet-destination forecasting."""
+
+    return _scored_sniper(obs, _SNIPER_V18)
+
+
 def _scored_sniper(obs: Any, profile: _SniperProfile) -> list[list]:
     o = parse_observation(obs)
     targets = o.enemy_planets() + o.neutral_planets()
@@ -523,7 +538,7 @@ def _scored_sniper(obs: Any, profile: _SniperProfile) -> list[list]:
     if profile.source_order == "ships":
         my_planets = sorted(my_planets, key=lambda p: (p.ships, p.production), reverse=True)
     planned_by_target: dict[int, list[tuple[float, int]]] = {}
-    pressure = _fleet_pressure(o)
+    pressure = _oracle_fleet_pressure(o) if profile.use_oracle_forecast else _fleet_pressure(o)
     moves: list[list] = []
     if profile.global_assignment:
         used_sources: set[int] = set()
@@ -1230,6 +1245,28 @@ def _defensive_reserve(
         produced = int(math.floor(max(0.0, arrival) * production))
         needed = max(needed, hostile - friendly - produced + 1)
     return max(0, needed)
+
+
+def _oracle_fleet_pressure(o) -> dict[int, list[tuple[float, int, int]]]:
+    """Fleet pressure built from the canonical destination oracle.
+
+    Same contract as `_fleet_pressure` (``{planet_id: [(eta, owner, ships), ...]}``)
+    but resolves every fleet's destination with `infer_fleet_destinations`, which is
+    bit-identical to the simulator: it correctly drops fleets that hit the sun, leave
+    the board, or expire at the horizon, and tracks comet/orbital motion. Only fleets
+    that land on a planet (``STATUS_PLANET``) contribute pressure, mirroring the legacy
+    forecaster which skips every non-hitting fleet. Assumes default ship speed (the
+    observation carries none); this matches `_inferred_fleet_target`.
+    """
+
+    pressure: dict[int, list[tuple[float, int, int]]] = {int(p.id): [] for p in o.planets}
+    dest_idx, eta, status = infer_fleet_destinations(o, episode_steps=o.episode_steps)
+    for slot, fleet in enumerate(o.fleets):
+        if int(status[slot]) != STATUS_PLANET:
+            continue
+        target_id = int(o.planets[int(dest_idx[slot])].id)
+        pressure[target_id].append((float(eta[slot]), int(fleet.owner), int(fleet.ships)))
+    return pressure
 
 
 def _fleet_pressure(o) -> dict[int, list[tuple[float, int, int]]]:

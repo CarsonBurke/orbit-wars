@@ -220,6 +220,7 @@ def main() -> None:
             "sniper_v14",
             "sniper_v15",
             "sniper_v17",
+            "sniper_v18",
         ],
         help="Native builtin bots to benchmark.",
     )

@@ -445,6 +445,7 @@ class RustVecEnv:
             "sniper_v15",
             "sniper_v16",
             "sniper_v17",
+            "sniper_v18",
         }
     )
 

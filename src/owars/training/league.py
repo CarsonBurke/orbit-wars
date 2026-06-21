@@ -29,7 +29,6 @@ from ..agents.heuristic import heuristic_agent
 from ..agents.learned import LearnedAgent
 from ..agents.random_agent import random_agent
 from ..agents.sniper import (
-    sniper_agent,
     sniper_v2_agent,
     sniper_v3_agent,
     sniper_v4_agent,
@@ -46,6 +45,7 @@ from ..agents.sniper import (
     sniper_v15_agent,
     sniper_v16_agent,
     sniper_v17_agent,
+    sniper_v18_agent,
 )
 from ..policies.model import OrbitPolicy
 from .elo import EloTracker
@@ -56,7 +56,9 @@ LEARNER_NAME = "learner"
 
 BUILTIN: dict[str, AgentFn] = {
     "random": random_agent,
-    "sniper": sniper_agent,
+    # "sniper" is the default: sniper_v17's strategy with oracle-driven forecasting
+    # (see sniper_v18_agent).
+    "sniper": sniper_v18_agent,
     "sniper_v2": sniper_v2_agent,
     "sniper_v3": sniper_v3_agent,
     "sniper_v4": sniper_v4_agent,
@@ -73,6 +75,7 @@ BUILTIN: dict[str, AgentFn] = {
     "sniper_v15": sniper_v15_agent,
     "sniper_v16": sniper_v16_agent,
     "sniper_v17": sniper_v17_agent,
+    "sniper_v18": sniper_v18_agent,
     "heuristic": heuristic_agent,
 }
 

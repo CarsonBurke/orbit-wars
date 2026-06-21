@@ -172,8 +172,8 @@ sac:
   grad_clip: 10.0
   log_metrics_every: 100
   snapshot_every: 25000
-  # Ignored because opponents.mode=fixed below forces [sniper_v17] every episode.
-  builtin_opponents: [random, sniper_v17, heuristic]
+  # Ignored because opponents.mode=fixed below forces [sniper_v18] every episode.
+  builtin_opponents: [random, sniper_v18, heuristic]
   builtin_prob: 0.5
 
 rollout:
@@ -187,7 +187,7 @@ rollout:
 
 opponents:
   mode: fixed
-  fixed_opponents: [sniper_v17]
+  fixed_opponents: [sniper_v18]
   snapshot_device: train
   snapshot_every: 1       # ignored in fixed mode
   top_k: 8                # ignored in fixed mode

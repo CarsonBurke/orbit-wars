@@ -21,7 +21,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from owars.agents import HeuristicAgent, random_agent, sniper_agent
+from owars.agents import (
+    HeuristicAgent,
+    random_agent,
+    sniper_agent,
+    sniper_v18_agent,
+)
 from owars.agents.learned import LearnedAgent
 from owars.agents.sac_agent import SACAgent
 
@@ -128,7 +133,12 @@ def _agent_factory(
         )
     if name == "heuristic":
         return HeuristicAgent()
-    if name in {"sniper", "bot"}:
+    if name == "sniper":
+        # Tracks the training/league default sniper (currently v18, the
+        # oracle-backed bot). Render against what we actually train against.
+        return sniper_v18_agent
+    if name == "bot":
+        # The weak competition starter bot, kept reachable as a sanity baseline.
         return sniper_agent
     if name == "random":
         return random_agent
@@ -178,7 +188,8 @@ def _parser() -> argparse.ArgumentParser:
         "--opponent",
         choices=("heuristic", "sniper", "bot", "random", "learned"),
         default="learned",
-        help="Opponent agent. 'bot' is an alias for the competition sniper starter bot.",
+        help="Opponent agent. 'sniper' is the strong league-default sniper (v18); "
+        "'bot' is the weak competition starter bot.",
     )
     parser.add_argument("--opponent-ckpt", type=Path, default=None)
     parser.add_argument("--num-players", type=int, choices=(2, 4), default=2)

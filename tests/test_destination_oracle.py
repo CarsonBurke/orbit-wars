@@ -407,6 +407,44 @@ def test_python_oracle_matches_rust_bindings_bit_exactly(seed: int, step: int):
 
 
 @requires_cargo
+@pytest.mark.parametrize("episode_steps", [60, 120])
+@pytest.mark.parametrize("seed", range(6))
+def test_observation_episode_steps_threads_into_oracle(seed: int, episode_steps: int):
+    # Regression for the v18 oracle-forecast sniper: the destination-oracle
+    # lookahead is `episode_steps - 1 - step`, so the Python oracle must learn the
+    # true episode length from the observation rather than assuming the default
+    # 500. Deep into a short episode the horizon is tiny; if the obs did not carry
+    # `episode_steps`, the Python oracle (horizon ~500) would diverge from the Rust
+    # oracle (true short horizon) for any fleet whose impact lies beyond it.
+    _build_rust_extension()
+    from owars.training.rust_env import RustVecEnv
+
+    step = episode_steps - 12  # deep enough that the horizon truncates far fleets
+    obs = _random_obs_dict(seed, step)
+    obs["episode_steps"] = episode_steps
+
+    # The observation length flows through parse_observation.
+    parsed = parse_observation(obs)
+    assert parsed.episode_steps == episode_steps
+
+    rust = RustVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=episode_steps,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    rust._core.load_observation(0, obs)
+    rust_out = rust._core.fleet_destination_oracle([(0, 0)])
+
+    n = len(obs["fleets"])
+    dest, eta, status = infer_fleet_destinations(parsed, episode_steps=parsed.episode_steps)
+    np.testing.assert_array_equal(rust_out["dest_idx"][0, :n], dest)
+    np.testing.assert_array_equal(rust_out["eta"][0, :n], eta)
+    np.testing.assert_array_equal(rust_out["status"][0, :n], status)
+
+
+@requires_cargo
 def test_python_oracle_matches_rust_with_empty_initial_planets():
     # The binding falls back to current planets when initial_planets is
     # empty; the Python oracle must rotate the same planets.

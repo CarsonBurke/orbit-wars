@@ -13,8 +13,8 @@ def test_load_default():
     assert cfg.game.num_players == 2
     assert cfg.game.train_num_players == [2]
     assert cfg.model.depth == 3
-    assert cfg.opponents.fixed_opponents == ["sniper_v17"]
-    assert cfg.sac.builtin_opponents == ["random", "sniper_v17", "heuristic"]
+    assert cfg.opponents.fixed_opponents == ["sniper_v18"]
+    assert cfg.sac.builtin_opponents == ["random", "sniper_v18", "heuristic"]
 
 
 def test_unknown_key_raises():
@@ -170,7 +170,7 @@ def test_no_builtins_opponent_mode_loads():
     assert cfg.opponents.historical_archive_prob == 0.3
     assert cfg.opponents.active_sample_panel_size == 8
     assert cfg.opponents.historical_sample_panel_size == 8
-    assert cfg.opponents.fixed_opponents == ["sniper_v17"]
+    assert cfg.opponents.fixed_opponents == ["sniper_v18"]
 
 
 def test_no_builtins_opponent_mode_rejects_builtin_value_pretraining():
@@ -390,16 +390,17 @@ def test_learned_configs_use_conventional_gae():
 
 
 def test_sniper_training_configs_load():
-    for path in (
-        "configs/ppo_sniper.yaml",
-        "configs/ppo_sniper_oldblock.yaml",
-        "configs/ppo_vs_sniper.yaml",
-        "configs/sac_vs_sniper.yaml",
-    ):
+    expected = {
+        "configs/ppo_sniper.yaml": ["sniper_v18"],
+        "configs/ppo_sniper_oldblock.yaml": ["sniper_v17"],
+        "configs/ppo_vs_sniper.yaml": ["sniper"],
+        "configs/sac_vs_sniper.yaml": ["sniper_v18"],
+    }
+    for path, fixed_opponents in expected.items():
         with open(path) as f:
             cfg = RunConfig.from_dict(yaml.safe_load(f))
         assert cfg.opponents.mode == "fixed"
-        assert cfg.opponents.fixed_opponents == ["sniper_v17"]
+        assert cfg.opponents.fixed_opponents == fixed_opponents
 
 
 def test_ablation_yaml_keys_load():

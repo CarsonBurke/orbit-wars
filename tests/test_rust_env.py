@@ -909,7 +909,8 @@ def test_rust_pending_enqueue_rejects_duplicate_rows():
 @pytest.mark.parametrize(
     ("name", "agent_name"),
     [
-        ("sniper", "sniper_agent"),
+        # "sniper" is the default and resolves to the oracle-forecast v18.
+        ("sniper", "sniper_v18_agent"),
         ("sniper_v2", "sniper_v2_agent"),
         ("sniper_v3", "sniper_v3_agent"),
         ("sniper_v4", "sniper_v4_agent"),
@@ -926,6 +927,7 @@ def test_rust_pending_enqueue_rejects_duplicate_rows():
         ("sniper_v15", "sniper_v15_agent"),
         ("sniper_v16", "sniper_v16_agent"),
         ("sniper_v17", "sniper_v17_agent"),
+        ("sniper_v18", "sniper_v18_agent"),
     ],
 )
 def test_rust_vec_env_native_sniper_matches_python_sniper(name: str, agent_name: str):
@@ -946,6 +948,12 @@ def test_rust_vec_env_native_sniper_matches_python_sniper(name: str, agent_name:
     rows = [(0, 0), (0, 1), (1, 0), (1, 1)]
     native = rust.builtin_actions(name, rows, native_actions=False)
 
+    # Compared at a single early step: the Python lead-solver and the Rust
+    # lead-solver are not bit-identical for complex orbiting-target geometry deep
+    # in an episode (sub-0.01 rad angle drift in the bisection), so deeper
+    # full-action parity is not guaranteed. The destination-oracle horizon
+    # consistency (the part v18 depends on) is covered bit-exactly by
+    # test_destination_oracle.py::test_observation_episode_steps_threads_into_oracle.
     for row_actions, (env_idx, player) in zip(native, rows, strict=True):
         expected = agent(rust.observation(env_idx, player))
         assert len(row_actions) == len(expected)
