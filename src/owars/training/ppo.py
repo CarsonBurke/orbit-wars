@@ -372,6 +372,150 @@ def _beta_entropy(alpha: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _beta_kl(
+    alpha0: torch.Tensor,
+    beta0: torch.Tensor,
+    alpha1: torch.Tensor,
+    beta1: torch.Tensor,
+) -> torch.Tensor:
+    """Closed-form KL(Beta(alpha0, beta0) || Beta(alpha1, beta1)), per element.
+
+    Standard exponential-family form:
+      ln B(a1,b1) − ln B(a0,b0)
+      + (a0−a1)·ψ(a0) + (b0−b1)·ψ(b0) + (a1−a0+b1−b0)·ψ(a0+b0)
+    with ln B(a,b) = lgamma(a)+lgamma(b)−lgamma(a+b) and ψ = digamma.
+    """
+    a0 = alpha0.float()
+    b0 = beta0.float()
+    a1 = alpha1.float()
+    b1 = beta1.float()
+    total0 = a0 + b0
+    ln_b0 = torch.lgamma(a0) + torch.lgamma(b0) - torch.lgamma(total0)
+    ln_b1 = torch.lgamma(a1) + torch.lgamma(b1) - torch.lgamma(a1 + b1)
+    return (
+        ln_b1
+        - ln_b0
+        + (a0 - a1) * torch.digamma(a0)
+        + (b0 - b1) * torch.digamma(b0)
+        + (a1 - a0 + b1 - b0) * torch.digamma(total0)
+    )
+
+
+def _categorical_kl_from_log_probs(
+    log_p: torch.Tensor,
+    log_q: torch.Tensor,
+) -> torch.Tensor:
+    """KL(P‖Q) over the last dim from log-probs, P = exp(log_p).
+
+    Grad-safe at zero-mass outcomes: where `p == 0` (e.g. masked-illegal
+    targets, whose logits are −inf in BOTH p and q since the same legality mask
+    is applied), the term and its gradient are forced to 0 — `torch.where`
+    alone would still route a NaN through the unselected `0·(−inf)` branch on
+    the backward pass, so the log-probs are sanitized BEFORE the multiply.
+    """
+    p = log_p.exp()
+    pos = p > 0.0
+    zeros = torch.zeros_like(log_p)
+    safe_log_p = torch.where(pos, log_p, zeros)
+    safe_log_q = torch.where(pos, log_q, zeros)
+    return (p * (safe_log_p - safe_log_q)).sum(dim=-1)
+
+
+def _pmpo_per_planet_kl(
+    new_launch_logits: torch.Tensor,
+    new_target_logits: torch.Tensor,
+    new_fraction_alpha: torch.Tensor,
+    new_fraction_beta: torch.Tensor,
+    old_launch_logits: torch.Tensor,
+    old_target_logits: torch.Tensor,
+    old_fraction_alpha: torch.Tensor,
+    old_fraction_beta: torch.Tensor,
+    target_legal_mask: torch.Tensor,
+    action_logit_softcap: float | None,
+    *,
+    reverse_kl: bool,
+) -> torch.Tensor:
+    """Analytical per-source-planet KL between the old (rollout) and new policy.
+
+    The per-planet action factorizes as a single Categorical over {no-launch,
+    target₁…target_P} (the softcap action head) times a Beta fraction that only
+    applies when a launch is chosen. So
+
+      KL = KL_categorical(·) + p_launch · KL_Beta(·)
+
+    where `p_launch` is the probability of any launch under the FIRST argument of
+    the KL (old for reverse KL(old‖new), new for forward KL(new‖old)), matching
+    the chain rule for the launch-gated fraction. Returns a per-planet tensor in
+    the source layout of the logits (`[rows, P]` dense, `[S]` source-major).
+    """
+    if action_logit_softcap is None:
+        raise NotImplementedError(
+            "PMPO analytical KL requires the softcap action path; OrbitPolicy "
+            "always sets a positive action_logit_softcap"
+        )
+    softcap = float(action_logit_softcap)
+    legal = target_legal_mask.bool()
+    new_tl = new_target_logits.masked_fill(~legal, float("-inf"))
+    old_tl = old_target_logits.masked_fill(~legal, float("-inf"))
+    new_alp = _categorical_action_log_probs(new_launch_logits, new_tl, softcap)
+    old_alp = _categorical_action_log_probs(old_launch_logits, old_tl, softcap)
+    if reverse_kl:
+        kl_cat = _categorical_kl_from_log_probs(old_alp, new_alp)
+        p_launch = old_alp[..., 1:].exp().sum(dim=-1)
+        kl_beta = _beta_kl(
+            old_fraction_alpha,
+            old_fraction_beta,
+            new_fraction_alpha,
+            new_fraction_beta,
+        )
+    else:
+        kl_cat = _categorical_kl_from_log_probs(new_alp, old_alp)
+        p_launch = new_alp[..., 1:].exp().sum(dim=-1)
+        kl_beta = _beta_kl(
+            new_fraction_alpha,
+            new_fraction_beta,
+            old_fraction_alpha,
+            old_fraction_beta,
+        )
+    return kl_cat + p_launch * kl_beta
+
+
+def _pmpo_pg_loss(
+    chosen: torch.Tensor,
+    advantage: torch.Tensor,
+    weight: torch.Tensor,
+    pos_to_neg_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """dreamer4 PMPO sign-only policy gradient (cleanrl `pmpo_v1`).
+
+    The update direction is the sign of the (RAW, un-normalized) advantage; the
+    magnitude is `tanh(|adv|) ∈ [0, 1)`. Positive- and negative-advantage terms
+    are averaged SEPARATELY (each over its own active-mass) and combined with
+    `pos_to_neg_weight`, so a minibatch dominated by one sign cannot drown the
+    other. `weight` is the active actor's per-element mass (owned-planet count
+    dense, launch-source count source-major) — the same mass every other kernel
+    aggregate uses, so PMPO and PPO share an identical sample weighting.
+    """
+    advantage = advantage.float()
+    adv_weight = advantage.tanh().abs()
+    signed = chosen * adv_weight
+    # Zero-weight rows are padded / invalid source slots (no owned planet or no
+    # launch source). The model still produces logits/Beta for their constant
+    # garbage features, which can drift non-finite as real-row gradients move
+    # the shared params — and `nonfinite * 0 == nan` would poison the weighted
+    # sums below. Gate them to exactly 0 BEFORE the multiply, mirroring the
+    # `torch.where(valid, …, 0)` guard PPO applies to `log_ratio`.
+    signed = torch.where(weight > 0.0, signed, torch.zeros_like(signed))
+    pos_f = (advantage >= 0.0).to(weight.dtype)
+    neg_f = 1.0 - pos_f
+    pos_w = weight * pos_f
+    neg_w = weight * neg_f
+    pos_loss = (signed * pos_w).sum() / pos_w.sum().clamp_min(1.0)
+    neg_loss = (signed * neg_w).sum() / neg_w.sum().clamp_min(1.0)
+    pg_loss = -pos_to_neg_weight * pos_loss + (1.0 - pos_to_neg_weight) * neg_loss
+    return pg_loss, pos_loss, neg_loss
+
+
 def _launched_beta_log_prob(
     alpha: torch.Tensor,
     beta: torch.Tensor,
@@ -697,14 +841,19 @@ def _stage_ppo_minibatch(
     device: torch.device,
     pinned_cache: PinnedSliceCache | None = None,
     slot: int = 0,
+    include_old_dist: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Slice one logical minibatch and move it to the model device.
 
     The full PPO rollout batch may live on CPU to keep VRAM bounded. The compiled
     CUDA kernel still receives static-shape CUDA tensors; host-to-device staging
     stays outside the compiled fullgraph body.
+
+    Under PMPO (`include_old_dist`), the four frozen old-policy distribution
+    tensors are appended LAST, matching the kernel forward's trailing optional
+    args — PPO stages neither, so its 20-tensor call pattern is unchanged.
     """
-    return (
+    staged = (
         _slice_to_device(
             global_feats, mb, device, pinned_cache=pinned_cache, slot=slot, name="global_feats"
         ),
@@ -813,6 +962,42 @@ def _stage_ppo_minibatch(
             slot=slot,
         ),
     )
+    if not include_old_dist:
+        return staged
+    return staged + (
+        _slice_to_device(
+            batch["old_launch_logits"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="old_launch_logits",
+        ),
+        _slice_to_device(
+            batch["old_target_logits"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="old_target_logits",
+        ),
+        _slice_to_device(
+            batch["old_fraction_alpha"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="old_fraction_alpha",
+        ),
+        _slice_to_device(
+            batch["old_fraction_beta"],
+            mb,
+            device,
+            pinned_cache=pinned_cache,
+            slot=slot,
+            name="old_fraction_beta",
+        ),
+    )
 
 
 def _source_indices_for_minibatch(
@@ -910,6 +1095,7 @@ def _stage_source_ppo_minibatch(
     source_capacity: int,
     pinned_cache: PinnedSliceCache | None = None,
     slot: int = 0,
+    include_old_dist: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     mb_cpu = mb.detach().to(device="cpu", dtype=torch.long)
     source_idx, source_row_local = _source_indices_for_minibatch(batch, mb_cpu)
@@ -949,6 +1135,37 @@ def _stage_source_ppo_minibatch(
         fill=False,
     )
     source_valid = source_exists & (source_weight > 0.0)
+    old_dist_fields: tuple[torch.Tensor, ...] = ()
+    if include_old_dist:
+        # Gather the frozen DENSE old-policy dist into source-major exactly like
+        # old_log_prob: launch/Beta params are [rows,P]->[S]; target logits are
+        # [rows,P,P]->[S,P] (the leading [rows,P] indexes pick the source planet's
+        # full target row). Pad invalid sources to a finite/valid Beta (α=β=1) so
+        # the closed-form KL stays finite there — source_weight=0 masks them out.
+        old_launch_logits = _pad_first_dim_cpu(
+            batch["old_launch_logits"].float()[source_global_rows, source_global_cols],
+            source_capacity,
+        )
+        old_target_logits = _pad_first_dim_cpu(
+            batch["old_target_logits"].float()[source_global_rows, source_global_cols],
+            source_capacity,
+        )
+        old_fraction_alpha = _pad_first_dim_cpu(
+            batch["old_fraction_alpha"].float()[source_global_rows, source_global_cols],
+            source_capacity,
+            fill=1.0,
+        )
+        old_fraction_beta = _pad_first_dim_cpu(
+            batch["old_fraction_beta"].float()[source_global_rows, source_global_cols],
+            source_capacity,
+            fill=1.0,
+        )
+        old_dist_fields = (
+            _move_staged_source_field(old_launch_logits, device),
+            _move_staged_source_field(old_target_logits, device),
+            _move_staged_source_field(old_fraction_alpha, device),
+            _move_staged_source_field(old_fraction_beta, device),
+        )
     return (
         _slice_to_device(
             global_feats, mb, device, pinned_cache=pinned_cache, slot=slot, name="global_feats"
@@ -1039,7 +1256,7 @@ def _stage_source_ppo_minibatch(
             name="return_mtp_mask",
         ),
         _move_staged_source_field(target_legal_mask, device),
-    )
+    ) + old_dist_fields
 
 
 def _stage_value_minibatch(
@@ -1298,6 +1515,10 @@ class _PPOMinibatchKernel(torch.nn.Module):
         clip_coef_high: float,
         autocast_enabled: bool,
         include_value: bool,
+        policy_objective: str = "ppo",
+        pmpo_pos_to_neg_weight: float = 0.5,
+        pmpo_kl_coef: float = 0.3,
+        pmpo_reverse_kl: bool = True,
     ) -> None:
         super().__init__()
         self.model = model
@@ -1309,6 +1530,10 @@ class _PPOMinibatchKernel(torch.nn.Module):
         self.clip_coef_high = float(clip_coef_high)
         self.autocast_enabled = bool(autocast_enabled)
         self.include_value = bool(include_value)
+        self.policy_objective = str(policy_objective)
+        self.pmpo_pos_to_neg_weight = float(pmpo_pos_to_neg_weight)
+        self.pmpo_kl_coef = float(pmpo_kl_coef)
+        self.pmpo_reverse_kl = bool(pmpo_reverse_kl)
         self._model_accepts_head_flags = isinstance(model, OrbitPolicy)
 
     def forward(
@@ -1333,6 +1558,10 @@ class _PPOMinibatchKernel(torch.nn.Module):
         ret_mtp_mask: torch.Tensor,
         owned_mask: torch.Tensor,
         target_legal_mask: torch.Tensor,
+        old_launch_logits: torch.Tensor | None = None,
+        old_target_logits: torch.Tensor | None = None,
+        old_fraction_alpha: torch.Tensor | None = None,
+        old_fraction_beta: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -1432,15 +1661,62 @@ class _PPOMinibatchKernel(torch.nn.Module):
         )
         log_ratio = log_ratio.clamp(-60.0, 60.0)
         ratio = log_ratio.exp()
-        adv_actor = adv_b
-        if self.norm_advantage:
-            adv_mean = (adv_actor * owned_w).sum() / denom
-            adv_var = (((adv_actor - adv_mean).square()) * owned_w).sum() / denom
-            adv_actor = (adv_actor - adv_mean) * torch.rsqrt(adv_var + 1e-8)
-        ratio_clamped = ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef_high)
-        pg_unclipped = -adv_actor * ratio
-        pg_clipped = -adv_actor * ratio_clamped
-        policy_loss = _weighted_mean(torch.maximum(pg_unclipped, pg_clipped), owned_w)
+        if self.policy_objective == "pmpo":
+            # dreamer4 PMPO: sign-only PG on RAW advantage + analytical per-planet
+            # reverse-KL trust region (no ratio clip, no advnorm). The ratio /
+            # log_ratio above stay defined purely for the shared PPO diagnostics
+            # below; they do not enter the PMPO loss.
+            policy_loss, pmpo_pos_loss, pmpo_neg_loss = _pmpo_pg_loss(
+                chosen,
+                adv_b,
+                owned_w,
+                self.pmpo_pos_to_neg_weight,
+            )
+            reverse_kl_per_planet = _pmpo_per_planet_kl(
+                launch_logits,
+                target_logits,
+                fraction_alpha,
+                fraction_beta,
+                old_launch_logits,
+                old_target_logits,
+                old_fraction_alpha,
+                old_fraction_beta,
+                target_legal_mask,
+                action_logit_softcap,
+                reverse_kl=self.pmpo_reverse_kl,
+            )
+            # Gate padded/unowned rows (`owned_w == 0`) before the multiply:
+            # their per-planet KL can be non-finite (see `_pmpo_pg_loss`) and
+            # `nonfinite * 0 == nan` would poison the reduction.
+            reverse_kl_per_planet = torch.where(
+                owned_w > 0.0,
+                reverse_kl_per_planet,
+                torch.zeros_like(reverse_kl_per_planet),
+            )
+            # Aggregate the trust region as the cleanrl PMPO ref does:
+            # `kl_divergence(old, new).sum(-1).mean()` — SUM the per-component KL
+            # within one sample (here: over the turn's owned planets, the joint
+            # action), then MEAN over samples (turns). Dividing by the OWNED
+            # count (`denom`) instead mean-pools over planets and dilutes the
+            # trust region by ~N (mean owned planets/turn), leaving the penalty
+            # ~N x too weak relative to the per-element PG term. `row_w` is 1.0
+            # per real turn.
+            kl_turn_denom = row_w.sum().clamp_min(1.0)
+            reverse_kl = (reverse_kl_per_planet * owned_w).sum() / kl_turn_denom
+            policy_loss = policy_loss + self.pmpo_kl_coef * reverse_kl
+        else:
+            adv_actor = adv_b
+            if self.norm_advantage:
+                adv_mean = (adv_actor * owned_w).sum() / denom
+                adv_var = (((adv_actor - adv_mean).square()) * owned_w).sum() / denom
+                adv_actor = (adv_actor - adv_mean) * torch.rsqrt(adv_var + 1e-8)
+            ratio_clamped = ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef_high)
+            pg_unclipped = -adv_actor * ratio
+            pg_clipped = -adv_actor * ratio_clamped
+            policy_loss = _weighted_mean(torch.maximum(pg_unclipped, pg_clipped), owned_w)
+            pmpo_pos_loss = policy_loss * 0.0
+            pmpo_neg_loss = policy_loss * 0.0
+            reverse_kl = policy_loss * 0.0
 
         if self.include_value:
             value_loss = _distributional_value_loss(
@@ -1634,6 +1910,9 @@ class _PPOMinibatchKernel(torch.nn.Module):
                 turn_no_action_frac.detach(),
                 legal_target_count_mean.detach(),
                 uniform_move_prior.detach(),
+                reverse_kl.detach(),
+                pmpo_pos_loss.detach(),
+                pmpo_neg_loss.detach(),
             ]
         ).float()
         return actor_loss, critic_loss, metrics
@@ -1652,6 +1931,10 @@ class _PPOSourceMinibatchKernel(torch.nn.Module):
         clip_coef_high: float,
         autocast_enabled: bool,
         include_value: bool,
+        policy_objective: str = "ppo",
+        pmpo_pos_to_neg_weight: float = 0.5,
+        pmpo_kl_coef: float = 0.3,
+        pmpo_reverse_kl: bool = True,
     ) -> None:
         super().__init__()
         self.model = model
@@ -1663,6 +1946,10 @@ class _PPOSourceMinibatchKernel(torch.nn.Module):
         self.clip_coef_high = float(clip_coef_high)
         self.autocast_enabled = bool(autocast_enabled)
         self.include_value = bool(include_value)
+        self.policy_objective = str(policy_objective)
+        self.pmpo_pos_to_neg_weight = float(pmpo_pos_to_neg_weight)
+        self.pmpo_kl_coef = float(pmpo_kl_coef)
+        self.pmpo_reverse_kl = bool(pmpo_reverse_kl)
 
     def forward(
         self,
@@ -1689,6 +1976,10 @@ class _PPOSourceMinibatchKernel(torch.nn.Module):
         ret_mtp: torch.Tensor,
         ret_mtp_mask: torch.Tensor,
         target_legal_mask: torch.Tensor,
+        old_launch_logits: torch.Tensor | None = None,
+        old_target_logits: torch.Tensor | None = None,
+        old_fraction_alpha: torch.Tensor | None = None,
+        old_fraction_beta: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -1788,14 +2079,60 @@ class _PPOSourceMinibatchKernel(torch.nn.Module):
             posinf=60.0,
         ).clamp(-60.0, 60.0)
         ratio = log_ratio.exp()
-        if self.norm_advantage:
-            adv_mean = (adv_actor * source_w).sum() / denom
-            adv_var = (((adv_actor - adv_mean).square()) * source_w).sum() / denom
-            adv_actor = (adv_actor - adv_mean) * torch.rsqrt(adv_var + 1e-8)
-        ratio_clamped = ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef_high)
-        pg_unclipped = -adv_actor * ratio
-        pg_clipped = -adv_actor * ratio_clamped
-        policy_loss = _weighted_mean(torch.maximum(pg_unclipped, pg_clipped), source_w)
+        if self.policy_objective == "pmpo":
+            # PMPO uses the RAW per-source advantage (adv_actor before any
+            # z-score) — sign-only PG + analytical per-source reverse KL. The
+            # ratio above remains for the shared PPO diagnostics only.
+            policy_loss, pmpo_pos_loss, pmpo_neg_loss = _pmpo_pg_loss(
+                chosen,
+                adv_actor,
+                source_w,
+                self.pmpo_pos_to_neg_weight,
+            )
+            reverse_kl_per_planet = _pmpo_per_planet_kl(
+                launch_logits,
+                target_logits,
+                fraction_alpha,
+                fraction_beta,
+                old_launch_logits,
+                old_target_logits,
+                old_fraction_alpha,
+                old_fraction_beta,
+                target_legal_mask,
+                action_logit_softcap,
+                reverse_kl=self.pmpo_reverse_kl,
+            )
+            # Gate padded/invalid source rows (`source_w == 0`) before the
+            # multiply: their per-planet KL can be non-finite (see `_pmpo_pg_loss`)
+            # and `nonfinite * 0 == nan` would poison the reduction.
+            reverse_kl_per_planet = torch.where(
+                source_w > 0.0,
+                reverse_kl_per_planet,
+                torch.zeros_like(reverse_kl_per_planet),
+            )
+            # Aggregate the trust region as the cleanrl PMPO ref does:
+            # `kl_divergence(old, new).sum(-1).mean()` — SUM the per-component KL
+            # within one sample (here: over the turn's launch sources, the joint
+            # action), then MEAN over samples (turns). Dividing by the SOURCE
+            # count (`denom`) instead mean-pools over sources and dilutes the
+            # trust region by ~N (mean launch sources/turn), leaving the penalty
+            # ~N x too weak relative to the per-element PG term — which collapses
+            # entropy within one update. `row_weight` is 1.0 per real turn.
+            kl_turn_denom = row_weight.to(dtype=source_w.dtype).sum().clamp_min(1.0)
+            reverse_kl = (reverse_kl_per_planet * source_w).sum() / kl_turn_denom
+            policy_loss = policy_loss + self.pmpo_kl_coef * reverse_kl
+        else:
+            if self.norm_advantage:
+                adv_mean = (adv_actor * source_w).sum() / denom
+                adv_var = (((adv_actor - adv_mean).square()) * source_w).sum() / denom
+                adv_actor = (adv_actor - adv_mean) * torch.rsqrt(adv_var + 1e-8)
+            ratio_clamped = ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef_high)
+            pg_unclipped = -adv_actor * ratio
+            pg_clipped = -adv_actor * ratio_clamped
+            policy_loss = _weighted_mean(torch.maximum(pg_unclipped, pg_clipped), source_w)
+            pmpo_pos_loss = policy_loss * 0.0
+            pmpo_neg_loss = policy_loss * 0.0
+            reverse_kl = policy_loss * 0.0
 
         row_w = row_weight.to(device=value_logits.device, dtype=value_logits.dtype)
         if self.include_value:
@@ -1989,6 +2326,9 @@ class _PPOSourceMinibatchKernel(torch.nn.Module):
                 turn_no_action_frac.detach(),
                 legal_target_count_mean.detach(),
                 uniform_move_prior.detach(),
+                reverse_kl.detach(),
+                pmpo_pos_loss.detach(),
+                pmpo_neg_loss.detach(),
             ]
         ).float()
         return actor_loss, critic_loss, metrics
@@ -2217,6 +2557,84 @@ class _OldLogProbValueKernel(torch.nn.Module):
         return old_log_prob, out.value.float()
 
 
+class _OldPolicyDistKernel(torch.nn.Module):
+    """Recompute the frozen rollout policy's per-planet DENSE distribution params.
+
+    PMPO's analytical reverse KL needs the full old per-planet action
+    distribution, not just the taken action's log-prob. This runs the model in
+    DENSE mode (no source args) and returns the RAW head outputs alongside the
+    behavior log-prob and value, so the loss kernel can reconstruct the old
+    Categorical/Beta with the exact same masking it applies to the new policy.
+    The dense [rows, P, ...] layout matches `old_log_prob`, so the source-major
+    actor gathers these the same way (see `_stage_source_ppo_minibatch`).
+    """
+
+    def __init__(self, model: torch.nn.Module, *, autocast_enabled: bool) -> None:
+        super().__init__()
+        self.model = model
+        self.autocast_enabled = bool(autocast_enabled)
+        self._model_accepts_head_flags = isinstance(model, OrbitPolicy)
+
+    def forward(
+        self,
+        global_feats: torch.Tensor,
+        planet_feats: torch.Tensor,
+        planet_mask: torch.Tensor,
+        planet_owned_mask: torch.Tensor,
+        planet_ids: torch.Tensor,
+        planet_garrison: torch.Tensor,
+        fleet_feats: torch.Tensor,
+        fleet_mask: torch.Tensor,
+        fleet_target_planet_idx: torch.Tensor,
+        planet_inbound_feats: torch.Tensor,
+        launch: torch.Tensor,
+        target_idx: torch.Tensor,
+        fraction: torch.Tensor,
+        target_legal_mask: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        feats = EncodedObs(
+            planet_feats=planet_feats,
+            planet_mask=planet_mask,
+            planet_owned_mask=planet_owned_mask,
+            planet_ids=planet_ids,
+            planet_garrison=planet_garrison,
+            fleet_feats=fleet_feats,
+            fleet_mask=fleet_mask,
+            global_feats=global_feats,
+            fleet_target_planet_idx=fleet_target_planet_idx,
+            planet_inbound_feats=planet_inbound_feats,
+        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
+        ):
+            out = self.model(feats)
+
+        old_log_prob = _old_log_prob_from_output(
+            out,
+            launch,
+            target_idx,
+            fraction,
+            target_legal_mask,
+        )
+        if out.fraction_alpha is None or out.fraction_beta is None:
+            raise ValueError("PMPO OrbitPolicy output must include Beta fraction params")
+        return (
+            old_log_prob,
+            out.value.float(),
+            out.launch_logits.float(),
+            out.target_logits.float(),
+            out.fraction_alpha.float(),
+            out.fraction_beta.float(),
+        )
+
+
 def _kernel_cache(model: torch.nn.Module) -> dict:
     cache = model.__dict__.get("_owars_minibatch_kernel_cache")
     if cache is None:
@@ -2253,6 +2671,10 @@ def _get_ppo_kernel(
     compile_mode: str | None,
     include_value: bool,
     shape_key: tuple[int, int, int, int, int],
+    policy_objective: str = "ppo",
+    pmpo_pos_to_neg_weight: float = 0.5,
+    pmpo_kl_coef: float = 0.3,
+    pmpo_reverse_kl: bool = True,
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
@@ -2267,6 +2689,10 @@ def _get_ppo_kernel(
         float(clip_coef_high),
         bool(include_value),
         shape_key,
+        str(policy_objective),
+        float(pmpo_pos_to_neg_weight),
+        float(pmpo_kl_coef),
+        bool(pmpo_reverse_kl),
     )
     cache = _kernel_cache(model)
     cached = cache.get(key)
@@ -2282,6 +2708,10 @@ def _get_ppo_kernel(
         clip_coef_high=clip_coef_high,
         autocast_enabled=device.type == "cuda",
         include_value=include_value,
+        policy_objective=policy_objective,
+        pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
+        pmpo_kl_coef=pmpo_kl_coef,
+        pmpo_reverse_kl=pmpo_reverse_kl,
     )
     kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
     cache[key] = kernel
@@ -2300,6 +2730,10 @@ def _get_source_ppo_kernel(
     compile_mode: str | None,
     include_value: bool,
     shape_key: tuple[int, ...],
+    policy_objective: str = "ppo",
+    pmpo_pos_to_neg_weight: float = 0.5,
+    pmpo_kl_coef: float = 0.3,
+    pmpo_reverse_kl: bool = True,
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
@@ -2314,6 +2748,10 @@ def _get_source_ppo_kernel(
         float(clip_coef_high),
         bool(include_value),
         shape_key,
+        str(policy_objective),
+        float(pmpo_pos_to_neg_weight),
+        float(pmpo_kl_coef),
+        bool(pmpo_reverse_kl),
     )
     cache = _kernel_cache(model)
     cached = cache.get(key)
@@ -2329,6 +2767,10 @@ def _get_source_ppo_kernel(
         clip_coef_high=clip_coef_high,
         autocast_enabled=device.type == "cuda",
         include_value=include_value,
+        policy_objective=policy_objective,
+        pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
+        pmpo_kl_coef=pmpo_kl_coef,
+        pmpo_reverse_kl=pmpo_reverse_kl,
     )
     kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
     cache[key] = kernel
@@ -2401,6 +2843,28 @@ def _get_old_log_prob_value_kernel(
     return kernel
 
 
+def _get_old_policy_dist_kernel(
+    model: torch.nn.Module,
+    *,
+    compile_mode: str | None,
+    shape_key: tuple[int, int, int, int, int, int],
+) -> torch.nn.Module:
+    device = _module_device(model)
+    mode = compile_mode if device.type == "cuda" else None
+    key = ("old_policy_dist", mode, shape_key)
+    cache = _kernel_cache(model)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    kernel = _OldPolicyDistKernel(
+        model,
+        autocast_enabled=device.type == "cuda",
+    )
+    kernel = _compile_kernel(kernel, device=device, compile_mode=mode)
+    cache[key] = kernel
+    return kernel
+
+
 @dataclass
 class PPOLog:
     policy_loss: float
@@ -2445,6 +2909,14 @@ class PPOLog:
     action_logit_softcap: float = 0.0
     legal_target_count_mean: float = 0.0
     uniform_move_prior: float = 0.0
+    # PMPO diagnostics (0 under the PPO clipped-surrogate objective).
+    #   reverse_kl: the analytical per-planet KL(old‖new) trust-region term
+    #     (mean over minibatches), the PMPO loss's only trust region.
+    #   pmpo_pos_loss / pmpo_neg_loss: the advantage-weighted positive/negative
+    #     mean log-probs before the pos/neg balance — sign-split learning signal.
+    reverse_kl: float = 0.0
+    pmpo_pos_loss: float = 0.0
+    pmpo_neg_loss: float = 0.0
     # Number of PPO epochs actually run.
     epochs_run: float = 0.0
 
@@ -2744,6 +3216,117 @@ def compute_old_log_probs_and_values(
         model.train(was_training)
 
 
+def compute_old_policy_dist(
+    model: OrbitPolicy,
+    batch: dict[str, torch.Tensor],
+    *,
+    minibatch_size: int,
+    minibatch_count: int | None = None,
+    compile_mode: str | None = None,
+    output_device: torch.device | str | None = None,
+) -> dict[str, torch.Tensor]:
+    """Recompute the frozen rollout policy's behavior log-probs, values, and the
+    full DENSE per-planet distribution params (raw launch/target logits + Beta
+    alpha/beta), used by the PMPO analytical reverse-KL trust region.
+
+    Returns a dict with keys `old_log_prob` [N,P], `value` [N], plus
+    `old_launch_logits` [N,P], `old_target_logits` [N,P,P], `old_fraction_alpha`
+    [N,P], `old_fraction_beta` [N,P]. The model is frozen between rollout and
+    this call (no gradient steps yet), so these equal the rollout policy exactly.
+    """
+    n = int(batch["planet_feats"].shape[0])
+    if n <= 0:
+        empty_lp = batch["launch"].new_empty(batch["launch"].shape).float()
+        return {
+            "old_log_prob": empty_lp,
+            "value": batch["launch"].new_empty(0).float(),
+            "old_launch_logits": empty_lp.clone(),
+            "old_target_logits": batch["launch"].new_empty(
+                (0, batch["launch"].shape[1], batch["launch"].shape[1])
+            ).float(),
+            "old_fraction_alpha": empty_lp.clone(),
+            "old_fraction_beta": empty_lp.clone(),
+        }
+    batch_device = batch["planet_feats"].device
+    batch_view = _batch_encoded_view(batch)
+    global_feats = _global_feats_or_empty(batch)
+    fleet_target_planet_idx = fleet_target_planet_idx_or_empty(batch_view)
+    planet_inbound_feats = planet_inbound_feats_or_empty(batch_view)
+    device = _module_device(model)
+    out_device = torch.device(output_device) if output_device is not None else batch_device
+    if minibatch_count is not None:
+        static_minibatch_rows = math.ceil(n / max(1, min(int(minibatch_count), n)))
+    else:
+        static_minibatch_rows = max(1, int(minibatch_size))
+    was_training = model.training
+    model.eval()
+
+    def _to_out(t: torch.Tensor) -> torch.Tensor:
+        retained = t.detach().clone()
+        if retained.device != out_device:
+            retained = retained.to(out_device, non_blocking=out_device.type != "cpu")
+        return retained
+
+    try:
+        kernel = _get_old_policy_dist_kernel(
+            model,
+            compile_mode=compile_mode,
+            shape_key=(
+                static_minibatch_rows,
+                int(batch["planet_feats"].shape[1]),
+                int(batch["fleet_feats"].shape[1]),
+                int(global_feats.shape[1]),
+                int(planet_inbound_feats.shape[-2]),
+                int(planet_inbound_feats.shape[-1]),
+            ),
+        )
+        chunks: dict[str, list[torch.Tensor]] = {
+            "old_log_prob": [],
+            "value": [],
+            "old_launch_logits": [],
+            "old_target_logits": [],
+            "old_fraction_alpha": [],
+            "old_fraction_beta": [],
+        }
+        pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
+        with torch.no_grad():
+            for mb, _row_weight, real in _fixed_order_minibatches(
+                n,
+                minibatch_size,
+                batch_device,
+                minibatch_count=minibatch_count,
+                weight_device=device,
+            ):
+                staged = _stage_old_log_prob_minibatch(
+                    batch,
+                    global_feats,
+                    fleet_target_planet_idx,
+                    planet_inbound_feats,
+                    mb,
+                    device,
+                    pinned_cache=pinned_cache,
+                )
+                if compile_mode is not None:
+                    _mark_cuda_graph_step(device)
+                (
+                    old_lp,
+                    value,
+                    launch_logits,
+                    target_logits,
+                    fraction_alpha,
+                    fraction_beta,
+                ) = kernel(*staged)
+                chunks["old_log_prob"].append(_to_out(old_lp[:real]))
+                chunks["value"].append(_to_out(value[:real]))
+                chunks["old_launch_logits"].append(_to_out(launch_logits[:real]))
+                chunks["old_target_logits"].append(_to_out(target_logits[:real]))
+                chunks["old_fraction_alpha"].append(_to_out(fraction_alpha[:real]))
+                chunks["old_fraction_beta"].append(_to_out(fraction_beta[:real]))
+        return {key: torch.cat(parts, dim=0).float() for key, parts in chunks.items()}
+    finally:
+        model.train(was_training)
+
+
 def ppo_update(
     model: OrbitPolicy,
     optimizer: torch.optim.Optimizer,
@@ -2761,6 +3344,10 @@ def ppo_update(
     grad_clip: float,
     return_norm_scale: float = 1.0,
     norm_advantage_scope: str = "minibatch",
+    policy_objective: str = "ppo",
+    pmpo_pos_to_neg_weight: float = 0.5,
+    pmpo_kl_coef: float = 0.3,
+    pmpo_reverse_kl: bool = True,
     minibatch_count: int | None = None,
     compile_mode: str | None = None,
 ) -> PPOLog:
@@ -2801,40 +3388,65 @@ def ppo_update(
         and "actor_source_row_idx" in batch
         and "actor_target_legal_mask" in batch
     )
-    policy_advantage = _shape_policy_advantage(
-        batch["advantage"],
-        transform=advantage_transform,
-    )
-    # advnorm scope (cleanrl `norm_adv_scope`). "batch" standardizes the shaped
-    # actor advantage ONCE here, by the whole rollout's weighted mean/std, shared
-    # by every minibatch (cleanrl `b_policy_adv_normed`); the per-mb kernel z-score
-    # is then disabled so the advantage is never standardized twice. "minibatch"
-    # leaves standardization to the kernel. Ordered before retnorm so the two
-    # compose as in cleanrl (z-score, then the percentile-range divide).
-    #
-    # Each row is weighted by the SAME per-row mass the active loss kernel applies
-    # to its own z-score, so "batch" is a pure widening of "minibatch" scope: the
-    # source-major actor weights by launch-source count (`source_w`, == the
-    # `actor_source_row_offsets` row spans), the dense actor by owned-planet count
-    # (`owned_w`). Anything else would change the gradient direction, not just the
-    # window, between the two scopes on the same path.
-    kernel_norm_advantage = norm_advantage
-    if norm_advantage and norm_advantage_scope == "batch":
-        if use_source_actor:
-            offsets = batch["actor_source_row_offsets"].long()
-            row_norm_weight = (offsets[1:] - offsets[:-1]).to(torch.float32)
-        else:
-            row_norm_weight = batch["owned_mask"].to(torch.float32).sum(dim=-1)
-        policy_advantage = _batch_normalize_advantage(
-            policy_advantage,
-            row_norm_weight,
-        )
+    use_pmpo = policy_objective == "pmpo"
+    if use_pmpo:
+        missing = [
+            key
+            for key in (
+                "old_launch_logits",
+                "old_target_logits",
+                "old_fraction_alpha",
+                "old_fraction_beta",
+            )
+            if key not in batch
+        ]
+        if missing:
+            raise ValueError(
+                "PMPO ppo_update requires the frozen old-policy dist in the batch "
+                f"(missing {missing}); call compute_old_policy_dist first"
+            )
+    if use_pmpo:
+        # PMPO consumes the RAW advantage: sign + tanh(|adv|) are the only
+        # shaping. No rankgauss transform, no advnorm (kernel or batch), no
+        # return-norm — the analytical reverse-KL coef is the sole trust region.
+        policy_advantage = batch["advantage"]
         kernel_norm_advantage = False
-    # DreamerV3 retnorm: scale the actor advantage by 1/max(limit, p95-p5). The
-    # caller computes the percentile-range scale on this batch's returns; the
-    # critic still trains on raw returns (valnorm=none). Default 1.0 is a no-op.
-    if return_norm_scale != 1.0:
-        policy_advantage = policy_advantage / float(return_norm_scale)
+    else:
+        # advnorm scope (cleanrl `norm_adv_scope`). "batch" standardizes the
+        # shaped actor advantage ONCE here, by the whole rollout's weighted
+        # mean/std, shared by every minibatch (cleanrl `b_policy_adv_normed`);
+        # the per-mb kernel z-score is then disabled so the advantage is never
+        # standardized twice. "minibatch" leaves standardization to the kernel.
+        # Ordered before retnorm so the two compose as in cleanrl (z-score, then
+        # the percentile-range divide).
+        #
+        # Each row is weighted by the SAME per-row mass the active loss kernel
+        # applies to its own z-score, so "batch" is a pure widening of
+        # "minibatch" scope: the source-major actor weights by launch-source
+        # count (`source_w`, == the `actor_source_row_offsets` row spans), the
+        # dense actor by owned-planet count (`owned_w`). Anything else would
+        # change the gradient direction, not just the window, between scopes.
+        policy_advantage = _shape_policy_advantage(
+            batch["advantage"],
+            transform=advantage_transform,
+        )
+        kernel_norm_advantage = norm_advantage
+        if norm_advantage and norm_advantage_scope == "batch":
+            if use_source_actor:
+                offsets = batch["actor_source_row_offsets"].long()
+                row_norm_weight = (offsets[1:] - offsets[:-1]).to(torch.float32)
+            else:
+                row_norm_weight = batch["owned_mask"].to(torch.float32).sum(dim=-1)
+            policy_advantage = _batch_normalize_advantage(
+                policy_advantage,
+                row_norm_weight,
+            )
+            kernel_norm_advantage = False
+        # DreamerV3 retnorm: scale the actor advantage by 1/max(limit, p95-p5).
+        # The caller computes the percentile-range scale on this batch's returns;
+        # the critic still trains on raw returns (valnorm=none). 1.0 = no-op.
+        if return_norm_scale != 1.0:
+            policy_advantage = policy_advantage / float(return_norm_scale)
     return_mtp = batch.get("return_mtp", batch["return"].unsqueeze(-1))
     return_mtp_mask = batch.get(
         "return_mtp_mask",
@@ -2890,6 +3502,10 @@ def ppo_update(
                 int(planet_inbound_feats.shape[-1]),
                 int(batch["actor_target_legal_mask"].shape[1]),
             ),
+            policy_objective=policy_objective,
+            pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
+            pmpo_kl_coef=pmpo_kl_coef,
+            pmpo_reverse_kl=pmpo_reverse_kl,
         )
     else:
         kernel = _get_ppo_kernel(
@@ -2911,6 +3527,10 @@ def ppo_update(
                 int(planet_inbound_feats.shape[-2]),
                 int(planet_inbound_feats.shape[-1]),
             ),
+            policy_objective=policy_objective,
+            pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
+            pmpo_kl_coef=pmpo_kl_coef,
+            pmpo_reverse_kl=pmpo_reverse_kl,
         )
     epochs_run = 0
     pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
@@ -2947,6 +3567,7 @@ def ppo_update(
                     source_capacity=source_capacity,
                     pinned_cache=pinned_cache,
                     slot=slot,
+                    include_old_dist=use_pmpo,
                 )
             return _stage_ppo_minibatch(
                 batch,
@@ -2961,6 +3582,7 @@ def ppo_update(
                 device,
                 pinned_cache=pinned_cache,
                 slot=slot,
+                include_old_dist=use_pmpo,
             )
 
         for staged in _prefetch_staged_minibatches(stage, minibatches, device):
@@ -3040,12 +3662,12 @@ def ppo_update(
         epochs_run += 1
 
     n_steps = max(1, n_steps)
-    mean_logs_t = torch.zeros(30, device=device) if metric_sum is None else metric_sum / n_steps
+    mean_logs_t = torch.zeros(33, device=device) if metric_sum is None else metric_sum / n_steps
     # Match CleanRL's PPO KL logging: `approx_kl` is the latest minibatch's
     # estimate after the PPO epoch loop, not an epoch mean. The surrounding
     # diagnostics stay averaged to preserve their lower-noise TensorBoard
     # behavior.
-    kl_logs_t = torch.zeros(30, device=device) if last_metrics is None else last_metrics
+    kl_logs_t = torch.zeros(33, device=device) if last_metrics is None else last_metrics
     grad_logs_t = (
         torch.stack(
             [
@@ -3065,9 +3687,9 @@ def ppo_update(
         / n_steps
     )
     logs = torch.cat((mean_logs_t, kl_logs_t, grad_logs_t)).detach().cpu().tolist()
-    mean_logs = logs[:30]
-    kl_logs = logs[30:60]
-    grad_logs = logs[60:]
+    mean_logs = logs[:33]
+    kl_logs = logs[33:66]
+    grad_logs = logs[66:]
     return PPOLog(
         policy_loss=float(mean_logs[0]),
         value_loss=float(mean_logs[1]),
@@ -3111,6 +3733,9 @@ def ppo_update(
         action_logit_softcap=float(mean_logs[26]),
         legal_target_count_mean=float(mean_logs[28]),
         uniform_move_prior=float(mean_logs[29]),
+        reverse_kl=float(mean_logs[30]),
+        pmpo_pos_loss=float(mean_logs[31]),
+        pmpo_neg_loss=float(mean_logs[32]),
         epochs_run=float(epochs_run),
     )
 

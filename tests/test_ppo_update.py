@@ -33,12 +33,15 @@ from owars.training.config import RunConfig
 from owars.training.ppo import (
     _backward_actor_critic_with_group_clips,
     _batch_normalize_advantage,
+    _beta_kl,
     _beta_log_prob,
+    _categorical_kl_from_log_probs,
     _conditional_action_entropy,
     _distributional_value_loss,
     _fixed_minibatches,
     _fixed_minibatches_by_count,
     _minibatch_loss_scale,
+    _pmpo_pg_loss,
     _rank_gaussian_advantage,
     _source_capacity_for_minibatch,
     _source_planet_bucket,
@@ -46,6 +49,7 @@ from owars.training.ppo import (
     compute_gae,
     compute_old_log_probs,
     compute_old_log_probs_and_values,
+    compute_old_policy_dist,
     ppo_update,
     value_only_update,
 )
@@ -383,6 +387,210 @@ def test_batch_scope_source_path_weights_by_launch_source_count_not_owned_count(
         return log.policy_loss
 
     assert run("batch") == pytest.approx(run("minibatch"), rel=1e-4, abs=1e-5)
+
+
+# --- PMPO (dreamer4 Policy-Mirror) objective ---------------------------------
+
+
+def _pmpo_kwargs(**overrides) -> dict:
+    kwargs = dict(
+        value_coef=1.0,
+        target_entropy_coef=0.0,
+        fraction_entropy_coef=0.0,
+        norm_advantage=False,
+        advantage_transform="none",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        policy_objective="pmpo",
+        pmpo_pos_to_neg_weight=0.5,
+        pmpo_kl_coef=0.3,
+        pmpo_reverse_kl=True,
+        epochs=2,
+        minibatch_size=4,
+        grad_clip=1.0,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _add_old_policy_dist(model: OrbitPolicy, batch: dict[str, torch.Tensor]) -> None:
+    """Populate the frozen old-policy dist keys PMPO `ppo_update` requires."""
+    old_dist = compute_old_policy_dist(model, batch, minibatch_size=8)
+    for key in (
+        "old_launch_logits",
+        "old_target_logits",
+        "old_fraction_alpha",
+        "old_fraction_beta",
+    ):
+        batch[key] = old_dist[key]
+
+
+def test_beta_kl_matches_torch_distributions():
+    torch.manual_seed(0)
+    a0 = 1.0 + torch.rand(64) * 5.0
+    b0 = 1.0 + torch.rand(64) * 5.0
+    a1 = 1.0 + torch.rand(64) * 5.0
+    b1 = 1.0 + torch.rand(64) * 5.0
+    ref = torch.distributions.kl.kl_divergence(
+        torch.distributions.Beta(a0, b0),
+        torch.distributions.Beta(a1, b1),
+    )
+    assert torch.allclose(_beta_kl(a0, b0, a1, b1), ref, atol=1e-5)
+
+
+def test_categorical_kl_from_log_probs_matches_torch_with_masked_entries():
+    torch.manual_seed(0)
+    logits_p = torch.randn(16, 6)
+    logits_q = torch.randn(16, 6)
+    # Mask the last two outcomes as illegal in BOTH dists (−inf), mirroring the
+    # shared target-legality mask the kernel applies.
+    logits_p[:, -2:] = float("-inf")
+    logits_q[:, -2:] = float("-inf")
+    log_p = torch.log_softmax(logits_p, dim=-1)
+    log_q = torch.log_softmax(logits_q, dim=-1)
+    ref = torch.distributions.kl.kl_divergence(
+        torch.distributions.Categorical(logits=log_p),
+        torch.distributions.Categorical(logits=log_q),
+    )
+    out = _categorical_kl_from_log_probs(log_p, log_q)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, ref, atol=1e-5)
+
+
+def test_categorical_kl_gradient_is_finite_with_masked_entries():
+    # The 0·(−inf) zero-mass guard must not leak NaN into the backward pass.
+    log_p = torch.log_softmax(
+        torch.tensor([[2.0, 1.0, float("-inf")]]),
+        dim=-1,
+    )
+    raw_q = torch.tensor([[0.5, -0.5, 0.0]], requires_grad=True)
+    masked_q = raw_q.masked_fill(
+        torch.tensor([[False, False, True]]),
+        float("-inf"),
+    )
+    log_q = torch.log_softmax(masked_q, dim=-1)
+    _categorical_kl_from_log_probs(log_p, log_q).sum().backward()
+    assert torch.isfinite(raw_q.grad).all()
+
+
+def test_pmpo_pg_loss_gradient_reinforces_by_advantage_sign():
+    # The correctness invariant is the GRADIENT direction: minimizing the loss
+    # should raise the log-prob of positive-advantage actions and lower it for
+    # negative-advantage ones.
+    weight = torch.ones(1, 2)
+    pos_adv = torch.tensor([[2.0, 2.0]])
+    neg_adv = torch.tensor([[-2.0, -2.0]])
+
+    chosen_pos = torch.tensor([[-1.0, -1.0]], requires_grad=True)
+    _pmpo_pg_loss(chosen_pos, pos_adv, weight, 0.5)[0].backward()
+    assert (chosen_pos.grad < 0).all()  # descent raises chosen -> reinforce
+
+    chosen_neg = torch.tensor([[-1.0, -1.0]], requires_grad=True)
+    _pmpo_pg_loss(chosen_neg, neg_adv, weight, 0.5)[0].backward()
+    assert (chosen_neg.grad > 0).all()  # descent lowers chosen -> suppress
+
+
+def test_pmpo_pg_loss_balances_empty_bucket():
+    # All-positive minibatch: negative bucket empty -> neg_loss 0, and the
+    # combined PG is exactly -w * pos_loss (no division-by-zero blowup).
+    chosen = torch.tensor([[-1.0, -1.0]])
+    weight = torch.ones(1, 2)
+    pos_adv = torch.tensor([[2.0, 2.0]])
+    pg_pos, pos_loss, neg_loss = _pmpo_pg_loss(chosen, pos_adv, weight, 0.5)
+    assert neg_loss == pytest.approx(0.0)
+    assert pg_pos.item() == pytest.approx(-0.5 * pos_loss.item(), abs=1e-6)
+
+
+def test_pmpo_pg_loss_uses_raw_advantage_magnitude_via_tanh():
+    # tanh saturates: advantages of 5 and 50 give nearly identical weight.
+    chosen = torch.tensor([[-1.0]])
+    weight = torch.ones(1, 1)
+    small, _, _ = _pmpo_pg_loss(chosen, torch.tensor([[5.0]]), weight, 0.5)
+    large, _, _ = _pmpo_pg_loss(chosen, torch.tensor([[50.0]]), weight, 0.5)
+    assert small.item() == pytest.approx(large.item(), abs=1e-3)
+
+
+def test_compute_old_policy_dist_matches_old_log_probs_and_values():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=8)
+    ref_lp, ref_val = compute_old_log_probs_and_values(model, batch, minibatch_size=8)
+    dist = compute_old_policy_dist(model, batch, minibatch_size=8)
+    assert torch.allclose(dist["old_log_prob"], ref_lp, atol=1e-5)
+    assert torch.allclose(dist["value"], ref_val, atol=1e-5)
+    p = int(batch["planet_feats"].shape[1])
+    assert dist["old_launch_logits"].shape == (8, p)
+    assert dist["old_target_logits"].shape == (8, p, p)
+    assert dist["old_fraction_alpha"].shape == (8, p)
+    assert (dist["old_fraction_alpha"] >= 1.0).all()
+    assert (dist["old_fraction_beta"] >= 1.0).all()
+
+
+def test_ppo_update_pmpo_runs_dense_path():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=8)
+    _add_old_policy_dist(model, batch)
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    log = ppo_update(model, optim, batch, **_pmpo_kwargs())
+    assert math.isfinite(log.policy_loss)
+    assert math.isfinite(log.value_loss)
+    assert math.isfinite(log.reverse_kl)
+    assert log.reverse_kl >= 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all()
+
+
+def test_ppo_update_pmpo_runs_source_major_path():
+    cfg = OrbitPolicyConfig(
+        dim=32, ff_dim=64, depth=2, n_heads=2, encoder_backend="destination_conditioned"
+    )
+    model = OrbitPolicy(cfg)
+    batch = _with_source_actor_keys(_toy_batch(model, batch_size=8))
+    _add_old_policy_dist(model, batch)
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    log = ppo_update(model, optim, batch, **_pmpo_kwargs())
+    assert math.isfinite(log.policy_loss)
+    assert math.isfinite(log.reverse_kl)
+    assert log.reverse_kl >= 0.0
+
+
+def test_ppo_update_pmpo_requires_old_policy_dist():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=8)  # no old-dist keys
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    with pytest.raises(ValueError, match="frozen old-policy dist"):
+        ppo_update(model, optim, batch, **_pmpo_kwargs())
+
+
+def test_ppo_update_ppo_objective_ignores_missing_old_policy_dist():
+    # The PPO path must be entirely unaffected by PMPO plumbing: no old-dist keys
+    # required, identical call shape as before.
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    batch = _toy_batch(model, batch_size=8)
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    log = ppo_update(
+        model,
+        optim,
+        batch,
+        value_coef=1.0,
+        target_entropy_coef=0.0,
+        fraction_entropy_coef=0.0,
+        norm_advantage=True,
+        advantage_transform="rankgauss",
+        clip_coef=0.2,
+        clip_coef_high=0.28,
+        epochs=2,
+        minibatch_size=4,
+        grad_clip=1.0,
+    )
+    assert math.isfinite(log.policy_loss)
+    assert log.reverse_kl == 0.0
+    assert log.pmpo_pos_loss == 0.0
+    assert log.pmpo_neg_loss == 0.0
 
 
 def test_source_major_ppo_capacity_uses_log_spaced_source_buckets():

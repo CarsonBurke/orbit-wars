@@ -209,6 +209,26 @@ class PPOCfg:
     # an already-favored one stays capped.
     clip_coef: float = 0.2
     clip_coef_high: float = 0.28
+    # Actor objective. "ppo" is the clipped-ratio surrogate above. "pmpo" is the
+    # dreamer4 Policy-Mirror objective (cleanrl iterthink_v24 `pmpo_v1`): a
+    # sign-only update — `chosen_logp · tanh(|adv|)`, with positive- and
+    # negative-advantage terms balanced by `pmpo_pos_to_neg_weight` — anchored by
+    # an ANALYTICAL per-planet reverse KL(old‖new) trust region (NOT a ratio clip).
+    # Under "pmpo" the advantage is used RAW: no rankgauss transform, no advnorm,
+    # no return-norm (sign + tanh magnitude are the only shaping), and the
+    # KL-adaptive LR controller is held constant (the reverse-KL coef is the sole
+    # trust region — "no other kl measures"). Reproduces "ppo" exactly when unset.
+    policy_objective: Literal["ppo", "pmpo"] = "ppo"
+    # PMPO positive/negative balance `w`: pg = -w·pos_loss + (1-w)·neg_loss, where
+    # pos/neg are the advantage-weighted mean log-probs of better/worse-than-value
+    # actions. 0.5 = symmetric (cleanrl default).
+    pmpo_pos_to_neg_weight: float = 0.5
+    # PMPO trust-region coefficient on the per-planet reverse KL(old‖new). 0
+    # disables the anchor (pure sign update). cleanrl default 0.3.
+    pmpo_kl_coef: float = 0.3
+    # PMPO trust-region direction. True = reverse KL(old‖new) (cleanrl default,
+    # mode-covering toward the rollout policy); False = forward KL(new‖old).
+    pmpo_reverse_kl: bool = True
     # Distributional CE gradients are naturally bounded (per-bin
     # `softmax − target_probs` has ‖∇‖ ~ O(1)), unlike MSE which blew
     # up under bad predictions. dreamer4 effectively runs the equivalent
@@ -572,6 +592,12 @@ class RunConfig:
             raise ValueError("ppo.advantage_return_norm_scope must be 'ema' or 'batch'")
         if cfg.ppo.norm_advantage_scope not in {"minibatch", "batch"}:
             raise ValueError("ppo.norm_advantage_scope must be 'minibatch' or 'batch'")
+        if cfg.ppo.policy_objective not in {"ppo", "pmpo"}:
+            raise ValueError("ppo.policy_objective must be 'ppo' or 'pmpo'")
+        if not 0.0 <= cfg.ppo.pmpo_pos_to_neg_weight <= 1.0:
+            raise ValueError("ppo.pmpo_pos_to_neg_weight must be in [0, 1]")
+        if cfg.ppo.pmpo_kl_coef < 0.0:
+            raise ValueError("ppo.pmpo_kl_coef must be non-negative")
         if not (
             0.0
             <= cfg.ppo.advantage_return_norm_perclo

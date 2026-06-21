@@ -62,6 +62,7 @@ from .numpy_env import NumpyVecEnv
 from .ppo import (
     compute_gae,
     compute_old_log_probs_and_values,
+    compute_old_policy_dist,
     ppo_update,
     value_only_update,
 )
@@ -2002,7 +2003,34 @@ def _ppo_loop(
         old_log_prob_native = bool(batch.get("old_log_prob_computed", False))
         values_native = bool(batch.get("values_computed", False))
         old_log_prob_t0 = perf_counter()
-        if not old_log_prob_native or not values_native:
+        if cfg.ppo.policy_objective == "pmpo":
+            # PMPO needs the FULL frozen old per-planet distribution for the
+            # analytical reverse KL, not just the taken action's log-prob — always
+            # recompute it here (the model is unchanged since rollout, so this
+            # equals the rollout policy exactly). Reuses the recomputed value for
+            # the advantage refresh, same as the PPO path below.
+            old_dist = compute_old_policy_dist(
+                model,
+                batch,
+                minibatch_size=ppo_minibatch_size,
+                minibatch_count=cfg.optim.minibatch_count,
+                compile_mode=compile_mode,
+            )
+            batch["old_log_prob"] = old_dist["old_log_prob"]
+            batch["old_log_prob_computed"] = torch.tensor(True)
+            batch["old_launch_logits"] = old_dist["old_launch_logits"]
+            batch["old_target_logits"] = old_dist["old_target_logits"]
+            batch["old_fraction_alpha"] = old_dist["old_fraction_alpha"]
+            batch["old_fraction_beta"] = old_dist["old_fraction_beta"]
+            _refresh_batch_advantages_from_values(
+                batch,
+                old_dist["value"],
+                gamma=cfg.ppo.gamma,
+                gae_lambda=cfg.ppo.gae_lambda,
+                value_gae_lambda=cfg.ppo.value_gae_lambda,
+                critic_mtp_horizon=cfg.model.critic_mtp_horizon,
+            )
+        elif not old_log_prob_native or not values_native:
             old_log_prob, behavior_values = compute_old_log_probs_and_values(
                 model,
                 batch,
@@ -2054,6 +2082,10 @@ def _ppo_loop(
             return_norm_scale=return_norm_scale,
             clip_coef=cfg.ppo.clip_coef,
             clip_coef_high=cfg.ppo.clip_coef_high,
+            policy_objective=cfg.ppo.policy_objective,
+            pmpo_pos_to_neg_weight=cfg.ppo.pmpo_pos_to_neg_weight,
+            pmpo_kl_coef=cfg.ppo.pmpo_kl_coef,
+            pmpo_reverse_kl=cfg.ppo.pmpo_reverse_kl,
             epochs=cfg.optim.epochs_per_update,
             minibatch_size=ppo_minibatch_size,
             grad_clip=cfg.optim.grad_clip,
@@ -2061,12 +2093,16 @@ def _ppo_loop(
             compile_mode=compile_mode,
         )
         kl_lr_signal = kl_lr_signal_from_log(log)
-        kl_lr_ema, kl_lr_scale = update_kl_lr_controller(
-            kl_ema=kl_lr_ema,
-            lr_scale=kl_lr_scale,
-            observed_kl=kl_lr_signal,
-            cfg=cfg.optim,
-        )
+        if cfg.ppo.policy_objective != "pmpo":
+            kl_lr_ema, kl_lr_scale = update_kl_lr_controller(
+                kl_ema=kl_lr_ema,
+                lr_scale=kl_lr_scale,
+                observed_kl=kl_lr_signal,
+                cfg=cfg.optim,
+            )
+        # else PMPO: hold the LR scale constant — the analytical reverse-KL
+        # penalty inside the loss is the sole trust region ("no other kl
+        # measures"), so the PPO-style approx KL must NOT drive the optimizer.
         ppo_s = perf_counter() - phase_t0
         value_ev = _explained_variance(batch["value"], batch["return"])
 
@@ -2123,6 +2159,9 @@ def _ppo_loop(
                 "raw_advantage_abs_mean": float(batch["raw_advantage_abs_mean"]),
                 "advantage_return_scale": return_norm_scale,
                 "epochs_run": log.epochs_run,
+                "pmpo_reverse_kl": log.reverse_kl,
+                "pmpo_pos_loss": log.pmpo_pos_loss,
+                "pmpo_neg_loss": log.pmpo_neg_loss,
             },
             update,
         )
