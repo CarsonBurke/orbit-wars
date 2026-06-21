@@ -662,7 +662,16 @@ def rollout_episodes_batched(
     timings: dict[str, float] | None = None,
     sample_timings: dict[str, float] | None = None,
 ) -> list[Trajectory]:
-    """Play `len(opponents_per_env)` episodes in parallel; one Trajectory per env.
+    """Play `len(opponents_per_env)` episodes in parallel; one Trajectory per
+    *live-learner seat*.
+
+    A fixed-opponent / evaluation rollout records only each env's designated
+    learner seat, so the result is one trajectory per env in env order. A
+    self-play rollout (opponent seats whose slot name is LEARNER_NAME) records
+    those seats too — each from its own perspective — so an env can contribute
+    several trajectories. `Trajectory.env_index` identifies the source env for
+    per-game bookkeeping; the designated learner seat satisfies
+    `traj.learner_seat == learner_seat[env_index]`.
 
     `vec` is a long-lived `VecEnv` owned by the caller — we just call
     `vec.reset()` here. Spawning subprocess workers per call would burn
@@ -686,7 +695,22 @@ def rollout_episodes_batched(
     learner_seats = _normalize_learner_seats(learner_seat, num_envs, num_players)
     seat_agents = _resolve_seat_agents(opponents_per_env, num_players, learner_seats)
 
-    trajectories = [_empty_traj() for _ in range(num_envs)]
+    # Record EVERY live-learner seat, not just the designated learner seat: in
+    # self-play the opponent seats are the live model too (slot.name ==
+    # LEARNER_NAME) and their transitions are equally valid on-policy training
+    # data. `recorded_keys` is ordered (env, then seat); for fixed/eval rollouts
+    # (no LEARNER_NAME opponents) it degenerates to one designated seat per env,
+    # so the returned list stays one-trajectory-per-env in env order.
+    recorded_keys = [
+        (env_idx, seat)
+        for env_idx in range(num_envs)
+        for seat in range(num_players)
+        if seat_agents[env_idx][seat] is None
+        or seat_agents[env_idx][seat].name == LEARNER_NAME
+    ]
+    trajectories: dict[tuple[int, int], Trajectory] = {
+        key: _empty_traj() for key in recorded_keys
+    }
     finals: list[Any] = [None] * num_envs
 
     states = vec.reset()
@@ -694,15 +718,21 @@ def rollout_episodes_batched(
     active_envs = list(range(num_envs))
     episode_steps = int(getattr(vec, "episode_steps", 500))
     dense_potential = record_trajectories and reward_cfg.uses_dense_potential()
-    previous_potential = [0.0] * num_envs
+    previous_potential: dict[tuple[int, int], float] = {key: 0.0 for key in recorded_keys}
     if dense_potential:
-        previous_potential = _reward_potentials(
-            vec,
-            states,
-            [(idx, learner_seats[idx]) for idx in range(num_envs)],
-            num_players,
-            episode_steps,
-            reward_cfg,
+        previous_potential = dict(
+            zip(
+                recorded_keys,
+                _reward_potentials(
+                    vec,
+                    states,
+                    recorded_keys,
+                    num_players,
+                    episode_steps,
+                    reward_cfg,
+                ),
+                strict=True,
+            )
         )
     fast_policy_batch = getattr(vec, "policy_batch", None)
     fast_policy_batch_no_context = getattr(vec, "policy_batch_no_context", None)
@@ -887,7 +917,6 @@ def rollout_episodes_batched(
                 flat_player_rows,
                 flat_actions,
                 trajectories,
-                learner_seats,
                 device,
                 deterministic,
                 record_trajectories,
@@ -967,7 +996,6 @@ def rollout_episodes_batched(
                     flat_player_rows,
                     flat_actions,
                     trajectories,
-                    learner_seats,
                     str(getattr(agent, "device", device)),
                     bool(getattr(agent, "deterministic", deterministic)),
                     False,
@@ -1034,10 +1062,11 @@ def rollout_episodes_batched(
         active_envs = [idx for idx in active_envs if not dones[idx]]
         if dense_potential:
             phase_t0 = perf_counter()
+            active_set = set(active)
             rows = [
-                (idx, learner_seats[idx])
-                for idx in active
-                if trajectories[idx].reward
+                (env_idx, seat)
+                for (env_idx, seat) in recorded_keys
+                if env_idx in active_set and trajectories[(env_idx, seat)].reward
             ]
             current_potential = _reward_potentials(
                 vec,
@@ -1047,20 +1076,23 @@ def rollout_episodes_batched(
                 episode_steps,
                 reward_cfg,
             )
-            for (env_idx, _seat), phi in zip(rows, current_potential, strict=True):
-                trajectories[env_idx].reward[-1] += reward_cfg.potential_weight * (
-                    phi - previous_potential[env_idx]
+            for (env_idx, seat), phi in zip(rows, current_potential, strict=True):
+                key = (env_idx, seat)
+                trajectories[key].reward[-1] += reward_cfg.potential_weight * (
+                    phi - previous_potential[key]
                 )
-                previous_potential[env_idx] = phi
+                previous_potential[key] = phi
             _add_timing(timings, "reward_s", perf_counter() - phase_t0)
 
-    # 5. Apply terminal reward + record seat_rewards on each trajectory.
-    for env_idx in range(num_envs):
-        _finalize_trajectory(
-            trajectories[env_idx], finals[env_idx], learner_seats[env_idx], reward_cfg
-        )
+    # 5. Apply terminal reward + record seat_rewards on each trajectory. Each
+    # recorded seat is finalized from its OWN perspective (margin/outcome), so a
+    # self-play game contributes one trajectory per live-learner seat.
+    for env_idx, seat in recorded_keys:
+        traj = trajectories[(env_idx, seat)]
+        traj.env_index = env_idx
+        _finalize_trajectory(traj, finals[env_idx], seat, reward_cfg)
 
-    return trajectories
+    return [trajectories[key] for key in recorded_keys]
 
 
 def _step_learner_bucket(
@@ -1070,8 +1102,7 @@ def _step_learner_bucket(
     flat_env_rows: list[int] | None,
     flat_player_rows: list[int] | None,
     flat_actions: list[Any] | None,
-    trajectories: list[Trajectory],
-    learner_seats: Sequence[int],
+    trajectories: dict[tuple[int, int], Trajectory],
     device: str,
     deterministic: bool,
     record_trajectories: bool,
@@ -1244,14 +1275,13 @@ def _step_learner_bucket(
         if stacked.planet_feats.shape[0] < real_rows:
             raise RuntimeError("encoded rollout batch has fewer rows than bucket")
     learner_rows: list[int] = []
-    learner_envs: list[int] = []
+    learner_keys: list[tuple[int, int]] = []
     if record_trajectories:
-        learner_rows = [
-            k
-            for k, (env_idx, seat, _obs) in enumerate(bucket)
-            if seat == learner_seats[env_idx]
-        ]
-        learner_envs = [bucket[k][0] for k in learner_rows]
+        # The learner bucket holds ONLY live-learner seats (the designated learner
+        # seat plus any LEARNER_NAME self-play opponents), so every row is recorded
+        # into its own (env, seat)-keyed trajectory.
+        learner_rows = list(range(len(bucket)))
+        learner_keys = [(bucket[k][0], bucket[k][1]) for k in learner_rows]
     record_source_mask_full = None
     compact_source_rows = None
     compact_source_cols = None
@@ -1489,8 +1519,8 @@ def _step_learner_bucket(
                 row_idx,
                 learner_rows,
             )
-            for j, env_idx in enumerate(learner_envs):
-                traj = trajectories[env_idx]
+            for j, (env_idx, seat) in enumerate(learner_keys):
+                traj = trajectories[(env_idx, seat)]
                 traj.encoded.append(
                     EncodedObs(
                         planet_feats=rec["planet_feats"][j],
@@ -1524,13 +1554,13 @@ def _step_learner_bucket(
                 timings=timings,
             )
             if chunk_records:
-                for j, env_idx in enumerate(learner_envs):
-                    traj = trajectories[env_idx]
+                for j, (env_idx, seat) in enumerate(learner_keys):
+                    traj = trajectories[(env_idx, seat)]
                     traj.record_refs.append(TrajectoryRecordRef(rec, j))
                     traj.reward.append(0.0)
             else:
-                for j, env_idx in enumerate(learner_envs):
-                    traj = trajectories[env_idx]
+                for j, (env_idx, seat) in enumerate(learner_keys):
+                    traj = trajectories[(env_idx, seat)]
                     traj.encoded.append(
                         EncodedObs(
                             planet_feats=rec["planet_feats"][j],

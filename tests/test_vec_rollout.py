@@ -478,6 +478,80 @@ def test_numpy_fast_rollout_can_record_chunked_ppo_records():
     assert torch.equal(batch["old_log_prob"], torch.zeros_like(batch["launch"]))
 
 
+def test_self_play_records_every_live_learner_seat():
+    # A self-play opponent (slot name == LEARNER_NAME, agent driven by the live
+    # model) is recorded into its own (env, seat) trajectory, so a single 2p env
+    # yields two trajectories — one per seat — both tagged with env_index 0.
+    model = OrbitPolicy(
+        OrbitPolicyConfig(
+            dim=16,
+            ff_dim=32,
+            depth=1,
+            n_heads=2,
+            encoder_backend="destination_conditioned",
+        )
+    )
+    self_play = OpponentSlot(LEARNER_NAME, agent=None)
+    vec = NumpyVecEnv(
+        num_envs=1,
+        num_players=2,
+        episode_steps=10,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+
+    with vec:
+        trajs = rollout_episodes_batched(
+            model,
+            vec,
+            [[self_play]],
+            num_players=2,
+            learner_seat=0,
+            device="cpu",
+        )
+
+    # Both seats recorded, from the same env, each from its own perspective.
+    assert len(trajs) == 2
+    assert sorted(traj.learner_seat for traj in trajs) == [0, 1]
+    assert all(traj.env_index == 0 for traj in trajs)
+    assert all(traj.encoded for traj in trajs)
+    assert all(traj.reward for traj in trajs)
+    # seat_rewards are the same game scores for both seats; the two trajectories'
+    # final-score margins are mirror images (zero-sum).
+    a, b = sorted(trajs, key=lambda t: t.learner_seat)
+    assert a.seat_rewards == b.seat_rewards
+    assert a.final_score == pytest.approx(-b.final_score)
+    assert a.won == (not b.won) or (a.drawn and b.drawn)
+
+
+def test_fixed_opponent_records_one_trajectory_per_env():
+    # A non-learner opponent (named slot) must NOT be recorded — fixed/eval
+    # rollouts stay one designated-seat trajectory per env, in env order.
+    model = OrbitPolicy(OrbitPolicyConfig(dim=16, ff_dim=32, depth=1, n_heads=2))
+    opponent = OpponentSlot("noop", agent=lambda _obs: [])
+    vec = NumpyVecEnv(
+        num_envs=3,
+        num_players=2,
+        episode_steps=8,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+
+    with vec:
+        trajs = rollout_episodes_batched(
+            model,
+            vec,
+            [[opponent], [opponent], [opponent]],
+            num_players=2,
+            learner_seat=[0, 1, 0],
+            device="cpu",
+        )
+
+    assert len(trajs) == 3
+    assert [traj.env_index for traj in trajs] == [0, 1, 2]
+    assert [traj.learner_seat for traj in trajs] == [0, 1, 0]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_materialize_records_cpu_handles_mixed_record_devices():
     batch = 2

@@ -1869,6 +1869,12 @@ def _ppo_loop(
         update_t0 = perf_counter()
         phase_t0 = update_t0
         trajs = []
+        # Designated-learner-seat trajectories only (one per env). Self-play folds
+        # opponent live-learner seats into `trajs` for training, but per-game
+        # bookkeeping and diagnostics key off the designated seat so their
+        # semantics are identical to fixed-opponent runs (zero-sum self-play
+        # would otherwise drive win_rate/margin to a constant 0.5/0).
+        primary_trajs = []
         rollout_s = 0.0
         rollout_timings: dict[str, float] | None = (
             {} if cfg.rollout.detail_timing or cfg.rollout.sample_detail_timing else None
@@ -1956,7 +1962,14 @@ def _ppo_loop(
                         vec.last_replay_html
                     )
 
-                for env_idx, traj in enumerate(batch_trajs):
+                for traj in batch_trajs:
+                    env_idx = traj.env_index
+                    # Record each game once, from its designated learner seat.
+                    # Self-play opponent seats (also live-learner) ride along in
+                    # `batch_trajs` for training but are skipped here.
+                    if traj.learner_seat != learner_seats[env_idx]:
+                        continue
+                    primary_trajs.append(traj)
                     slots = opponents_per_env[env_idx]
                     seat_names = _seat_names(traj.learner_seat, slots)
                     seats = list(zip(seat_names, traj.seat_rewards, strict=True))
@@ -2107,16 +2120,20 @@ def _ppo_loop(
         value_ev = _explained_variance(batch["value"], batch["return"])
 
         phase_t0 = perf_counter()
-        margins = [float(t.final_score) for t in trajs]
-        episode_returns = [float(sum(t.reward)) for t in trajs]
-        episode_lengths = [float(len(t.reward)) for t in trajs]
-        win_rate = float(np.mean([t.won for t in trajs]))
+        margins = [float(t.final_score) for t in primary_trajs]
+        episode_returns = [float(sum(t.reward)) for t in primary_trajs]
+        episode_lengths = [float(len(t.reward)) for t in primary_trajs]
+        win_rate = float(np.mean([t.won for t in primary_trajs]))
         margin = float(np.mean(margins))
         episodic_return = float(np.mean(episode_returns)) if episode_returns else 0.0
         episodic_length = float(np.mean(episode_lengths)) if episode_lengths else 0.0
-        update_win_margin = sum(m for t, m in zip(trajs, margins, strict=True) if t.won)
+        update_win_margin = sum(
+            m for t, m in zip(primary_trajs, margins, strict=True) if t.won
+        )
         update_loss_margin = sum(
-            m for t, m in zip(trajs, margins, strict=True) if not t.won and not t.drawn
+            m
+            for t, m in zip(primary_trajs, margins, strict=True)
+            if not t.won and not t.drawn
         )
         cumulative_margin += sum(margins)
         cumulative_win_margin += update_win_margin
@@ -2383,7 +2400,7 @@ def _ppo_loop(
         learner_steps = sum(len(t.reward) for t in trajs)
         learner_steps_per_s = learner_steps / max(rollout_s, 1e-9)
         end_to_end_steps_per_s = learner_steps / max(update_s, 1e-9)
-        games_per_minute = len(trajs) * 60.0 / max(update_s, 1e-9)
+        games_per_minute = len(primary_trajs) * 60.0 / max(update_s, 1e-9)
 
         logger.scalars(
             "timing",
@@ -2400,7 +2417,7 @@ def _ppo_loop(
                 "snapshot_s": snapshot_s,
                 "learner_steps_per_s": learner_steps_per_s,
                 "games_per_minute": games_per_minute,
-                "rollout_games_per_minute": len(trajs) * 60.0 / max(rollout_s, 1e-9),
+                "rollout_games_per_minute": len(primary_trajs) * 60.0 / max(rollout_s, 1e-9),
             },
             update,
         )

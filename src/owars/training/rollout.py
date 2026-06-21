@@ -136,6 +136,10 @@ class Trajectory:
     drawn: bool = False
     seat_rewards: list[float] = field(default_factory=list)  # all seats, in seat order
     learner_seat: int = 0
+    env_index: int = 0  # which rollout env produced this trajectory. Multi-seat
+                        # self-play records every live-learner seat of an env, so a
+                        # trajectory's position in the returned list is no longer its
+                        # env index — bookkeeping/metrics key off this field instead.
     record_refs: list[TrajectoryRecordRef] = field(default_factory=list)
 
 
