@@ -1,0 +1,144 @@
+# PMPO self-play — the dreamer4 Policy-Mirror actor objective, trained in the
+# `no_builtins` live-self-play pool (the same pool ppo_base / ppo_4p use), not
+# against a fixed sniper.
+#
+# = ppo_base's self-play opponent setup (current-learner + active + historical
+#   pools, 2p AND 4p via train_num_players) + the PMPO actor objective validated
+#   in ppo_sniper_pmpo (sign-only `chosen_logp · tanh(|adv|)`, analytical
+#   per-planet reverse-KL trust region, single epoch, raw-return HL-Gauss critic,
+#   all advantage/return normalization OFF) + board-aligned planet RoPE.
+#
+# Train from scratch — pass no `--load` (the sniper-trained 99% checkpoint used
+# base=10000/fraction=0.25 RoPE and is NOT load-compatible with this config).
+#
+# NOTE: PMPO was validated 2p vs sniper. The source-major PMPO kernel is
+# per-source-planet and should be player-count agnostic, but 4p PMPO is
+# UNVALIDATED — set `train_num_players: [2]` to restrict to 2p if it misbehaves.
+
+run:
+  name: ppo_selfplay_pmpo
+  seed: 0
+  device: cuda
+  compile_mode: reduce-overhead
+  log_root: runs
+  ckpt_root: checkpoints
+  total_updates: 1000
+
+game:
+  num_players: 2
+  train_num_players: [2, 4]  # self-training samples 2p vs 4p uniformly per wave
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  dim: 128
+  ff_dim: 256
+  depth: 3
+  n_heads: 4
+  n_kv_heads: 1
+  dropout: 0.0
+  # Board-aligned 2D RoPE on physical coords (0..100): base=100 (~board extent)
+  # + fraction=0.5 (head_dim 32 -> axis_dim 8 -> 4 freqs/axis) -> ladder
+  # lambda={6.3,19.9,62.8,198.7}, fine-local through monotonic board-scale.
+  planet_rope_fraction: 0.5
+  planet_rope_base: 100.0
+  encoder_backend: destination_conditioned
+  num_fleet_latents: 64
+  fleet_tokenizer_depth: 1
+  # Raw projected_margin returns reach O(10^4-10^5) with reward normalization
+  # OFF, so the symlog critic support covers ±200k raw: symexp(12.3) ≈ ±220k.
+  value_min: -12.3
+  value_max: 12.3
+  value_num_bins: 255
+  value_sigma_to_bin_ratio: 0.75
+  critic_mtp_horizon: 6
+  value_symlog: false
+  value_bucket: dreamer3
+
+optim:
+  # ../trading_bot_0 found muon 5e-3 (~4x below NorMuon 0.02) stable on a real
+  # transformer; Adam heads match the cleanrl PMPO ref's single 3e-4 LR.
+  muon_lr: 5.0e-3
+  lr: 3.0e-4
+  head_lr: 3.0e-4
+  control_lr: 3.0e-4
+  lr_warmup_steps: 200
+  # KL-adaptive LR is INERT under PMPO (the reverse-KL penalty is the sole trust
+  # region); kept so a `policy_objective: ppo` override behaves like ppo_base.
+  kl_lr_target: 0.025
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  minibatch_size: 4096
+  # Single epoch per update — PMPO's sole trust region is the coef=0.3
+  # reverse-KL penalty (no ratio clip, no target_kl early-stop). With 4 epochs
+  # the per-update approx_kl blew to 2-4 and the actor limit-cycled into a no-op
+  # death spiral; one pass per rollout caps per-update movement directly.
+  epochs_per_update: 1
+
+ppo:
+  gamma: 0.997
+  gae_lambda: 0.95
+  # dreamer4 Policy-Mirror actor objective with an analytical per-planet reverse
+  # KL trust region. All advantage/return normalization is OFF (sign + tanh are
+  # the only shaping).
+  policy_objective: pmpo
+  pmpo_pos_to_neg_weight: 0.5
+  # dreamer4 / cleanrl PMPO default; sign-only & magnitude-agnostic by design
+  # (tanh(|adv|) is EXPECTED to saturate). Sole trust region (no early-stop, no
+  # KL-LR controller). See ppo_sniper_pmpo.yaml for the full rationale.
+  pmpo_kl_coef: 0.3
+  pmpo_reverse_kl: true
+  advantage_transform: none
+  norm_advantage: false
+  norm_advantage_scope: minibatch
+  advantage_return_norm: none
+  advantage_return_norm_scope: batch
+  clip_coef: 0.2
+  clip_coef_high: 0.28
+  value_coef: 1.0
+  target_entropy_coef: 0.0
+  critic_return_norm: none
+  critic_return_norm_clip: 10.0
+  fraction_entropy_coef: 0.0
+  # no_builtins requires pretrain_updates=0.
+  pretrain_updates: 0
+  pretrain_episodes: 32
+  pretrain_lr: 1.0e-3
+  pretrain_behavior: heuristic
+
+rollout:
+  num_envs: 128
+  num_workers: 0
+  env_backend: rust
+  compile_policy: true
+  compile_fleet_width: 0
+  snapshot_compile_rows: 128
+  strict_target_legality: true
+
+opponents:
+  mode: no_builtins
+  snapshot_device: train
+  snapshot_every: 1
+  current_learner_prob: 0.6   # weight self-play vs the LIVE policy
+  active_pool_prob: 0.2
+  historical_archive_prob: 0.2
+  active_pool_size: 16
+  active_sample_panel_size: 1
+  historical_training_archive_size: 128
+  historical_sample_panel_size: 2
+  historical_agent_cache_size: 4
+  min_games_before_active_eviction: 16
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+reward:
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
+  draw_value: 0.0
+  margin_scale: 0.0
