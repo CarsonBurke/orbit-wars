@@ -83,9 +83,9 @@ opponents:
   mode: no_builtins
   snapshot_device: train
   snapshot_every: 1
-  current_learner_prob: 0.4
-  active_pool_prob: 0.3
-  historical_archive_prob: 0.3
+  current_learner_prob: 0.6   # was 0.4 — weight self-play vs the LIVE policy
+  active_pool_prob: 0.2       # higher live self-play, less stale-snapshot play
+  historical_archive_prob: 0.2
   active_pool_size: 16
   active_sample_panel_size: 1
   historical_training_archive_size: 128
