@@ -180,6 +180,29 @@ class PPOCfg:
     # minibatching; "none" keeps raw GAE.
     advantage_transform: Literal["rankgauss", "none"] = "rankgauss"
     norm_advantage: bool = True
+    # PPO advantage-normalization scope (cleanrl `norm_adv_scope`). Only consulted
+    # when norm_advantage=true.
+    #   - "minibatch": idiomatic PPO — standardize each minibatch's advantage by
+    #     its own weighted mean/std inside the loss kernel.
+    #   - "batch": standardize ONCE by the whole rollout's weighted mean/std,
+    #     computed before the epoch loop and shared by every minibatch (cleanrl
+    #     `b_policy_adv_normed`). Same statistic as "minibatch", wider, less noisy
+    #     window; the kernel's per-mb z-score is then disabled. Both scopes weight
+    #     each row by the active actor's per-row mass (source-major: launch-source
+    #     count; dense: owned-planet count), so "batch" is a pure widening.
+    norm_advantage_scope: Literal["minibatch", "batch"] = "minibatch"
+    # DreamerV3 advantage scaling (embodied/jax/utils.py `Normalize(impl='perc')`,
+    # configs.yaml `retnorm`): divide the policy advantage by an EMA of the
+    # (perclo, perchi) percentile RANGE of returns, floored at `limit`, with NO
+    # mean subtraction. DreamerV3 pairs this with advnorm=none and raw critic
+    # targets — so to mirror it set norm_advantage=false, advantage_transform=none,
+    # and critic_return_norm=none. "none" disables it (plain PPO advantage path).
+    advantage_return_norm: Literal["none", "perc"] = "none"
+    advantage_return_norm_scope: Literal["ema", "batch"] = "ema"
+    advantage_return_norm_rate: float = 0.01
+    advantage_return_norm_perclo: float = 5.0
+    advantage_return_norm_perchi: float = 95.0
+    advantage_return_norm_limit: float = 1.0
     # Asymmetric PPO clip-higher (DAPO / cleanRL iterthink_v24_beta): the
     # surrogate ratio is clamped to [1-clip_coef, 1+clip_coef_high]. The upper
     # bound is deliberately looser so an under-weighted action can recover while
@@ -543,6 +566,25 @@ class RunConfig:
             raise ValueError("ppo.critic_return_norm_epsilon must be positive")
         if cfg.ppo.advantage_transform not in {"rankgauss", "none"}:
             raise ValueError("ppo.advantage_transform must be 'rankgauss' or 'none'")
+        if cfg.ppo.advantage_return_norm not in {"none", "perc"}:
+            raise ValueError("ppo.advantage_return_norm must be 'none' or 'perc'")
+        if cfg.ppo.advantage_return_norm_scope not in {"ema", "batch"}:
+            raise ValueError("ppo.advantage_return_norm_scope must be 'ema' or 'batch'")
+        if cfg.ppo.norm_advantage_scope not in {"minibatch", "batch"}:
+            raise ValueError("ppo.norm_advantage_scope must be 'minibatch' or 'batch'")
+        if not (
+            0.0
+            <= cfg.ppo.advantage_return_norm_perclo
+            < cfg.ppo.advantage_return_norm_perchi
+            <= 100.0
+        ):
+            raise ValueError(
+                "ppo.advantage_return_norm percentiles must satisfy 0<=perclo<perchi<=100"
+            )
+        if not 0.0 < cfg.ppo.advantage_return_norm_rate <= 1.0:
+            raise ValueError("ppo.advantage_return_norm_rate must be in (0, 1]")
+        if cfg.ppo.advantage_return_norm_limit <= 0.0:
+            raise ValueError("ppo.advantage_return_norm_limit must be positive")
         if cfg.optim.minibatch_count is not None and cfg.optim.minibatch_count <= 0:
             raise ValueError("optim.minibatch_count must be positive when set")
         if cfg.optim.minibatch_size <= 0:

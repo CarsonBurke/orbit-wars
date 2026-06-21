@@ -32,6 +32,7 @@ from owars.training import train as train_mod
 from owars.training.config import RunConfig
 from owars.training.ppo import (
     _backward_actor_critic_with_group_clips,
+    _batch_normalize_advantage,
     _beta_log_prob,
     _conditional_action_entropy,
     _distributional_value_loss,
@@ -233,6 +234,155 @@ def test_ppo_update_runs_with_source_major_actor_records():
     assert math.isfinite(log.value_loss)
     assert math.isfinite(log.approx_kl)
     assert 0.0 <= log.ratio_clip_frac_high <= 1.0
+
+
+def test_batch_normalize_advantage_weighted():
+    # Per-row advantages weighted by the active kernel's per-row mass; a row with
+    # zero weight (e.g. no launch sources) must not influence the statistic.
+    adv = torch.tensor([1.0, 2.0, 3.0, 100.0])
+    w = torch.tensor([2.0, 1.0, 3.0, 0.0])
+    out = _batch_normalize_advantage(adv, w)
+
+    mean = (adv * w).sum() / w.sum()
+    std = (((adv - mean).square() * w).sum() / w.sum()).sqrt()
+    expected = (adv - mean) / (std + 1e-8)
+    assert torch.allclose(out, expected, atol=1e-6)
+    # Weighted mean removed -> weighted mean of the output is ~0.
+    assert abs(float((out * w).sum() / w.sum())) < 1e-5
+
+
+def test_batch_normalize_advantage_degenerate_falls_back():
+    adv = torch.tensor([1.0, 2.0, 3.0])
+    # Zero total weight (no owned planets / no sources) -> unchanged.
+    assert torch.allclose(_batch_normalize_advantage(adv, torch.zeros(3)), adv.float())
+    # Zero-variance advantage -> unchanged.
+    flat = torch.tensor([5.0, 5.0, 5.0])
+    assert torch.allclose(
+        _batch_normalize_advantage(flat, torch.ones(3)),
+        flat,
+    )
+
+
+def test_ppo_update_batch_scope_advnorm_runs_on_both_paths():
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    for with_source in (False, True):
+        model = OrbitPolicy(cfg)
+        batch = _toy_batch(model, batch_size=8)
+        if with_source:
+            batch = _with_source_actor_keys(batch)
+        optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+        log = ppo_update(
+            model,
+            optim,
+            batch,
+            value_coef=0.5,
+            target_entropy_coef=0.0,
+            fraction_entropy_coef=0.0,
+            norm_advantage=True,
+            norm_advantage_scope="batch",
+            advantage_transform="none",
+            clip_coef=0.2,
+            clip_coef_high=0.28,
+            epochs=2,
+            minibatch_size=4,
+            grad_clip=0.5,
+        )
+        assert math.isfinite(log.policy_loss), with_source
+        assert math.isfinite(log.value_loss), with_source
+        assert math.isfinite(log.approx_kl), with_source
+
+
+@pytest.mark.parametrize("with_source", [False, True])
+def test_batch_scope_matches_minibatch_scope_for_single_full_minibatch(with_source):
+    # With one minibatch spanning the whole rollout, the kernel's per-minibatch
+    # z-score (minibatch scope) sees exactly the whole-batch statistic that batch
+    # scope applies pre-loop, so the actor objective must coincide. This must hold
+    # on BOTH actor paths: the dense kernel weights by owned-planet count and the
+    # source-major kernel by launch-source count, and batch scope mirrors each.
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    base = OrbitPolicy(cfg)
+    batch = _toy_batch(base, batch_size=8)
+    if with_source:
+        batch = _with_source_actor_keys(batch)
+
+    def run(scope: str) -> float:
+        model = OrbitPolicy(cfg)
+        model.load_state_dict(base.state_dict())
+        optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+        log = ppo_update(
+            model,
+            optim,
+            dict(batch),
+            value_coef=0.5,
+            target_entropy_coef=0.0,
+            fraction_entropy_coef=0.0,
+            norm_advantage=True,
+            norm_advantage_scope=scope,
+            advantage_transform="none",
+            clip_coef=0.2,
+            clip_coef_high=0.28,
+            epochs=1,
+            minibatch_size=8,
+            grad_clip=0.5,
+        )
+        return log.policy_loss
+
+    assert run("batch") == pytest.approx(run("minibatch"), rel=1e-4, abs=1e-5)
+
+
+def test_batch_scope_source_path_weights_by_launch_source_count_not_owned_count():
+    # Regression guard for the source-major path: batch scope must weight rows by
+    # launch-source count (the source kernel's source_w), NOT total owned-planet
+    # count. Drop one source from row 0 so its source count (2) differs from its
+    # owned count (3); a self-consistent batch where the two weightings diverge.
+    # With correct source-count weighting the pre-loop z-score's centering still
+    # cancels against the source-weighted loss mean (epoch-0 policy_loss ~ 0 and
+    # equals minibatch scope); owned-count weighting would break that cancellation.
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    base = OrbitPolicy(cfg)
+    batch = _with_source_actor_keys(_toy_batch(base, batch_size=8))
+    keep = torch.arange(1, batch["actor_source_row_idx"].numel())
+    rows = batch["actor_source_row_idx"][keep]
+    for key in (
+        "actor_source_row_idx",
+        "actor_source_col_idx",
+        "actor_launch",
+        "actor_raw_launch",
+        "actor_target_idx",
+        "actor_fraction",
+        "actor_target_legal_mask",
+    ):
+        batch[key] = batch[key][keep]
+    counts = torch.bincount(rows, minlength=int(batch["owned_mask"].shape[0]))
+    batch["actor_source_row_offsets"] = torch.cat(
+        (torch.zeros(1, dtype=torch.long), counts.cumsum(0).long()),
+    )
+    # Precondition: the two candidate weightings genuinely disagree on row 0.
+    assert int(counts[0]) < int(batch["owned_mask"][0].sum())
+
+    def run(scope: str) -> float:
+        model = OrbitPolicy(cfg)
+        model.load_state_dict(base.state_dict())
+        optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+        log = ppo_update(
+            model,
+            optim,
+            dict(batch),
+            value_coef=0.5,
+            target_entropy_coef=0.0,
+            fraction_entropy_coef=0.0,
+            norm_advantage=True,
+            norm_advantage_scope=scope,
+            advantage_transform="none",
+            clip_coef=0.2,
+            clip_coef_high=0.28,
+            epochs=1,
+            minibatch_size=8,
+            grad_clip=0.5,
+        )
+        return log.policy_loss
+
+    assert run("batch") == pytest.approx(run("minibatch"), rel=1e-4, abs=1e-5)
 
 
 def test_source_major_ppo_capacity_uses_log_spaced_source_buckets():

@@ -222,6 +222,60 @@ class DiscountedReturnNormalizer:
         self.count = float(state.get("count", self.count) or 1.0e-4)
 
 
+@dataclass
+class PercentileReturnNormalizer:
+    """DreamerV3 percentile return normalizer for actor advantages.
+
+    Mirrors dreamerv3 `Normalize(impl='perc')` (embodied/jax/utils.py) under the
+    `retnorm` config (rate=0.01, limit=1.0, perclo=5, perchi=95, debias=False):
+    track an EMA of the `perclo`/`perchi` percentiles of returns, then scale the
+    policy advantage by `1 / max(limit, hi - lo)` with no mean subtraction. The
+    `max(limit, .)` floor stops near-degenerate return spreads from amplifying
+    advantages — the failure mode that a per-minibatch z-score has at cold start.
+    """
+
+    rate: float = 0.01
+    perclo: float = 5.0
+    perchi: float = 95.0
+    limit: float = 1.0
+    lo: float = 0.0
+    hi: float = 0.0
+
+    def update(self, returns: np.ndarray) -> None:
+        if returns.size == 0:
+            return
+        lo = float(np.percentile(returns, self.perclo))
+        hi = float(np.percentile(returns, self.perchi))
+        self.lo = (1.0 - self.rate) * self.lo + self.rate * lo
+        self.hi = (1.0 - self.rate) * self.hi + self.rate * hi
+
+    @property
+    def scale(self) -> float:
+        return max(self.limit, self.hi - self.lo)
+
+    def state_dict(self) -> dict[str, float]:
+        return {
+            "rate": self.rate,
+            "perclo": self.perclo,
+            "perchi": self.perchi,
+            "limit": self.limit,
+            "lo": self.lo,
+            "hi": self.hi,
+        }
+
+    def load_state_dict(self, state: dict[str, float]) -> None:
+        for key in ("rate", "perclo", "perchi", "limit"):
+            stored = state.get(key)
+            if stored is not None and not math.isclose(
+                float(stored), getattr(self, key), rel_tol=0.0, abs_tol=1.0e-12
+            ):
+                raise ValueError(
+                    f"checkpoint advantage_return_normalizer {key} does not match config"
+                )
+        self.lo = float(state.get("lo", self.lo) or 0.0)
+        self.hi = float(state.get("hi", self.hi) or 0.0)
+
+
 def kl_lr_ema_alpha(half_life: float) -> float:
     """Return EMA alpha for a half-life measured in PPO updates."""
     if half_life <= 0.0:
@@ -423,12 +477,72 @@ def _restore_reward_normalizer_from_checkpoint(
     )
 
 
-def _reward_normalizer_checkpoint_extra(
-    reward_normalizer: DiscountedReturnNormalizer | None,
-) -> dict[str, object] | None:
-    if reward_normalizer is None:
+def _build_percentile_return_normalizer(
+    cfg: RunConfig,
+) -> PercentileReturnNormalizer | None:
+    # The stateful EMA normalizer exists ONLY for the "ema" scope (DreamerV3
+    # retnorm: a slow global percentile EMA). The "batch" scope keeps no state and
+    # uses no EMA — it recomputes a fresh whole-rollout percentile spread each
+    # update via _fresh_percentile_return_scale, so it builds no normalizer here.
+    if (
+        cfg.ppo.advantage_return_norm != "perc"
+        or cfg.ppo.advantage_return_norm_scope != "ema"
+    ):
         return None
-    return {"critic_return_normalizer": reward_normalizer.state_dict()}
+    return PercentileReturnNormalizer(
+        rate=cfg.ppo.advantage_return_norm_rate,
+        perclo=cfg.ppo.advantage_return_norm_perclo,
+        perchi=cfg.ppo.advantage_return_norm_perchi,
+        limit=cfg.ppo.advantage_return_norm_limit,
+    )
+
+
+def _fresh_percentile_return_scale(
+    returns: torch.Tensor,
+    *,
+    perclo: float,
+    perchi: float,
+    limit: float,
+) -> float:
+    """Fresh whole-rollout percentile-range scale for the "batch" retnorm scope.
+
+    Stateless and EMA-free: each update divides the actor advantage by
+    `max(limit, p95 - p5)` of the current rollout's returns. Same percentile and
+    floor formula as the EMA normalizer's `.scale`, minus the smoothing.
+    """
+    arr = returns.detach().to(torch.float32).cpu().numpy()
+    if arr.size == 0:
+        return float(limit)
+    lo = float(np.percentile(arr, perclo))
+    hi = float(np.percentile(arr, perchi))
+    return max(float(limit), hi - lo)
+
+
+def _restore_percentile_return_normalizer_from_checkpoint(
+    return_pct_normalizer: PercentileReturnNormalizer | None,
+    ckpt: object,
+) -> None:
+    # Best-effort: the EMA only warms up actor-advantage scaling, so a checkpoint
+    # without it (older runs, or one saved before this normalizer existed) just
+    # re-warms from zero rather than erroring.
+    if return_pct_normalizer is None:
+        return
+    if isinstance(ckpt, dict) and isinstance(
+        ckpt.get("advantage_return_normalizer"), dict
+    ):
+        return_pct_normalizer.load_state_dict(ckpt["advantage_return_normalizer"])
+
+
+def _normalizer_checkpoint_extra(
+    reward_normalizer: DiscountedReturnNormalizer | None,
+    return_pct_normalizer: PercentileReturnNormalizer | None = None,
+) -> dict[str, object] | None:
+    extra: dict[str, object] = {}
+    if reward_normalizer is not None:
+        extra["critic_return_normalizer"] = reward_normalizer.state_dict()
+    if return_pct_normalizer is not None:
+        extra["advantage_return_normalizer"] = return_pct_normalizer.state_dict()
+    return extra or None
 
 
 def _compile_mode_for_model(model: OrbitPolicy, cfg: RunConfig) -> str | None:
@@ -1344,11 +1458,14 @@ def _save_ppo_checkpoint(
     model: OrbitPolicy,
     path: Path,
     reward_normalizer: DiscountedReturnNormalizer | None = None,
+    return_pct_normalizer: PercentileReturnNormalizer | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"model": model.state_dict(), "config": model.cfg.to_dict()}
     if reward_normalizer is not None:
         payload["critic_return_normalizer"] = reward_normalizer.state_dict()
+    if return_pct_normalizer is not None:
+        payload["advantage_return_normalizer"] = return_pct_normalizer.state_dict()
     torch.save(payload, path)
 
 
@@ -1537,6 +1654,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
         model.bfloat16()
         restore_fp32_params(model)
     reward_normalizer = _build_reward_normalizer(cfg)
+    return_pct_normalizer = _build_percentile_return_normalizer(cfg)
     if load_weights is not None:
         # Resume: load model weights only — fresh optimizer state and a fresh
         # opponent pool. Restoring the optimizer is rarely worth it across
@@ -1550,6 +1668,10 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             reward_normalizer,
             ckpt,
             load_weights,
+        )
+        _restore_percentile_return_normalizer_from_checkpoint(
+            return_pct_normalizer,
+            ckpt,
         )
         print(f"loaded weights from {load_weights}")
     # Re-project the trunk matrices onto the hypersphere: the bf16 round-trip
@@ -1663,6 +1785,7 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
             device,
             vecs,
             reward_normalizer,
+            return_pct_normalizer,
         )
 
 
@@ -1676,6 +1799,7 @@ def _ppo_loop(
     device: torch.device,
     vecs: dict[int, VecEnv],
     reward_normalizer: DiscountedReturnNormalizer | None = None,
+    return_pct_normalizer: PercentileReturnNormalizer | None = None,
 ) -> dict:
     summary: dict = {"updates": []}
     cumulative_margin = 0.0
@@ -1698,7 +1822,9 @@ def _ppo_loop(
             "init",
             model,
             init_ckpt,
-            checkpoint_extra=_reward_normalizer_checkpoint_extra(reward_normalizer),
+            checkpoint_extra=_normalizer_checkpoint_extra(
+                reward_normalizer, return_pct_normalizer
+            ),
         )
     elif cfg.opponents.mode == "no_builtins":
         init_ckpt = Path(cfg.run.ckpt_root) / cfg.run.name / "snapshot_init.pt"
@@ -1708,7 +1834,9 @@ def _ppo_loop(
             model,
             init_ckpt,
             created_update=0,
-            checkpoint_extra=_reward_normalizer_checkpoint_extra(reward_normalizer),
+            checkpoint_extra=_normalizer_checkpoint_extra(
+                reward_normalizer, return_pct_normalizer
+            ),
         )
 
     # `ppo_update` owns minibatch-level compile/capture. Keeping compilation
@@ -1893,6 +2021,26 @@ def _ppo_loop(
                 critic_mtp_horizon=cfg.model.critic_mtp_horizon,
             )
         old_log_prob_s = perf_counter() - old_log_prob_t0
+        # retnorm: scale the actor advantage by max(limit, p95-p5) of this
+        # rollout's returns, computed once per update (never per minibatch).
+        #   - scope "ema":   slow global percentile EMA (DreamerV3 retnorm).
+        #   - scope "batch": fresh whole-rollout spread each update, no EMA.
+        return_norm_scale = 1.0
+        if return_pct_normalizer is not None:
+            return_pct_normalizer.update(
+                batch["return"].detach().to(torch.float32).cpu().numpy()
+            )
+            return_norm_scale = return_pct_normalizer.scale
+        elif (
+            cfg.ppo.advantage_return_norm == "perc"
+            and cfg.ppo.advantage_return_norm_scope == "batch"
+        ):
+            return_norm_scale = _fresh_percentile_return_scale(
+                batch["return"],
+                perclo=cfg.ppo.advantage_return_norm_perclo,
+                perchi=cfg.ppo.advantage_return_norm_perchi,
+                limit=cfg.ppo.advantage_return_norm_limit,
+            )
         log = ppo_update(
             model,
             optimizer,
@@ -1901,7 +2049,9 @@ def _ppo_loop(
             target_entropy_coef=cfg.ppo.target_entropy_coef,
             fraction_entropy_coef=cfg.ppo.fraction_entropy_coef,
             norm_advantage=cfg.ppo.norm_advantage,
+            norm_advantage_scope=cfg.ppo.norm_advantage_scope,
             advantage_transform=cfg.ppo.advantage_transform,
+            return_norm_scale=return_norm_scale,
             clip_coef=cfg.ppo.clip_coef,
             clip_coef_high=cfg.ppo.clip_coef_high,
             epochs=cfg.optim.epochs_per_update,
@@ -1971,6 +2121,7 @@ def _ppo_loop(
                 "log_ratio_abs_max": log.log_ratio_abs_max,
                 "row_log_ratio_abs_mean": log.row_log_ratio_abs_mean,
                 "raw_advantage_abs_mean": float(batch["raw_advantage_abs_mean"]),
+                "advantage_return_scale": return_norm_scale,
                 "epochs_run": log.epochs_run,
             },
             update,
@@ -2144,7 +2295,7 @@ def _ppo_loop(
             best_margin = margin
             best_update = update
             best_path = Path(cfg.run.ckpt_root) / cfg.run.name / "best.pt"
-            _save_ppo_checkpoint(model, best_path, reward_normalizer)
+            _save_ppo_checkpoint(model, best_path, reward_normalizer, return_pct_normalizer)
             best_meta = {
                 "update": best_update,
                 "win_rate": best_win_rate,
@@ -2163,7 +2314,9 @@ def _ppo_loop(
                 f"{update:04d}",
                 model,
                 ckpt,
-                checkpoint_extra=_reward_normalizer_checkpoint_extra(reward_normalizer),
+                checkpoint_extra=_normalizer_checkpoint_extra(
+                    reward_normalizer, return_pct_normalizer
+                ),
             )
         elif (
             cfg.opponents.mode == "no_builtins" and (update + 1) % cfg.opponents.snapshot_every == 0
@@ -2175,13 +2328,16 @@ def _ppo_loop(
                 model,
                 ckpt,
                 created_update=update + 1,
-                checkpoint_extra=_reward_normalizer_checkpoint_extra(reward_normalizer),
+                checkpoint_extra=_normalizer_checkpoint_extra(
+                    reward_normalizer, return_pct_normalizer
+                ),
             )
         elif cfg.opponents.mode == "fixed" and (update + 1) % cfg.opponents.snapshot_every == 0:
             _save_ppo_checkpoint(
                 model,
                 Path(cfg.run.ckpt_root) / cfg.run.name / "latest.pt",
                 reward_normalizer,
+                return_pct_normalizer,
             )
         snapshot_s = perf_counter() - phase_t0
         update_s = perf_counter() - update_t0
@@ -2214,7 +2370,7 @@ def _ppo_loop(
         logger.scalars("charts", {"SPS": end_to_end_steps_per_s}, update)
 
     final_path = Path(cfg.run.ckpt_root) / cfg.run.name / "final.pt"
-    _save_ppo_checkpoint(model, final_path, reward_normalizer)
+    _save_ppo_checkpoint(model, final_path, reward_normalizer, return_pct_normalizer)
 
     elo_path = final_path.with_name("elo.json")
     elo_path.write_text(json.dumps(elo.snapshot_dict(), indent=2, sort_keys=True))

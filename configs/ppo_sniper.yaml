@@ -34,8 +34,13 @@ model:
   encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
-  value_min: -8.0
-  value_max: 8.0
+  # Symlog-coordinate support bounds (buckets are uniform in THIS symlog space,
+  # so raw centers cluster densely near 0 and spread exponentially at the tails).
+  # With reward normalization OFF (DreamerV3 alignment) the critic trains on RAW
+  # projected_margin returns, whose turns_left projection can reach O(10^4-10^5),
+  # so the support covers ±200k raw: symexp(12.3) = e^12.3 - 1 ≈ ±220k.
+  value_min: -12.3
+  value_max: 12.3
   value_num_bins: 255
   value_sigma_to_bin_ratio: 0.75
   critic_mtp_horizon: 6
@@ -75,13 +80,28 @@ optim:
 ppo:
   gamma: 0.997
   gae_lambda: 0.95
-  advantage_transform: rankgauss
+  # Advantage normalization = batch-scope PPO advnorm, no return norm
+  # (cleanrl iterthink_v24_beta_d3bucket_mtp_ppoadvnorm_batch_v1:
+  #  norm_adv=True, norm_adv_scope="batch", ret_percnorm=False, adv_transform=v10):
+  #   - no reward normalization: critic_return_norm=none -> raw rewards/returns
+  #     (DreamerV3 valnorm=none). Needs the wider value_min/value_max below.
+  #   - identity advantage shaping: advantage_transform=none (no rankgauss).
+  #   - whole-rollout advantage z-score: norm_advantage=true with
+  #     norm_advantage_scope=batch -> standardize the actor advantage ONCE by the
+  #     full rollout's weighted mean/std (per-row mass = launch-source count for
+  #     this destination_conditioned/source-major actor), shared by every minibatch.
+  #   - retnorm dropped: advantage_return_norm=none (the percentile return-spread
+  #     divide is off; the z-score above is the only advantage scaling).
+  advantage_transform: none
   norm_advantage: true
+  norm_advantage_scope: batch
+  advantage_return_norm: none
+  advantage_return_norm_scope: batch
   clip_coef: 0.2
   clip_coef_high: 0.28
   value_coef: 1.0
   target_entropy_coef: 0.0
-  critic_return_norm: discounted_return_rms
+  critic_return_norm: none
   critic_return_norm_clip: 10.0
   fraction_entropy_coef: 0.0
   pretrain_updates: 0

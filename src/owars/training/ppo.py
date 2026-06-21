@@ -431,6 +431,34 @@ def _shape_policy_advantage(
     raise ValueError(f"unknown PPO advantage_transform={transform!r}")
 
 
+def _batch_normalize_advantage(
+    advantage: torch.Tensor,
+    row_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Whole-rollout weighted z-score of the per-row actor advantage.
+
+    The "batch" advantage-norm scope (cleanrl `b_policy_adv_normed`): standardize
+    the advantage ONCE over the full rollout and share it across every minibatch,
+    instead of the per-minibatch z-score the loss kernels apply under the
+    "minibatch" scope. `row_weight` is the per-row mass the active loss kernel
+    uses for its own z-score (source-major: launch-source count; dense:
+    owned-planet count), so this is the same statistic over a wider, less noisy
+    window rather than a different one. Falls back to the unchanged advantage when
+    the total weight is zero or the statistic is degenerate (non-finite / ~zero
+    spread), so it never divides by ~0.
+    """
+    adv = advantage.float().reshape(-1)
+    w = row_weight.to(adv.dtype).reshape(-1)
+    denom = w.sum()
+    if not bool(torch.isfinite(denom)) or float(denom) <= 0.0:
+        return adv
+    mean = (adv * w).sum() / denom
+    std = (((adv - mean).square() * w).sum() / denom).clamp_min(0.0).sqrt()
+    if not bool(torch.isfinite(mean) & torch.isfinite(std)) or float(std) <= 1e-12:
+        return adv
+    return (adv - mean) / (std + 1e-8)
+
+
 def _module_device(model: torch.nn.Module) -> torch.device:
     try:
         return next(model.parameters()).device
@@ -2731,6 +2759,8 @@ def ppo_update(
     epochs: int,
     minibatch_size: int,
     grad_clip: float,
+    return_norm_scale: float = 1.0,
+    norm_advantage_scope: str = "minibatch",
     minibatch_count: int | None = None,
     compile_mode: str | None = None,
 ) -> PPOLog:
@@ -2766,10 +2796,45 @@ def ppo_update(
     fleet_target_planet_idx = fleet_target_planet_idx_or_empty(batch_view)
     planet_inbound_feats = planet_inbound_feats_or_empty(batch_view)
     device = _module_device(model)
+    use_source_actor = (
+        isinstance(model, OrbitPolicy)
+        and "actor_source_row_idx" in batch
+        and "actor_target_legal_mask" in batch
+    )
     policy_advantage = _shape_policy_advantage(
         batch["advantage"],
         transform=advantage_transform,
     )
+    # advnorm scope (cleanrl `norm_adv_scope`). "batch" standardizes the shaped
+    # actor advantage ONCE here, by the whole rollout's weighted mean/std, shared
+    # by every minibatch (cleanrl `b_policy_adv_normed`); the per-mb kernel z-score
+    # is then disabled so the advantage is never standardized twice. "minibatch"
+    # leaves standardization to the kernel. Ordered before retnorm so the two
+    # compose as in cleanrl (z-score, then the percentile-range divide).
+    #
+    # Each row is weighted by the SAME per-row mass the active loss kernel applies
+    # to its own z-score, so "batch" is a pure widening of "minibatch" scope: the
+    # source-major actor weights by launch-source count (`source_w`, == the
+    # `actor_source_row_offsets` row spans), the dense actor by owned-planet count
+    # (`owned_w`). Anything else would change the gradient direction, not just the
+    # window, between the two scopes on the same path.
+    kernel_norm_advantage = norm_advantage
+    if norm_advantage and norm_advantage_scope == "batch":
+        if use_source_actor:
+            offsets = batch["actor_source_row_offsets"].long()
+            row_norm_weight = (offsets[1:] - offsets[:-1]).to(torch.float32)
+        else:
+            row_norm_weight = batch["owned_mask"].to(torch.float32).sum(dim=-1)
+        policy_advantage = _batch_normalize_advantage(
+            policy_advantage,
+            row_norm_weight,
+        )
+        kernel_norm_advantage = False
+    # DreamerV3 retnorm: scale the actor advantage by 1/max(limit, p95-p5). The
+    # caller computes the percentile-range scale on this batch's returns; the
+    # critic still trains on raw returns (valnorm=none). Default 1.0 is a no-op.
+    if return_norm_scale != 1.0:
+        policy_advantage = policy_advantage / float(return_norm_scale)
     return_mtp = batch.get("return_mtp", batch["return"].unsqueeze(-1))
     return_mtp_mask = batch.get(
         "return_mtp_mask",
@@ -2795,11 +2860,6 @@ def ppo_update(
         static_minibatch_rows = math.ceil(n / max(1, min(int(minibatch_count), n)))
     else:
         static_minibatch_rows = max(1, int(minibatch_size))
-    use_source_actor = (
-        isinstance(model, OrbitPolicy)
-        and "actor_source_row_idx" in batch
-        and "actor_target_legal_mask" in batch
-    )
     source_capacity = 0
     if use_source_actor:
         actor_offsets = batch["actor_source_row_offsets"].long()
@@ -2814,7 +2874,7 @@ def ppo_update(
             value_coef=value_coef,
             target_entropy_coef=target_entropy_coef,
             fraction_entropy_coef=fraction_entropy_coef,
-            norm_advantage=norm_advantage,
+            norm_advantage=kernel_norm_advantage,
             clip_coef=clip_coef,
             clip_coef_high=clip_coef_high,
             compile_mode=compile_mode,
@@ -2837,7 +2897,7 @@ def ppo_update(
             value_coef=value_coef,
             target_entropy_coef=target_entropy_coef,
             fraction_entropy_coef=fraction_entropy_coef,
-            norm_advantage=norm_advantage,
+            norm_advantage=kernel_norm_advantage,
             clip_coef=clip_coef,
             clip_coef_high=clip_coef_high,
             compile_mode=compile_mode,
