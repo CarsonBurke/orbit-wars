@@ -43,8 +43,15 @@ model:
   n_heads: 4
   n_kv_heads: 1
   dropout: 0.0
-  planet_rope_fraction: 0.25
-  planet_rope_base: 10000.0
+  # 2D RoPE over planet tokens on PHYSICAL board coords (0..100). Aligned to the
+  # 100-unit board: base=100 sets the lowest-frequency wavelength ~= board
+  # extent (vs the LLM default 10000 -> ~628 >> board), fraction=0.5 gives 4
+  # freqs/axis (head_dim 32 -> axis_dim 8) -> ladder lambda={6.3,19.9,62.8,198.7}
+  # spanning fine-local to monotonic board-scale. NOTE: the 99%-win checkpoint
+  # was trained with base=10000/fraction=0.25 and is NOT --load-compatible with
+  # these frequencies; this is a from-scratch architecture change.
+  planet_rope_fraction: 0.5
+  planet_rope_base: 100.0
   encoder_backend: destination_conditioned
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1

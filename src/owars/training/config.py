@@ -43,8 +43,18 @@ class ModelCfg:
     eigen_alpha_init: float = 0.05
     qk_gain_init: float = 1.0
     block_skip: bool = False
-    planet_rope_fraction: float = 0.25
-    planet_rope_base: float = 10000.0
+    # Partial 2D RoPE over planet tokens, applied to PHYSICAL board coordinates
+    # (0..100), not sequence indices, so frequencies must be scaled to the
+    # board's actual extent. `base` sets the LOWEST frequency (the highest, j=0,
+    # is always omega=1 / wavelength=2*pi regardless of base). On a 100-unit
+    # board the LLM-sequence default base=10000 pushes the lowest wavelength to
+    # ~628 (>> board, near-flat) and leaves a hole at the 10-50 unit
+    # planet-group / orbit scales. base=100 (~board extent) + fraction=0.5
+    # (head_dim 32 -> axis_dim 8 -> 4 freqs/axis) gives a board-aligned ladder
+    # lambda = {6.3, 19.9, 62.8, 198.7}: fine-local through a monotonic
+    # board-scale gradient. Same board (BOARD_SIZE=100) for 2p and 4p.
+    planet_rope_fraction: float = 0.5
+    planet_rope_base: float = 100.0
     encoder_backend: Literal["dense", "fleet_latent", "destination_conditioned"] = "fleet_latent"
     global_features: int = 27
     num_fleet_latents: int = 64
