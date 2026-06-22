@@ -34,7 +34,6 @@ from ..policies.sampling import (
     _apply_target_legal_mask,
     _batch_record_from_materialized_launch,
     _categorical_action_logits,
-    _ensure_deterministic_launch_if_idle,
     _mask_impossible_launches,
     _policy_fraction_params,
     _sample_categorical_action,
@@ -896,7 +895,6 @@ class RustVecEnv:
         deterministic: bool = False,
         record_rows: list[int] | None = None,
         record_source_mask: Any | None = None,
-        deterministic_fallback: bool = False,
         native_actions: bool = False,
         enqueue_actions: bool = False,
         compute_log_prob: bool = True,
@@ -930,7 +928,6 @@ class RustVecEnv:
         has_active_fields_masker = callable(active_fields_masker)
         use_compiled_action_fields = (
             deterministic
-            and deterministic_fallback
             and not record_rows
             and action_logit_softcap is not None
             and target_logits.device.type == "cuda"
@@ -1336,8 +1333,6 @@ class RustVecEnv:
             )
             cpu_source_mask_np = _as_numpy_view(cpu_owned_mask & cpu_planet_mask)
             mask_launch = support_launch
-            if deterministic_fallback:
-                mask_launch = torch.ones_like(mask_launch)
             mask_frac = frac
             _add_elapsed(timings, "sample_fraction_s", phase_t0)
 
@@ -1385,13 +1380,10 @@ class RustVecEnv:
                     deterministic,
                     fraction_dist,
                 )
-                if use_compiled_action_fields:
-                    support_launch = torch.ones_like(frac)
-                else:
-                    support_launch = (out.planet_owned_mask & out.planet_mask).to(
-                        dtype=frac.dtype,
-                        device=frac.device,
-                    )
+                support_launch = (out.planet_owned_mask & out.planet_mask).to(
+                    dtype=frac.dtype,
+                    device=frac.device,
+                )
             mask_launch = launch if action_logit_softcap is None else support_launch
             mask_frac = frac
             _add_elapsed(timings, "sample_fraction_s", phase_t0)
@@ -1403,9 +1395,7 @@ class RustVecEnv:
                     torch.stack((mask_frac.float(), mask_launch.float()), dim=-1),
                 )
                 _add_elapsed(timings, "legal_active_d2h_s", phase_t0)
-                if deterministic_fallback:
-                    active_fields_np[:, :, 1] = 1.0
-                elif record_rows and action_logit_softcap is None:
+                if record_rows and action_logit_softcap is None:
                     active_fields_np[record_rows, :, 1] = 1.0
                 frac_np = active_fields_np[:, :, 0]
                 phase_t0 = _timing_start(timings)
@@ -1427,9 +1417,7 @@ class RustVecEnv:
                 _add_elapsed(timings, "legal_active_d2h_s", phase_t0)
             if not has_active_fields_masker and callable(active_masker):
                 active_source = mask_launch.to(dtype=torch.bool)
-                if deterministic_fallback:
-                    active_source = torch.ones_like(active_source, dtype=torch.bool)
-                elif record_rows and action_logit_softcap is None:
+                if record_rows and action_logit_softcap is None:
                     active_source = active_source.clone()
                     record_idx = torch.as_tensor(
                         record_rows,
@@ -1571,14 +1559,6 @@ class RustVecEnv:
                     target_legal_mask,
                     out.planet_owned_mask,
                     out.planet_mask,
-                )
-                launch = _ensure_deterministic_launch_if_idle(
-                    launch_logits,
-                    launch,
-                    target_legal_mask,
-                    out.planet_owned_mask,
-                    out.planet_mask,
-                    deterministic_fallback,
                 )
                 target_idx = _sample_target(target_logits, deterministic)
             else:
@@ -1756,7 +1736,6 @@ class RustVecEnv:
             rows,
             deterministic=deterministic,
             record_rows=[],
-            deterministic_fallback=deterministic,
             native_actions=native_actions,
             enqueue_actions=enqueue_actions,
             compute_log_prob=False,

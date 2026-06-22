@@ -1880,11 +1880,16 @@ def test_ppo_update_sanitizes_masked_deferred_log_ratio(cuda_device):
     assert math.isfinite(log.policy_loss)
 
 
-def test_categorical_flat_logits_balance_noop_against_target_group():
+def test_categorical_logits_have_no_count_normalization():
+    # The action categorical is a plain softmax over {noop, target_i} with NO
+    # `- log(target_count)` reweighting: with equal logits every option is
+    # equiprobable, so noop's share shrinks to 1/(1+N) as more targets become
+    # legal. The launch-propensity prior that used to pin noop at a fixed 0.5
+    # share now lives in the model's learnable noop bias, not in these logits.
     noop_logits = torch.zeros(1, 2)
     target_logits = torch.full((1, 2, 5), float("-inf"))
-    target_logits[0, 0, :4] = 0.0
-    target_logits[0, 1, :2] = 0.0
+    target_logits[0, 0, :4] = 0.0  # 4 legal targets -> 1/5 each incl. noop
+    target_logits[0, 1, :2] = 0.0  # 2 legal targets -> 1/3 each incl. noop
     log_probs = _categorical_action_log_probs(
         noop_logits,
         target_logits,
@@ -1892,15 +1897,17 @@ def test_categorical_flat_logits_balance_noop_against_target_group():
     )
 
     probs = log_probs.exp()
-    assert torch.allclose(probs[0, 0, 0], torch.tensor(0.5), atol=1e-6)
-    assert torch.allclose(probs[0, 1, 0], torch.tensor(0.5), atol=1e-6)
-    assert torch.allclose(probs[0, 0, 1:5], torch.full((4,), 0.125), atol=1e-6)
-    assert torch.allclose(probs[0, 1, 1:3], torch.full((2,), 0.25), atol=1e-6)
-    assert torch.allclose(probs[0, 0, 1:].sum(), torch.tensor(0.5), atol=1e-6)
-    assert torch.allclose(probs[0, 1, 1:].sum(), torch.tensor(0.5), atol=1e-6)
+    assert torch.allclose(probs[0, 0, 0], torch.tensor(0.2), atol=1e-6)
+    assert torch.allclose(probs[0, 0, 1:5], torch.full((4,), 0.2), atol=1e-6)
+    assert torch.allclose(probs[0, 1, 0], torch.tensor(1.0 / 3.0), atol=1e-6)
+    assert torch.allclose(probs[0, 1, 1:3], torch.full((2,), 1.0 / 3.0), atol=1e-6)
+    # noop no longer holds a count-independent half of the mass.
+    assert torch.allclose(probs[0, 0, 1:].sum(), torch.tensor(0.8), atol=1e-6)
+    assert torch.allclose(probs[0, 1, 1:].sum(), torch.tensor(2.0 / 3.0), atol=1e-6)
 
 
-def test_categorical_softcap_preserves_balanced_group_semantics():
+def test_categorical_softcap_has_no_count_normalization():
+    # noop vs 3 equal targets -> uniform 1/4 each, not the old fixed P(noop)=0.5.
     noop_logits = torch.zeros(1, 1)
     target_logits = torch.zeros(1, 1, 3)
     log_probs = _categorical_action_log_probs(
@@ -1909,8 +1916,8 @@ def test_categorical_softcap_preserves_balanced_group_semantics():
         action_logit_softcap=8.0,
     )
 
-    noop_prob = log_probs.exp()[0, 0, 0]
-    assert torch.allclose(noop_prob, torch.tensor(0.5), atol=1e-6)
+    probs = log_probs.exp()[0, 0]
+    assert torch.allclose(probs, torch.full((4,), 0.25), atol=1e-6)
 
 
 def test_threshold_normal_launch_log_std_controls_exploration():

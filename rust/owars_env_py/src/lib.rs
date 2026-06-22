@@ -6477,7 +6477,11 @@ fn select_compact_categorical_beta_action_from_state(
             best_solution = Some(solution);
         }
     }
-    if legal_count == 0 || best_target_score - (legal_count as f64).ln() <= noop_score {
+    // No `- ln(legal_count)` count-normalization: the launch-propensity prior it
+    // encoded now lives in the model's learnable `noop_logit_bias` (folded into
+    // `noop_logit` upstream), so this is a clean argmax(noop, target_i) — matching
+    // sampling.py `_categorical_action_logits`.
+    if legal_count == 0 || best_target_score <= noop_score {
         (0.0, 0, None)
     } else {
         (1.0, best_target, best_solution)
@@ -6529,7 +6533,9 @@ fn select_categorical_beta_action_choice(
             best_target = target;
         }
     }
-    if best_target_score - (legal_count as f64).ln() <= noop_score {
+    // No `- ln(legal_count)` count-normalization (prior moved to the model's
+    // learnable noop bias) — clean argmax(noop, target_i).
+    if best_target_score <= noop_score {
         (0.0, 0)
     } else {
         (1.0, best_target)
@@ -6574,7 +6580,9 @@ fn select_categorical_beta_action_choice_rng(
             best_target = target;
         }
     }
-    if best_target_score - (legal_count as f64).ln() <= noop_score {
+    // No `- ln(legal_count)` count-normalization (prior moved to the model's
+    // learnable noop bias) — clean argmax(noop, target_i).
+    if best_target_score <= noop_score {
         (0.0, 0)
     } else {
         (1.0, best_target)

@@ -607,8 +607,14 @@ def test_noop_column_is_stable_across_planet_counts():
         small = model(encode_observation(parse_observation(obs_small))).launch_logits
         large = model(encode_observation(parse_observation(obs_large))).launch_logits
 
-    assert torch.allclose(small[0, 0], torch.zeros(()), atol=1e-5)
-    assert torch.allclose(large[0, 0], torch.zeros(()), atol=1e-5)
+    # With query/key zeroed the noop attention score is 0, so the noop logit is
+    # exactly the learnable launch-propensity bias — and it must not depend on
+    # the planet count. (The old `- log(target_count)` reweighting that made noop
+    # count-dependent lived in the sampler and is gone entirely; the prior is now
+    # this constant model bias.)
+    expected = torch.tensor(float(cfg.noop_logit_init_bias))
+    assert torch.allclose(small[0, 0], expected, atol=1e-5)
+    assert torch.allclose(large[0, 0], expected, atol=1e-5)
 
 
 def test_fraction_beta_concentrations_are_unimodal():

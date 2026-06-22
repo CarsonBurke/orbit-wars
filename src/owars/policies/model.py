@@ -1738,6 +1738,14 @@ class OrbitPolicy(nn.Module):
         self.target_query = CastedLinear(2 * cfg.dim, cfg.dim, bias=False)
         self.target_key = CastedLinear(cfg.dim, cfg.dim, bias=False)
         self.target_noop_key = nn.Parameter(torch.zeros(cfg.dim))
+        # Learnable no-op-logit bias. Holds the launch-propensity prior that used
+        # to be a runtime `- log(target_count)` reweighting (see sampling.py /
+        # OrbitPolicyConfig.noop_logit_init_bias). Init ≈ log(N_typical) keeps the
+        # cold-start launch rate calibrated; the model then learns it freely and
+        # the categorical mode stays a clean argmax(noop, target_i).
+        self.noop_logit_bias = nn.Parameter(
+            torch.tensor(float(cfg.noop_logit_init_bias))
+        )
         # Target attention temperature (per parameter-golf `q_gain` pattern,
         # `sota_train_gpt.py:101,104`). We RMS-norm Q & K below, then scale
         # by this learnable scalar before the softmax. Pins the target-logit
@@ -2110,7 +2118,10 @@ class OrbitPolicy(nn.Module):
                 (q.size(-1),),
             )
             if source_major:
-                noop_logits = torch.einsum("sd,d->s", q, noop_k) / (d**0.5)
+                noop_logits = (
+                    torch.einsum("sd,d->s", q, noop_k) / (d**0.5)
+                    + self.noop_logit_bias.to(q.dtype)
+                )
                 target_h = planet_h[:, :target_planets]
                 k = self.target_key(target_h)
                 k = F.rms_norm(k, (k.size(-1),))
@@ -2133,7 +2144,10 @@ class OrbitPolicy(nn.Module):
                 noop_logits = noop_logits.masked_fill(~source_valid, 0.0)
                 target_logits = logits
             else:
-                noop_logits = torch.einsum("bid,d->bi", q, noop_k) / (d**0.5)
+                noop_logits = (
+                    torch.einsum("bid,d->bi", q, noop_k) / (d**0.5)
+                    + self.noop_logit_bias.to(q.dtype)
+                )
                 k = self.target_key(planet_h)
                 k = F.rms_norm(k, (k.size(-1),))
                 # [B, P, P] — keep the canonical 1/√d divisor; `target_q_gain`

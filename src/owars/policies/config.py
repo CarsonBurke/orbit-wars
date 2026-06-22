@@ -88,6 +88,18 @@ class OrbitPolicyConfig:
     # lead-intercept solver in `sampling.py` — no learned angle component.
     action_logit_softcap: float = 8.0
 
+    # Learnable scalar bias added to the no-op logit of the per-source action
+    # categorical {noop, target_0, ...}. Replaces the old runtime
+    # `- log(target_count)` reweighting of the launch logits, which was a fixed
+    # launch-propensity prior masquerading as a per-state offset (it corrupted
+    # the deterministic mode toward no-op and could not be reshaped by the
+    # model). Initialized to ~log(N_typical) so the cold-start launch
+    # propensity matches the old count-normalized distribution; thereafter the
+    # model learns the no-op/launch balance directly and the categorical mode
+    # is a clean argmax(noop, target_i). log(20) ≈ 3.0 ≈ a typical legal-target
+    # count on a 20–40 planet board after route-legality pruning.
+    noop_logit_init_bias: float = 3.0
+
     # Distributional critic. The first horizon predicts V(s_t); additional
     # MTP horizons predict future-row lambda returns from the same critic token
     # and are masked at episode tails. `dreamer3` uses a CleanRL v162-style

@@ -380,32 +380,45 @@ def test_batched_deterministic_uses_categorical_mode():
     assert torch.equal(records[1].target_idx[source[1]], expected_target[1][source[1]])
 
 
-def test_categorical_deterministic_stays_idle_when_only_move_mass_beats_noop():
+def test_categorical_deterministic_is_clean_argmax_of_noop_vs_each_target():
+    # Deterministic decode is a clean argmax over {noop, target_i} with NO
+    # `- log(target_count)` reweighting: it launches whenever the best legal
+    # target logit beats the no-op logit, regardless of how many targets are
+    # legal. (The old count-normalization biased the mode toward no-op — every
+    # launch sat ~log(N) below noop — and is gone; the launch-propensity prior
+    # now lives in the model's learnable noop bias.)
     obs = _obs()
     obs["angular_velocity"] = 0.0
-    o = parse_observation(obs)
-    feats = encode_observation(o)
+    feats = encode_observation(parse_observation(obs))
     p = feats.planet_ids.shape[-1]
-    out = PolicyOutput(
-        launch_logits=torch.full((1, p), -100.0),
-        target_logits=torch.full((1, p, p), -100.0),
-        value=torch.zeros(1),
-        value_logits=torch.zeros(1, 51),
-        planet_owned_mask=feats.planet_owned_mask.unsqueeze(0),
-        planet_mask=feats.planet_mask.unsqueeze(0),
-        planet_ids=feats.planet_ids.unsqueeze(0),
-        action_logit_softcap=8.0,
-        fraction_alpha=torch.full((1, p), 20.0),
-        fraction_beta=torch.full((1, p), 2.0),
-    )
-    out.launch_logits[:, 0] = 0.0
-    out.target_logits[:, 0, 1] = 0.2
-    out.target_logits[:, 0, 2] = 0.2
 
-    actions, records = sample_batch_with_records_raw(
-        out, [obs], deterministic=True
-    )
+    def _out(noop_logit: float) -> PolicyOutput:
+        out = PolicyOutput(
+            launch_logits=torch.full((1, p), -100.0),
+            target_logits=torch.full((1, p, p), -100.0),
+            value=torch.zeros(1),
+            value_logits=torch.zeros(1, 51),
+            planet_owned_mask=feats.planet_owned_mask.unsqueeze(0),
+            planet_mask=feats.planet_mask.unsqueeze(0),
+            planet_ids=feats.planet_ids.unsqueeze(0),
+            action_logit_softcap=8.0,
+            fraction_alpha=torch.full((1, p), 20.0),
+            fraction_beta=torch.full((1, p), 2.0),
+        )
+        out.launch_logits[:, 0] = noop_logit
+        out.target_logits[:, 0, 1] = 0.2
+        out.target_logits[:, 0, 2] = 0.2
+        return out
 
+    # Two legal targets at 0.2 each; noop at 0.0. The best target beats noop, so
+    # the clean argmax launches — the old count-normalized rule stayed idle here.
+    actions, records = sample_batch_with_records_raw(_out(0.0), [obs], deterministic=True)
+    assert actions[0]
+    assert records[0].launch[0].item() == 1.0
+    assert records[0].target_idx[0].item() in (1, 2)
+
+    # Raise noop above every target logit: now no-op is the argmax → idle.
+    actions, records = sample_batch_with_records_raw(_out(0.5), [obs], deterministic=True)
     assert actions[0] == []
     assert records[0].launch[0].item() == 0.0
     assert records[0].target_idx[0].item() == 0
@@ -633,63 +646,6 @@ def test_moves_only_sampler_matches_record_path_deterministic():
 
     assert moves
     assert [m.as_list() for m in moves] == [m.as_list() for m in moves_with_record]
-
-
-def test_deterministic_moves_only_falls_back_to_plausible_legal_launch():
-    obs = _obs()
-    obs["angular_velocity"] = 0.0
-    o = parse_observation(obs)
-    feats = encode_observation(o)
-    out = _forced_move_output(feats)
-    out.launch_logits[:, 0] = -1.0
-    context = ActionContext(
-        planets=obs["planets"],
-        angular_velocity=obs["angular_velocity"],
-        comet_planet_ids=obs.get("comet_planet_ids", ()),
-    )
-
-    parsed_moves = sample_actions(out, o, deterministic=True)
-    raw_actions = sample_batch_actions_raw(out, [obs], deterministic=True)[0]
-    context_actions = sample_batch_actions_context(
-        out, [context], deterministic=True
-    )[0]
-
-    assert parsed_moves
-    assert raw_actions
-    assert context_actions
-
-    out.launch_logits[:, 0] = -100.0
-    assert sample_actions(out, o, deterministic=True) == []
-    assert sample_batch_actions_raw(out, [obs], deterministic=True) == [[]]
-
-
-def test_deterministic_moves_only_fallback_allows_multiple_sources():
-    obs = _obs()
-    obs["angular_velocity"] = 0.0
-    obs["planets"][2] = [2, 0, 90.0, 10.0, 1.0, 40, 2]
-    obs["planets"].append([3, -1, 90.0, 90.0, 1.0, 20, 1])
-    o = parse_observation(obs)
-    feats = encode_observation(o)
-    p = feats.planet_ids.shape[-1]
-    out = PolicyOutput(
-        launch_logits=torch.full((1, p), -100.0),
-        target_logits=torch.full((1, p, p), -100.0),
-        value=torch.zeros(1),
-        value_logits=torch.zeros(1, 51),
-        planet_owned_mask=feats.planet_owned_mask.unsqueeze(0),
-        planet_mask=feats.planet_mask.unsqueeze(0),
-        planet_ids=feats.planet_ids.unsqueeze(0),
-        fraction_alpha=torch.full((1, p), 2.0),
-        fraction_beta=torch.full((1, p), 2.0),
-    )
-    out.launch_logits[:, 0] = -1.0
-    out.launch_logits[:, 2] = -1.2
-    out.target_logits[:, 0, 1] = 10.0
-    out.target_logits[:, 2, 3] = 10.0
-
-    actions = sample_batch_actions_raw(out, [obs], deterministic=True)[0]
-
-    assert len(actions) == 2
 
 
 def test_moves_only_sampler_matches_record_path_stochastic_under_fixed_seed():

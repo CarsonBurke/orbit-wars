@@ -439,6 +439,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         value_symlog=cfg.model.value_symlog,
         value_bucket=cfg.model.value_bucket,
         action_logit_softcap=cfg.model.action_logit_softcap,
+        noop_logit_init_bias=cfg.model.noop_logit_init_bias,
         global_features=cfg.model.global_features,
     )
     return OrbitPolicy(pcfg)

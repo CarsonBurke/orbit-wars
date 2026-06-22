@@ -72,6 +72,10 @@ class ModelCfg:
     value_symlog: bool = False
     value_bucket: Literal["dreamer3", "legacy"] = "dreamer3"
     action_logit_softcap: float = 8.0
+    # Learnable no-op-logit bias init (see OrbitPolicyConfig.noop_logit_init_bias):
+    # the launch-propensity prior that replaces the old `- log(target_count)`
+    # runtime reweighting. log(20) ≈ 3.0 ≈ typical legal-target count.
+    noop_logit_init_bias: float = 3.0
     # Real-units bound on the per-planet SAC advantage heads (see
     # OrbitPolicyConfig.adv_scale): each head emits adv_scale·tanh(raw/adv_scale).
     adv_scale: float = 40.0

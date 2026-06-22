@@ -45,7 +45,6 @@ from .model import PolicyOutput
 SAMPLE_EPS: float = 1e-7
 SQUASH_EPS: float = 1e-6
 BETA_SAMPLE_EPS: float = 1e-6
-DETERMINISTIC_LAUNCH_FALLBACK_LOGIT: float = -3.0
 
 
 def _threshold_normal_launch_prob(
@@ -136,12 +135,13 @@ def _categorical_action_logits(
             noop_logits_f,
             torch.full_like(noop_logits_f, -1.0e9),
         )
-    target_count = target_finite.sum(dim=-1, keepdim=True).clamp_min(1)
-    target_logits_f = torch.where(
-        target_finite,
-        target_logits_f - target_count.to(target_logits_f.dtype).log(),
-        target_logits_f,
-    )
+    # No `- log(target_count)` reweighting: the count-normalization used to be a
+    # per-state offset baked into the action logits, which (a) corrupted the
+    # deterministic mode toward no-op (every launch sat ~log(N) below noop) and
+    # (b) is really a fixed prior on launch propensity. That prior now lives in
+    # the model's learnable `noop_logit_bias` (initialized to ~log(N_typical)),
+    # so the categorical mode is a clean argmax(noop, target_i) and the policy
+    # learns the no-op/launch balance directly.
     action_logits = torch.cat(
         (noop_logits_f.unsqueeze(-1), target_logits_f),
         dim=-1,
@@ -1315,53 +1315,6 @@ def _mask_impossible_launches(
     return launch_logits, launch
 
 
-def _ensure_deterministic_launch_if_idle(
-    launch_logits: torch.Tensor,
-    launch: torch.Tensor,
-    target_legal_mask: torch.Tensor,
-    owned: torch.Tensor,
-    pmask: torch.Tensor,
-    deterministic: bool,
-) -> torch.Tensor:
-    """For moves-only deterministic inference, try plausible legal sources.
-
-    Deterministic inference can learn useful launch probabilities below 0.5,
-    in which case the thresholded mode is a permanent
-    no-op. Submission/replay inference should still act by selecting legal
-    sources above a low confidence floor when the thresholded mode launches
-    nothing.
-    """
-    if not deterministic:
-        return launch
-    source = (owned.to(dtype=torch.bool) & pmask.to(dtype=torch.bool)).to(
-        device=launch.device
-    )
-    has_legal = target_legal_mask.to(device=launch.device, dtype=torch.bool).any(
-        dim=-1
-    )
-    confident = (
-        launch_logits.float().to(launch.device)
-        >= DETERMINISTIC_LAUNCH_FALLBACK_LOGIT
-    )
-    eligible = source & has_legal & confident
-    active = launch.to(dtype=torch.bool) & eligible
-    if launch.dim() == 1:
-        if bool(active.any()) or not bool(eligible.any()):
-            return launch
-        out = launch.clone()
-        out[eligible] = 1.0
-        return out
-
-    row_active = active.any(dim=-1)
-    row_eligible = eligible.any(dim=-1)
-    rows = torch.nonzero(~row_active & row_eligible, as_tuple=False).flatten()
-    if rows.numel() == 0:
-        return launch
-    out = launch.clone()
-    out[rows] = eligible[rows].to(dtype=out.dtype)
-    return out
-
-
 def _sample_launch_fraction(
     launch_logits: torch.Tensor,
     fraction_param1: torch.Tensor,
@@ -1484,8 +1437,6 @@ def _prepare_batch_action_fields(
     batch_len: int,
     deterministic: bool,
     target_mask_builder: Any,
-    *,
-    ensure_deterministic_idle: bool,
 ) -> _PreparedBatchActions:
     """Sample factored actions and apply per-env target legality masks.
 
@@ -1554,15 +1505,6 @@ def _prepare_batch_action_fields(
             out.planet_owned_mask,
             out.planet_mask,
         )
-        if ensure_deterministic_idle:
-            launch = _ensure_deterministic_launch_if_idle(
-                launch_logits,
-                launch,
-                target_legal_mask,
-                out.planet_owned_mask,
-                out.planet_mask,
-                deterministic,
-            )
         target_idx = _sample_target(target_logits, deterministic)
     else:
         launch, target_idx = _sample_categorical_action(
@@ -2289,9 +2231,6 @@ def sample_actions(
         _launch_logits, launch = _mask_impossible_launches(
             launch_logits, launch, target_legal_mask, owned, pmask
         )
-        launch = _ensure_deterministic_launch_if_idle(
-            launch_logits, launch, target_legal_mask, owned, pmask, deterministic
-        )
         target_idx = _sample_target(target_logits, deterministic)
     else:
         launch, target_idx = _sample_categorical_action(
@@ -2341,7 +2280,6 @@ def sample_batch_with_records(
             parsed_list[k].angular_velocity,
             parsed_list[k].comet_planet_ids,
         ),
-        ensure_deterministic_idle=False,
     )
     fields_l = _packed_action_fields_from_legality_fields(
         prepared.target_idx,
@@ -2434,7 +2372,6 @@ def sample_batch_with_records_raw(
         len(raw_observations),
         deterministic,
         _raw_target_mask,
-        ensure_deterministic_idle=False,
     )
     fields_l = _packed_action_fields_from_legality_fields(
         prepared.target_idx,
@@ -2514,7 +2451,6 @@ def sample_batch_with_records_context(
             contexts[k].angular_velocity,
             contexts[k].comet_planet_ids,
         ),
-        ensure_deterministic_idle=False,
     )
     fields_l = _packed_action_fields_from_legality_fields(
         prepared.target_idx,
@@ -2593,7 +2529,6 @@ def sample_batch_actions(
             parsed_list[k].angular_velocity,
             parsed_list[k].comet_planet_ids,
         ),
-        ensure_deterministic_idle=True,
     )
     fields_l = _packed_action_fields_from_legality_fields(
         prepared.target_idx,
@@ -2636,7 +2571,6 @@ def sample_batch_actions_raw(
         len(raw_observations),
         deterministic,
         _raw_target_mask,
-        ensure_deterministic_idle=True,
     )
     fields_l = _packed_action_fields_from_legality_fields(
         prepared.target_idx,
@@ -2667,7 +2601,6 @@ def sample_batch_actions_context(
             contexts[k].angular_velocity,
             contexts[k].comet_planet_ids,
         ),
-        ensure_deterministic_idle=True,
     )
     fields_l = _packed_action_fields_from_legality_fields(
         prepared.target_idx,
