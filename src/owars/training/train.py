@@ -2139,6 +2139,14 @@ def _ppo_loop(
         margin = float(np.mean(margins))
         episodic_return = float(np.mean(episode_returns)) if episode_returns else 0.0
         episodic_length = float(np.mean(episode_lengths)) if episode_lengths else 0.0
+        # Length-respective return: when the policy wins faster, games end early
+        # and accumulate less shaped return, so raw episodic_return drops even as
+        # win-rate rises — making a stronger policy look worse. Dividing by mean
+        # episode length recovers a per-step return rate that isn't penalized for
+        # ending games early.
+        lengthnorm_episodic_return = (
+            episodic_return / episodic_length if episodic_length > 0.0 else 0.0
+        )
         update_win_margin = sum(
             m for t, m in zip(primary_trajs, margins, strict=True) if t.won
         )
@@ -2302,6 +2310,7 @@ def _ppo_loop(
                 "episodic_return_min": min(episode_returns) if episode_returns else 0.0,
                 "episodic_return_max": max(episode_returns) if episode_returns else 0.0,
                 "episodic_length_mean": episodic_length,
+                "lengthnorm_episodic_return": lengthnorm_episodic_return,
             },
             update,
         )
@@ -2352,6 +2361,7 @@ def _ppo_loop(
                 "margin": margin,
                 "episodic_return": episodic_return,
                 "episodic_length": episodic_length,
+                "lengthnorm_episodic_return": lengthnorm_episodic_return,
                 "cumulative_margin": cumulative_margin,
                 "cumulative_mean_margin": cumulative_mean_margin,
                 "elo_learner": elo.get(LEARNER_NAME),
@@ -2371,6 +2381,7 @@ def _ppo_loop(
                 "margin": best_margin,
                 "episodic_return": episodic_return,
                 "episodic_length": episodic_length,
+                "lengthnorm_episodic_return": lengthnorm_episodic_return,
                 "run_dir": str(logger.path),
             }
             best_path.with_name("best.json").write_text(
