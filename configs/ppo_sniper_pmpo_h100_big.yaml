@@ -1,0 +1,121 @@
+# PMPO vs sniper_v18, H100 capacity build (big model).
+#
+# IDENTICAL to ppo_sniper_pmpo_h100.yaml except the model is scaled up to
+# actually use the H100. The standard model (dim 128 / depth 3) leaves the GPU
+# at ~3% util: the rollout is launch/CPU-bound and CUDA-graphed, so a bigger
+# model barely lengthens the rollout (the bottleneck) while doing much more
+# useful GPU work in the PPO update and yielding a stronger policy for the
+# self-play endgame. (Contrast num_envs scaling, which collapsed throughput:
+# rollout time is ~linear in env count and the PPO update blew up.)
+#
+# Scaling choices:
+#   dim    128 -> 256   (4x linear FLOPs; head_dim stays 32 = dim/n_heads,
+#                        cuDNN-flash-friendly and preserves RoPE axis geometry)
+#   depth  3   -> 6     (CUDA-graph replay amortizes the extra layers' launches)
+#   n_heads     4 -> 8  (head_dim 256/8 = 32, unchanged)
+#   n_kv_heads  1 -> 2  (GQA 4:1 kept)
+#   ff_dim 256 -> 512   (2x dim, as before)
+#   num_fleet_latents 64 (unchanged here — token-count scaling is a separate
+#                        lever to test next)
+#
+# NOTE: this is a from-scratch ARCHITECTURE change — NOT --load-compatible with
+# dim-128 checkpoints. Train fresh (no --load). Muon LR is kept at 5e-3; watch
+# the trunk-drift / reverse-KL early; if it destabilizes, drop muon_lr.
+
+run:
+  name: ppo_sniper_pmpo_h100_big
+  seed: 0
+  device: cuda
+  compile_mode: reduce-overhead
+  log_root: runs
+  ckpt_root: checkpoints
+  total_updates: 1000
+
+game:
+  num_players: 2
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  dim: 256
+  ff_dim: 512
+  depth: 6
+  n_heads: 8
+  n_kv_heads: 2
+  dropout: 0.0
+  planet_rope_fraction: 0.5
+  planet_rope_base: 100.0
+  encoder_backend: destination_conditioned
+  num_fleet_latents: 64
+  fleet_tokenizer_depth: 1
+  value_min: -12.3
+  value_max: 12.3
+  value_num_bins: 255
+  value_sigma_to_bin_ratio: 0.75
+  critic_mtp_horizon: 6
+  value_symlog: false
+  value_bucket: dreamer3
+
+optim:
+  muon_lr: 5.0e-3
+  lr: 3.0e-4
+  head_lr: 3.0e-4
+  control_lr: 3.0e-4
+  lr_warmup_steps: 200
+  kl_lr_target: 0.025
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  minibatch_size: 8192
+  epochs_per_update: 1
+
+ppo:
+  gamma: 0.997
+  gae_lambda: 0.95
+  policy_objective: pmpo
+  pmpo_pos_to_neg_weight: 0.5
+  pmpo_kl_coef: 0.3
+  pmpo_reverse_kl: true
+  advantage_transform: none
+  norm_advantage: false
+  norm_advantage_scope: minibatch
+  advantage_return_norm: none
+  advantage_return_norm_scope: batch
+  clip_coef: 0.2
+  clip_coef_high: 0.28
+  value_coef: 1.0
+  target_entropy_coef: 0.0
+  critic_return_norm: none
+  critic_return_norm_clip: 10.0
+  fraction_entropy_coef: 0.0
+  pretrain_updates: 0
+  pretrain_episodes: 32
+  pretrain_lr: 1.0e-3
+  pretrain_behavior: heuristic
+
+rollout:
+  num_envs: 256
+  num_workers: 0
+  env_backend: rust
+  compile_fleet_width: 0
+  snapshot_compile_rows: 64
+  strict_target_legality: true
+
+opponents:
+  mode: fixed
+  fixed_opponents:
+    - sniper_v18
+  snapshot_device: train
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+reward:
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
+  draw_value: 0.0
+  margin_scale: 0.0
