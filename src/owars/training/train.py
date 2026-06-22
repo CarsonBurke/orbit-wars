@@ -2412,13 +2412,18 @@ def _ppo_loop(
                     reward_normalizer, return_pct_normalizer
                 ),
             )
-        elif cfg.opponents.mode == "fixed" and (update + 1) % cfg.opponents.snapshot_every == 0:
-            _save_ppo_checkpoint(
-                model,
-                Path(cfg.run.ckpt_root) / cfg.run.name / "latest.pt",
-                reward_normalizer,
-                return_pct_normalizer,
-            )
+        # Rolling, always-current checkpoint, every update in every mode.
+        # `final.pt` is written only on normal completion, and self-play
+        # (`no_builtins`) / `league` modes write no `best.pt`, so without this a
+        # crash before the last update would leave only the pruned pool snapshots
+        # and nothing cleanly "current". Cheap (~2.6MB) overwrite; `_save_ppo_
+        # checkpoint` embeds the normalizers so it is `--load`-compatible.
+        _save_ppo_checkpoint(
+            model,
+            Path(cfg.run.ckpt_root) / cfg.run.name / "latest.pt",
+            reward_normalizer,
+            return_pct_normalizer,
+        )
         snapshot_s = perf_counter() - phase_t0
         update_s = perf_counter() - update_t0
         learner_steps = sum(len(t.reward) for t in trajs)
