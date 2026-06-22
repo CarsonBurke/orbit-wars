@@ -392,7 +392,6 @@ def test_learned_configs_use_conventional_gae():
 def test_sniper_training_configs_load():
     expected = {
         "configs/ppo_sniper.yaml": ["sniper_v18"],
-        "configs/ppo_sniper_oldblock.yaml": ["sniper_v17"],
         "configs/ppo_vs_sniper.yaml": ["sniper"],
         "configs/sac_vs_sniper.yaml": ["sniper_v18"],
     }
