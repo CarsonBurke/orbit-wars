@@ -168,6 +168,11 @@ def main() -> None:
     args = p.parse_args()
     compile_mode = None if args.compile_mode.lower() == "none" else args.compile_mode
 
+    if args.device == "cuda":
+        # TF32 for the residual fp32 GEMMs around the bf16 model (mirrors the
+        # training entrypoint); no effect on CPU eval or the bf16 path itself.
+        torch.set_float32_matmul_precision("high")
+
     results = evaluate_ckpt(
         args.ckpt, n_games=args.games, num_players=args.num_players,
         baselines=tuple(args.baselines),
