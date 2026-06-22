@@ -34,17 +34,30 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 
 mkdir -p "$REPO/logs"
 LOG="$REPO/logs/$NAME.log"
-CKPT_LATEST="$REPO/checkpoints/$NAME/latest.pt"
+CKPT_DIR="$REPO/checkpoints/$NAME"
+CKPT_LATEST="$CKPT_DIR/latest.pt"
 
 attempt=0
 while true; do
   attempt=$(( attempt + 1 ))
   LOADARG=()
   if [ -f "$CKPT_LATEST" ]; then
+    # fixed-opponent runs write latest.pt every snapshot_every updates.
     LOADARG=(--load "$CKPT_LATEST")
     resume_note="resume from latest.pt"
   else
-    resume_note="fresh start"
+    # self-play (no_builtins/league) never writes latest.pt — it only emits
+    # snapshot_*.pt. Resume from the newest snapshot (by mtime, so the latest
+    # update's snapshot beats the older snapshot_init.pt seed); with
+    # snapshot_every:1 that snapshot IS the current learner. Without this a
+    # crash would fall through to a fresh random-init start and wipe progress.
+    newest_snap=$(ls -1t "$CKPT_DIR"/snapshot_*.pt 2>/dev/null | head -1)
+    if [ -n "$newest_snap" ]; then
+      LOADARG=(--load "$newest_snap")
+      resume_note="resume from $(basename "$newest_snap")"
+    else
+      resume_note="fresh start"
+    fi
   fi
 
   echo "=== $(date -u +%FT%TZ) [attempt $attempt] launching '$NAME' ($resume_note) total=$TOTAL ===" >>"$LOG"
