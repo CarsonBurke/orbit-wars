@@ -4,10 +4,11 @@
 `destination_learned_fleet_attention: true`, and confirmation that it does the
 destination-scoped attention we intended.*
 
-Status: implemented behind a config flag (default **off**), independently
-reviewed, smoke-verified, and currently training as
-`configs/ppo_sniper_pmpo_fleetattn.yaml` (flag **on**) vs the
-`ppo_sniper_pmpo` baseline.
+Status: implemented, independently reviewed, smoke-verified, and now the
+**default for every PMPO config** (`destination_learned_fleet_attention: true`
++ a fixed `compile_fleet_width: 64` bucket). The earlier flag-off baseline /
+flag-on A/B split has been retired — `ppo_sniper_pmpo.yaml` and the rest now
+ship the learned attention on.
 
 ---
 
@@ -228,5 +229,4 @@ blow up otherwise); flag-off baseline smoke clean; full `test_ppo_update` /
 | Flag | `OrbitPolicyConfig.destination_learned_fleet_attention` |
 | Rollout mask threading | `vec_rollout.py:1467-1540` |
 | Update/compute mask threading | `ppo.py` (`_staged_destination_block_mask`) |
-| Live A/B config | `configs/ppo_sniper_pmpo_fleetattn.yaml` |
-| Baseline | `configs/ppo_sniper_pmpo.yaml` |
+| Default config (PMPO) | `configs/ppo_sniper_pmpo.yaml` (+ all other PMPO configs) |

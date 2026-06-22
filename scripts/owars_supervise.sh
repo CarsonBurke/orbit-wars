@@ -9,7 +9,7 @@
 # Usage:
 #   scripts/owars_supervise.sh <name> <config> [total_updates] [extra train.py args...]
 # Example:
-#   scripts/owars_supervise.sh pmpo_sniper_v18_sdpa configs/ppo_sniper_pmpo_h100.yaml 1000000
+#   scripts/owars_supervise.sh pmpo_sniper_v18_sdpa configs/ppo_sniper_pmpo.yaml 1000000
 #
 # Meant to be launched detached on the box, e.g.:
 #   nohup scripts/owars_supervise.sh ... >/root/orbit-wars/logs/<name>.sup 2>&1 &

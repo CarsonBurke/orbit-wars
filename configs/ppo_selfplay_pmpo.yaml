@@ -44,6 +44,12 @@ model:
   planet_rope_fraction: 0.5
   planet_rope_base: 100.0
   encoder_backend: destination_conditioned
+  # LEARNED fleet->planet flex attention (PMPO default): the destination-conditioned
+  # trunk learns inbound-fleet conditioning via flex_attention over the full fleet
+  # set instead of the hand-crafted native-Rust inbound summary. Requires the fixed
+  # `compile_fleet_width` bucket below (the destination BlockMask is built outside
+  # the captured CUDA-graph region).
+  destination_learned_fleet_attention: true
   num_fleet_latents: 64
   fleet_tokenizer_depth: 1
   # Raw projected_margin returns reach O(10^4-10^5) with reward normalization
@@ -120,7 +126,7 @@ rollout:
   num_workers: 0
   env_backend: rust
   compile_policy: true
-  compile_fleet_width: 0
+  compile_fleet_width: 64  # fixed fleet bucket required by destination_learned_fleet_attention
   snapshot_compile_rows: 128
   strict_target_legality: true
 
