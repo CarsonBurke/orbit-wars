@@ -16,6 +16,17 @@ from owars.policies.model import (
 from owars.policies.sampling import BETA_SAMPLE_EPS, _deterministic_fraction
 
 
+@pytest.fixture(autouse=True)
+def _cpu_inference_only():
+    """On CPU the policy is only ever run forward for inference — flex_attention
+    has no CPU backward, so it rejects inputs that require grad. Run every CPU
+    forward in this module under no_grad, exactly as LearnedAgent does in the
+    submission shell.
+    """
+    with torch.no_grad():
+        yield
+
+
 def _obs():
     return {
         "player": 0,
@@ -709,3 +720,100 @@ def test_ngpt_control_stats_reports_effective_init_values():
     assert abs(stats["sqk_k_eff_mean"] - 1.0) < 1e-6
     assert abs(stats["suv_mean"] - 1.0) < 1e-6
     assert abs(stats["target_q_gain"] - 1.0) < 1e-6
+
+
+def _destination_obs_batch(seed: int = 0):
+    """Synthetic destination-conditioned policy inputs (full fleets, no summary)."""
+    torch.manual_seed(seed)
+    b, p, f = 4, 8, 30
+    planet_feats = torch.randn(b, p, 19)
+    planet_mask = torch.ones(b, p, dtype=torch.bool)
+    planet_mask[:, p - 2:] = False
+    fleet_mask = torch.ones(b, f, dtype=torch.bool)
+    fleet_mask[:, f - 6:] = False
+    target_idx = torch.randint(0, p, (b, f))
+    target_idx[~fleet_mask] = -1
+    return {
+        "planet_feats": planet_feats,
+        "planet_mask": planet_mask,
+        "planet_owned_mask": planet_mask.clone(),
+        "planet_ids": torch.arange(p).unsqueeze(0).expand(b, p).contiguous(),
+        "planet_garrison": torch.rand(b, p),
+        "fleet_feats": torch.randn(b, f, 20),
+        "fleet_mask": fleet_mask,
+        "global_feats": torch.randn(b, 27),
+        "fleet_target_planet_idx": target_idx,
+        "planet_inbound_feats": None,
+    }
+
+
+def test_learned_fleet_attention_flag_off_is_identity_to_baseline():
+    """Flag OFF must not change the destination-conditioned forward at all."""
+    from owars.policies.features import EncodedObs
+
+    cfg_kwargs = dict(
+        dim=32,
+        ff_dim=64,
+        depth=2,
+        n_heads=4,
+        n_kv_heads=1,
+        encoder_backend="destination_conditioned",
+    )
+    cfg_off = OrbitPolicyConfig(**cfg_kwargs, destination_learned_fleet_attention=False)
+    model = OrbitPolicy(cfg_off).eval()
+    # Perturb the FiLM so the cross-attention output actually flows through.
+    torch.nn.init.orthogonal_(model.destination_fleet_conditioner.mod.weight, gain=0.5)
+    torch.nn.init.normal_(model.destination_fleet_conditioner.mod.bias, std=0.1)
+
+    fields = _destination_obs_batch()
+    feats = EncodedObs(**fields)
+
+    out_default = model(feats)
+    out_none_mask = model(feats, destination_block_mask=None)
+    assert torch.equal(out_default.value, out_none_mask.value)
+    assert torch.equal(out_default.target_logits, out_none_mask.target_logits)
+    # The conditioner must NOT report learned attention when the flag is off.
+    assert model.destination_fleet_conditioner.learned_fleet_attention is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="flex_attention requires CUDA")
+def test_learned_fleet_attention_flex_matches_scatter_softmax_on_cuda():
+    """The CUDA flex path must match the CPU/CUDA scatter-softmax reference."""
+    from owars.policies.features import EncodedObs
+
+    cfg = OrbitPolicyConfig(
+        dim=128,
+        ff_dim=256,
+        depth=2,
+        n_heads=4,
+        n_kv_heads=1,
+        encoder_backend="destination_conditioned",
+        destination_learned_fleet_attention=True,
+    )
+    model = OrbitPolicy(cfg).eval()
+    torch.nn.init.orthogonal_(model.destination_fleet_conditioner.mod.weight, gain=0.5)
+    torch.nn.init.normal_(model.destination_fleet_conditioner.mod.bias, std=0.1)
+    model = model.cuda()
+
+    fields = _destination_obs_batch(seed=1)
+    feats = EncodedObs(**{k: (v.cuda() if torch.is_tensor(v) else v) for k, v in fields.items()})
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out_flex = model(feats)
+        # `_force_scatter` routes the CUDA forward through the scatter-softmax
+        # reference (the production path always uses flex; this is test-only).
+        model.destination_fleet_conditioner.cross_attn._force_scatter = True
+        out_scatter = model(feats)
+        model.destination_fleet_conditioner.cross_attn._force_scatter = False
+
+    def _max_finite_diff(a, b):
+        a = a.float()
+        b = b.float()
+        m = torch.isfinite(a) & torch.isfinite(b)
+        return (a[m] - b[m]).abs().max().item()
+
+    # bf16 tolerance: logits feed a <=p-way softmax; 0.05 is comfortably above
+    # the observed ~0.02 max diff and well below anything that flips decisions.
+    assert _max_finite_diff(out_flex.value, out_scatter.value) < 0.05
+    assert _max_finite_diff(out_flex.target_logits, out_scatter.target_logits) < 0.05
+    assert _max_finite_diff(out_flex.launch_logits, out_scatter.launch_logits) < 0.05

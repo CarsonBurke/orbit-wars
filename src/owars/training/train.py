@@ -427,6 +427,7 @@ def _build_model(cfg: RunConfig) -> OrbitPolicy:
         planet_rope_fraction=cfg.model.planet_rope_fraction,
         planet_rope_base=cfg.model.planet_rope_base,
         encoder_backend=cfg.model.encoder_backend,
+        destination_learned_fleet_attention=cfg.model.destination_learned_fleet_attention,
         num_fleet_latents=cfg.model.num_fleet_latents,
         fleet_tokenizer_depth=cfg.model.fleet_tokenizer_depth,
         value_hidden=cfg.model.value_hidden,

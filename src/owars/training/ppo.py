@@ -28,7 +28,11 @@ from ..policies.features import (
     fleet_target_planet_idx_or_empty,
     planet_inbound_feats_or_empty,
 )
-from ..policies.model import OrbitPolicy, normalize_matrices
+from ..policies.model import (
+    OrbitPolicy,
+    build_destination_block_mask,
+    normalize_matrices,
+)
 from ..policies.sampling import (
     _categorical_action_log_probs,
     _threshold_normal_launch_entropy,
@@ -1562,6 +1566,7 @@ class _PPOMinibatchKernel(torch.nn.Module):
         old_target_logits: torch.Tensor | None = None,
         old_fraction_alpha: torch.Tensor | None = None,
         old_fraction_beta: torch.Tensor | None = None,
+        destination_block_mask: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -1579,7 +1584,11 @@ class _PPOMinibatchKernel(torch.nn.Module):
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
             if self._model_accepts_head_flags:
-                out = self.model(feats, include_value=self.include_value)
+                out = self.model(
+                    feats,
+                    include_value=self.include_value,
+                    destination_block_mask=destination_block_mask,
+                )
             else:
                 out = self.model(feats)
 
@@ -1980,6 +1989,7 @@ class _PPOSourceMinibatchKernel(torch.nn.Module):
         old_target_logits: torch.Tensor | None = None,
         old_fraction_alpha: torch.Tensor | None = None,
         old_fraction_beta: torch.Tensor | None = None,
+        destination_block_mask: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -2003,6 +2013,7 @@ class _PPOSourceMinibatchKernel(torch.nn.Module):
                 actor_source_cols=source_col_idx,
                 actor_source_valid=source_valid,
                 target_planets=int(target_legal_mask.shape[1]),
+                destination_block_mask=destination_block_mask,
             )
 
         target_legal_mask = target_legal_mask.bool()
@@ -2356,6 +2367,7 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
         row_weight: torch.Tensor,
         ret_mtp: torch.Tensor,
         ret_mtp_mask: torch.Tensor,
+        destination_block_mask: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -2373,7 +2385,11 @@ class _ValueOnlyMinibatchKernel(torch.nn.Module):
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
             if self._model_accepts_head_flags:
-                out = self.model(feats, include_actor=False)
+                out = self.model(
+                    feats,
+                    include_actor=False,
+                    destination_block_mask=destination_block_mask,
+                )
             else:
                 out = self.model(feats)
         value_logits = out.value_logits.float()
@@ -2476,6 +2492,7 @@ class _OldLogProbKernel(torch.nn.Module):
         target_idx: torch.Tensor,
         fraction: torch.Tensor,
         target_legal_mask: torch.Tensor,
+        destination_block_mask: Any | None = None,
     ) -> torch.Tensor:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -2493,7 +2510,11 @@ class _OldLogProbKernel(torch.nn.Module):
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
             if self._model_accepts_head_flags:
-                out = self.model(feats, include_value=False)
+                out = self.model(
+                    feats,
+                    include_value=False,
+                    destination_block_mask=destination_block_mask,
+                )
             else:
                 out = self.model(feats)
 
@@ -2529,6 +2550,7 @@ class _OldLogProbValueKernel(torch.nn.Module):
         target_idx: torch.Tensor,
         fraction: torch.Tensor,
         target_legal_mask: torch.Tensor,
+        destination_block_mask: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -2545,7 +2567,10 @@ class _OldLogProbValueKernel(torch.nn.Module):
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
-            out = self.model(feats)
+            if self._model_accepts_head_flags:
+                out = self.model(feats, destination_block_mask=destination_block_mask)
+            else:
+                out = self.model(feats)
 
         old_log_prob = _old_log_prob_from_output(
             out,
@@ -2591,6 +2616,7 @@ class _OldPolicyDistKernel(torch.nn.Module):
         target_idx: torch.Tensor,
         fraction: torch.Tensor,
         target_legal_mask: torch.Tensor,
+        destination_block_mask: Any | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2614,7 +2640,10 @@ class _OldPolicyDistKernel(torch.nn.Module):
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
-            out = self.model(feats)
+            if self._model_accepts_head_flags:
+                out = self.model(feats, destination_block_mask=destination_block_mask)
+            else:
+                out = self.model(feats)
 
         old_log_prob = _old_log_prob_from_output(
             out,
@@ -2670,7 +2699,7 @@ def _get_ppo_kernel(
     clip_coef_high: float,
     compile_mode: str | None,
     include_value: bool,
-    shape_key: tuple[int, int, int, int, int],
+    shape_key: tuple[int, int, int, int, int, int, int, bool],
     policy_objective: str = "ppo",
     pmpo_pos_to_neg_weight: float = 0.5,
     pmpo_kl_coef: float = 0.3,
@@ -2781,7 +2810,7 @@ def _get_value_only_kernel(
     model: torch.nn.Module,
     *,
     compile_mode: str | None,
-    shape_key: tuple[int, int, int, int],
+    shape_key: tuple[int, int, int, int, int, int, bool],
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
@@ -2803,7 +2832,7 @@ def _get_old_log_prob_kernel(
     model: torch.nn.Module,
     *,
     compile_mode: str | None,
-    shape_key: tuple[int, int, int, int, int, int],
+    shape_key: tuple[int, int, int, int, int, int, bool],
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
@@ -2825,7 +2854,7 @@ def _get_old_log_prob_value_kernel(
     model: torch.nn.Module,
     *,
     compile_mode: str | None,
-    shape_key: tuple[int, int, int, int, int, int],
+    shape_key: tuple[int, int, int, int, int, int, bool],
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
@@ -2847,7 +2876,7 @@ def _get_old_policy_dist_kernel(
     model: torch.nn.Module,
     *,
     compile_mode: str | None,
-    shape_key: tuple[int, int, int, int, int, int],
+    shape_key: tuple[int, int, int, int, int, int, bool],
 ) -> torch.nn.Module:
     device = _module_device(model)
     mode = compile_mode if device.type == "cuda" else None
@@ -3053,6 +3082,47 @@ def _stage_old_log_prob_minibatch(
     )
 
 
+def _model_uses_learned_fleet_attn(model: torch.nn.Module) -> bool:
+    """True when the model runs the learned flex fleet→planet attention path.
+
+    Only the destination-conditioned backend with the flag on threads a
+    destination BlockMask; every other backend leaves it None and is unaffected.
+    """
+    cfg = getattr(model, "cfg", None)
+    return (
+        getattr(cfg, "encoder_backend", None) == "destination_conditioned"
+        and bool(getattr(cfg, "destination_learned_fleet_attention", False))
+    )
+
+
+def _staged_destination_block_mask(
+    staged: tuple[torch.Tensor, ...],
+    learned_fleet_attn: bool,
+    device: torch.device,
+) -> Any | None:
+    """Build the destination BlockMask for a staged minibatch OUTSIDE any
+    compiled / cudagraph-captured kernel, mirroring the rollout discipline.
+
+    Returns None when learned fleet attention is off, the minibatch has no fleet
+    tokens, or the device is not CUDA (the CPU path uses scatter-softmax and
+    ignores the mask). The staged tuple layout is shared by every minibatch
+    kernel: planet_feats[1], fleet_feats[6], fleet_mask[7],
+    fleet_target_planet_idx[8].
+    """
+    if (
+        not learned_fleet_attn
+        or device.type != "cuda"
+        or int(staged[6].shape[-2]) <= 0
+    ):
+        return None
+    fleet_mask_mb = staged[7]
+    dest_mb = staged[8].to(dtype=torch.long)
+    p_pad = int(staged[1].shape[1])
+    f_pad = int(staged[6].shape[-2])
+    valid_mb = fleet_mask_mb & (dest_mb >= 0) & (dest_mb < p_pad)
+    return build_destination_block_mask(dest_mb, valid_mb, p_pad, f_pad, device)
+
+
 def compute_old_log_probs(
     model: OrbitPolicy,
     batch: dict[str, torch.Tensor],
@@ -3080,6 +3150,7 @@ def compute_old_log_probs(
     was_training = model.training
     model.eval()
     try:
+        learned_fleet_attn = _model_uses_learned_fleet_attn(model)
         kernel = _get_old_log_prob_kernel(
             model,
             compile_mode=compile_mode,
@@ -3090,6 +3161,7 @@ def compute_old_log_probs(
                 int(global_feats.shape[1]),
                 int(planet_inbound_feats.shape[-2]),
                 int(planet_inbound_feats.shape[-1]),
+                learned_fleet_attn,
             ),
         )
         chunks: list[torch.Tensor] = []
@@ -3111,9 +3183,12 @@ def compute_old_log_probs(
                     device,
                     pinned_cache=pinned_cache,
                 )
+                destination_block_mask = _staged_destination_block_mask(
+                    staged, learned_fleet_attn, device
+                )
                 if compile_mode is not None:
                     _mark_cuda_graph_step(device)
-                old_lp = kernel(*staged)
+                old_lp = kernel(*staged, destination_block_mask=destination_block_mask)
                 # `reduce-overhead` may return views into CUDA-graph replay
                 # buffers. Clone on the producing device before any transfer so
                 # the next replay cannot overwrite an in-flight CPU copy.
@@ -3159,6 +3234,7 @@ def compute_old_log_probs_and_values(
     was_training = model.training
     model.eval()
     try:
+        learned_fleet_attn = _model_uses_learned_fleet_attn(model)
         kernel = _get_old_log_prob_value_kernel(
             model,
             compile_mode=compile_mode,
@@ -3169,6 +3245,7 @@ def compute_old_log_probs_and_values(
                 int(global_feats.shape[1]),
                 int(planet_inbound_feats.shape[-2]),
                 int(planet_inbound_feats.shape[-1]),
+                learned_fleet_attn,
             ),
         )
         logprob_chunks: list[torch.Tensor] = []
@@ -3191,9 +3268,12 @@ def compute_old_log_probs_and_values(
                     device,
                     pinned_cache=pinned_cache,
                 )
+                destination_block_mask = _staged_destination_block_mask(
+                    staged, learned_fleet_attn, device
+                )
                 if compile_mode is not None:
                     _mark_cuda_graph_step(device)
-                old_lp, value = kernel(*staged)
+                old_lp, value = kernel(*staged, destination_block_mask=destination_block_mask)
                 retained_lp = old_lp[:real].detach().clone()
                 retained_value = value[:real].detach().clone()
                 if retained_lp.device != out_device:
@@ -3268,6 +3348,7 @@ def compute_old_policy_dist(
         return retained
 
     try:
+        learned_fleet_attn = _model_uses_learned_fleet_attn(model)
         kernel = _get_old_policy_dist_kernel(
             model,
             compile_mode=compile_mode,
@@ -3278,6 +3359,7 @@ def compute_old_policy_dist(
                 int(global_feats.shape[1]),
                 int(planet_inbound_feats.shape[-2]),
                 int(planet_inbound_feats.shape[-1]),
+                learned_fleet_attn,
             ),
         )
         chunks: dict[str, list[torch.Tensor]] = {
@@ -3306,6 +3388,9 @@ def compute_old_policy_dist(
                     device,
                     pinned_cache=pinned_cache,
                 )
+                destination_block_mask = _staged_destination_block_mask(
+                    staged, learned_fleet_attn, device
+                )
                 if compile_mode is not None:
                     _mark_cuda_graph_step(device)
                 (
@@ -3315,7 +3400,7 @@ def compute_old_policy_dist(
                     target_logits,
                     fraction_alpha,
                     fraction_beta,
-                ) = kernel(*staged)
+                ) = kernel(*staged, destination_block_mask=destination_block_mask)
                 chunks["old_log_prob"].append(_to_out(old_lp[:real]))
                 chunks["value"].append(_to_out(value[:real]))
                 chunks["old_launch_logits"].append(_to_out(launch_logits[:real]))
@@ -3468,6 +3553,12 @@ def ppo_update(
     critic_clip_frac_sum = torch.zeros((), device=device)
     n_steps = 0
 
+    # When the destination-conditioned backend uses learned flex fleet
+    # attention, the update consumes the recorded full fleets (already staged)
+    # and the destination BlockMask is built OUTSIDE the compiled kernel per
+    # minibatch, then threaded in as a kwarg (mirrors the rollout discipline).
+    learned_fleet_attn = _model_uses_learned_fleet_attn(model)
+
     if minibatch_count is not None:
         static_minibatch_rows = math.ceil(n / max(1, min(int(minibatch_count), n)))
     else:
@@ -3501,6 +3592,7 @@ def ppo_update(
                 int(planet_inbound_feats.shape[-2]),
                 int(planet_inbound_feats.shape[-1]),
                 int(batch["actor_target_legal_mask"].shape[1]),
+                learned_fleet_attn,
             ),
             policy_objective=policy_objective,
             pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
@@ -3526,6 +3618,7 @@ def ppo_update(
                 int(return_mtp.shape[1]),
                 int(planet_inbound_feats.shape[-2]),
                 int(planet_inbound_feats.shape[-1]),
+                learned_fleet_attn,
             ),
             policy_objective=policy_objective,
             pmpo_pos_to_neg_weight=pmpo_pos_to_neg_weight,
@@ -3587,9 +3680,14 @@ def ppo_update(
 
         for staged in _prefetch_staged_minibatches(stage, minibatches, device):
             row_weight = staged[10]
+            destination_block_mask = _staged_destination_block_mask(
+                staged, learned_fleet_attn, device
+            )
             if compile_mode is not None:
                 _mark_cuda_graph_step(device)
-            actor_loss, critic_loss, metrics = kernel(*staged)
+            actor_loss, critic_loss, metrics = kernel(
+                *staged, destination_block_mask=destination_block_mask
+            )
             _raise_if_nonfinite_tensor(f"ppo_step_{n_steps}:metrics", metrics)
             _raise_if_nonfinite_tensor(f"ppo_step_{n_steps}:actor_loss", actor_loss)
             _raise_if_nonfinite_tensor(f"ppo_step_{n_steps}:critic_loss", critic_loss)
@@ -3774,6 +3872,7 @@ def value_only_update(
         torch.ones_like(return_mtp, dtype=torch.bool),
     )
     static_minibatch_rows = max(1, int(minibatch_size))
+    learned_fleet_attn = _model_uses_learned_fleet_attn(model)
     kernel = _get_value_only_kernel(
         model,
         compile_mode=compile_mode,
@@ -3784,6 +3883,7 @@ def value_only_update(
             int(global_feats.shape[1]),
             int(planet_inbound_feats.shape[-2]),
             int(planet_inbound_feats.shape[-1]),
+            learned_fleet_attn,
         ),
     )
     pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
@@ -3816,9 +3916,14 @@ def value_only_update(
 
         for staged in _prefetch_staged_minibatches(stage, minibatches, device):
             row_weight = staged[10]
+            destination_block_mask = _staged_destination_block_mask(
+                staged, learned_fleet_attn, device
+            )
             if compile_mode is not None:
                 _mark_cuda_graph_step(device)
-            value_loss, metric = kernel(*staged)
+            value_loss, metric = kernel(
+                *staged, destination_block_mask=destination_block_mask
+            )
 
             optimizer.zero_grad(set_to_none=True)
             (value_loss * _minibatch_loss_scale(row_weight)).backward()

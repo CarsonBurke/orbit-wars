@@ -56,6 +56,10 @@ class ModelCfg:
     planet_rope_fraction: float = 0.5
     planet_rope_base: float = 100.0
     encoder_backend: Literal["dense", "fleet_latent", "destination_conditioned"] = "fleet_latent"
+    # Learn the destination-conditioned fleet->planet conditioning with a
+    # flex_attention cross-attention over the full fleet set instead of the
+    # native-Rust inbound summary. OFF preserves the baseline byte-for-byte.
+    destination_learned_fleet_attention: bool = False
     global_features: int = 27
     num_fleet_latents: int = 64
     fleet_tokenizer_depth: int = 1

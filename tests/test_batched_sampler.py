@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from owars.game import parse_observation
@@ -25,6 +26,17 @@ from owars.policies.sampling import (
     sample_batch_with_records_raw,
     sample_with_record,
 )
+
+
+@pytest.fixture(autouse=True)
+def _cpu_inference_only():
+    """On CPU the policy is only ever run forward for inference — flex_attention
+    has no CPU backward, so it rejects inputs that require grad. Run every CPU
+    forward in this module under no_grad, exactly as LearnedAgent does in the
+    submission shell.
+    """
+    with torch.no_grad():
+        yield
 
 
 def _obs(player: int = 0):

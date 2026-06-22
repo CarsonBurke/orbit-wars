@@ -82,14 +82,70 @@ from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+)
 from hl_gauss_pytorch import HLGaussLoss as _LibraryHLGaussLoss
 
 from .config import OrbitPolicyConfig, normalize_attention_config
 from .features import EncodedObs
 
+# Destination fleet->planet cross-attention uses `flex_attention` on CUDA.
+# The HOP must be compiled (eager flex is order-of-magnitude slower) and the
+# BlockMask must be built OUTSIDE the captured region (eager `create_block_mask`
+# is 5-20x slower than the compiled builder and erases the kernel win). The
+# compiled rollout/update paths build the mask in their un-compiled wrappers and
+# pass it in as a static-shape kernel argument; the eager fallback below builds
+# it on demand. A generous dynamo cache budget keeps the many fixed (P, F)
+# specializations from evicting each other.
+torch._dynamo.config.cache_size_limit = max(
+    256, int(getattr(torch._dynamo.config, "cache_size_limit", 0))
+)
+_flex_attention = torch.compile(flex_attention)
+
+
+def build_destination_block_mask(
+    fleet_target_planet_idx: torch.Tensor,
+    fleet_valid: torch.Tensor,
+    p_pad: int,
+    f_pad: int,
+    device: torch.device,
+) -> BlockMask:
+    """Build the planet-query / fleet-key BlockMask for destination attention.
+
+    Each fleet (key/value row `kv`) attends to exactly its destination planet
+    (query row `q`) when valid. Built with `_compile=True` so the compiled
+    block-mask builder is used (the validated fast path). MUST be called outside
+    the captured compiled region — cudagraph_trees copies the resulting mask
+    tensors into the recorded static slots without re-recording.
+    """
+    dest = fleet_target_planet_idx
+    valid = fleet_valid
+
+    def mask_mod(b, h, q_idx, kv_idx):  # noqa: ANN001
+        return (dest[b, kv_idx] == q_idx) & valid[b, kv_idx]
+
+    return create_block_mask(
+        mask_mod,
+        B=int(dest.shape[0]),
+        H=None,
+        Q_LEN=int(p_pad),
+        KV_LEN=int(f_pad),
+        device=device,
+        _compile=True,
+    )
+
 _PLANET_XY_SCALE: float = 100.0
 _PLANET_XY_OFFSET: float = 50.0
 _DEST_FLEET_STATS_DIM: int = 13
+# Learnable summary tokens prepended to the set before the trunk, in order:
+# actor (index 0), critic (index 1), global (index 2). The planet block starts
+# at this offset; fleets follow the planets. Changing this requires updating the
+# token concat in `_embed_tokens` to add/remove the matching parameter.
+_NUM_PREFIX_TOKENS: int = 3
 
 # Hypersphere-normalization epsilon. nGPT's `justnorm` divides by the raw L2
 # norm with no floor (model.py:103-106), which is safe for a dense LM where
@@ -487,6 +543,89 @@ def _splice_rope(
     return torch.cat([pre, new_mid, post], dim=1)
 
 
+_SDPA_PRIORITY = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+
+
+def _attention_keypad(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    scale: float,
+    enable_gqa: bool,
+) -> torch.Tensor:
+    """Scaled-dot-product attention (fused, GQA-aware) with an additive
+    key-padding `bias` ([B, T_kv]).
+
+    `q`/`k`/`v` are [B, H, T, head_dim]; `bias` carries `0` for valid keys and
+    `-inf` for padded ones, broadcast over heads and query positions. We use
+    `F.scaled_dot_product_attention` rather than `flex_attention` deliberately:
+    our only score modification is this additive mask, which SDPA's `attn_mask`
+    expresses natively. The `flex_attention` HOP, by contrast, *inlines* the
+    captured `bias` buffer's producer chain (mask `cat`/pad/index) into its
+    score subgraph, which the current torch build mis-codegens (`'function'
+    object has no attribute 'graph'`, then `XBLOCK is not defined`). SDPA takes
+    `attn_mask` as a realized aten input, sidestepping that entirely.
+
+    Backend selection. For this exact call — GQA (`enable_gqa`, one KV head)
+    plus a float additive `attn_mask` — flash and mem-efficient are
+    disqualified, and SDPA's own heuristic picks MATH even though cuDNN accepts
+    it and runs it ~6-18x faster eagerly. Worse, under `torch.compile` Inductor
+    does NOT keep a fused SDPA for this call: it decomposes to fp32 math
+    (sgemm + a separate safe-softmax), ~20% of the compiled rollout forward.
+    cuDNN fixes both, so we force an ordered backend priority
+    (`set_priority=True`) of cuDNN → mem-efficient → math: cuDNN takes the
+    GQA+mask call directly; a future build that rejects it falls through to the
+    next accepted backend (math always works). The chosen fused backend is
+    numerically equivalent within bf16 tol (max abs diff ~0.0156 vs math).
+
+    The `sdpa_kernel` context is entered for both the eager CUDA path
+    (uncompiled snapshot opponents in self-play rollout and evaluation) AND the
+    compiled *inference* forward — the learner rollout kernel runs under
+    `torch.no_grad()` (see `vec_rollout._step_learner_bucket`), so Inductor
+    traces a no-grad graph and `torch.is_grad_enabled()` is False during that
+    trace; cuDNN then fires inside the CUDA graph (verified: fullgraph, no graph
+    break). We deliberately do NOT enter it for a compiled *grad-enabled* graph
+    — that is the PPO-update forward, whose backward an `sdpa_kernel` context
+    has historically broken under AOT autograd. (On the current build a forced
+    test of cuDNN through the real compiled update backward did NOT break, so
+    that warning is build-stale; we still keep the update path off cuDNN as the
+    conservative default, since enabling a fused attention backend inside the
+    gradient computation is a wider blast radius than the rollout/eval win and
+    warrants its own numerical validation before being turned on.) The gate
+    `not (is_compiling and is_grad_enabled)` isolates exactly that one path,
+    leaving it on SDPA's default dispatch, byte-for-byte unchanged. On CPU (the
+    offline submission bundle) math is the only backend; `q.is_cuda` is False,
+    so the context is skipped and the plain call dispatches to math.
+
+    The bf16 autocast is the caller's.
+    """
+    compiled_with_grad = torch.compiler.is_compiling() and torch.is_grad_enabled()
+    if q.is_cuda and not compiled_with_grad:
+        with sdpa_kernel(_SDPA_PRIORITY, set_priority=True):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=bias[:, None, None, :],
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+    return F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=bias[:, None, None, :],
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+
+
 class SelfAttention(nn.Module):
     """Multi-head self-attention with nGPT hypersphere QK normalization.
 
@@ -588,24 +727,17 @@ class SelfAttention(nn.Module):
         )
         q = sqk_q * justnorm(q)
         k = sqk_k * justnorm(k)
-        # SDPA expects [B, H, j, head_dim]. Caller is responsible for bf16
-        # autocast on CUDA — that's what keeps the FlashAttention-2 /
-        # mem-efficient backend in play (the key-padding mask routes to the
-        # mem-efficient kernel; flash proper only fires for unmasked rows).
-        # No inner autocast/`sdpa_kernel` context — that breaks AOT autograd
-        # under `torch.compile`. On CPU SDPA falls to the math kernel (tests).
+        # Fused SDPA with the key-padding mask as an additive score bias
+        # (see `_attention_keypad`).
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        attn_mask = None
-        if valid_mask is not None:
-            attn_mask = valid_mask[:, None, None, :]
-        o = F.scaled_dot_product_attention(
+        bias = torch.where(valid_mask, 0.0, float("-inf")).to(q.dtype)
+        o = _attention_keypad(
             q,
             k,
             v,
-            attn_mask=attn_mask,
-            is_causal=False,
+            bias,
             scale=self.head_dim**0.5,
             enable_gqa=self.n_kv_heads != self.n_heads,
         )
@@ -686,12 +818,12 @@ class CrossAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        attn_mask = safe_mask[:, None, None, :]
-        o = F.scaled_dot_product_attention(
+        bias = torch.where(safe_mask, 0.0, float("-inf")).to(q.dtype)
+        o = _attention_keypad(
             q,
             k,
             v,
-            attn_mask=attn_mask,
+            bias,
             scale=self.head_dim**0.5,
             enable_gqa=self.n_kv_heads != self.n_heads,
         )
@@ -746,6 +878,63 @@ class DestinationFleetCrossAttention(nn.Module):
             self.c_v.weight.copy_(justnorm(self.c_v.weight, dim=1))
             self.out_proj.weight.copy_(justnorm(self.out_proj.weight, dim=0))
 
+    def _forward_flex(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dest_idx: torch.Tensor,
+        valid_dest: torch.Tensor,
+        planet_mask: torch.Tensor,
+        block_mask: BlockMask | None,
+    ) -> torch.Tensor:
+        """CUDA destination cross-attention via `flex_attention`.
+
+        Numerically equivalent (bf16) to the CPU scatter-softmax below: each
+        planet query attends only over the fleets whose destination is that
+        planet, with `scale = sqrt(head_dim)` matching the reference's explicit
+        `scores * head_dim**0.5`. GQA flex-decoding is broken on sm_120, so we
+        MHA-expand the KV heads and call with `enable_gqa=False`. Fully-masked
+        planet rows (no inbound valid fleet) return 0 from flex; we zero those
+        plus padded planet slots to match the reference's denom->0 behavior.
+        """
+        b, _, p, _ = q.shape
+        f = k.shape[2]
+        if block_mask is None:
+            block_mask = build_destination_block_mask(
+                dest_idx,
+                valid_dest,
+                p,
+                f,
+                q.device,
+            )
+        # MHA-expand the KV heads to the full query-head count. flex's GQA path
+        # is broken on sm_120, so we materialize the broadcast instead.
+        group_size = self.n_heads // self.n_kv_heads
+        if group_size != 1:
+            k = k.repeat_interleave(group_size, dim=1)
+            v = v.repeat_interleave(group_size, dim=1)
+        o = _flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=float(self.head_dim**0.5),
+            enable_gqa=False,
+        )  # [B, H, P, D]
+        # Planets with no inbound valid fleet: flex returns 0 (matches the
+        # reference's denom->0). Also zero padded planet slots.
+        has_inbound_i = torch.zeros(b, p, dtype=torch.int32, device=q.device)
+        has_inbound_i.scatter_add_(
+            1,
+            dest_idx.clamp_min(0),
+            valid_dest.to(torch.int32),
+        )
+        keep = (has_inbound_i > 0) & planet_mask
+        o = o.masked_fill(~keep[:, None, :, None], 0.0).to(q.dtype)
+        o = o.transpose(1, 2).flatten(-2)  # [B, P, H*D]
+        return self.out_proj(o)
+
     def forward(
         self,
         planets: torch.Tensor,
@@ -753,6 +942,7 @@ class DestinationFleetCrossAttention(nn.Module):
         planet_mask: torch.Tensor,
         fleet_mask: torch.Tensor,
         fleet_target_planet_idx: torch.Tensor,
+        block_mask: BlockMask | None = None,
     ) -> torch.Tensor:
         b, p, _ = planets.shape
         f = fleets.shape[1]
@@ -783,9 +973,23 @@ class DestinationFleetCrossAttention(nn.Module):
         k = sqk_k * justnorm(k)
         v = v.masked_fill(~fleet_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = q.transpose(1, 2)  # [B, H, P, D]
+        k = k.transpose(1, 2)  # [B, n_kv, F, D]
+        v = v.transpose(1, 2)  # [B, n_kv, F, D]
+
+        # `_force_scatter` is a test-only hook so the CUDA scatter-softmax path
+        # can be exercised for numerical-equivalence checks; it is never set in
+        # production, so the live CUDA path always uses flex.
+        if planets.is_cuda and not getattr(self, "_force_scatter", False):
+            return self._forward_flex(
+                q,
+                k,
+                v,
+                dest_idx,
+                valid_dest,
+                planet_mask,
+                block_mask,
+            )
 
         group_size = self.n_heads // self.n_kv_heads
         q = q.unflatten(1, (self.n_kv_heads, group_size))
@@ -936,6 +1140,7 @@ class DestinationFleetConditioner(nn.Module):
         *,
         n_kv_heads: int | None = None,
         qk_gain_init: float = 1.0,
+        learned_fleet_attention: bool = False,
     ) -> None:
         super().__init__()
         self.cross_attn = DestinationFleetCrossAttention(
@@ -944,6 +1149,10 @@ class DestinationFleetConditioner(nn.Module):
             n_kv_heads=n_kv_heads,
             qk_gain_init=qk_gain_init,
         )
+        # When ON, prefer the learned flex cross-attention over the native-Rust
+        # inbound summary even when the summary is supplied (the compiled
+        # rollout/update path). OFF keeps the summary-bypass behavior byte-exact.
+        self.learned_fleet_attention = bool(learned_fleet_attention)
         self.mod = CastedLinear(dim + _DEST_FLEET_STATS_DIM, 2 * dim)
         nn.init.zeros_(self.mod.weight)
         nn.init.zeros_(self.mod.bias)
@@ -957,11 +1166,13 @@ class DestinationFleetConditioner(nn.Module):
         fleet_feats: torch.Tensor | None = None,
         planet_inbound_feats: torch.Tensor | None = None,
         fleets: torch.Tensor | None = None,
+        block_mask: BlockMask | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, p, _ = planets.shape
         h_p = justnorm(planets)
         if (
-            planet_inbound_feats is not None
+            not self.learned_fleet_attention
+            and planet_inbound_feats is not None
             and planet_inbound_feats.shape[-2] > 0
         ):
             fleet_stats = planet_inbound_feats.to(device=planets.device, dtype=planets.dtype)
@@ -1001,6 +1212,7 @@ class DestinationFleetConditioner(nn.Module):
                 planet_mask,
                 fleet_mask,
                 fleet_target_planet_idx,
+                block_mask,
             )
             fleet_stats = _destination_fleet_stats(
                 fleet_feats,
@@ -1204,7 +1416,9 @@ class FleetLatentBlock(nn.Module):
         # tokenizer's block-stack input, fed to the self-block's U-net skip.
         cross = self.cross_attn(latents, fleets, fleet_mask)
         latents = eigen_residual(latents, cross, self.cross_alpha().to(latents.dtype))
-        return self.self_block(latents, x0=latents0)
+        # Latents are fixed-size with no padding — an all-valid key mask.
+        latent_mask = latents.new_ones(latents.shape[:2], dtype=torch.bool)
+        return self.self_block(latents, latent_mask, x0=latents0)
 
 
 class FleetLatentTokenizer(nn.Module):
@@ -1476,6 +1690,7 @@ class OrbitPolicy(nn.Module):
                 cfg.n_heads,
                 n_kv_heads=cfg.n_kv_heads,
                 qk_gain_init=cfg.qk_gain_init,
+                learned_fleet_attention=cfg.destination_learned_fleet_attention,
             )
             if cfg.encoder_backend == "destination_conditioned"
             else None
@@ -1613,7 +1828,9 @@ class OrbitPolicy(nn.Module):
         normalize_matrices(self)
 
     def _embed_tokens(
-        self, feats: EncodedObs
+        self,
+        feats: EncodedObs,
+        destination_block_mask: BlockMask | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1682,22 +1899,30 @@ class OrbitPolicy(nn.Module):
         h_g = self.global_embed(global_feats)
         h_p = self.planet_embed(planet_feats)
         if self.destination_fleet_conditioner is not None:
-            has_planet_inbound_feats = (
-                planet_inbound_feats is not None
+            learned_fleet_attention = (
+                self.destination_fleet_conditioner.learned_fleet_attention
+            )
+            # When learned attention is ON we always consume the raw fleets
+            # (and ignore the native inbound summary), so the cross-attention
+            # path runs even on the compiled rollout where a summary is present.
+            use_summary = (
+                not learned_fleet_attention
+                and planet_inbound_feats is not None
                 and planet_inbound_feats.shape[-2] > 0
             )
-            if not has_planet_inbound_feats:
-                h_f = self.fleet_embed(fleet_feats)
-            else:
+            if use_summary:
                 h_f = h_p.new_zeros(b, 0, h_p.shape[-1])
+            else:
+                h_f = self.fleet_embed(fleet_feats)
             h_p, h_f, fleet_mask = self.destination_fleet_conditioner(
                 h_p,
                 planet_mask,
                 fleet_mask,
                 fleet_target_planet_idx,
                 fleet_feats,
-                planet_inbound_feats,
-                h_f if not has_planet_inbound_feats else None,
+                planet_inbound_feats if not learned_fleet_attention else None,
+                h_f if not use_summary else None,
+                destination_block_mask,
             )
             f = 0
         elif self.fleet_tokenizer is not None:
@@ -1724,14 +1949,16 @@ class OrbitPolicy(nn.Module):
         # (nGPT). Runs on padded `[B, T, D]` — padded slots are normed too
         # (eps-safe) but masks keep them inert in attention.
         h = justnorm(h)
-        summary_mask = torch.ones(b, 3, dtype=torch.bool, device=planet_mask.device)
+        summary_mask = torch.ones(
+            b, _NUM_PREFIX_TOKENS, dtype=torch.bool, device=planet_mask.device
+        )
         full_mask = torch.cat([summary_mask, planet_mask, fleet_mask], dim=1)
         # Planet features store centered normalized coordinates:
         # ((x - 50) / 100, (y - 50) / 100). RoPE uses physical board
         # coordinates so the phase scale is meaningful on the 100x100 map.
         planet_xy = planet_feats[..., :2] * _PLANET_XY_SCALE + _PLANET_XY_OFFSET
         rope_cache = self.planet_rope.cache(planet_xy, h.dtype)
-        planet_slice = slice(3, 3 + p)
+        planet_slice = slice(_NUM_PREFIX_TOKENS, _NUM_PREFIX_TOKENS + p)
         return h, full_mask, planet_mask, fleet_mask, rope_cache, planet_slice, p, f
 
     def _split_encoded(
@@ -1744,8 +1971,8 @@ class OrbitPolicy(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         h_actor = h[:, 0]                   # [B, d]
         h_critic = h[:, 1]                  # [B, d]
-        planet_h = h[:, 3 : 3 + p]          # [B, P, d]
-        fleet_h = h[:, 3 + p : 3 + p + f]   # [B, F, d]
+        planet_h = h[:, _NUM_PREFIX_TOKENS : _NUM_PREFIX_TOKENS + p]          # [B, P, d]
+        fleet_h = h[:, _NUM_PREFIX_TOKENS + p : _NUM_PREFIX_TOKENS + p + f]   # [B, F, d]
         token_mask = torch.cat([planet_mask, fleet_mask], dim=1)
         return planet_h, fleet_h, h_actor, h_critic, token_mask
 
@@ -1783,7 +2010,9 @@ class OrbitPolicy(nn.Module):
         return self._split_encoded(h, planet_mask, fleet_mask, p, f)
 
     def encode(
-        self, feats: EncodedObs
+        self,
+        feats: EncodedObs,
+        destination_block_mask: BlockMask | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the transformer over [actor, critic, global, planets..., fleets...].
 
@@ -1793,7 +2022,7 @@ class OrbitPolicy(nn.Module):
         not attention compute, dominating model latency.
         """
         h, full_mask, planet_mask, fleet_mask, rope_cache, planet_slice, p, f = (
-            self._embed_tokens(feats)
+            self._embed_tokens(feats, destination_block_mask)
         )
         return self._encode_dense(
             h,
@@ -1816,8 +2045,11 @@ class OrbitPolicy(nn.Module):
         actor_source_cols: torch.Tensor | None = None,
         actor_source_valid: torch.Tensor | None = None,
         target_planets: int | None = None,
+        destination_block_mask: BlockMask | None = None,
     ) -> PolicyOutput:
-        planet_h, _fleet_h, h_actor, h_critic, _token_mask = self.encode(feats)
+        planet_h, _fleet_h, h_actor, h_critic, _token_mask = self.encode(
+            feats, destination_block_mask
+        )
         b, p, d = planet_h.shape
 
         # Promote scalar mask/garrison/id to batch dim if not already.

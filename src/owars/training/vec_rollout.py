@@ -42,7 +42,11 @@ from ..policies.features import (
     planet_inbound_feats_or_empty,
     slice_encoded_fleet_width,
 )
-from ..policies.model import OrbitPolicy, PolicyOutput
+from ..policies.model import (
+    OrbitPolicy,
+    PolicyOutput,
+    build_destination_block_mask,
+)
 from ..policies.sampling import (
     ActionContext,
     sample_batch_actions_context,
@@ -56,6 +60,20 @@ from .rollout import Trajectory, TrajectoryRecordRef, _obs_production_margin
 from .vec_env import VecEnv
 
 _SOURCE_MAJOR_COMPILE_ROW_CAP = 32
+
+
+def _learned_fleet_attention(model: torch.nn.Module) -> bool:
+    """True iff the destination-conditioned backend uses learned flex attention.
+
+    When ON, the compiled rollout must feed the raw fleets (a fixed `F_pad`
+    bucket width) and a prebuilt destination BlockMask instead of the
+    width-0 + native inbound-summary path.
+    """
+    cfg = getattr(model, "cfg", None)
+    return (
+        getattr(cfg, "encoder_backend", None) == "destination_conditioned"
+        and bool(getattr(cfg, "destination_learned_fleet_attention", False))
+    )
 
 
 def _mark_cuda_graph_step(device: torch.device) -> None:
@@ -184,6 +202,7 @@ class _DenseRolloutForwardKernel(torch.nn.Module):
         fleet_mask: torch.Tensor,
         fleet_target_planet_idx: torch.Tensor,
         planet_inbound_feats: torch.Tensor,
+        destination_block_mask: Any | None = None,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -200,7 +219,11 @@ class _DenseRolloutForwardKernel(torch.nn.Module):
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=self.autocast_enabled
         ):
-            return self.model(feats, include_value=self.include_value)
+            return self.model(
+                feats,
+                include_value=self.include_value,
+                destination_block_mask=destination_block_mask,
+            )
 
 
 class _SourceMajorRolloutForwardKernel(torch.nn.Module):
@@ -233,6 +256,7 @@ class _SourceMajorRolloutForwardKernel(torch.nn.Module):
         actor_source_rows: torch.Tensor,
         actor_source_cols: torch.Tensor,
         actor_source_valid: torch.Tensor,
+        destination_block_mask: Any | None = None,
     ) -> PolicyOutput:
         feats = EncodedObs(
             planet_feats=planet_feats,
@@ -256,6 +280,7 @@ class _SourceMajorRolloutForwardKernel(torch.nn.Module):
                 actor_source_cols=actor_source_cols,
                 actor_source_valid=actor_source_valid,
                 target_planets=self.target_planets,
+                destination_block_mask=destination_block_mask,
             )
 
 
@@ -376,8 +401,14 @@ def _global_feats_or_empty(feats: EncodedObs) -> torch.Tensor:
     return feats.planet_feats.new_zeros(batch, 0)
 
 
-def _trim_fleets_for_forward(feats: EncodedObs) -> EncodedObs:
-    if feats.planet_inbound_feats is not None and feats.planet_inbound_feats.shape[-2] > 0:
+def _trim_fleets_for_forward(
+    feats: EncodedObs, *, keep_fleets: bool = False
+) -> EncodedObs:
+    if (
+        not keep_fleets
+        and feats.planet_inbound_feats is not None
+        and feats.planet_inbound_feats.shape[-2] > 0
+    ):
         return slice_encoded_fleet_width(feats, 0)
     return bucket_encoded_fleet_width(feats)
 
@@ -386,8 +417,13 @@ def _bucket_fleets_for_graph(
     feats: EncodedObs,
     *,
     fixed_width: int | None = None,
+    keep_fleets: bool = False,
 ) -> EncodedObs:
-    if feats.planet_inbound_feats is not None and feats.planet_inbound_feats.shape[-2] > 0:
+    if (
+        not keep_fleets
+        and feats.planet_inbound_feats is not None
+        and feats.planet_inbound_feats.shape[-2] > 0
+    ):
         return slice_encoded_fleet_width(feats, 0)
     used = active_fleet_width(feats.fleet_mask)
     width = (
@@ -398,7 +434,23 @@ def _bucket_fleets_for_graph(
     return slice_encoded_fleet_width(feats, width)
 
 
-def _assert_destination_compiled_shape(feats: EncodedObs) -> None:
+def _assert_destination_compiled_shape(
+    feats: EncodedObs, *, learned_fleet_attention: bool = False
+) -> None:
+    if learned_fleet_attention:
+        # Learned flex attention consumes the raw fleets at a fixed F_pad bucket
+        # width and ignores the native inbound summary; the destination
+        # BlockMask is built outside the captured region and threaded in.
+        if int(feats.fleet_feats.shape[-2]) == 0:
+            raise RuntimeError(
+                "learned destination fleet attention requires a nonzero compiled "
+                "fleet width"
+            )
+        if feats.fleet_target_planet_idx is None:
+            raise RuntimeError(
+                "learned destination fleet attention requires fleet_target_planet_idx"
+            )
+        return
     inbound = feats.planet_inbound_feats
     if inbound is None:
         raise RuntimeError("destination-conditioned compiled rollout requires inbound summaries")
@@ -1142,7 +1194,12 @@ def _step_learner_bucket(
         getattr(getattr(model, "cfg", None), "encoder_backend", None)
         == "destination_conditioned"
     )
-    if graph_enabled and include_fleet_targets:
+    learned_fleet_attn = _learned_fleet_attention(model)
+    if graph_enabled and include_fleet_targets and not learned_fleet_attn:
+        # Summary path: slice fleets to width 0 and feed the native inbound
+        # summary. The learned path instead keeps fleets (at the configured
+        # `compile_fleet_width` bucket, or the dynamic bucket if unset) so the
+        # flex destination attention sees them; the summary is ignored.
         fixed_graph_fleet_width = 0
     sync_timing = sample_timings is not None
     action_contexts: list[ActionContext] | None = None
@@ -1160,9 +1217,15 @@ def _step_learner_bucket(
             cpu_stacked = preencoded_cpu
             source_index_stacked = cpu_stacked
             device_source = (
-                _bucket_fleets_for_graph(cpu_stacked, fixed_width=fixed_graph_fleet_width)
+                _bucket_fleets_for_graph(
+                    cpu_stacked,
+                    fixed_width=fixed_graph_fleet_width,
+                    keep_fleets=learned_fleet_attn,
+                )
                 if graph_enabled
-                else _trim_fleets_for_forward(cpu_stacked)
+                else _trim_fleets_for_forward(
+                    cpu_stacked, keep_fleets=learned_fleet_attn
+                )
             )
             if graph_enabled:
                 device_source = _pad_encoded_rows(device_source, graph_rows)
@@ -1180,10 +1243,13 @@ def _step_learner_bucket(
                 stacked = _bucket_fleets_for_graph(
                     stacked,
                     fixed_width=fixed_graph_fleet_width,
+                    keep_fleets=learned_fleet_attn,
                 )
                 stacked = _pad_encoded_rows(stacked, graph_rows)
             else:
-                stacked = _trim_fleets_for_forward(stacked)
+                stacked = _trim_fleets_for_forward(
+                    stacked, keep_fleets=learned_fleet_attn
+                )
     elif callable(policy_batch):
         policy_rows = [(env_idx, seat) for env_idx, seat, _obs in bucket]
         if target_device.type == "cuda":
@@ -1198,9 +1264,15 @@ def _step_learner_bucket(
             )
             source_index_stacked = cpu_stacked
             device_source = (
-                _bucket_fleets_for_graph(cpu_stacked, fixed_width=fixed_graph_fleet_width)
+                _bucket_fleets_for_graph(
+                    cpu_stacked,
+                    fixed_width=fixed_graph_fleet_width,
+                    keep_fleets=learned_fleet_attn,
+                )
                 if graph_enabled
-                else _trim_fleets_for_forward(cpu_stacked)
+                else _trim_fleets_for_forward(
+                    cpu_stacked, keep_fleets=learned_fleet_attn
+                )
             )
             if graph_enabled:
                 device_source = _pad_encoded_rows(device_source, graph_rows)
@@ -1223,7 +1295,9 @@ def _step_learner_bucket(
             if stacked.planet_feats.device.type == "cpu":
                 source_index_stacked = stacked
             if not graph_enabled:
-                stacked = _trim_fleets_for_forward(stacked)
+                stacked = _trim_fleets_for_forward(
+                    stacked, keep_fleets=learned_fleet_attn
+                )
     else:
         cpu_stacked = (
             encode_raw_observations(
@@ -1237,9 +1311,15 @@ def _step_learner_bucket(
         if cpu_stacked is not None:
             source_index_stacked = cpu_stacked
             device_source = (
-                _bucket_fleets_for_graph(cpu_stacked, fixed_width=fixed_graph_fleet_width)
+                _bucket_fleets_for_graph(
+                    cpu_stacked,
+                    fixed_width=fixed_graph_fleet_width,
+                    keep_fleets=learned_fleet_attn,
+                )
                 if graph_enabled
-                else _trim_fleets_for_forward(cpu_stacked)
+                else _trim_fleets_for_forward(
+                    cpu_stacked, keep_fleets=learned_fleet_attn
+                )
             )
             if graph_enabled:
                 device_source = _pad_encoded_rows(device_source, graph_rows)
@@ -1262,10 +1342,13 @@ def _step_learner_bucket(
                 stacked = _bucket_fleets_for_graph(
                     stacked,
                     fixed_width=fixed_graph_fleet_width,
+                    keep_fleets=learned_fleet_attn,
                 )
                 stacked = _pad_encoded_rows(stacked, graph_rows)
             else:
-                stacked = _trim_fleets_for_forward(stacked)
+                stacked = _trim_fleets_for_forward(
+                    stacked, keep_fleets=learned_fleet_attn
+                )
     _sync_cuda_timing(target_device, sync_timing)
     _add_timing(timings, "policy_feature_s", perf_counter() - phase_t0)
     if cpu_stacked is not None:
@@ -1319,7 +1402,9 @@ def _step_learner_bucket(
     # graph even as envs finish and the real learner bucket shrinks.
     graph_stacked = _pad_encoded_rows(stacked, graph_rows) if graph_enabled else stacked
     if graph_enabled and include_fleet_targets:
-        _assert_destination_compiled_shape(graph_stacked)
+        _assert_destination_compiled_shape(
+            graph_stacked, learned_fleet_attention=learned_fleet_attn
+        )
     source_major_actor = (
         policy_rows is not None
         and compact_source_rows is not None
@@ -1375,6 +1460,33 @@ def _step_learner_bucket(
         actor_source_rows_t = source_rows_t.to(target_device, non_blocking=True)
         actor_source_cols_t = source_cols_t.to(target_device, non_blocking=True)
         actor_source_valid_t = source_valid_t.to(target_device, non_blocking=True)
+    # Build the destination BlockMask OUTSIDE the captured/compiled region (same
+    # discipline as actor_source_rows_t): cudagraph_trees copies the new mask
+    # tensors into the recorded static slots without re-recording. The model
+    # falls back to building it internally for the eager path (mask is None).
+    destination_block_mask = None
+    if (
+        learned_fleet_attn
+        and graph_enabled
+        and int(graph_stacked.fleet_feats.shape[1]) > 0
+    ):
+        f_pad = int(graph_stacked.fleet_feats.shape[1])
+        p_pad = int(graph_stacked.planet_feats.shape[1])
+        dest_dev = graph_stacked.fleet_target_planet_idx.to(
+            device=target_device, dtype=torch.long
+        )
+        valid_dev = (
+            graph_stacked.fleet_mask.to(target_device)
+            & (dest_dev >= 0)
+            & (dest_dev < p_pad)
+        )
+        destination_block_mask = build_destination_block_mask(
+            dest_dev,
+            valid_dev,
+            p_pad,
+            f_pad,
+            target_device,
+        )
     kernel = _get_rollout_kernel(
         model,
         target_device,
@@ -1391,6 +1503,7 @@ def _step_learner_bucket(
             int(planet_inbound_feats_or_empty(graph_stacked).shape[-1]),
             int(actor_source_rows_t.shape[0]) if source_major_actor else 0,
             target_planets_for_actor if source_major_actor else 0,
+            destination_block_mask is not None,
         ),
     )
     was_training = model.training
@@ -1419,9 +1532,13 @@ def _step_learner_bucket(
                     actor_source_rows_t,
                     actor_source_cols_t,
                     actor_source_valid_t,
+                    destination_block_mask=destination_block_mask,
                 )
             else:
-                out = kernel(*kernel_args)
+                out = kernel(
+                    *kernel_args,
+                    destination_block_mask=destination_block_mask,
+                )
             _sync_cuda_timing(target_device, sync_timing)
             _add_timing(timings, "policy_forward_s", perf_counter() - phase_t0)
     finally:

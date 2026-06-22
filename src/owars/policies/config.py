@@ -67,6 +67,13 @@ class OrbitPolicyConfig:
     # Encoder dispatch. `fleet_latent` is the default: raw planet tokens are
     # preserved for the action vocabulary, while raw fleets are compressed.
     encoder_backend: Literal["dense", "fleet_latent", "destination_conditioned"] = "fleet_latent"
+    # When the destination_conditioned backend is active, learn the
+    # fleet->planet conditioning with a flex_attention cross-attention over the
+    # full fleet set instead of consuming the hand-crafted native-Rust inbound
+    # summary. OFF preserves the summary path byte-for-byte (the A/B baseline);
+    # ON threads the raw fleets to the device forward and runs the learned
+    # destination cross-attention even when an inbound summary is present.
+    destination_learned_fleet_attention: bool = False
     # Perceiver-style fleet tokenizer. Raw planet tokens are preserved because
     # they define the source/target action vocabulary; raw fleet tokens are
     # compressed into this fixed latent set before the main policy encoder.
