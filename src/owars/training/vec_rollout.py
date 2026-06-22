@@ -1147,6 +1147,253 @@ def rollout_episodes_batched(
     return [trajectories[key] for key in recorded_keys]
 
 
+def rollout_league_episodes_batched(
+    models: Sequence[OrbitPolicy],
+    vec: VecEnv,
+    seat_instances_per_env: list[list[int]],
+    *,
+    num_players: int,
+    device: str = "cpu",
+    deterministic: bool = False,
+    reward_cfg: RewardCfg | None = None,
+    compile_mode: str | None = None,
+    compile_fleet_width: int | None = None,
+    policy_graph_rows: int | None = None,
+    snapshot_compile_rows: int = 64,
+    defer_log_prob: bool = False,
+    chunk_records: bool = False,
+    timings: dict[str, float] | None = None,
+    sample_timings: dict[str, float] | None = None,
+) -> dict[int, list[Trajectory]]:
+    """Parallel learning-league rollout (``opponents.mode == league_parallel``).
+
+    Unlike :func:`rollout_episodes_batched` there is no single learner identity:
+    every seat of every env is a *recorded learner* belonging to one of the
+    ``models`` instances, assigned by ``seat_instances_per_env[env][seat]`` (a
+    list of ``num_players`` DISTINCT instance indices per env — the matchmaker
+    output). Each instance's seats are bucketed and run through ITS own model via
+    :func:`_step_learner_bucket` with ``record_trajectories=True``, so an
+    instance trains only on the seats it controlled.
+
+    Because every ``(env, seat)`` belongs to exactly one instance the trajectory
+    store stays a single ``(env, seat)``-keyed dict (no collisions); we split it
+    by instance only at the end. Returns ``{instance_idx: [Trajectory, ...]}``.
+    Each trajectory is finalized from its own seat's perspective
+    (margin = own_score − max(others)), exactly like the single-learner path, so
+    seat rotation across waves gives every instance balanced seat coverage.
+    """
+    num_envs = len(seat_instances_per_env)
+    assert 0 < num_envs <= vec.num_envs, (
+        f"seat_instances_per_env has {num_envs} entries but vec has "
+        f"{vec.num_envs} workers"
+    )
+    n_instances = len(models)
+    for env_idx, seats in enumerate(seat_instances_per_env):
+        if len(seats) != num_players:
+            raise ValueError(
+                f"env {env_idx} has {len(seats)} seat instances, expected "
+                f"{num_players}"
+            )
+        if len(set(seats)) != num_players:
+            raise ValueError(
+                f"env {env_idx} seat instances {seats} are not distinct"
+            )
+        if any(not 0 <= inst < n_instances for inst in seats):
+            raise ValueError(
+                f"env {env_idx} seat instances {seats} out of range "
+                f"[0, {n_instances})"
+            )
+    if reward_cfg is None:
+        reward_cfg = RewardCfg()
+
+    # Every seat is recorded; each maps to exactly one instance.
+    recorded_keys = [
+        (env_idx, seat)
+        for env_idx in range(num_envs)
+        for seat in range(num_players)
+    ]
+    key_instance: dict[tuple[int, int], int] = {
+        (env_idx, seat): seat_instances_per_env[env_idx][seat]
+        for env_idx, seat in recorded_keys
+    }
+    trajectories: dict[tuple[int, int], Trajectory] = {
+        key: _empty_traj() for key in recorded_keys
+    }
+    finals: list[Any] = [None] * num_envs
+
+    states = vec.reset()
+    dones = [False] * num_envs
+    active_envs = list(range(num_envs))
+    episode_steps = int(getattr(vec, "episode_steps", 500))
+    dense_potential = reward_cfg.uses_dense_potential()
+    previous_potential: dict[tuple[int, int], float] = {key: 0.0 for key in recorded_keys}
+    if dense_potential:
+        previous_potential = dict(
+            zip(
+                recorded_keys,
+                _reward_potentials(
+                    vec,
+                    states,
+                    recorded_keys,
+                    num_players,
+                    episode_steps,
+                    reward_cfg,
+                ),
+                strict=True,
+            )
+        )
+    fast_policy_batch = getattr(vec, "policy_batch", None)
+    fast_policy_batch_no_context = getattr(vec, "policy_batch_no_context", None)
+    fast_observation = getattr(vec, "observation", None)
+    fast_step_subset = getattr(vec, "step_subset_fast", None)
+    fast_step_pending = getattr(vec, "step_subset_pending_actions", None)
+    use_fast_numpy_path = (
+        bool(getattr(vec, "fast_rollout", False))
+        and callable(fast_policy_batch)
+        and callable(fast_observation)
+        and callable(fast_step_subset)
+    )
+    # Prefer the native pending-action step: each instance bucket *enqueues* its
+    # sampled actions into the rust per-(env, seat) pending buffer, then a single
+    # `step_subset_pending_actions` advances every alive env. Because every seat
+    # is a recorded learner, all actions live in the pending buffer and the flat
+    # override lists stay empty. This path also drives the rust sampler's COMPACT
+    # legality records (`target_legal_source_mask`/`_row_idx`/`_source_idx`), which
+    # `_stack_target_legal_record_refs` requires for variable-width stacking — the
+    # nested `step_subset` path emits only the dense per-row mask and cannot stack.
+    use_pending_step = use_fast_numpy_path and callable(fast_step_pending)
+    if chunk_records and not use_pending_step:
+        # The nested fallback emits only the dense per-row legality mask, which
+        # `_stack_target_legal_record_refs` cannot concatenate across envs with
+        # differing planet counts. Compact records require the native pending
+        # path, so the parallel league is rust-only when chunking (the default).
+        raise RuntimeError(
+            "rollout_league_episodes_batched(chunk_records=True) requires a vec "
+            "env with step_subset_pending_actions (the rust backend); the nested "
+            "step path cannot stack compact legality records"
+        )
+    league_policy_batch = (
+        fast_policy_batch_no_context
+        if use_fast_numpy_path and callable(fast_policy_batch_no_context)
+        else fast_policy_batch
+        if use_fast_numpy_path
+        else None
+    )
+    # Each instance occupies at most one seat per env, so its per-wave bucket is
+    # at most `num_envs` rows — the static graph cap for its compiled kernel.
+    instance_graph_rows = int(policy_graph_rows or num_envs)
+
+    while active_envs:
+        phase_t0 = perf_counter()
+        # 1. Bucket (env, seat, obs) by instance index.
+        inst_buckets: dict[int, list[tuple[int, int, Any]]] = defaultdict(list)
+        for env_idx in active_envs:
+            state = None if use_fast_numpy_path else states[env_idx]
+            for seat in range(num_players):
+                inst = seat_instances_per_env[env_idx][seat]
+                if use_fast_numpy_path:
+                    inst_buckets[inst].append((env_idx, seat, None))
+                else:
+                    obs = state[seat]["observation"]
+                    inst_buckets[inst].append((env_idx, seat, obs))
+        _add_timing(timings, "bucket_s", perf_counter() - phase_t0)
+
+        # On the native pending path actions are enqueued into the rust buffer
+        # (so `_step_learner_bucket` returns no action list and skips these);
+        # on the nested fallback they are collected per env/seat instead.
+        actions_per_env: dict[int, list[Any]] | None = (
+            None if use_pending_step else {i: [None] * num_players for i in active_envs}
+        )
+        flat_env_rows: list[int] | None = [] if use_pending_step else None
+        flat_player_rows: list[int] | None = [] if use_pending_step else None
+        flat_actions: list[Any] | None = [] if use_pending_step else None
+
+        # 2. One batched recorded forward per instance, each on its own model.
+        for inst in sorted(inst_buckets):
+            bucket = inst_buckets[inst]
+            phase_t0 = perf_counter()
+            _step_learner_bucket(
+                models[inst],
+                bucket,
+                actions_per_env,
+                flat_env_rows,
+                flat_player_rows,
+                flat_actions,
+                trajectories,
+                device,
+                deterministic,
+                True,
+                league_policy_batch,
+                compile_mode,
+                compile_fleet_width,
+                instance_graph_rows,
+                None,
+                defer_log_prob=defer_log_prob,
+                chunk_records=chunk_records,
+                enqueue_native_actions=use_pending_step,
+                timings=timings,
+                sample_timings=sample_timings,
+                # 1-based to match the `p{i+1}` display naming used everywhere else.
+                sample_timing_prefix=f"p{inst + 1}_sample",
+                preencoded_cpu=None,
+            )
+            _add_timing(timings, "learner_bucket_s", perf_counter() - phase_t0)
+
+        # 3. Step alive envs in parallel.
+        active = active_envs
+        phase_t0 = perf_counter()
+        if use_pending_step:
+            results = fast_step_pending(
+                active, flat_env_rows, flat_player_rows, flat_actions
+            )
+        else:
+            actions_list = [actions_per_env[i] for i in active]
+            step_subset = fast_step_subset if use_fast_numpy_path else vec.step_subset
+            results = step_subset(active, actions_list)
+        _add_timing(timings, "env_step_s", perf_counter() - phase_t0)
+        for i, (state, done, final) in results.items():
+            if state is not None:
+                states[i] = state
+            if done:
+                dones[i] = True
+                finals[i] = final
+        active_envs = [idx for idx in active_envs if not dones[idx]]
+        if dense_potential:
+            phase_t0 = perf_counter()
+            active_set = set(active)
+            rows = [
+                (env_idx, seat)
+                for (env_idx, seat) in recorded_keys
+                if env_idx in active_set and trajectories[(env_idx, seat)].reward
+            ]
+            current_potential = _reward_potentials(
+                vec,
+                states,
+                rows,
+                num_players,
+                episode_steps,
+                reward_cfg,
+            )
+            for (env_idx, seat), phi in zip(rows, current_potential, strict=True):
+                key = (env_idx, seat)
+                trajectories[key].reward[-1] += reward_cfg.potential_weight * (
+                    phi - previous_potential[key]
+                )
+                previous_potential[key] = phi
+            _add_timing(timings, "reward_s", perf_counter() - phase_t0)
+
+    # 4. Terminal reward + seat_rewards, each seat from its own perspective.
+    for env_idx, seat in recorded_keys:
+        traj = trajectories[(env_idx, seat)]
+        traj.env_index = env_idx
+        _finalize_trajectory(traj, finals[env_idx], seat, reward_cfg)
+
+    out: dict[int, list[Trajectory]] = {i: [] for i in range(n_instances)}
+    for key in recorded_keys:
+        out[key_instance[key]].append(trajectories[key])
+    return out
+
+
 def _step_learner_bucket(
     model: OrbitPolicy,
     bucket: list[tuple[int, int, Any]],

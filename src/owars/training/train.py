@@ -29,6 +29,7 @@ import argparse
 import json
 import math
 import random
+from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
@@ -53,9 +54,11 @@ from .league import (
     BUILTIN,
     LEARNER_NAME,
     FixedOpponentPool,
+    LeaguePool,
     NoBuiltinTrainingPool,
     OpponentPool,
     OpponentSlot,
+    instance_name,
 )
 from .muon import MultiOptimizer, Muon
 from .numpy_env import NumpyVecEnv
@@ -69,7 +72,11 @@ from .ppo import (
 from .rollout import Trajectory, TrajectoryRecordRef
 from .sharded_numpy_env import ShardedNumpyVecEnv
 from .vec_env import VecEnv
-from .vec_rollout import alternating_learner_seats, rollout_episodes_batched
+from .vec_rollout import (
+    alternating_learner_seats,
+    rollout_episodes_batched,
+    rollout_league_episodes_batched,
+)
 
 # Subset of control tensors that route to the dedicated `control_lr` AdamW
 # group — the nGPT hypersphere controls (per-channel eigen LRs
@@ -1646,6 +1653,8 @@ def train_one_run(cfg: RunConfig, load_weights: str | None = None) -> dict:
     # bf16 (explicit master-cast below + autocast), so attention/Linear stay
     # bf16 and are unaffected — this just upgrades the leftover fp32 GEMMs.
     torch.set_float32_matmul_precision("high")
+    if cfg.opponents.mode == "league_parallel":
+        return _league_train(cfg, device, load_weights)
     model = _build_model(cfg).to(device)
     # parameter-golf fp32-master pattern: cast everything to bf16, then
     # restore fp32 for the params that actually need precision (Linear
@@ -2441,6 +2450,523 @@ def _ppo_loop(
     summary["elo_learner_final"] = elo.get(LEARNER_NAME)
     summary["cumulative_margin"] = cumulative_margin
     summary["cumulative_mean_margin"] = cumulative_margin / max(1, cumulative_games)
+    return summary
+
+
+def _perturb_trunk_matrices(model: OrbitPolicy, std: float, seed: int) -> None:
+    """Seeded symmetry-break: add `std·||W||·N(0,1)` (Frobenius-relative) to each
+    2D trunk matrix, then re-project onto the unit hypersphere.
+
+    The single most important league anti-collapse measure: without it, instances
+    sharing a warm-start (or identical fresh init) stay locked together and every
+    league game degenerates to self-play. Only 2D matrices are perturbed; the 1D
+    nGPT control scalars are left alone (they set magnitudes that aren't
+    re-projected). `normalize_matrices` afterward keeps the trunk on-manifold.
+    """
+    if std <= 0.0:
+        return
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.ndim < 2:
+                continue
+            noise = torch.randn(
+                p.shape, generator=gen, dtype=torch.float32
+            ).to(p.device, p.dtype)
+            scale = std * p.detach().to(torch.float32).norm().item() / math.sqrt(
+                max(1, p.numel())
+            )
+            p.add_(noise, alpha=scale)
+    normalize_matrices(model)
+
+
+def _init_league_models(
+    cfg: RunConfig, device: torch.device, load_weights: str | None
+) -> list[OrbitPolicy]:
+    """Build `league.num_instances` independent policies, warm-start, perturb.
+
+    Warm-start precedence per instance i: `league.init_paths[i]` if present, else
+    the single `--load` checkpoint (applied to ALL instances), else fresh init.
+    Every instance is then perturbed with a per-instance seed so warm/identical
+    starts diverge (see `_perturb_trunk_matrices`). Fresh instances also differ
+    from each other because each `_build_model` draws fresh RNG, but the
+    perturbation makes divergence deterministic and is essential for warm-starts.
+    """
+    n = cfg.league.num_instances
+    models: list[OrbitPolicy] = []
+    for i in range(n):
+        model = _build_model(cfg).to(device)
+        if device.type == "cuda":
+            model.bfloat16()
+            restore_fp32_params(model)
+        warm_path: str | None = None
+        if i < len(cfg.league.init_paths) and cfg.league.init_paths[i]:
+            warm_path = cfg.league.init_paths[i]
+        elif load_weights is not None:
+            warm_path = load_weights
+        if warm_path is not None:
+            ckpt = torch.load(warm_path, map_location=device, weights_only=False)
+            state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+            model.load_state_dict(state, strict=True)
+            print(f"league instance p{i}: loaded weights from {warm_path}")
+        normalize_matrices(model)
+        _perturb_trunk_matrices(
+            model, cfg.league.init_perturb_std, seed=cfg.run.seed + 1009 + i
+        )
+        models.append(model)
+    return models
+
+
+def _league_instance_update(
+    cfg: RunConfig,
+    model: OrbitPolicy,
+    optimizer: torch.optim.Optimizer,
+    trajs: list[Trajectory],
+    reward_normalizer: DiscountedReturnNormalizer | None,
+    return_pct_normalizer: PercentileReturnNormalizer | None,
+    device: torch.device,
+    kl_lr_ema: float,
+    kl_lr_scale: float,
+) -> dict:
+    """Run one PPO/PMPO update for a single league instance on its own trajs.
+
+    Mirrors the optimization section of `_ppo_loop` (stack → trim → old policy
+    dist / log-probs + advantage refresh → ppo_update → KL-LR controller), scoped
+    to one instance's model/optimizer/normalizers. Returns the PPOLog, the
+    explained variance, the per-update margin/win/return aggregates, and the
+    updated (kl_lr_ema, kl_lr_scale).
+
+    If `trajs` is empty (an instance that drew no seats this wave — possible
+    under `elo_matched` pairing starving a far-off-Elo instance) the update is a
+    no-op: the model/optimizer are untouched and `log` is None so the caller
+    skips that instance's loss/policy logging for the update.
+    """
+    if not trajs:
+        return {
+            "log": None,
+            "value_ev": 0.0,
+            "return_norm_scale": 1.0,
+            "kl_lr_ema": kl_lr_ema,
+            "kl_lr_scale": kl_lr_scale,
+        }
+    batch = _stack_trajectories(
+        trajs,
+        gamma=cfg.ppo.gamma,
+        gae_lambda=cfg.ppo.gae_lambda,
+        value_gae_lambda=cfg.ppo.value_gae_lambda,
+        critic_mtp_horizon=cfg.model.critic_mtp_horizon,
+        reward_normalizer=reward_normalizer,
+        include_old_log_prob=True,
+    )
+    compile_mode = _compile_mode_for_model(model, cfg)
+    batch = _trim_ppo_batch_fleet_width(
+        batch,
+        pad_to_bucket=compile_mode is not None and device.type == "cuda",
+    )
+    if hasattr(optimizer, "set_lr_scale"):
+        optimizer.set_lr_scale(kl_lr_scale)
+    ppo_minibatch_size = _ppo_minibatch_size_for_fleet_width(
+        cfg, int(batch["fleet_feats"].shape[1])
+    )
+    old_log_prob_native = bool(batch.get("old_log_prob_computed", False))
+    values_native = bool(batch.get("values_computed", False))
+    if cfg.ppo.policy_objective == "pmpo":
+        old_dist = compute_old_policy_dist(
+            model,
+            batch,
+            minibatch_size=ppo_minibatch_size,
+            minibatch_count=cfg.optim.minibatch_count,
+            compile_mode=compile_mode,
+        )
+        batch["old_log_prob"] = old_dist["old_log_prob"]
+        batch["old_log_prob_computed"] = torch.tensor(True)
+        batch["old_launch_logits"] = old_dist["old_launch_logits"]
+        batch["old_target_logits"] = old_dist["old_target_logits"]
+        batch["old_fraction_alpha"] = old_dist["old_fraction_alpha"]
+        batch["old_fraction_beta"] = old_dist["old_fraction_beta"]
+        _refresh_batch_advantages_from_values(
+            batch,
+            old_dist["value"],
+            gamma=cfg.ppo.gamma,
+            gae_lambda=cfg.ppo.gae_lambda,
+            value_gae_lambda=cfg.ppo.value_gae_lambda,
+            critic_mtp_horizon=cfg.model.critic_mtp_horizon,
+        )
+    elif not old_log_prob_native or not values_native:
+        old_log_prob, behavior_values = compute_old_log_probs_and_values(
+            model,
+            batch,
+            minibatch_size=ppo_minibatch_size,
+            minibatch_count=cfg.optim.minibatch_count,
+            compile_mode=compile_mode,
+        )
+        batch["old_log_prob"] = old_log_prob
+        batch["old_log_prob_computed"] = torch.tensor(True)
+        _refresh_batch_advantages_from_values(
+            batch,
+            behavior_values,
+            gamma=cfg.ppo.gamma,
+            gae_lambda=cfg.ppo.gae_lambda,
+            value_gae_lambda=cfg.ppo.value_gae_lambda,
+            critic_mtp_horizon=cfg.model.critic_mtp_horizon,
+        )
+    return_norm_scale = 1.0
+    if return_pct_normalizer is not None:
+        return_pct_normalizer.update(
+            batch["return"].detach().to(torch.float32).cpu().numpy()
+        )
+        return_norm_scale = return_pct_normalizer.scale
+    elif (
+        cfg.ppo.advantage_return_norm == "perc"
+        and cfg.ppo.advantage_return_norm_scope == "batch"
+    ):
+        return_norm_scale = _fresh_percentile_return_scale(
+            batch["return"],
+            perclo=cfg.ppo.advantage_return_norm_perclo,
+            perchi=cfg.ppo.advantage_return_norm_perchi,
+            limit=cfg.ppo.advantage_return_norm_limit,
+        )
+    log = ppo_update(
+        model,
+        optimizer,
+        batch,
+        value_coef=cfg.ppo.value_coef,
+        target_entropy_coef=cfg.ppo.target_entropy_coef,
+        fraction_entropy_coef=cfg.ppo.fraction_entropy_coef,
+        norm_advantage=cfg.ppo.norm_advantage,
+        norm_advantage_scope=cfg.ppo.norm_advantage_scope,
+        advantage_transform=cfg.ppo.advantage_transform,
+        return_norm_scale=return_norm_scale,
+        clip_coef=cfg.ppo.clip_coef,
+        clip_coef_high=cfg.ppo.clip_coef_high,
+        policy_objective=cfg.ppo.policy_objective,
+        pmpo_pos_to_neg_weight=cfg.ppo.pmpo_pos_to_neg_weight,
+        pmpo_kl_coef=cfg.ppo.pmpo_kl_coef,
+        pmpo_reverse_kl=cfg.ppo.pmpo_reverse_kl,
+        pmpo_target_kl=cfg.ppo.pmpo_target_kl,
+        epochs=cfg.optim.epochs_per_update,
+        minibatch_size=ppo_minibatch_size,
+        grad_clip=cfg.optim.grad_clip,
+        minibatch_count=cfg.optim.minibatch_count,
+        compile_mode=compile_mode,
+    )
+    if cfg.ppo.policy_objective != "pmpo":
+        kl_lr_ema, kl_lr_scale = update_kl_lr_controller(
+            kl_ema=kl_lr_ema,
+            lr_scale=kl_lr_scale,
+            observed_kl=kl_lr_signal_from_log(log),
+            cfg=cfg.optim,
+        )
+    value_ev = _explained_variance(batch["value"], batch["return"])
+    return {
+        "log": log,
+        "value_ev": value_ev,
+        "return_norm_scale": return_norm_scale,
+        "kl_lr_ema": kl_lr_ema,
+        "kl_lr_scale": kl_lr_scale,
+    }
+
+
+def _league_train(
+    cfg: RunConfig, device: torch.device, load_weights: str | None
+) -> dict:
+    """Set up and run the parallel learning league (`league_parallel` mode)."""
+    n = cfg.league.num_instances
+    models = _init_league_models(cfg, device, load_weights)
+    optimizers = [_build_optimizer(m, cfg.optim) for m in models]
+    reward_normalizers = [_build_reward_normalizer(cfg) for _ in range(n)]
+    return_pct_normalizers = [_build_percentile_return_normalizer(cfg) for _ in range(n)]
+
+    elo = EloTracker(
+        initial_rating=cfg.opponents.initial_rating,
+        k_factor=cfg.opponents.k_factor,
+    )
+    pool = LeaguePool(
+        n_instances=n,
+        pairing=cfg.league.pairing,
+        elo=elo,
+        rng=random.Random(cfg.run.seed + 0x1EA6),
+        elo_match_spread=cfg.league.elo_match_spread,
+    )
+    logger = TBLogger(cfg.run.name, root=cfg.run.log_root)
+    vec_counts = _training_vec_counts(cfg)
+    with ExitStack() as stack:
+        vecs = {
+            num_players: stack.enter_context(
+                _build_training_vec(cfg, num_players, num_envs)
+            )
+            for num_players, num_envs in vec_counts.items()
+            if num_envs > 0
+        }
+        return _league_loop(
+            cfg,
+            models,
+            optimizers,
+            elo,
+            pool,
+            logger,
+            device,
+            vecs,
+            reward_normalizers,
+            return_pct_normalizers,
+        )
+
+
+def _league_loop(
+    cfg: RunConfig,
+    models: list[OrbitPolicy],
+    optimizers: list[torch.optim.Optimizer],
+    elo: EloTracker,
+    pool: LeaguePool,
+    logger: TBLogger,
+    device: torch.device,
+    vecs: dict[int, VecEnv],
+    reward_normalizers: list[DiscountedReturnNormalizer | None],
+    return_pct_normalizers: list[PercentileReturnNormalizer | None],
+) -> dict:
+    n = len(models)
+    summary: dict = {"updates": []}
+    for vec in vecs.values():
+        vec.set_recording(False)  # rust renders nothing; no per-update replay dumps
+
+    kl_lr_emas = [cfg.optim.kl_lr_target] * n
+    kl_lr_scales = [1.0] * n
+    train_num_players = _train_num_players(cfg)
+    format_rng = random.Random(cfg.run.seed + 0x5E1F)
+    ckpt_dir = Path(cfg.run.ckpt_root) / cfg.run.name
+
+    for update in range(cfg.run.total_updates):
+        update_t0 = perf_counter()
+        rollout_s = 0.0
+        rollout_timings: dict[str, float] | None = (
+            {} if cfg.rollout.detail_timing or cfg.rollout.sample_detail_timing else None
+        )
+        sample_timings = rollout_timings if cfg.rollout.sample_detail_timing else None
+        inst_trajs: dict[int, list[Trajectory]] = {i: [] for i in range(n)}
+        format_counts = {num_players: 0 for num_players in train_num_players}
+        # Pairwise game tallies for the win-rate matrix (upper triangle).
+        pair_games: dict[tuple[int, int], int] = defaultdict(int)
+        pair_wins: dict[tuple[int, int], float] = defaultdict(float)
+
+        total_games = cfg.rollout.num_envs * cfg.rollout.games_per_env_per_update
+        episode_counts = _format_episode_counts(total_games, train_num_players, format_rng)
+        format_order = list(train_num_players)
+        format_rng.shuffle(format_order)
+        for num_players in format_order:
+            remaining = episode_counts.get(num_players, 0)
+            if remaining <= 0:
+                continue
+            vec = vecs[num_players]
+            while remaining > 0:
+                rollout_envs = min(vec.num_envs, remaining)
+                remaining -= rollout_envs
+                format_counts[num_players] += rollout_envs
+                seat_instances_per_env = [
+                    pool.sample_match(num_players) for _ in range(rollout_envs)
+                ]
+                phase_t0 = perf_counter()
+                wave_out = rollout_league_episodes_batched(
+                    models,
+                    vec,
+                    seat_instances_per_env,
+                    num_players=num_players,
+                    device=str(device),
+                    reward_cfg=cfg.reward,
+                    compile_mode=_rollout_compile_mode_for_model(models[0], cfg),
+                    compile_fleet_width=cfg.rollout.compile_fleet_width,
+                    policy_graph_rows=rollout_envs,
+                    snapshot_compile_rows=cfg.rollout.snapshot_compile_rows,
+                    defer_log_prob=True,
+                    chunk_records=True,
+                    timings=rollout_timings,
+                    sample_timings=sample_timings,
+                )
+                rollout_s += perf_counter() - phase_t0
+                env_seat_rewards: dict[int, list[float]] = {}
+                for i, trajs in wave_out.items():
+                    inst_trajs[i].extend(trajs)
+                    for traj in trajs:
+                        if traj.seat_rewards:
+                            env_seat_rewards[traj.env_index] = traj.seat_rewards
+                for env_idx in range(rollout_envs):
+                    seat_rewards = env_seat_rewards.get(env_idx)
+                    if seat_rewards is None:
+                        continue
+                    seats_insts = seat_instances_per_env[env_idx]
+                    elo.update_from_game(
+                        [
+                            (instance_name(inst), seat_rewards[seat])
+                            for seat, inst in enumerate(seats_insts)
+                        ]
+                    )
+                    # Pairwise win tally (upper-triangle key, score by seat reward).
+                    for a in range(num_players):
+                        for b in range(a + 1, num_players):
+                            ia, ib = seats_insts[a], seats_insts[b]
+                            lo, hi = (ia, ib) if ia < ib else (ib, ia)
+                            pair_games[(lo, hi)] += 1
+                            sa, sb = seat_rewards[a], seat_rewards[b]
+                            win_for_lo = sa > sb if ia < ib else sb > sa
+                            draw = sa == sb
+                            pair_wins[(lo, hi)] += 0.5 if draw else (1.0 if win_for_lo else 0.0)
+
+        # Per-instance optimization.
+        update_logs: list[dict] = []
+        inst_margin: list[float] = []
+        inst_win: list[float] = []
+        for i in range(n):
+            trajs = inst_trajs[i]
+            margins = [float(t.final_score) for t in trajs]
+            inst_margin.append(float(np.mean(margins)) if margins else 0.0)
+            inst_win.append(float(np.mean([t.won for t in trajs])) if trajs else 0.0)
+            res = _league_instance_update(
+                cfg,
+                models[i],
+                optimizers[i],
+                trajs,
+                reward_normalizers[i],
+                return_pct_normalizers[i],
+                device,
+                kl_lr_emas[i],
+                kl_lr_scales[i],
+            )
+            kl_lr_emas[i] = res["kl_lr_ema"]
+            kl_lr_scales[i] = res["kl_lr_scale"]
+            update_logs.append(res)
+
+        # --- Logging. ---
+        elos = [elo.get(instance_name(i)) for i in range(n)]
+        logger.scalars(
+            "elo",
+            {
+                **{instance_name(i): elos[i] for i in range(n)},
+                "spread": max(elos) - min(elos),
+                "std": float(np.std(elos)) if n > 1 else 0.0,
+            },
+            update,
+        )
+        for (lo, hi), games in pair_games.items():
+            if games > 0:
+                logger.scalars(
+                    "winrate",
+                    {f"{instance_name(lo)}_vs_{instance_name(hi)}": pair_wins[(lo, hi)] / games},
+                    update,
+                )
+        for i in range(n):
+            log = update_logs[i]["log"]
+            if log is None:
+                # Instance drew no seats this wave (see _league_instance_update);
+                # nothing optimized, so skip its loss/policy scalars.
+                continue
+            logger.scalars(
+                f"{instance_name(i)}/losses",
+                {
+                    "policy_loss": log.policy_loss,
+                    "value_loss": log.value_loss,
+                    "entropy": log.entropy,
+                    "approx_kl": log.approx_kl,
+                    "per_planet_approx_kl": log.per_planet_approx_kl,
+                    "explained_variance": update_logs[i]["value_ev"],
+                    "pmpo_reverse_kl": log.reverse_kl,
+                    "actor_grad_norm": log.actor_grad_norm,
+                    "critic_grad_norm": log.critic_grad_norm,
+                },
+                update,
+            )
+            logger.scalars(
+                f"{instance_name(i)}/policy",
+                {
+                    "target_entropy": log.target_entropy,
+                    "move_prob": log.move_prob,
+                    "executed_launch_frac": log.executed_launch_frac,
+                    "turn_no_action_frac": log.turn_no_action_frac,
+                    "margin": inst_margin[i],
+                    "win_rate": inst_win[i],
+                },
+                update,
+            )
+        logger.scalars(
+            "rollout",
+            {
+                "games_2p": float(format_counts.get(2, 0)),
+                "games_4p": float(format_counts.get(4, 0)),
+                "margin_mean": float(np.mean(inst_margin)) if inst_margin else 0.0,
+                "episodic_length_mean": float(
+                    np.mean([len(t.reward) for ts in inst_trajs.values() for t in ts])
+                    or 0.0
+                ),
+            },
+            update,
+        )
+
+        # --- Checkpoints. ---
+        if cfg.league.submission_select == "best_elo":
+            best_i = max(range(n), key=lambda i: elos[i])
+        else:
+            best_i = cfg.league.submission_index
+        for i in range(n):
+            _save_ppo_checkpoint(
+                models[i],
+                ckpt_dir / f"latest_{instance_name(i)}.pt",
+                reward_normalizers[i],
+                return_pct_normalizers[i],
+            )
+        _save_ppo_checkpoint(
+            models[best_i],
+            ckpt_dir / "latest.pt",
+            reward_normalizers[best_i],
+            return_pct_normalizers[best_i],
+        )
+
+        update_s = perf_counter() - update_t0
+        learner_steps = sum(len(t.reward) for ts in inst_trajs.values() for t in ts)
+        logger.scalars(
+            "timing",
+            {
+                "update_s": update_s,
+                "rollout_s": rollout_s,
+                "learner_steps_per_s": learner_steps / max(rollout_s, 1e-9),
+            },
+            update,
+        )
+        logger.scalars(
+            "charts", {"SPS": learner_steps / max(update_s, 1e-9)}, update
+        )
+        if rollout_timings is not None:
+            logger.scalars("rollout_detail", rollout_timings, update)
+        summary["updates"].append(
+            {
+                "update": update,
+                "elo": {instance_name(i): elos[i] for i in range(n)},
+                "elo_spread": max(elos) - min(elos),
+                "margin_mean": float(np.mean(inst_margin)) if inst_margin else 0.0,
+            }
+        )
+
+    # --- Final checkpoints. ---
+    elos = [elo.get(instance_name(i)) for i in range(n)]
+    if cfg.league.submission_select == "best_elo":
+        best_i = max(range(n), key=lambda i: elos[i])
+    else:
+        best_i = cfg.league.submission_index
+    for i in range(n):
+        _save_ppo_checkpoint(
+            models[i],
+            ckpt_dir / f"final_{instance_name(i)}.pt",
+            reward_normalizers[i],
+            return_pct_normalizers[i],
+        )
+    final_path = ckpt_dir / "final.pt"
+    _save_ppo_checkpoint(
+        models[best_i], final_path, reward_normalizers[best_i], return_pct_normalizers[best_i]
+    )
+    elo_path = final_path.with_name("elo.json")
+    elo_path.write_text(json.dumps(elo.snapshot_dict(), indent=2, sort_keys=True))
+    logger.close()
+    summary["final_ckpt"] = str(final_path)
+    summary["elo_path"] = str(elo_path)
+    summary["submission_instance"] = instance_name(best_i)
+    summary["elo_final"] = {instance_name(i): elos[i] for i in range(n)}
     return summary
 
 

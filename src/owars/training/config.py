@@ -434,9 +434,14 @@ class OpponentsCfg:
     ``mode="no_builtins"`` is a learned-policy-only training pool: current
     learner + active training snapshots + historical training archive. It uses
     no fixed builtin agents in the training opponent mix.
+
+    ``mode="league_parallel"`` runs the parallel learning league (see
+    ``LeagueCfg``): ``league.num_instances`` independent policies all learning
+    and playing each other. This mode reads the ``league:`` config block, not
+    the snapshot-pool fields above.
     """
 
-    mode: Literal["league", "fixed", "no_builtins"] = "league"
+    mode: Literal["league", "fixed", "no_builtins", "league_parallel"] = "league"
     fixed_opponents: list[str] = field(default_factory=lambda: ["sniper_v18"])
     snapshot_every: int = 25      # save a frozen snapshot for the pool every N updates
     top_k: int = 10               # max live snapshots; lowest-Elo evicted past this
@@ -461,6 +466,53 @@ class OpponentsCfg:
     historical_agent_cache_size: int = 8
     recent_eviction_archive_size: int | None = None
     notable_archive_size: int | None = None
+
+
+@dataclass
+class LeagueCfg:
+    """Parallel learning league (AlphaStar-style, simple symmetric variant).
+
+    Active only when ``opponents.mode == "league_parallel"``. Instead of one
+    live learner + frozen snapshots, we hold ``num_instances`` independent
+    ``OrbitPolicy`` instances that ALL learn, 100% of the time, by playing each
+    other (never themselves) on randomized maps/seats. Each instance carries its
+    own Elo (logged as ``elo/p1``..``elo/p{N}``). The submission checkpoint
+    (``final.pt`` / ``latest.pt``) is the highest-Elo instance (or a fixed
+    index). See docs/specs/league_4instance.md.
+    """
+
+    num_instances: int = 4
+    # Matchmaking. "uniform" picks `num_players` distinct instances per env
+    # uniformly (full coverage of the win-rate matrix). "elo_matched" biases
+    # toward similar-Elo opponents (more informative games once Elo spreads).
+    pairing: Literal["uniform", "elo_matched"] = "uniform"
+    # Symmetry-break perturbation applied to every instance's trunk matrices at
+    # init (seeded per instance). Without it, instances sharing a warm-start (or
+    # the same fresh seed) stay identical, every league game collapses to
+    # self-play, and Elo never spreads. This is the single most important
+    # anti-collapse measure — keep it > 0. Relative scale: w += std·||w||·N(0,1)
+    # per matrix, then matrices are re-projected onto the unit hypersphere.
+    init_perturb_std: float = 0.01
+    # Optional per-instance warm-start checkpoints (len <= num_instances).
+    # Unspecified instances are fresh-init. Empty => all instances warm from the
+    # single `--load` checkpoint (if any) or all fresh.
+    init_paths: list[str] = field(default_factory=list)
+    # Elo-matched pairing temperature (only used when pairing == "elo_matched"):
+    # opponent j is sampled with weight softmax(-|elo_i - elo_j| / spread).
+    elo_match_spread: float = 200.0
+    # Which instance is "the submission": "best_elo" (default) or "index".
+    submission_select: Literal["best_elo", "index"] = "best_elo"
+    # Zero-based instance index used when submission_select == "index". Note the
+    # display names are one-based (instance 0 == "p1"), so index 2 submits "p3".
+    submission_index: int = 0
+    # --- Opt-in diversity knobs, NOT implemented in v1 (validated to defaults). ---
+    # Per-instance reward-shaping jitter. Reserved; must be 0.0 in v1.
+    reward_jitter: float = 0.0
+    # Probability a seat is a frozen historical snapshot / builtin. Reserved;
+    # must be 0.0 in v1 (pure inter-instance league per the user's ask).
+    historical_prob: float = 0.0
+    builtin_prob: float = 0.0
+    builtin_opponents: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -529,6 +581,7 @@ class RunConfig:
     sac: SACCfg = field(default_factory=SACCfg)
     rollout: RolloutCfg = field(default_factory=RolloutCfg)
     opponents: OpponentsCfg = field(default_factory=OpponentsCfg)
+    league: LeagueCfg = field(default_factory=LeagueCfg)
     reward: RewardCfg = field(default_factory=RewardCfg)
 
     @classmethod
@@ -743,9 +796,15 @@ class RunConfig:
             raise ValueError("sac.alpha_discrete_lr/continuous_lr must be positive")
         from .league import BUILTIN
 
-        if cfg.opponents.mode not in {"league", "fixed", "no_builtins"}:
+        if cfg.opponents.mode not in {
+            "league",
+            "fixed",
+            "no_builtins",
+            "league_parallel",
+        }:
             raise ValueError(
-                "opponents.mode must be 'league', 'fixed', or 'no_builtins'"
+                "opponents.mode must be 'league', 'fixed', 'no_builtins', or "
+                "'league_parallel'"
             )
         if not 0.0 <= cfg.opponents.self_play_prob <= 1.0:
             raise ValueError("opponents.self_play_prob must be in [0, 1]")
@@ -856,6 +915,63 @@ class RunConfig:
                 "opponents.mode='no_builtins' requires ppo.pretrain_updates=0; "
                 "value pretraining uses builtin behavior policies"
             )
+
+        if cfg.opponents.mode == "league_parallel":
+            if cfg.league.num_instances < 2:
+                raise ValueError("league.num_instances must be >= 2")
+            max_players = max(cfg.game.train_num_players)
+            if cfg.league.num_instances < max_players:
+                raise ValueError(
+                    f"league.num_instances ({cfg.league.num_instances}) must be "
+                    f">= max(game.train_num_players) ({max_players}): need a "
+                    "distinct instance per seat with no self-play repeats"
+                )
+            if cfg.league.pairing not in {"uniform", "elo_matched"}:
+                raise ValueError(
+                    "league.pairing must be 'uniform' or 'elo_matched'"
+                )
+            if not math.isfinite(cfg.league.init_perturb_std) or (
+                cfg.league.init_perturb_std < 0.0
+            ):
+                raise ValueError("league.init_perturb_std must be non-negative")
+            if len(cfg.league.init_paths) > cfg.league.num_instances:
+                raise ValueError(
+                    "league.init_paths has more entries than league.num_instances"
+                )
+            if cfg.league.submission_select not in {"best_elo", "index"}:
+                raise ValueError(
+                    "league.submission_select must be 'best_elo' or 'index'"
+                )
+            if not 0 <= cfg.league.submission_index < cfg.league.num_instances:
+                raise ValueError(
+                    "league.submission_index must be in "
+                    f"[0, {cfg.league.num_instances})"
+                )
+            if cfg.league.elo_match_spread <= 0.0:
+                raise ValueError("league.elo_match_spread must be positive")
+            if cfg.ppo.pretrain_updates > 0:
+                raise ValueError(
+                    "opponents.mode='league_parallel' requires "
+                    "ppo.pretrain_updates=0; there is no single learner to "
+                    "value-pretrain"
+                )
+            # v1 implements the pure inter-instance league only. These knobs are
+            # reserved in LeagueCfg but not yet wired; reject non-defaults rather
+            # than silently ignoring them.
+            if cfg.league.reward_jitter != 0.0:
+                raise ValueError(
+                    "league.reward_jitter is not implemented in v1; must be 0.0"
+                )
+            if cfg.league.historical_prob != 0.0 or cfg.league.builtin_prob != 0.0:
+                raise ValueError(
+                    "league.historical_prob / builtin_prob are not implemented "
+                    "in v1; must be 0.0 (pure inter-instance league)"
+                )
+            if cfg.league.builtin_opponents:
+                raise ValueError(
+                    "league.builtin_opponents is not implemented in v1; must be "
+                    "empty"
+                )
 
         unknown = set(cfg.sac.builtin_opponents) - set(BUILTIN)
         if unknown:

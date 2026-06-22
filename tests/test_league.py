@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
+import pytest
 import torch
 
 from owars.agents.sniper import sniper_v18_agent
@@ -14,9 +15,11 @@ from owars.training.elo import EloTracker
 from owars.training.league import (
     LEARNER_NAME,
     FixedOpponentPool,
+    LeaguePool,
     NoBuiltinTrainingPool,
     OpponentPool,
     _copy_model_without_compile_caches,
+    instance_name,
 )
 
 
@@ -726,3 +729,82 @@ def test_no_builtin_diversify_does_not_cross_sources(tmp_path: Path):
     slots = pool.sample(3)
 
     assert [slot.name for slot in slots] == ["frozen:historical"] * 3
+
+
+# --- Parallel learning league (`league_parallel` mode). ---
+
+
+def test_instance_name_is_one_indexed():
+    # The user reads off Elo as p1..pN; instance 0 must display as "p1" so the
+    # TB tags, elo.json keys, and checkpoint names all agree with that mental
+    # model while the zero-based index still addresses models/seat lists.
+    assert [instance_name(i) for i in range(4)] == ["p1", "p2", "p3", "p4"]
+
+
+def test_league_pool_seats_are_distinct_and_in_range():
+    elo = EloTracker(initial_rating=1500.0)
+    pool = LeaguePool(
+        n_instances=4,
+        pairing="uniform",
+        elo=elo,
+        rng=random.Random(0),
+    )
+    for _ in range(200):
+        for num_players in (2, 4):
+            seats = pool.sample_match(num_players)
+            assert len(seats) == num_players
+            assert len(set(seats)) == num_players  # never plays a copy of itself
+            assert all(0 <= s < 4 for s in seats)
+
+
+def test_league_pool_ensures_elo_for_every_instance():
+    elo = EloTracker(initial_rating=1500.0)
+    LeaguePool(n_instances=4, elo=elo, rng=random.Random(0))
+    assert set(elo.snapshot_dict()) == {"p1", "p2", "p3", "p4"}
+
+
+def test_league_pool_uniform_covers_every_2p_matchup():
+    elo = EloTracker(initial_rating=1500.0)
+    pool = LeaguePool(n_instances=4, pairing="uniform", elo=elo, rng=random.Random(1))
+    seen = {frozenset(pool.sample_match(2)) for _ in range(500)}
+    # C(4, 2) = 6 distinct unordered pairs must all appear under uniform pairing.
+    assert len(seen) == 6
+
+
+def test_league_pool_4p_full_permutation_uses_all_instances():
+    elo = EloTracker(initial_rating=1500.0)
+    pool = LeaguePool(n_instances=4, pairing="uniform", elo=elo, rng=random.Random(2))
+    seats = pool.sample_match(4)
+    assert sorted(seats) == [0, 1, 2, 3]
+
+
+def test_league_pool_rejects_more_players_than_instances():
+    elo = EloTracker(initial_rating=1500.0)
+    pool = LeaguePool(n_instances=2, elo=elo, rng=random.Random(0))
+    with pytest.raises(ValueError):
+        pool.sample_match(4)
+
+
+def test_league_pool_elo_matched_biases_toward_close_ratings():
+    # p0 and p1 are top-rated; an Elo-matched seed at p0 should pick p1 as its
+    # 2p opponent far more often than the distant p2/p3.
+    elo = EloTracker(initial_rating=1500.0)
+    elo.set("p1", 2000.0)  # instance 0
+    elo.set("p2", 1990.0)  # instance 1
+    elo.set("p3", 1000.0)  # instance 2
+    elo.set("p4", 990.0)   # instance 3
+    pool = LeaguePool(
+        n_instances=4,
+        pairing="elo_matched",
+        elo=elo,
+        rng=random.Random(0),
+        elo_match_spread=100.0,
+    )
+    close = far = 0
+    for _ in range(2000):
+        seats = set(pool.sample_match(2))
+        if seats == {0, 1}:
+            close += 1
+        elif seats == {0, 2} or seats == {0, 3}:
+            far += 1
+    assert close > far

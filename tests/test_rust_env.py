@@ -3746,3 +3746,81 @@ def test_python_deterministic_actions_match_rust_native_sampler(num_players: int
                     f"deterministic launch set diverges seed={seed} depth={depth} "
                     f"players={num_players} row={r}: py={py} rust={ru}"
                 )
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+def test_rust_league_rollout_records_stack_per_instance():
+    # Regression: the parallel-learning-league rollout must drive the rust
+    # sampler's COMPACT legality records (target_legal_source_mask / _row_idx /
+    # _source_idx) via the native pending-step path. The earlier nested-step
+    # path emitted only the dense per-row mask, which `_stack_trajectories`
+    # cannot concatenate across envs with different planet counts.
+    _build_rust_extension()
+    from owars.policies.config import OrbitPolicyConfig
+    from owars.policies.model import OrbitPolicy
+    from owars.training import train as train_mod
+    from owars.training.rust_env import RustVecEnv
+    from owars.training.vec_rollout import rollout_league_episodes_batched
+
+    num_players = 2
+    n_instances = 4
+    models = [
+        OrbitPolicy(
+            OrbitPolicyConfig(
+                dim=16,
+                ff_dim=32,
+                depth=1,
+                n_heads=2,
+                encoder_backend="destination_conditioned",
+            )
+        )
+        for _ in range(n_instances)
+    ]
+    rust = RustVecEnv(
+        num_envs=4,
+        num_players=num_players,
+        episode_steps=8,
+        ship_speed=6.0,
+        random_seed=0,
+    )
+    # Distinct instance per seat; rotate so every instance gets both seats.
+    seat_instances = [
+        [0, 1],
+        [2, 3],
+        [1, 2],
+        [3, 0],
+    ]
+
+    with rust:
+        per_instance = rollout_league_episodes_batched(
+            models,
+            rust,
+            seat_instances,
+            num_players=num_players,
+            device="cpu",
+            defer_log_prob=True,
+            chunk_records=True,
+        )
+
+    # One trajectory per (env, seat), partitioned by the instance that held it.
+    assert set(per_instance) == {0, 1, 2, 3}
+    assert sum(len(ts) for ts in per_instance.values()) == 4 * num_players
+    for inst, trajs in per_instance.items():
+        assert trajs, f"instance {inst} recorded no trajectories"
+        for traj in trajs:
+            assert traj.record_refs
+            assert len(traj.record_refs) == len(traj.reward)
+            # Compact legality keys must be present (the bug they regressed on).
+            assert all(
+                "target_legal_source_mask" in ref.chunk for ref in traj.record_refs
+            )
+
+    # Each instance's records must stack into a PPO batch without width errors.
+    for trajs in per_instance.values():
+        batch = train_mod._stack_trajectories(
+            trajs,
+            gamma=1.0,
+            gae_lambda=1.0,
+            include_old_log_prob=False,
+        )
+        assert int(batch["launch"].shape[0]) == sum(len(t.reward) for t in trajs)

@@ -1,0 +1,128 @@
+# PMPO parallel learning league — 4 independent instances, AlphaStar-style.
+#
+# `opponents.mode: league_parallel` runs `league.num_instances` (=4) independent
+# OrbitPolicy instances that ALL learn, 100% of the time, by playing each other
+# (never themselves) on randomized maps/seats/comets. Each carries its own Elo
+# (logged as elo/p1..elo/p4); the submission checkpoint (final.pt / latest.pt) is
+# the highest-Elo instance. There are NO fixed builtins and NO frozen snapshots in
+# the learning signal — pure inter-instance play. See docs/specs/league_4instance.md.
+#
+# Same model / optim / reward / PMPO objective as the self-play run
+# (`ppo_selfplay_pmpo.yaml`); the only structural change is the opponent mode +
+# the `league:` block below.
+#
+# Recommended migration (§12): warm ALL 4 instances from the strongest self-play
+# checkpoint and rely on the per-instance symmetry-break perturbation + different
+# opponent mixes to diverge them:
+#   python scripts/train.py --config configs/league_4p_pmpo.yaml \
+#       --load checkpoints/ppo_selfplay_pmpo/final.pt
+# (`--load` warm-starts every instance from that one checkpoint; per-instance
+# `league.init_perturb_std` then breaks the symmetry so they don't collapse to one
+# policy. Omit `--load` to train all four from scratch.)
+
+run:
+  name: league_4p_pmpo
+  seed: 0
+  device: cuda
+  compile_mode: reduce-overhead
+  log_root: runs
+  ckpt_root: checkpoints
+  total_updates: 1000
+
+game:
+  num_players: 2
+  train_num_players: [2, 4]  # 50/50 2p/4p mix (uniform sample per wave)
+  episode_steps: 500
+  act_timeout: 1.0
+  ship_speed: 6.0
+
+model:
+  dim: 128
+  ff_dim: 256
+  depth: 3
+  n_heads: 4
+  n_kv_heads: 1
+  dropout: 0.0
+  planet_rope_fraction: 0.5
+  planet_rope_base: 100.0
+  encoder_backend: destination_conditioned
+  # MUST match a `--load` warm-start checkpoint's architecture (strict load).
+  destination_learned_fleet_attention: true
+  num_fleet_latents: 64
+  fleet_tokenizer_depth: 1
+  value_min: -12.3
+  value_max: 12.3
+  value_num_bins: 255
+  value_sigma_to_bin_ratio: 0.75
+  critic_mtp_horizon: 6
+  value_symlog: false
+  value_bucket: dreamer3
+
+optim:
+  muon_lr: 5.0e-3
+  lr: 3.0e-4
+  head_lr: 3.0e-4
+  control_lr: 3.0e-4
+  lr_warmup_steps: 200
+  kl_lr_target: 0.025
+  kl_lr_ema_half_life: 20.0
+  kl_lr_min_scale: 0.1
+  kl_lr_max_scale: 10.0
+  weight_decay: 0.0
+  grad_clip: 1.0
+  minibatch_size: 4096
+  epochs_per_update: 1
+
+ppo:
+  gamma: 0.997
+  gae_lambda: 0.95
+  policy_objective: pmpo
+  pmpo_pos_to_neg_weight: 0.5
+  pmpo_kl_coef: 0.3
+  pmpo_reverse_kl: true
+  pmpo_target_kl: 0.03
+  advantage_transform: none
+  norm_advantage: false
+  norm_advantage_scope: minibatch
+  advantage_return_norm: none
+  advantage_return_norm_scope: batch
+  clip_coef: 0.2
+  clip_coef_high: 0.28
+  value_coef: 1.0
+  target_entropy_coef: 0.0
+  critic_return_norm: none
+  critic_return_norm_clip: 10.0
+  fraction_entropy_coef: 0.0
+  pretrain_updates: 0
+
+rollout:
+  # Larger than the single-learner run: with 4 instances the rollout seats split
+  # ~4 ways, so a bigger env count keeps each instance's per-update batch in the
+  # same order as the single-learner minibatch (§6.5). 256 envs × ~2-4 seats / 4
+  # instances ≈ a healthy per-instance batch.
+  num_envs: 256
+  num_workers: 0
+  env_backend: rust
+  compile_policy: true
+  compile_fleet_width: 64
+  snapshot_compile_rows: 128
+  strict_target_legality: true
+
+opponents:
+  mode: league_parallel
+  initial_rating: 1500.0
+  k_factor: 32.0
+
+league:
+  num_instances: 4
+  pairing: uniform          # full win-rate-matrix coverage; switch to elo_matched later
+  init_perturb_std: 0.01    # per-instance symmetry break (essential anti-collapse)
+  submission_select: best_elo
+
+reward:
+  potential_weight: 1.0
+  production_weight: 1.0
+  win_value: 0.0
+  loss_value: 0.0
+  draw_value: 0.0
+  margin_scale: 0.0

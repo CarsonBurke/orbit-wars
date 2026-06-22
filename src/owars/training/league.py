@@ -80,6 +80,89 @@ BUILTIN: dict[str, AgentFn] = {
 }
 
 
+def instance_name(i: int) -> str:
+    """Display / Elo / checkpoint identity for league instance `i`.
+
+    One-indexed ("p1", "p2", ...) so it matches the per-player Elo the user
+    reads off TensorBoard (``elo/p1``..``elo/pN``); the zero-based ``i`` stays
+    the list index into ``models``/``seat_instances_per_env``.
+    """
+    return f"p{i + 1}"
+
+
+class LeaguePool:
+    """Matchmaker for the parallel learning league (``league_parallel`` mode).
+
+    Holds no models — just the bookkeeping needed to assign ``num_players``
+    *distinct* instance indices to each env's seats every rollout wave, and the
+    shared ``EloTracker`` keyed on ``instance_name(i)``. Because each seat gets a
+    distinct instance, "an instance never plays a copy of itself" is structural,
+    not a post-hoc filter. The returned list IS the seat assignment (index k =
+    seat k), and since it is a random sample/permutation, seat assignment is
+    already uniformly random across instances (the symmetry coverage the
+    AGENTS.md paranoia rule wants).
+    """
+
+    def __init__(
+        self,
+        *,
+        n_instances: int,
+        pairing: str = "uniform",
+        elo: EloTracker,
+        rng: random.Random,
+        elo_match_spread: float = 200.0,
+    ) -> None:
+        if n_instances < 2:
+            raise ValueError("LeaguePool needs at least 2 instances")
+        if pairing not in {"uniform", "elo_matched"}:
+            raise ValueError(f"unknown pairing {pairing!r}")
+        self.n_instances = int(n_instances)
+        self.pairing = pairing
+        self.elo = elo
+        self.rng = rng
+        self.elo_match_spread = float(elo_match_spread)
+        for i in range(self.n_instances):
+            self.elo.ensure(instance_name(i))
+
+    def sample_match(self, num_players: int) -> list[int]:
+        """Return `num_players` distinct instance indices, one per seat."""
+        if num_players > self.n_instances:
+            raise ValueError(
+                f"need {num_players} distinct instances but only "
+                f"{self.n_instances} exist"
+            )
+        if self.pairing == "uniform":
+            return self.rng.sample(range(self.n_instances), num_players)
+        return self._sample_elo_matched(num_players)
+
+    def _sample_elo_matched(self, num_players: int) -> list[int]:
+        """Seed with a uniform pick, then add similar-Elo instances (no repeats).
+
+        Each subsequent seat draws from the remaining instances with weight
+        ``exp(-|elo_seed - elo_j| / spread)`` relative to the FIRST pick, so a
+        quartet stays Elo-coherent. Seat order is then shuffled so the seed isn't
+        always seat 0 (keeps seat assignment unbiased for the symmetry tests).
+        """
+        remaining = list(range(self.n_instances))
+        seed = self.rng.choice(remaining)
+        remaining.remove(seed)
+        chosen = [seed]
+        seed_elo = self.elo.get(instance_name(seed))
+        while len(chosen) < num_players and remaining:
+            weights = [
+                math.exp(
+                    -abs(seed_elo - self.elo.get(instance_name(j)))
+                    / self.elo_match_spread
+                )
+                for j in remaining
+            ]
+            pick = self.rng.choices(remaining, weights=weights, k=1)[0]
+            remaining.remove(pick)
+            chosen.append(pick)
+        self.rng.shuffle(chosen)
+        return chosen
+
+
 def _copy_model_without_compile_caches(model: OrbitPolicy) -> OrbitPolicy:
     cache_names = (
         "_owars_minibatch_kernel_cache",
