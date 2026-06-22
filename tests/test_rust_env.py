@@ -2979,7 +2979,9 @@ def test_rust_fast_rollout_uses_policy_batch_no_context(monkeypatch):
         device="cpu",
     )
 
-    assert len(trajs) == 2
+    # Self-play: both seats in each env are live learners (designated seat +
+    # LEARNER_NAME opponent), so every seat is recorded → 2 envs × 2 seats.
+    assert len(trajs) == 4
     assert all(traj.encoded for traj in trajs)
     assert all(traj.reward for traj in trajs)
     assert all(traj.log_prob for traj in trajs)
@@ -3213,7 +3215,7 @@ def test_rust_fast_rollout_mixes_pending_native_and_python_flat_actions(monkeypa
         OpponentSlot("sniper", agent=sniper_agent),
         OpponentSlot("python:no-op", agent=python_agent),
     ]
-    [traj] = rollout_episodes_batched(
+    trajs = rollout_episodes_batched(
         model,
         rust,
         [opponents],
@@ -3221,6 +3223,9 @@ def test_rust_fast_rollout_mixes_pending_native_and_python_flat_actions(monkeypa
         learner_seat=0,
         device="cpu",
     )
+    # Seat 1 is a LEARNER_NAME self-play opponent, so it also records; this test
+    # inspects the designated learner's trajectory (seat 0).
+    traj = next(t for t in trajs if t.learner_seat == 0)
 
     assert traj.encoded
     assert python_steps
