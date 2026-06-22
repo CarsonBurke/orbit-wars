@@ -167,7 +167,14 @@ class OptimCfg:
     kl_lr_ema_half_life: float = 20.0
     kl_lr_min_scale: float = 0.1
     kl_lr_max_scale: float = 10.0
-    weight_decay: float = 1e-4
+    # AdamW weight decay for the default + head groups (the nGPT control group is
+    # always wd=0, and Muon uses `muon_weight_decay`). Default 0: the policy is
+    # an nGPT trunk whose matrices are re-projected onto the unit hypersphere
+    # after every step (`normalize_matrices`), so an L2 pull toward the origin
+    # fights that constraint rather than regularizing — RL here is data-rich and
+    # not over-fitting in the supervised sense. Set >0 only with a specific
+    # reason.
+    weight_decay: float = 0.0
     # PPO clips actor and critic flows separately. Each flow includes its task
     # readout head plus the shared trunk, then clipped shared gradients are
     # summed before the optimizer step.

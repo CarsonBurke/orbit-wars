@@ -31,7 +31,7 @@ model:
 
 optim:
   lr: 3.0e-4
-  weight_decay: 1.0e-4
+  weight_decay: 0.0
   grad_clip: 0.5
   minibatch_size: 4096
   epochs_per_update: 4

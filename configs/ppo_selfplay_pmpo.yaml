@@ -76,7 +76,7 @@ optim:
   kl_lr_ema_half_life: 20.0
   kl_lr_min_scale: 0.1
   kl_lr_max_scale: 10.0
-  weight_decay: 1.0e-4
+  weight_decay: 0.0
   grad_clip: 1.0
   minibatch_size: 4096
   # Single epoch per update — PMPO's sole trust region is the coef=0.3
