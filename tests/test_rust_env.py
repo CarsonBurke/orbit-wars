@@ -3561,3 +3561,183 @@ def test_rust_crate_sources_tracks_library_inputs_without_dev_bins(tmp_path: Pat
     } <= rel_sources
     assert "src/oracle/tests.rs" not in rel_sources
     assert "src/bin/bench.rs" not in rel_sources
+
+
+def _stepped_rust_env(*, num_players: int, seed: int, depth: int):
+    """A RustVecEnv advanced `depth` no-op steps so orbiters have rotated and
+    (for depth > 50) comets are live — the geometry that stresses the Python
+    twins of the Rust legality/materialization path."""
+    from owars.training.rust_env import RustVecEnv
+
+    rust = RustVecEnv(
+        num_envs=3,
+        num_players=num_players,
+        episode_steps=500,
+        ship_speed=6.0,
+        random_seed=seed,
+    )
+    rust.reset()
+    noop = [[[] for _ in range(num_players)] for _ in range(3)]
+    for _ in range(depth):
+        rust.step_subset_fast(list(range(3)), noop)
+    rows = [(e, p) for e in range(3) for p in range(num_players)]
+    return rust, rows
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+@pytest.mark.parametrize("num_players", [2, 4])
+def test_python_legal_mask_matches_rust_state_legal_mask(num_players: int):
+    """The submission bundle is pure Python and masks target logits with
+    ``_target_legal_mask_from_planets``; training masks with the Rust env's
+    ``legal_target_mask_from_state``. They must agree bit-for-bit across
+    orbiting/comet geometry and launch fractions, or the served policy sees a
+    different legal target set than it was trained against."""
+    from owars.policies.sampling import _target_legal_mask_from_planets
+
+    _build_rust_extension()
+    for seed in range(4):
+        for depth in (40, 120, 300):
+            rust, rows = _stepped_rust_env(num_players=num_players, seed=seed, depth=depth)
+            fast, _ = rust.policy_batch(rows, device="cpu")
+            owned = fast.planet_owned_mask.numpy().astype(bool) & fast.planet_mask.numpy().astype(
+                bool
+            )
+            pmask = fast.planet_mask.numpy().astype(bool)
+            ids = fast.planet_ids.numpy()
+            obs_list = rust.observations(rows)
+            for frac_val in (0.1, 0.5, 0.75, 1.0):
+                frac = np.full(fast.planet_mask.shape, frac_val, dtype=np.float32)
+                rust_mask = np.asarray(
+                    rust._core.legal_target_mask_from_state_active(rows, frac, owned)
+                )
+                py_mask = np.zeros_like(rust_mask)
+                for r, obs in enumerate(obs_list):
+                    py_mask[r] = np.asarray(
+                        _target_legal_mask_from_planets(
+                            frac[r].tolist(),
+                            owned[r].tolist(),
+                            pmask[r].tolist(),
+                            ids[r].tolist(),
+                            obs["planets"],
+                            obs.get("angular_velocity", 0.0) or 0.0,
+                            obs.get("comet_planet_ids", []),
+                        ),
+                        dtype=bool,
+                    )
+                assert np.array_equal(py_mask, rust_mask), (
+                    f"legal-mask divergence seed={seed} depth={depth} "
+                    f"players={num_players} frac={frac_val}: "
+                    f"{int((py_mask != rust_mask).sum())} cells differ"
+                )
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+@pytest.mark.parametrize("num_players", [2, 4])
+def test_python_materialize_matches_rust_materialize_actions(num_players: int):
+    """``_build_moves_from_lists`` (submission) must produce the same
+    ``[planet_id, angle, ships]`` triples as the Rust env's
+    ``materialize_actions`` (training) for identical launch/target/fraction
+    inputs. frac=0.5 deliberately lands on exact half-ship boundaries, which
+    is where Python's banker's rounding used to send one fewer ship than
+    Rust's round-half-away-from-zero."""
+    from owars.game.observation import parse_observation
+    from owars.policies.sampling import _build_moves_from_lists
+
+    _build_rust_extension()
+    for seed in range(4):
+        for depth in (40, 150, 300):
+            rust, rows = _stepped_rust_env(num_players=num_players, seed=seed, depth=depth)
+            fast, _ = rust.policy_batch(rows, device="cpu")
+            b, p = fast.planet_ids.shape
+            owned = fast.planet_owned_mask.numpy().astype(bool) & fast.planet_mask.numpy().astype(
+                bool
+            )
+            pmask = fast.planet_mask.numpy().astype(bool)
+            ids = fast.planet_ids.numpy()
+            obs_list = rust.observations(rows)
+            for frac_val in (0.25, 0.5, 0.75, 1.0):
+                frac = np.full((b, p), frac_val, dtype=np.float32)
+                launch = owned.astype(np.float32)
+                rust_mask = np.asarray(
+                    rust._core.legal_target_mask_from_state_active(rows, frac, owned)
+                )
+                target_idx = np.zeros((b, p), dtype=np.int64)
+                for r in range(b):
+                    for s in range(p):
+                        legal = np.flatnonzero(rust_mask[r, s])
+                        if legal.size:
+                            target_idx[r, s] = legal[0]
+                        else:
+                            launch[r, s] = 0.0
+                rust_mat = rust._core.materialize_actions(
+                    rows, launch, target_idx, frac, owned, pmask, ids, False
+                )
+                for r, obs in enumerate(obs_list):
+                    moves, _ = _build_moves_from_lists(
+                        launch[r].tolist(),
+                        target_idx[r].tolist(),
+                        frac[r].tolist(),
+                        owned[r].tolist(),
+                        pmask[r].tolist(),
+                        ids[r].tolist(),
+                        parse_observation(obs),
+                    )
+                    py = sorted(
+                        (int(m.from_planet_id), int(m.num_ships), float(m.angle)) for m in moves
+                    )
+                    ru = sorted(
+                        (int(a[0]), int(a[2]), float(a[1])) for a in rust_mat["actions"][r]
+                    )
+                    assert [(pl, sh) for (pl, sh, _a) in py] == [
+                        (pl, sh) for (pl, sh, _a) in ru
+                    ], (
+                        f"launched (planet, ships) diverge seed={seed} depth={depth} "
+                        f"players={num_players} frac={frac_val} row={r}: py={py} rust={ru}"
+                    )
+                    for (_pl, _sh, pa), (_rpl, _rsh, ra) in zip(py, ru, strict=True):
+                        assert math.isclose(pa, ra, rel_tol=0.0, abs_tol=1e-9)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+@pytest.mark.parametrize("num_players", [2, 4])
+def test_python_deterministic_actions_match_rust_native_sampler(num_players: int):
+    """End-to-end usage parity: given identical policy logits and state, the
+    Python deterministic sampler the submission bundle runs
+    (``sample_batch_actions_raw``) must select the same launches as the Rust
+    native sampler used during training. Angles may differ only by the
+    observation's coordinate-serialization noise."""
+    from owars.policies.model import PolicyOutput
+    from owars.policies.sampling import sample_batch_actions_raw
+
+    _build_rust_extension()
+
+    def _make_out(fast, gen_seed: int) -> PolicyOutput:
+        gen = torch.Generator().manual_seed(gen_seed)
+        rb, rp = fast.planet_ids.shape
+        return PolicyOutput(
+            launch_logits=torch.randn(rb, rp, generator=gen) * 3.0,
+            target_logits=torch.randn(rb, rp, rp, generator=gen) * 2.0,
+            value=torch.zeros(rb),
+            value_logits=torch.zeros(rb, 51),
+            planet_owned_mask=fast.planet_owned_mask,
+            planet_mask=fast.planet_mask,
+            planet_ids=fast.planet_ids,
+            action_logit_softcap=8.0,
+            fraction_alpha=torch.rand(rb, rp, generator=gen) * 8 + 1,
+            fraction_beta=torch.rand(rb, rp, generator=gen) * 8 + 1,
+        )
+
+    for seed in range(4):
+        for depth in (35, 160, 320):
+            rust, rows = _stepped_rust_env(num_players=num_players, seed=seed, depth=depth)
+            fast, _ = rust.policy_batch(rows, device="cpu")
+            out = _make_out(fast, seed * 1000 + depth)
+            rust_actions = rust.sample_batch_actions(out, rows, deterministic=True)
+            py_actions = sample_batch_actions_raw(out, rust.observations(rows), deterministic=True)
+            for r in range(len(rows)):
+                py = sorted((int(a[0]), int(a[2])) for a in py_actions[r])
+                ru = sorted((int(a[0]), int(a[2])) for a in rust_actions[r])
+                assert py == ru, (
+                    f"deterministic launch set diverges seed={seed} depth={depth} "
+                    f"players={num_players} row={r}: py={py} rust={ru}"
+                )

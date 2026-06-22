@@ -908,6 +908,29 @@ def _lead_angle(
     return None if solution is None else solution.angle
 
 
+def _ships_to_send(remaining: int, frac: float) -> int:
+    """Ships launched from a planet for a given launch fraction.
+
+    Mirrors the Rust simulator's ``ships_to_send`` exactly, including its
+    round-half-away-from-zero rule (Rust ``f64::round``). Python's built-in
+    ``round`` is round-half-to-even, which diverges from Rust at exact
+    half-ship boundaries (e.g. ``round(24.5)`` is 24 in Python but 25 in
+    Rust). Training rolls out through the Rust env while the submission
+    bundle launches through this Python path, so any mismatch here is a
+    silent train/serve skew in the launched ship count.
+    """
+    if remaining < 2:
+        return 0
+    clamped = 0.0 if frac < 0.0 else 1.0 if frac > 1.0 else frac
+    scaled = remaining * clamped
+    raw = math.floor(scaled)
+    # scaled - floor(scaled) is exact in IEEE-754, so the >= 0.5 test
+    # reproduces round-half-away-from-zero for these non-negative values.
+    if scaled - raw >= 0.5:
+        raw += 1
+    return max(1, min(remaining - 1, raw))
+
+
 def _build_moves_from_lists(
     launch_l: list[float],
     target_idx_l: list[int],
@@ -959,7 +982,7 @@ def _build_moves_from_lists(
             continue
 
         f = max(0.0, min(1.0, frac_l[i]))
-        send = max(1, min(remaining - 1, int(round(remaining * f))))
+        send = _ships_to_send(remaining, f)
         if send <= 0:
             continue
 
@@ -1084,7 +1107,7 @@ def _target_legal_mask_from_planets(
         if remaining < 2:
             continue
         frac = max(0.0, min(1.0, float(frac_l[i])))
-        send = max(1, min(remaining - 1, int(round(remaining * frac))))
+        send = _ships_to_send(remaining, frac)
         if send <= 0:
             continue
         for j, target in target_fields:
@@ -1153,7 +1176,7 @@ def _target_legal_mask_from_packed_legality_fields(
         if remaining < 2:
             continue
         frac = max(0.0, min(1.0, float(fields[1])))
-        send = max(1, min(remaining - 1, int(round(remaining * frac))))
+        send = _ships_to_send(remaining, frac)
         if send <= 0:
             continue
         for j, target in target_fields:
@@ -1618,7 +1641,7 @@ def _build_moves_from_packed_fields_with_mask(
             continue
 
         f = max(0.0, min(1.0, float(fields[1])))
-        send = max(1, min(remaining - 1, int(round(remaining * f))))
+        send = _ships_to_send(remaining, f)
         if send <= 0:
             continue
 
@@ -1697,7 +1720,7 @@ def _build_action_lists_from_packed_fields_raw_with_mask(
             continue
 
         frac = max(0.0, min(1.0, float(fields[1])))
-        send = max(1, min(mine_ships - 1, int(round(mine_ships * frac))))
+        send = _ships_to_send(mine_ships, frac)
         if send <= 0:
             continue
 
@@ -1779,7 +1802,7 @@ def _build_deterministic_action_lists_from_logits_raw(
             continue
 
         frac = max(0.0, min(1.0, float(fields[1])))
-        send = max(1, min(mine_ships - 1, int(round(mine_ships * frac))))
+        send = _ships_to_send(mine_ships, frac)
         if send <= 0:
             continue
 
@@ -1875,7 +1898,7 @@ def _build_action_lists_from_packed_fields_context_with_mask(
             continue
 
         frac = max(0.0, min(1.0, float(fields[1])))
-        send = max(1, min(mine_ships - 1, int(round(mine_ships * frac))))
+        send = _ships_to_send(mine_ships, frac)
         if send <= 0:
             continue
 

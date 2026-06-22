@@ -15,6 +15,7 @@ from owars.policies.sampling import (
     _batch_record_from_materialized_launch,
     _categorical_action_log_probs,
     _record_from_materialized_launch,
+    _ships_to_send,
     sample_actions,
     sample_batch_actions,
     sample_batch_actions_context,
@@ -56,6 +57,30 @@ def _sun_crossing_only_obs():
     obs["planets"] = obs["planets"][:2]
     obs["initial_planets"] = obs["initial_planets"][:2]
     return obs
+
+
+def test_ships_to_send_rounds_half_away_from_zero_like_rust():
+    """The launched ship count must match the Rust simulator's ``ships_to_send``
+    (``(remaining * frac).round()`` clamped to ``[1, remaining - 1]``), whose
+    ``f64::round`` rounds half away from zero. Python's built-in ``round`` is
+    round-half-to-even, so it would send one fewer ship on exact halves and
+    skew training (Rust) vs submission (Python)."""
+    # Exact halves: round-half-away-from-zero, not banker's rounding.
+    assert _ships_to_send(49, 0.5) == 25  # 24.5 -> 25 (round half up), not 24
+    assert _ships_to_send(205, 0.5) == 103  # 102.5 -> 103, not 102
+    assert _ships_to_send(50, 0.5) == 25  # 25.0 exactly, no tie
+    assert _ships_to_send(3, 0.5) == 2  # 1.5 -> 2 (would clamp at 2 anyway)
+    # Non-tie values round to nearest as usual.
+    assert _ships_to_send(100, 0.244) == 24  # 24.4 -> 24
+    assert _ships_to_send(100, 0.246) == 25  # 24.6 -> 25
+    # Clamp to [1, remaining - 1].
+    assert _ships_to_send(10, 0.0) == 1
+    assert _ships_to_send(10, 1.0) == 9
+    assert _ships_to_send(10, 2.0) == 9  # frac clamped to 1.0 first
+    assert _ships_to_send(10, -1.0) == 1  # frac clamped to 0.0 first
+    # Fewer than two ships can never launch.
+    assert _ships_to_send(1, 1.0) == 0
+    assert _ships_to_send(0, 1.0) == 0
 
 
 def test_categorical_action_log_probs_ignore_nonfinite_targets():
