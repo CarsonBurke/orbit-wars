@@ -41,7 +41,16 @@ from ..game import (
 from ..game.observation import Observation
 from ..game.physics import fleet_speed
 
-MAX_PLANETS: int = 64
+# Right-sized to the spec ceiling: 40 base planets (10 symmetric groups of 4 —
+# the generator's hard max) + 8 comets (at most two of the period-100 comet
+# groups can briefly overlap; one group ≈ 4 comets is the measured steady state,
+# observed max 44 over 128 full episodes). The trunk processes planets + 3 prefix
+# tokens, so over-padding here is pure wasted attention/FFN every forward (64 →
+# 48 measured ~31% faster at the rollout batch). No learned parameter is sized by
+# MAX_PLANETS, so changing it is checkpoint-shape-compatible; it does rescale a
+# few count/production feature normalizers, so treat a change as from-scratch.
+# Must stay in sync with `MAX_PLANETS` in rust/owars_env_py/src/lib.rs.
+MAX_PLANETS: int = 48
 FLEET_WIDTH_BUCKETS: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048)
 PLANET_FEAT_DIM: int = 19
 FLEET_FEAT_DIM: int = 20

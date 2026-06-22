@@ -406,7 +406,7 @@ def test_rust_policy_batch_supports_large_fleet_count():
 
     assert encoded.fleet_feats.shape == (2, 0, 20)
     assert encoded.planet_inbound_feats is not None
-    assert encoded.planet_inbound_feats.shape == (2, 64, 13)
+    assert encoded.planet_inbound_feats.shape == (2, MAX_PLANETS, 13)
     assert encoded.fleet_mask.shape == (2, 0)
     assert encoded.fleet_target_planet_idx is not None
     assert encoded.fleet_target_planet_idx.shape == (2, 0)
@@ -1241,7 +1241,7 @@ def test_relaxed_target_legality_keeps_sun_mask_but_allows_planet_blocked_routes
         random_seed=0,
         strict_target_legality=False,
     )
-    frac = np.full((1, 64), 0.75, dtype=np.float32)
+    frac = np.full((1, MAX_PLANETS), 0.75, dtype=np.float32)
 
     strict._core.load_observation(0, blocked_obs)
     relaxed._core.load_observation(0, blocked_obs)
@@ -1290,7 +1290,7 @@ def test_relaxed_compact_sampler_executes_recorded_planet_blocked_target():
         strict_target_legality=False,
     )
     rust._core.load_observation(0, obs)
-    planets = 64
+    planets = MAX_PLANETS
     target_logits = np.full((1, planets), -8.0, dtype=np.float32)
     target_logits[0, 1] = 8.0
     result = rust._core.categorical_beta_actions_from_state_compact_sources(
@@ -2401,7 +2401,7 @@ def test_native_categorical_records_depleted_owned_planet_as_constrained():
         random_seed=0,
     )
     rust._core.load_observation(0, obs)
-    planets = 64
+    planets = MAX_PLANETS
     launch_logits = np.full((1, planets), 8.0, dtype=np.float32)
     target_logits = np.zeros((1, planets, planets), dtype=np.float32)
     alpha = np.full((1, planets), 8.0, dtype=np.float32)
@@ -2482,7 +2482,7 @@ def test_native_categorical_ignores_nonfinite_legal_target_logits():
         random_seed=0,
     )
     rust._core.load_observation(0, obs)
-    planets = 64
+    planets = MAX_PLANETS
     launch_logits = np.full((1, planets), -8.0, dtype=np.float32)
     target_logits = np.full((1, planets, planets), -8.0, dtype=np.float32)
     target_logits[0, 0, 1] = np.inf
@@ -2532,7 +2532,7 @@ def test_native_categorical_softcaps_positive_infinite_noop_logit():
         random_seed=0,
     )
     rust._core.load_observation(0, obs)
-    planets = 64
+    planets = MAX_PLANETS
     launch_logits = np.full((1, planets), -8.0, dtype=np.float32)
     launch_logits[0, 0] = np.inf
     target_logits = np.full((1, planets, planets), 8.0, dtype=np.float32)

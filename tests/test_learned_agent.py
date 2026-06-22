@@ -4,7 +4,7 @@ import torch
 from owars.agents.learned import LearnedAgent
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation
-from owars.policies.features import encode_raw_observations
+from owars.policies.features import MAX_PLANETS, encode_raw_observations
 
 
 def _obs(player: int = 0):
@@ -60,7 +60,7 @@ def test_learned_agent_cpu_ignores_compile_mode(tmp_path):
     out = agent._forward(feats, 1)
 
     assert agent.compile_mode is None
-    assert out.launch_logits.shape == (1, 64)
+    assert out.launch_logits.shape == (1, MAX_PLANETS)
     assert torch.allclose(out.launch_logits, direct.launch_logits)
     assert torch.allclose(out.value, direct.value)
 
@@ -109,7 +109,7 @@ def test_learned_agent_destination_compile_warmup_uses_inbound_summary(
     agent = LearnedAgent(ckpt, device="cpu")
     agent._warmup_forward_kernel(4)
 
-    assert seen_shapes == [((4, 0, 20), (4, 64, 13))]
+    assert seen_shapes == [((4, 0, 20), (4, MAX_PLANETS, 13))]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA compile smoke")

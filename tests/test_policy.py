@@ -4,6 +4,7 @@ import torch.nn.functional as F  # noqa: N812
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation, sample_actions
+from owars.policies.features import GLOBAL_PRODUCTION_SCALE, MAX_PLANETS
 from owars.policies.model import (
     HLGaussLoss,
     _destination_fleet_stats,
@@ -41,10 +42,19 @@ def test_encode_shapes():
     assert torch.allclose(feats.global_feats[:2], torch.tensor([0.0, 1.0]))
     # Self slot starts at offset 4: planet_count, production, planet_ships,
     # fleet_count, fleet_ships. Enemy_0 follows at offset 9.
-    assert torch.allclose(feats.global_feats[4:6], torch.tensor([1.0 / 64.0, 3.0 / 320.0]))
-    assert torch.allclose(feats.global_feats[9:11], torch.tensor([1.0 / 64.0, 2.0 / 320.0]))
-    assert torch.allclose(feats.global_feats[24:26], torch.tensor([1.0 / 64.0, 1.0 / 320.0]))
-    assert feats.planet_feats.shape == (64, 19)
+    assert torch.allclose(
+        feats.global_feats[4:6],
+        torch.tensor([1.0 / MAX_PLANETS, 3.0 / GLOBAL_PRODUCTION_SCALE]),
+    )
+    assert torch.allclose(
+        feats.global_feats[9:11],
+        torch.tensor([1.0 / MAX_PLANETS, 2.0 / GLOBAL_PRODUCTION_SCALE]),
+    )
+    assert torch.allclose(
+        feats.global_feats[24:26],
+        torch.tensor([1.0 / MAX_PLANETS, 1.0 / GLOBAL_PRODUCTION_SCALE]),
+    )
+    assert feats.planet_feats.shape == (MAX_PLANETS, 19)
     assert feats.fleet_feats.shape == (1, 20)
     assert feats.fleet_target_planet_idx is None
     assert int(feats.planet_mask.sum()) == 3
@@ -59,10 +69,10 @@ def test_policy_forward_shapes():
     feats = encode_observation(o)
     out = model(feats)
     # batch dim was added implicitly by the encoder fast path.
-    assert out.launch_logits.shape == (1, 64)
-    assert out.target_logits.shape == (1, 64, 64)
-    assert out.fraction_alpha.shape == (1, 64)
-    assert out.fraction_beta.shape == (1, 64)
+    assert out.launch_logits.shape == (1, MAX_PLANETS)
+    assert out.target_logits.shape == (1, MAX_PLANETS, MAX_PLANETS)
+    assert out.fraction_alpha.shape == (1, MAX_PLANETS)
+    assert out.fraction_beta.shape == (1, MAX_PLANETS)
     assert out.value.shape == (1,)
     # Distributional MTP value head: per-horizon, per-bin logits.
     assert out.value_logits.shape == (1, cfg.critic_mtp_horizon, cfg.value_num_bins)
@@ -315,7 +325,7 @@ def test_planet_rope_can_be_disabled():
     out = model(encode_observation(parse_observation(_obs())))
 
     assert model.planet_rope.rotate_dim == 0
-    assert out.launch_logits.shape == (1, 64)
+    assert out.launch_logits.shape == (1, MAX_PLANETS)
 
 
 def test_grouped_query_attention_forward_shapes():
@@ -328,8 +338,8 @@ def test_grouped_query_attention_forward_shapes():
     assert model.fleet_tokenizer is not None
     assert model.fleet_tokenizer.layers[0].cross_attn.n_kv_heads == 1
     assert model.fleet_tokenizer.layers[0].cross_attn.c_k.weight.shape == (16, 32)
-    assert out.launch_logits.shape == (1, 64)
-    assert out.target_logits.shape == (1, 64, 64)
+    assert out.launch_logits.shape == (1, MAX_PLANETS)
+    assert out.target_logits.shape == (1, MAX_PLANETS, MAX_PLANETS)
 
 
 def test_fleet_latent_encoder_compresses_fleet_tokens():
@@ -348,13 +358,13 @@ def test_fleet_latent_encoder_compresses_fleet_tokens():
         model._embed_tokens(feats)
     )
 
-    assert h.shape[1] == 3 + 64 + cfg.num_fleet_latents
+    assert h.shape[1] == 3 + MAX_PLANETS + cfg.num_fleet_latents
     assert full_mask.shape[1] == h.shape[1]
-    assert planet_mask.shape[-1] == 64
+    assert planet_mask.shape[-1] == MAX_PLANETS
     assert fleet_mask.shape[-1] == cfg.num_fleet_latents
     assert rope_cache is not None
-    assert planet_slice == slice(3, 67)
-    assert p == 64
+    assert planet_slice == slice(3, 3 + MAX_PLANETS)
+    assert p == MAX_PLANETS
     assert f == cfg.num_fleet_latents
 
 
@@ -378,16 +388,16 @@ def test_destination_conditioned_encoder_scopes_fleets_before_trunk():
 
     assert model.fleet_tokenizer is None
     assert model.destination_fleet_conditioner is not None
-    assert h.shape[1] == 3 + 64
+    assert h.shape[1] == 3 + MAX_PLANETS
     assert full_mask.shape[1] == h.shape[1]
-    assert planet_mask.shape[-1] == 64
+    assert planet_mask.shape[-1] == MAX_PLANETS
     assert fleet_mask.shape[-1] == 0
     assert rope_cache is not None
-    assert planet_slice == slice(3, 67)
-    assert p == 64
+    assert planet_slice == slice(3, 3 + MAX_PLANETS)
+    assert p == MAX_PLANETS
     assert f == 0
-    assert out.launch_logits.shape == (1, 64)
-    assert out.target_logits.shape == (1, 64, 64)
+    assert out.launch_logits.shape == (1, MAX_PLANETS)
+    assert out.target_logits.shape == (1, MAX_PLANETS, MAX_PLANETS)
 
 
 def test_destination_conditioned_encoder_is_identity_without_inbound_fleets():
@@ -625,7 +635,7 @@ def test_policy_accepts_legacy_fleet_feature_width():
     feats = encode_observation(parse_observation(_obs()))
     out = model(feats)
 
-    assert out.target_logits.shape == (1, 64, 64)
+    assert out.target_logits.shape == (1, MAX_PLANETS, MAX_PLANETS)
 
 
 def test_policy_ignores_padded_token_features():

@@ -25,7 +25,10 @@ const SUN_RADIUS: f64 = 10.0;
 const ROTATION_RADIUS_LIMIT: f64 = 50.0;
 const MAX_SHIP_SPEED: f64 = 6.0;
 const MAX_OMEGA: f64 = 0.05;
-const MAX_PLANETS: usize = 64;
+// Spec ceiling: 40 base planets (10 groups of 4) + 8 comets (<=2 overlapping
+// period-100 groups; measured max 44). Must match MAX_PLANETS in
+// src/owars/policies/features.py.
+const MAX_PLANETS: usize = 48;
 const PLANET_FEAT_DIM: usize = 19;
 const FLEET_FEAT_DIM: usize = 20;
 const PLANET_INBOUND_FEAT_DIM: usize = 13;

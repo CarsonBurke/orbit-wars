@@ -6,7 +6,7 @@ import torch
 
 from owars.game import parse_observation
 from owars.policies import OrbitPolicy, OrbitPolicyConfig, encode_observation
-from owars.policies.features import stack_encoded
+from owars.policies.features import MAX_PLANETS, stack_encoded
 from owars.policies.model import PolicyOutput
 from owars.policies.sampling import (
     ActionContext,
@@ -219,7 +219,7 @@ def test_stack_encoded_preserves_fields():
     assert stacked_targets.fleet_target_planet_idx is not None
     assert stacked_targets.fleet_target_planet_idx.shape == (2, 0)
     assert stacked_targets.planet_inbound_feats is not None
-    assert stacked_targets.planet_inbound_feats.shape == (2, 64, 13)
+    assert stacked_targets.planet_inbound_feats.shape == (2, MAX_PLANETS, 13)
     # Element 0 must equal the original.
     assert torch.equal(stacked.planet_feats[0], feats_a.planet_feats)
     assert torch.equal(stacked.fleet_feats[1], feats_b.fleet_feats)
