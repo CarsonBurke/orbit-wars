@@ -71,3 +71,6 @@ configs/local/
 
 
 logs/
+
+# Local checkpoint backstop pulled from the rented box (never commit weights).
+backups/
