@@ -32,6 +32,7 @@ from owars.training import train as train_mod
 from owars.training.config import RunConfig
 from owars.training.ppo import (
     _backward_actor_critic_with_group_clips,
+    _backward_critic_only_with_clips,
     _batch_normalize_advantage,
     _beta_kl,
     _beta_log_prob,
@@ -40,6 +41,7 @@ from owars.training.ppo import (
     _distributional_value_loss,
     _fixed_minibatches,
     _fixed_minibatches_by_count,
+    _grad_clip_groups,
     _minibatch_loss_scale,
     _pmpo_pg_loss,
     _rank_gaussian_advantage,
@@ -584,6 +586,66 @@ def test_ppo_update_pmpo_runs_source_major_path(cuda_device):
     assert math.isfinite(log.policy_loss)
     assert math.isfinite(log.reverse_kl)
     assert log.reverse_kl >= 0.0
+
+
+def test_ppo_update_pmpo_kl_freezes_actor_keeps_critic():
+    """A tiny analytical-KL target makes ppo_update FREEZE the actor once a step
+    drifts the policy past the trust region (Option-1 decouple), but the critic
+    keeps training every remaining minibatch/epoch — `epochs_run` stays full and
+    `actor_frozen_frac` rises above 0. With no target the actor never freezes.
+    Runs on CPU (fp32, no autocast) so old==new gives reverse_kl≈0 at the first
+    minibatch and the freeze is driven by real drift, not numerical noise."""
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+
+    def run(target_kl):
+        torch.manual_seed(0)
+        model = OrbitPolicy(cfg)
+        batch = _toy_batch(model, batch_size=8)
+        _add_old_policy_dist(model, batch)
+        optim = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+        return ppo_update(
+            model,
+            optim,
+            batch,
+            **_pmpo_kwargs(epochs=3, minibatch_size=4, pmpo_target_kl=target_kl),
+        )
+
+    full = run(None)
+    early = run(1e-9)
+    # No target → actor never freezes; both run every epoch (critic decoupled).
+    assert full.epochs_run == 3.0
+    assert full.actor_frozen_frac == 0.0
+    # Tiny target → actor freezes mid-update, but the critic still finishes ALL
+    # epochs (the Option-1 property: the backstop no longer abandons the update).
+    assert early.epochs_run == 3.0
+    assert early.actor_frozen_frac > 0.0
+
+
+def test_backward_critic_only_freezes_actor_params():
+    """`_backward_critic_only_with_clips` must leave the actor-only parameters
+    with no gradient so a weight_decay=0 optimizer step holds them fixed, while
+    the critic head and shared trunk still receive a gradient and move."""
+    torch.manual_seed(0)
+    cfg = OrbitPolicyConfig(dim=32, ff_dim=64, depth=2, n_heads=2)
+    model = OrbitPolicy(cfg)
+    actor, critic, shared = _grad_clip_groups(model)
+    assert actor and critic and shared
+
+    # A synthetic critic-side loss touching only critic + shared params.
+    critic_loss = sum((p * p).sum() for p in [*critic, *shared])
+    before = {id(p): p.detach().clone() for p in [*actor, *critic, *shared]}
+
+    optim = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+    optim.zero_grad(set_to_none=True)
+    norms = _backward_critic_only_with_clips(model, critic_loss, 1.0)
+    # Actor-side diagnostics are zeroed; actor params carry no gradient.
+    assert float(norms[0]) == 0.0  # actor_norm
+    assert all(p.grad is None for p in actor)
+    optim.step()
+
+    assert all(torch.equal(p, before[id(p)]) for p in actor), "actor params moved"
+    assert any(not torch.equal(p, before[id(p)]) for p in critic), "critic frozen"
+    assert any(not torch.equal(p, before[id(p)]) for p in shared), "trunk frozen"
 
 
 def test_ppo_update_pmpo_requires_old_policy_dist():

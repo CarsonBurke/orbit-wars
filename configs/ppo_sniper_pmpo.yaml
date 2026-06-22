@@ -108,10 +108,17 @@ ppo:
   # reinforced by the sign of its advantage at ~unit weight and the reverse-KL
   # penalty is the trust region. dreamer4 sums the KL over action components
   # (continuous_kl.sum(-1) + the MultiCategorical reduction) before averaging
-  # over samples — our per-turn-sum aggregation matches that. Sole trust region
-  # here (no early-stop, no KL-LR controller).
+  # over samples — our per-turn-sum aggregation matches that. The reverse-KL
+  # penalty is the primary trust region; `pmpo_target_kl` below is a hard
+  # actor-freeze backstop (no KL-LR controller).
   pmpo_kl_coef: 0.3
   pmpo_reverse_kl: true
+  # Actor-freeze backstop on the analytical per-minibatch reverse KL(old‖new):
+  # once a minibatch's mean per-source-planet KL exceeds this, the actor stops
+  # updating for the rest of the epoch (the critic keeps training). Guards the
+  # from-scratch-vs-strong-oracle-sniper regime against the large policy jumps
+  # that drove the observed training oscillation.
+  pmpo_target_kl: 0.03
   advantage_transform: none
   norm_advantage: false
   norm_advantage_scope: minibatch

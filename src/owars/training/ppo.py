@@ -1498,6 +1498,69 @@ def _backward_actor_critic_with_group_clips(
     )
 
 
+def _backward_critic_only_with_clips(
+    model: torch.nn.Module,
+    critic_loss: torch.Tensor,
+    max_norm: float,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Critic-only backward used after the PMPO analytical-KL backstop freezes
+    the actor (Option-1 decouple in `ppo_update`).
+
+    Only the critic head plus the shared trunk are backpropagated and clipped;
+    the actor-only parameters receive NO gradient. With `weight_decay=0` the
+    optimizer leaves those grad-`None` actor params untouched, so the actor HEAD
+    is held fixed while the critic keeps fitting on the remaining minibatches.
+    Note this freezes the actor's *gradient*, not its full output distribution:
+    the shared trunk still moves under the critic signal (and is re-normalized
+    each step), so the policy can still drift indirectly — the backstop bounds
+    actor-gradient-driven KL spikes, not trunk-driven drift. Returns the same
+    11-tuple of grad-norm diagnostics as `_backward_actor_critic_with_group_clips`,
+    with the actor-side entries zeroed (and `actor_clip_scale` = 1: no actor clip
+    occurred).
+    """
+    actor, critic, shared = _grad_clip_groups(model)
+    device = _module_device(model)
+    clip_norm = max_norm if max_norm > 0.0 else float("inf")
+    critic_params = [*critic, *shared]
+    all_params = [*actor, *critic, *shared]
+
+    _clear_param_grads(all_params)
+    critic_loss.backward()
+    critic_shared_raw_norm = _grad_norm(shared, device)
+    critic_norm = _clip_grad_norm(critic_params, clip_norm, device)
+    critic_shared_norm = _grad_norm(shared, device)
+    critic_clip_scale = _grad_clip_scale(critic_norm, clip_norm)
+    critic_clip_frac = (critic_clip_scale < 1.0).to(critic_norm.dtype)
+
+    zero = torch.zeros((), device=device)
+    one = torch.ones((), device=device)
+    return (
+        zero,  # actor_norm
+        critic_norm,
+        zero,  # actor_shared_norm
+        critic_shared_norm,
+        critic_shared_norm,  # shared_norm — only the critic contributes
+        zero,  # actor_shared_raw_norm
+        critic_shared_raw_norm,
+        one,  # actor_clip_scale — no actor grad to clip
+        critic_clip_scale,
+        zero,  # actor_clip_frac
+        critic_clip_frac,
+    )
+
+
 class _PPOMinibatchKernel(torch.nn.Module):
     """Fixed-shape PPO minibatch loss/metric kernel.
 
@@ -2948,6 +3011,10 @@ class PPOLog:
     pmpo_neg_loss: float = 0.0
     # Number of PPO epochs actually run.
     epochs_run: float = 0.0
+    # Fraction of optimizer steps in this update that ran CRITIC-ONLY because the
+    # PMPO analytical-KL backstop froze the actor (0 when no `pmpo_target_kl`
+    # trip; see the Option-1 decouple in `ppo_update`).
+    actor_frozen_frac: float = 0.0
 
 
 def compute_gae(
@@ -3433,6 +3500,7 @@ def ppo_update(
     pmpo_pos_to_neg_weight: float = 0.5,
     pmpo_kl_coef: float = 0.3,
     pmpo_reverse_kl: bool = True,
+    pmpo_target_kl: float | None = None,
     minibatch_count: int | None = None,
     compile_mode: str | None = None,
 ) -> PPOLog:
@@ -3626,6 +3694,16 @@ def ppo_update(
             pmpo_reverse_kl=pmpo_reverse_kl,
         )
     epochs_run = 0
+    # Hard trust-region backstop (PMPO only): once a minibatch's analytical
+    # reverse KL(old‖new) exceeds `pmpo_target_kl`, FREEZE the actor for the rest
+    # of the update. The soft `pmpo_kl_coef` penalty can still let one update
+    # spike the KL and collapse entropy; freezing the actor stops further policy
+    # drift mid-update. The critic is DECOUPLED: it keeps training on every
+    # remaining minibatch/epoch (Option 1), so the value function still gets its
+    # full epoch budget even when the actor trips the backstop early.
+    kl_early_stop = use_pmpo and pmpo_target_kl is not None
+    actor_frozen = False
+    frozen_steps = 0
     pinned_cache: PinnedSliceCache | None = {} if device.type == "cuda" else None
     for _ in range(epochs):
         if minibatch_count is not None:
@@ -3693,26 +3771,59 @@ def ppo_update(
             _raise_if_nonfinite_tensor(f"ppo_step_{n_steps}:critic_loss", critic_loss)
             metrics_for_step = metrics.detach().clone()
 
+            if kl_early_stop and not actor_frozen and float(metrics_for_step[30]) > pmpo_target_kl:
+                # metrics[30] is this minibatch's mean analytical reverse
+                # KL(old‖new) (see the kernel metric stacks). It reflects drift
+                # accumulated by PRIOR actor steps, so the policy is already past
+                # the trust region. FREEZE the actor for the rest of the update
+                # (no further policy-gradient steps) but keep training the CRITIC
+                # on this and every remaining minibatch/epoch — the value
+                # function should not be starved by an actor-side KL spike.
+                actor_frozen = True
+
             optimizer.zero_grad(set_to_none=True)
             loss_scale = _minibatch_loss_scale(row_weight, logical_minibatch_size)
-            (
-                actor_grad_norm,
-                critic_grad_norm,
-                actor_shared_grad_norm,
-                critic_shared_grad_norm,
-                shared_grad_norm,
-                actor_shared_raw_grad_norm,
-                critic_shared_raw_grad_norm,
-                actor_clip_scale,
-                critic_clip_scale,
-                actor_clip_frac,
-                critic_clip_frac,
-            ) = _backward_actor_critic_with_group_clips(
-                model,
-                actor_loss * loss_scale,
-                critic_loss * loss_scale,
-                grad_clip,
-            )
+            if actor_frozen:
+                # Critic-only: actor-head params get no gradient and, with
+                # weight_decay=0, the optimizer leaves them untouched. The shared
+                # trunk still moves under the critic.
+                (
+                    actor_grad_norm,
+                    critic_grad_norm,
+                    actor_shared_grad_norm,
+                    critic_shared_grad_norm,
+                    shared_grad_norm,
+                    actor_shared_raw_grad_norm,
+                    critic_shared_raw_grad_norm,
+                    actor_clip_scale,
+                    critic_clip_scale,
+                    actor_clip_frac,
+                    critic_clip_frac,
+                ) = _backward_critic_only_with_clips(
+                    model,
+                    critic_loss * loss_scale,
+                    grad_clip,
+                )
+                frozen_steps += 1
+            else:
+                (
+                    actor_grad_norm,
+                    critic_grad_norm,
+                    actor_shared_grad_norm,
+                    critic_shared_grad_norm,
+                    shared_grad_norm,
+                    actor_shared_raw_grad_norm,
+                    critic_shared_raw_grad_norm,
+                    actor_clip_scale,
+                    critic_clip_scale,
+                    actor_clip_frac,
+                    critic_clip_frac,
+                ) = _backward_actor_critic_with_group_clips(
+                    model,
+                    actor_loss * loss_scale,
+                    critic_loss * loss_scale,
+                    grad_clip,
+                )
             _raise_if_nonfinite_model_tensors(
                 model,
                 what=f"ppo_step_{n_steps}:grad",
@@ -3835,6 +3946,7 @@ def ppo_update(
         pmpo_pos_loss=float(mean_logs[31]),
         pmpo_neg_loss=float(mean_logs[32]),
         epochs_run=float(epochs_run),
+        actor_frozen_frac=float(frozen_steps) / float(n_steps),
     )
 
 

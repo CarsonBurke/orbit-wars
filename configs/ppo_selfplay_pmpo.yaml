@@ -92,6 +92,11 @@ ppo:
   # KL-LR controller). See ppo_sniper_pmpo.yaml for the full rationale.
   pmpo_kl_coef: 0.3
   pmpo_reverse_kl: true
+  # Actor-freeze backstop on the analytical per-minibatch reverse KL(old‖new):
+  # once a minibatch's mean per-source-planet KL exceeds this, the actor stops
+  # updating for the rest of the epoch (the critic keeps training). Matches
+  # ppo_sniper_pmpo.yaml — guards self-play against large policy jumps.
+  pmpo_target_kl: 0.03
   advantage_transform: none
   norm_advantage: false
   norm_advantage_scope: minibatch

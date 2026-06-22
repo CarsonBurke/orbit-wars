@@ -247,6 +247,17 @@ class PPOCfg:
     # PMPO trust-region direction. True = reverse KL(old‖new) (cleanrl default,
     # mode-covering toward the rollout policy); False = forward KL(new‖old).
     pmpo_reverse_kl: bool = True
+    # PMPO actor-freeze backstop on the ANALYTICAL per-planet reverse
+    # KL(old‖new): once a minibatch's mean analytical KL exceeds this target the
+    # ACTOR is frozen for the rest of the update (no further policy-gradient
+    # steps), while the CRITIC keeps training every remaining minibatch and epoch
+    # (Option-1 decouple — the value function is not starved by an actor-side KL
+    # spike). The soft `pmpo_kl_coef` penalty alone lets a single update spike the
+    # KL and collapse entropy; this is the hard trust-region backstop on the
+    # actor. None disables (default — preserves the no-backstop PMPO behavior).
+    # cleanrl's `target_kl` analogue, but on the closed-form KL rather than a
+    # sampled k3, and freezing the actor instead of breaking the whole update.
+    pmpo_target_kl: float | None = None
     # Distributional CE gradients are naturally bounded (per-bin
     # `softmax − target_probs` has ‖∇‖ ~ O(1)), unlike MSE which blew
     # up under bad predictions. dreamer4 effectively runs the equivalent
@@ -616,6 +627,8 @@ class RunConfig:
             raise ValueError("ppo.pmpo_pos_to_neg_weight must be in [0, 1]")
         if cfg.ppo.pmpo_kl_coef < 0.0:
             raise ValueError("ppo.pmpo_kl_coef must be non-negative")
+        if cfg.ppo.pmpo_target_kl is not None and cfg.ppo.pmpo_target_kl <= 0.0:
+            raise ValueError("ppo.pmpo_target_kl must be positive when set")
         if not (
             0.0
             <= cfg.ppo.advantage_return_norm_perclo
